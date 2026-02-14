@@ -1,8 +1,8 @@
 # snpguest build stage (AMD SEV-SNP attestation tool)
-FROM rust:1.77-alpine AS snpguest-builder
+FROM rust:1.83-alpine AS snpguest-builder
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static
-RUN cargo install snpguest@0.6.0 --root /usr/local
+RUN cargo install snpguest@0.7.1 --root /usr/local
 
 # Go build stage
 FROM golang:1.24-alpine AS builder

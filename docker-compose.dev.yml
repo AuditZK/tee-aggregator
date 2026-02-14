@@ -1,0 +1,72 @@
+services:
+  # =============================================
+  # PostgreSQL - Go Enclave Database (DEV)
+  # =============================================
+  enclave-go-db:
+    image: postgres:16-alpine
+    container_name: enclave_go_db_dev
+    environment:
+      POSTGRES_USER: enclave
+      POSTGRES_PASSWORD: enclave
+      POSTGRES_DB: enclave_go
+    ports:
+      - "5436:5432"    # Port différent du TypeScript (5432)
+    volumes:
+      - enclave-go-db-data-dev:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enclave -d enclave_go"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - enclave-go-network-dev
+
+  # =============================================
+  # Enclave Go - Development Mode (sans contraintes TEE)
+  # =============================================
+  enclave-go-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: enclave-go:dev
+    container_name: enclave_go_dev
+    ports:
+      - "8081:8080"    # REST API (8081 pour éviter conflit avec TS sur 8080)
+      - "50051:50051"  # gRPC
+      - "50052:50052"  # Log Stream (SSE)
+      - "9091:9090"    # Prometheus Metrics (9091 pour éviter conflit)
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgres://enclave:enclave@enclave-go-db:5432/enclave_go?sslmode=disable
+      - ENV=development
+      - LOG_LEVEL=debug
+      - GRPC_INSECURE=true
+      - CORS_ORIGIN=*
+      - METRICS_ENABLED=true
+      - ENABLE_DAILY_SYNC=true
+      - DATA_RETENTION_DAYS=30
+    depends_on:
+      enclave-go-db:
+        condition: service_healthy
+    restart: unless-stopped
+    # Pas de contraintes TEE strictes en dev mode
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - enclave-go-network-dev
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  enclave-go-db-data-dev:
+
+networks:
+  enclave-go-network-dev:
+    driver: bridge
