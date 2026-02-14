@@ -1,3 +1,12 @@
+# Production Dockerfile with SEV-SNP attestation support
+# Uses Rust nightly for snpguest build
+
+# snpguest build stage (AMD SEV-SNP attestation tool)
+FROM rustlang/rust:nightly-alpine AS snpguest-builder
+
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static git
+RUN cargo install snpguest --root /usr/local --locked
+
 # Go build stage
 FROM golang:1.24-alpine AS builder
 
@@ -27,6 +36,9 @@ WORKDIR /app
 
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates tzdata wget
+
+# Copy snpguest binary for SEV-SNP attestation
+COPY --from=snpguest-builder /usr/local/bin/snpguest /usr/local/bin/snpguest
 
 # Copy Go binary
 COPY --from=builder /enclave /app/enclave
