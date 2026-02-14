@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: enclave
       POSTGRES_DB: enclave_go
     ports:
-      - "5436:5432"    # Port différent du TypeScript (5432)
+      - "5437:5432"    # Port différent du TypeScript (5436) et Go prod (5436)
     volumes:
       - enclave-go-db-data-dev:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
