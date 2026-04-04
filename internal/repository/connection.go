@@ -41,7 +41,8 @@ type ExchangeConnection struct {
 	UpdatedAt           time.Time `json:"updated_at"`
 }
 
-// ConnectionRepo handles exchange connection persistence
+// ConnectionRepo handles exchange connection persistence.
+// Supports both TS (Prisma camelCase) and Go (snake_case) column naming.
 type ConnectionRepo struct {
 	pool *pgxpool.Pool
 
@@ -52,6 +53,7 @@ type ConnectionRepo struct {
 	hasExcludeFromReportCol bool
 	hasKYCLevelCol          bool
 	hasIsPaperCol           bool
+	isTSSchema              bool // true = TS Prisma camelCase columns
 }
 
 // NewConnectionRepo creates a new connection repository
@@ -165,6 +167,12 @@ func (r *ConnectionRepo) ExistsActiveByCredentialsHash(ctx context.Context, user
 
 // GetByUserAndExchange retrieves a connection by user and exchange
 func (r *ConnectionRepo) GetByUserAndExchange(ctx context.Context, userUID, exchange string) (*ExchangeConnection, error) {
+	r.getCapabilityFlags(ctx) // Ensure schema detection
+
+	if r.isTSSchema {
+		return r.getByUserAndExchangeTS(ctx, userUID, exchange)
+	}
+
 	query := `
 		SELECT id, user_uid, exchange, label,
 			encrypted_api_key, api_key_iv, api_key_auth_tag,
@@ -193,9 +201,41 @@ func (r *ConnectionRepo) GetByUserAndExchange(ctx context.Context, userUID, exch
 	return &conn, nil
 }
 
+// getByUserAndExchangeTS reads from TS Prisma camelCase schema.
+// TS has no separate IV/AuthTag columns — encrypted data is a single hex field.
+func (r *ConnectionRepo) getByUserAndExchangeTS(ctx context.Context, userUID, exchange string) (*ExchangeConnection, error) {
+	query := `
+		SELECT id, "userUid", exchange, label,
+			"encryptedApiKey", "encryptedApiSecret", "encryptedPassphrase",
+			"isActive", "createdAt", "updatedAt"
+		FROM exchange_connections
+		WHERE "userUid" = $1 AND exchange = $2 AND "isActive" = true`
+
+	var conn ExchangeConnection
+	err := r.pool.QueryRow(ctx, query, userUID, exchange).Scan(
+		&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
+		&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &conn.EncryptedPassphrase,
+		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// IV and AuthTag stay empty — decryptField detects TS format automatically
+	return &conn, nil
+}
+
 // GetActiveByUser retrieves all active connections for a user
 func (r *ConnectionRepo) GetActiveByUser(ctx context.Context, userUID string) ([]*ExchangeConnection, error) {
 	hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper := r.getCapabilityFlags(ctx)
+
+	if r.isTSSchema {
+		return r.getActiveByUserTS(ctx, userUID, hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper)
+	}
 
 	columns := []string{"id", "user_uid", "exchange", "label"}
 	if hasCredHash {
@@ -234,6 +274,84 @@ func (r *ConnectionRepo) GetActiveByUser(ctx context.Context, userUID string) ([
 	}
 	defer rows.Close()
 
+	return r.scanConnectionsGo(rows, hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper)
+}
+
+func (r *ConnectionRepo) getActiveByUserTS(ctx context.Context, userUID string, hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper bool) ([]*ExchangeConnection, error) {
+	columns := []string{`id`, `"userUid"`, `exchange`, `label`}
+	if hasCredHash {
+		columns = append(columns, `"credentialsHash"`)
+	}
+	if hasSyncMins {
+		columns = append(columns, `"syncIntervalMinutes"`)
+	}
+	if hasExclude {
+		columns = append(columns, `"excludeFromReport"`)
+	}
+	if hasKYCLevel {
+		columns = append(columns, `"kycLevel"`)
+	}
+	if hasIsPaper {
+		columns = append(columns, `"isPaper"`)
+	}
+	columns = append(columns,
+		`"encryptedApiKey"`, `"encryptedApiSecret"`, `"encryptedPassphrase"`,
+		`"isActive"`, `"createdAt"`, `"updatedAt"`,
+	)
+
+	query := fmt.Sprintf(`
+		SELECT %s
+		FROM exchange_connections
+		WHERE "userUid" = $1 AND "isActive" = true
+		ORDER BY "createdAt"`,
+		strings.Join(columns, ", "),
+	)
+
+	rows, err := r.pool.Query(ctx, query, userUID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var connections []*ExchangeConnection
+	for rows.Next() {
+		var conn ExchangeConnection
+		scanArgs := []any{&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label}
+		if hasCredHash {
+			scanArgs = append(scanArgs, &conn.CredentialsHash)
+		}
+		if hasSyncMins {
+			scanArgs = append(scanArgs, &conn.SyncIntervalMinutes)
+		}
+		if hasExclude {
+			scanArgs = append(scanArgs, &conn.ExcludeFromReport)
+		}
+		if hasKYCLevel {
+			scanArgs = append(scanArgs, &conn.KYCLevel)
+		}
+		if hasIsPaper {
+			scanArgs = append(scanArgs, &conn.IsPaper)
+		}
+		// TS: single encrypted field, no IV/AuthTag columns
+		scanArgs = append(scanArgs,
+			&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &conn.EncryptedPassphrase,
+			&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
+		)
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, err
+		}
+
+		if !hasSyncMins {
+			conn.SyncIntervalMinutes = 1440
+		}
+
+		connections = append(connections, &conn)
+	}
+	return connections, rows.Err()
+}
+
+func (r *ConnectionRepo) scanConnectionsGo(rows pgx.Rows, hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper bool) ([]*ExchangeConnection, error) {
 	var connections []*ExchangeConnection
 	for rows.Next() {
 		var conn ExchangeConnection
@@ -269,16 +387,9 @@ func (r *ConnectionRepo) GetActiveByUser(ctx context.Context, userUID string) ([
 		if !hasSyncMins {
 			conn.SyncIntervalMinutes = 1440
 		}
-		if !hasKYCLevel {
-			conn.KYCLevel = ""
-		}
-		if !hasIsPaper {
-			conn.IsPaper = false
-		}
 
 		connections = append(connections, &conn)
 	}
-
 	return connections, rows.Err()
 }
 
@@ -306,10 +417,18 @@ func (r *ConnectionRepo) GetExcludedConnectionKeysByUser(ctx context.Context, us
 		return excluded, nil
 	}
 
-	query := `
-		SELECT DISTINCT exchange, COALESCE(label, '')
-		FROM exchange_connections
-		WHERE user_uid = $1 AND is_active = true AND exclude_from_report = true`
+	var query string
+	if r.isTSSchema {
+		query = `
+			SELECT DISTINCT exchange, COALESCE(label, '')
+			FROM exchange_connections
+			WHERE "userUid" = $1 AND "isActive" = true AND "excludeFromReport" = true`
+	} else {
+		query = `
+			SELECT DISTINCT exchange, COALESCE(label, '')
+			FROM exchange_connections
+			WHERE user_uid = $1 AND is_active = true AND exclude_from_report = true`
+	}
 
 	rows, err := r.pool.Query(ctx, query, userUID)
 	if err != nil {
@@ -347,25 +466,35 @@ func (r *ConnectionRepo) GetExchangeDetailsByUser(ctx context.Context, userUID s
 	)
 
 	if hasKYCLevel && hasIsPaper {
-		query = `
-			SELECT
-				exchange,
-				COALESCE(MAX(NULLIF(kyc_level, '')), '') AS kyc_level,
-				BOOL_OR(is_paper) AS is_paper
-			FROM exchange_connections
-			WHERE user_uid = $1 AND is_active = true
-			GROUP BY exchange
-			ORDER BY exchange`
+		if r.isTSSchema {
+			query = `
+				SELECT exchange,
+					COALESCE(MAX(NULLIF("kycLevel", '')), '') AS kyc_level,
+					BOOL_OR("isPaper") AS is_paper
+				FROM exchange_connections
+				WHERE "userUid" = $1 AND "isActive" = true
+				GROUP BY exchange
+				ORDER BY exchange`
+		} else {
+			query = `
+				SELECT exchange,
+					COALESCE(MAX(NULLIF(kyc_level, '')), '') AS kyc_level,
+					BOOL_OR(is_paper) AS is_paper
+				FROM exchange_connections
+				WHERE user_uid = $1 AND is_active = true
+				GROUP BY exchange
+				ORDER BY exchange`
+		}
 		rows, err = r.pool.Query(ctx, query, userUID)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		query = `
-			SELECT DISTINCT exchange
-			FROM exchange_connections
-			WHERE user_uid = $1 AND is_active = true
-			ORDER BY exchange`
+		if r.isTSSchema {
+			query = `SELECT DISTINCT exchange FROM exchange_connections WHERE "userUid" = $1 AND "isActive" = true ORDER BY exchange`
+		} else {
+			query = `SELECT DISTINCT exchange FROM exchange_connections WHERE user_uid = $1 AND is_active = true ORDER BY exchange`
+		}
 		rows, err = r.pool.Query(ctx, query, userUID)
 		if err != nil {
 			return nil, err
@@ -454,6 +583,28 @@ func connectionKey(exchange, label string) string {
 
 // GetByUserExchangeLabel retrieves a connection by user, exchange, and label
 func (r *ConnectionRepo) GetByUserExchangeLabel(ctx context.Context, userUID, exchange, label string) (*ExchangeConnection, error) {
+	r.getCapabilityFlags(ctx)
+
+	if r.isTSSchema {
+		query := `
+			SELECT id, "userUid", exchange, label,
+				"encryptedApiKey", "encryptedApiSecret", "encryptedPassphrase",
+				"isActive", "createdAt", "updatedAt"
+			FROM exchange_connections
+			WHERE "userUid" = $1 AND exchange = $2 AND label = $3 AND "isActive" = true`
+
+		var conn ExchangeConnection
+		err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(
+			&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
+			&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &conn.EncryptedPassphrase,
+			&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
+		)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return &conn, err
+	}
+
 	query := `
 		SELECT id, user_uid, exchange, label,
 			encrypted_api_key, api_key_iv, api_key_auth_tag,
@@ -475,11 +626,7 @@ func (r *ConnectionRepo) GetByUserExchangeLabel(ctx context.Context, userUID, ex
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	if err != nil {
-		return nil, err
-	}
-
-	return &conn, nil
+	return &conn, err
 }
 
 // Deactivate soft-deletes a connection
@@ -497,26 +644,17 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 		return r.hasCredentialsHashCol, r.hasSyncIntervalMinsCol, r.hasExcludeFromReportCol, r.hasKYCLevelCol, r.hasIsPaperCol
 	}
 
-	credHashCol, err := r.columnExists(ctx, "exchange_connections", "credentials_hash")
-	if err != nil {
-		return false, false, false, false, false
-	}
-	syncIntervalCol, err := r.columnExists(ctx, "exchange_connections", "sync_interval_minutes")
-	if err != nil {
-		return false, false, false, false, false
-	}
-	excludeFromReportCol, err := r.columnExists(ctx, "exchange_connections", "exclude_from_report")
-	if err != nil {
-		return false, false, false, false, false
-	}
-	kycLevelCol, err := r.columnExists(ctx, "exchange_connections", "kyc_level")
-	if err != nil {
-		return false, false, false, false, false
-	}
-	isPaperCol, err := r.columnExists(ctx, "exchange_connections", "is_paper")
-	if err != nil {
-		return false, false, false, false, false
-	}
+	// Detect TS Prisma schema (camelCase) vs Go schema (snake_case)
+	// If "userUid" column exists → TS schema; if "user_uid" → Go schema
+	tsSchema, _ := r.columnExists(ctx, "exchange_connections", "userUid")
+	r.isTSSchema = tsSchema
+
+	// Check capability columns using the correct naming
+	credHashCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("credentials_hash"))
+	syncIntervalCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("sync_interval_minutes"))
+	excludeFromReportCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("exclude_from_report"))
+	kycLevelCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("kyc_level"))
+	isPaperCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("is_paper"))
 
 	r.hasCredentialsHashCol = credHashCol
 	r.hasSyncIntervalMinsCol = syncIntervalCol
@@ -526,6 +664,17 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 	r.capabilitiesLoaded = true
 
 	return r.hasCredentialsHashCol, r.hasSyncIntervalMinsCol, r.hasExcludeFromReportCol, r.hasKYCLevelCol, r.hasIsPaperCol
+}
+
+// colName returns the raw column name (without quotes) for columnExists checks.
+func (r *ConnectionRepo) colName(snakeName string) string {
+	if !r.isTSSchema {
+		return snakeName
+	}
+	if mapped, ok := tsColumnMap[snakeName]; ok {
+		return mapped
+	}
+	return snakeName
 }
 
 func (r *ConnectionRepo) columnExists(ctx context.Context, tableName, columnName string) (bool, error) {
@@ -542,4 +691,31 @@ func (r *ConnectionRepo) columnExists(ctx context.Context, tableName, columnName
 		return false, fmt.Errorf("check column %s.%s: %w", tableName, columnName, err)
 	}
 	return exists, nil
+}
+
+// col returns the correct column name based on schema type (TS camelCase vs Go snake_case).
+func (r *ConnectionRepo) col(snakeName string) string {
+	if !r.isTSSchema {
+		return snakeName
+	}
+	if mapped, ok := tsColumnMap[snakeName]; ok {
+		return fmt.Sprintf(`"%s"`, mapped) // Quote camelCase for Postgres
+	}
+	return snakeName
+}
+
+// tsColumnMap maps Go snake_case column names to TS Prisma camelCase names.
+var tsColumnMap = map[string]string{
+	"user_uid":              "userUid",
+	"encrypted_api_key":     "encryptedApiKey",
+	"encrypted_api_secret":  "encryptedApiSecret",
+	"encrypted_passphrase":  "encryptedPassphrase",
+	"credentials_hash":      "credentialsHash",
+	"is_active":             "isActive",
+	"sync_interval_minutes": "syncIntervalMinutes",
+	"exclude_from_report":   "excludeFromReport",
+	"is_paper":              "isPaper",
+	"kyc_level":             "kycLevel",
+	"created_at":            "createdAt",
+	"updated_at":            "updatedAt",
 }

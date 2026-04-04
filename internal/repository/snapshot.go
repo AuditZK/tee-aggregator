@@ -58,13 +58,15 @@ type MarketMetrics struct {
 	ShortVolume     float64 `json:"short_volume,omitempty"`
 }
 
-// SnapshotRepo handles snapshot persistence
+// SnapshotRepo handles snapshot persistence.
+// Supports both TS (Prisma camelCase) and Go (snake_case) column naming.
 type SnapshotRepo struct {
 	pool *pgxpool.Pool
 
 	capMu              sync.Mutex
 	capabilitiesLoaded bool
 	hasLabelCol        bool
+	isTSSchema         bool // true = TS Prisma camelCase columns
 }
 
 // NewSnapshotRepo creates a new snapshot repository
@@ -76,6 +78,10 @@ func NewSnapshotRepo(pool *pgxpool.Pool) *SnapshotRepo {
 func (r *SnapshotRepo) Upsert(ctx context.Context, s *Snapshot) error {
 	breakdownJSON, _ := json.Marshal(s.Breakdown)
 	hasLabel := r.hasLabelColumn(ctx)
+
+	if r.isTSSchema {
+		return r.upsertTS(ctx, s, breakdownJSON)
+	}
 
 	if hasLabel {
 		query := `
@@ -134,9 +140,44 @@ func (r *SnapshotRepo) Upsert(ctx context.Context, s *Snapshot) error {
 	).Scan(&s.ID)
 }
 
+// upsertTS writes to TS Prisma schema (camelCase columns, no total_trades/total_volume/total_fees).
+// TS always has the label column.
+func (r *SnapshotRepo) upsertTS(ctx context.Context, s *Snapshot, breakdownJSON []byte) error {
+	now := time.Now().UTC()
+	query := `
+		INSERT INTO snapshot_data (
+			"userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt", "updatedAt"
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		ON CONFLICT ("userUid", exchange, label, timestamp)
+		DO UPDATE SET
+			"totalEquity" = EXCLUDED."totalEquity",
+			"realizedBalance" = EXCLUDED."realizedBalance",
+			"unrealizedPnL" = EXCLUDED."unrealizedPnL",
+			deposits = EXCLUDED.deposits,
+			withdrawals = EXCLUDED.withdrawals,
+			breakdown_by_market = EXCLUDED.breakdown_by_market,
+			"updatedAt" = EXCLUDED."updatedAt"
+		RETURNING id`
+
+	return r.pool.QueryRow(ctx, query,
+		s.UserUID, s.Exchange, s.Label, s.Timestamp,
+		s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
+		s.Deposits, s.Withdrawals,
+		breakdownJSON, now, now,
+	).Scan(&s.ID)
+}
+
 // GetByUserAndDateRange returns snapshots for a user within a date range
 func (r *SnapshotRepo) GetByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
 	hasLabel := r.hasLabelColumn(ctx)
+
+	if r.isTSSchema {
+		return r.getByUserAndDateRangeTS(ctx, userUID, start, end)
+	}
+
 	selectCols := "id, user_uid, exchange, timestamp"
 	if hasLabel {
 		selectCols = "id, user_uid, exchange, label, timestamp"
@@ -161,9 +202,33 @@ func (r *SnapshotRepo) GetByUserAndDateRange(ctx context.Context, userUID string
 	return r.scanSnapshots(rows, hasLabel)
 }
 
+func (r *SnapshotRepo) getByUserAndDateRangeTS(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
+	query := `
+		SELECT id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt"
+		FROM snapshot_data
+		WHERE "userUid" = $1 AND timestamp >= $2 AND timestamp <= $3
+		ORDER BY timestamp`
+
+	rows, err := r.pool.Query(ctx, query, userUID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return r.scanSnapshotsTS(rows)
+}
+
 // GetLatestByUser returns the most recent snapshot for a user
 func (r *SnapshotRepo) GetLatestByUser(ctx context.Context, userUID string) (*Snapshot, error) {
 	hasLabel := r.hasLabelColumn(ctx)
+
+	if r.isTSSchema {
+		return r.getLatestByUserTS(ctx, userUID)
+	}
+
 	selectCols := "id, user_uid, exchange, timestamp"
 	if hasLabel {
 		selectCols = "id, user_uid, exchange, label, timestamp"
@@ -198,9 +263,43 @@ func (r *SnapshotRepo) GetLatestByUser(ctx context.Context, userUID string) (*Sn
 	return snapshots[0], nil
 }
 
+func (r *SnapshotRepo) getLatestByUserTS(ctx context.Context, userUID string) (*Snapshot, error) {
+	query := `
+		SELECT id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt"
+		FROM snapshot_data
+		WHERE "userUid" = $1
+		ORDER BY timestamp DESC
+		LIMIT 1`
+
+	rows, err := r.pool.Query(ctx, query, userUID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshotsTS(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+
+	return snapshots[0], nil
+}
+
 // GetByUserExchangeAndDate returns a specific snapshot
 func (r *SnapshotRepo) GetByUserExchangeAndDate(ctx context.Context, userUID, exchange string, date time.Time) (*Snapshot, error) {
 	hasLabel := r.hasLabelColumn(ctx)
+
+	if r.isTSSchema {
+		return r.getByUserExchangeAndDateTS(ctx, userUID, exchange, date)
+	}
+
 	selectCols := "id, user_uid, exchange, timestamp"
 	if hasLabel {
 		selectCols = "id, user_uid, exchange, label, timestamp"
@@ -237,9 +336,41 @@ func (r *SnapshotRepo) GetByUserExchangeAndDate(ctx context.Context, userUID, ex
 	return snapshots[0], nil
 }
 
+func (r *SnapshotRepo) getByUserExchangeAndDateTS(ctx context.Context, userUID, exchange string, date time.Time) (*Snapshot, error) {
+	query := `
+		SELECT id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt"
+		FROM snapshot_data
+		WHERE "userUid" = $1 AND exchange = $2 AND label = '' AND timestamp = $3`
+
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshotsTS(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+
+	return snapshots[0], nil
+}
+
 // GetByUserExchangeLabelAndDate returns a specific snapshot for a user/exchange/label/date.
 func (r *SnapshotRepo) GetByUserExchangeLabelAndDate(ctx context.Context, userUID, exchange, label string, date time.Time) (*Snapshot, error) {
 	hasLabel := r.hasLabelColumn(ctx)
+
+	if r.isTSSchema {
+		return r.getByUserExchangeLabelAndDateTS(ctx, userUID, exchange, label, date)
+	}
+
 	if !hasLabel {
 		return r.GetByUserExchangeAndDate(ctx, userUID, exchange, date)
 	}
@@ -268,9 +399,39 @@ func (r *SnapshotRepo) GetByUserExchangeLabelAndDate(ctx context.Context, userUI
 	return snapshots[0], nil
 }
 
+func (r *SnapshotRepo) getByUserExchangeLabelAndDateTS(ctx context.Context, userUID, exchange, label string, date time.Time) (*Snapshot, error) {
+	query := `
+		SELECT id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt"
+		FROM snapshot_data
+		WHERE "userUid" = $1 AND exchange = $2 AND label = $3 AND timestamp = $4`
+
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, label, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshotsTS(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+	return snapshots[0], nil
+}
+
 // GetLatestByUserExchangeLabel returns the most recent snapshot for a user/exchange/label.
 func (r *SnapshotRepo) GetLatestByUserExchangeLabel(ctx context.Context, userUID, exchange, label string) (*Snapshot, error) {
 	hasLabel := r.hasLabelColumn(ctx)
+
+	if r.isTSSchema {
+		return r.getLatestByUserExchangeLabelTS(ctx, userUID, exchange, label)
+	}
+
 	if !hasLabel {
 		query := `
 			SELECT id, user_uid, exchange, timestamp,
@@ -324,6 +485,33 @@ func (r *SnapshotRepo) GetLatestByUserExchangeLabel(ctx context.Context, userUID
 	return snapshots[0], nil
 }
 
+func (r *SnapshotRepo) getLatestByUserExchangeLabelTS(ctx context.Context, userUID, exchange, label string) (*Snapshot, error) {
+	query := `
+		SELECT id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt"
+		FROM snapshot_data
+		WHERE "userUid" = $1 AND exchange = $2 AND label = $3
+		ORDER BY timestamp DESC
+		LIMIT 1`
+
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, label)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshotsTS(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+	return snapshots[0], nil
+}
+
 // UpsertBatch atomically upserts multiple snapshots in a single transaction.
 // If any snapshot fails, the entire batch is rolled back (TS parity: atomic daily sync).
 func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) error {
@@ -342,7 +530,30 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 	for _, s := range snapshots {
 		breakdownJSON, _ := json.Marshal(s.Breakdown)
 
-		if hasLabel {
+		if r.isTSSchema {
+			now := time.Now().UTC()
+			_, err = tx.Exec(ctx, `
+				INSERT INTO snapshot_data (
+					"userUid", exchange, label, timestamp,
+					"totalEquity", "realizedBalance", "unrealizedPnL",
+					deposits, withdrawals,
+					breakdown_by_market, "createdAt", "updatedAt"
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				ON CONFLICT ("userUid", exchange, label, timestamp)
+				DO UPDATE SET
+					"totalEquity" = EXCLUDED."totalEquity",
+					"realizedBalance" = EXCLUDED."realizedBalance",
+					"unrealizedPnL" = EXCLUDED."unrealizedPnL",
+					deposits = EXCLUDED.deposits,
+					withdrawals = EXCLUDED.withdrawals,
+					breakdown_by_market = EXCLUDED.breakdown_by_market,
+					"updatedAt" = EXCLUDED."updatedAt"`,
+				s.UserUID, s.Exchange, s.Label, s.Timestamp,
+				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
+				s.Deposits, s.Withdrawals,
+				breakdownJSON, now, now,
+			)
+		} else if hasLabel {
 			_, err = tx.Exec(ctx, `
 				INSERT INTO snapshot_data (
 					user_uid, exchange, label, timestamp,
@@ -433,6 +644,40 @@ func (r *SnapshotRepo) scanSnapshots(rows pgx.Rows, hasLabel bool) ([]*Snapshot,
 	return snapshots, rows.Err()
 }
 
+// scanSnapshotsTS scans rows from TS Prisma schema (camelCase columns, no total_trades/total_volume/total_fees).
+// TS always has the label column. Go-only fields default to zero.
+func (r *SnapshotRepo) scanSnapshotsTS(rows pgx.Rows) ([]*Snapshot, error) {
+	var snapshots []*Snapshot
+
+	for rows.Next() {
+		var s Snapshot
+		var breakdownJSON []byte
+
+		err := rows.Scan(
+			&s.ID, &s.UserUID, &s.Exchange, &s.Label, &s.Timestamp,
+			&s.TotalEquity, &s.RealizedBalance, &s.UnrealizedPnL,
+			&s.Deposits, &s.Withdrawals,
+			&breakdownJSON, &s.CreatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// Go-only columns not present in TS schema — default to zero
+		s.TotalTrades = 0
+		s.TotalVolume = 0
+		s.TotalFees = 0
+
+		if len(breakdownJSON) > 0 {
+			json.Unmarshal(breakdownJSON, &s.Breakdown)
+		}
+
+		snapshots = append(snapshots, &s)
+	}
+
+	return snapshots, rows.Err()
+}
+
 func (r *SnapshotRepo) hasLabelColumn(ctx context.Context) bool {
 	r.capMu.Lock()
 	defer r.capMu.Unlock()
@@ -441,14 +686,23 @@ func (r *SnapshotRepo) hasLabelColumn(ctx context.Context) bool {
 		return r.hasLabelCol
 	}
 
-	exists, err := r.columnExists(ctx, "snapshot_data", "label")
-	if err != nil {
-		r.capabilitiesLoaded = true
-		r.hasLabelCol = false
-		return false
+	// Detect TS Prisma schema (camelCase) vs Go schema (snake_case).
+	// If "userUid" column exists in snapshot_data → TS schema.
+	tsSchema, _ := r.columnExists(ctx, "snapshot_data", "userUid")
+	r.isTSSchema = tsSchema
+
+	if tsSchema {
+		// TS Prisma always has the label column
+		r.hasLabelCol = true
+	} else {
+		exists, err := r.columnExists(ctx, "snapshot_data", "label")
+		if err != nil {
+			r.hasLabelCol = false
+		} else {
+			r.hasLabelCol = exists
+		}
 	}
 
-	r.hasLabelCol = exists
 	r.capabilitiesLoaded = true
 	return r.hasLabelCol
 }
