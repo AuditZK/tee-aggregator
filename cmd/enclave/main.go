@@ -99,9 +99,31 @@ func main() {
 	pool := connectDatabase(ctx, cfg, logger)
 
 	// 9. Init encryption (AES for credentials at rest)
-	enc, err := encryption.New(cfg.EncryptionKey)
-	if err != nil {
-		logger.Fatal("encryption init failed", zap.Error(err))
+	// Use KeyManagementService with DEK from DB when available (TS parity),
+	// fallback to ENCRYPTION_KEY env var directly for dev/standalone mode.
+	var enc *encryption.Service
+	if pool != nil {
+		keyMgmt, kmErr := encryption.NewKeyManagementService(pool)
+		if kmErr != nil {
+			logger.Warn("key management init failed, falling back to ENCRYPTION_KEY", zap.Error(kmErr))
+		} else {
+			enc, err = keyMgmt.GetEncryptionService()
+			if err != nil {
+				logger.Warn("DEK retrieval failed, falling back to ENCRYPTION_KEY", zap.Error(err))
+			} else {
+				logger.Info("encryption initialized via DEK from database",
+					zap.String("master_key_id", keyMgmt.GetMasterKeyID()),
+					zap.Bool("hardware_key", keyMgmt.IsHardwareKeyAvailable()),
+				)
+			}
+		}
+	}
+	if enc == nil {
+		enc, err = encryption.New(cfg.EncryptionKey)
+		if err != nil {
+			logger.Fatal("encryption init failed", zap.Error(err))
+		}
+		logger.Warn("encryption initialized with ENCRYPTION_KEY env var (no DEK)")
 	}
 
 	// 10. Init repositories

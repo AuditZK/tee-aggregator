@@ -121,9 +121,10 @@ func (s *KeyManagementService) RotateDEK(ctx context.Context) error {
 	return nil
 }
 
-// initializeDEK loads or creates the initial DEK
+// initializeDEK loads or creates the initial DEK.
+// Supports both Go (snake_case) and TS Prisma (camelCase) column names.
 func (s *KeyManagementService) initializeDEK(ctx context.Context) error {
-	// Try to load existing active DEK
+	// Try Go schema first, then TS schema
 	var dek DEK
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, encrypted_dek, iv, auth_tag, master_key_id
@@ -133,6 +134,18 @@ func (s *KeyManagementService) initializeDEK(ctx context.Context) error {
 		LIMIT 1`).Scan(
 		&dek.ID, &dek.EncryptedDEK, &dek.IV, &dek.AuthTag, &dek.MasterKeyID,
 	)
+
+	if err != nil {
+		// Try TS Prisma camelCase schema
+		err = s.pool.QueryRow(ctx, `
+			SELECT id, "encryptedDEK", iv, "authTag", "masterKeyId"
+			FROM data_encryption_keys
+			WHERE "isActive" = true
+			ORDER BY "createdAt" DESC
+			LIMIT 1`).Scan(
+			&dek.ID, &dek.EncryptedDEK, &dek.IV, &dek.AuthTag, &dek.MasterKeyID,
+		)
+	}
 
 	if err == nil {
 		// Unwrap existing DEK
