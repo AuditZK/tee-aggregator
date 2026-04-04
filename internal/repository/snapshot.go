@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -10,6 +11,13 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// generateCUID generates a CUID-like identifier compatible with Prisma's @id @default(cuid()).
+func generateCUID() string {
+	b := make([]byte, 12)
+	rand.Read(b)
+	return fmt.Sprintf("c%x%010x", time.Now().UnixMilli(), b)
+}
 
 // Snapshot represents a daily equity snapshot
 type Snapshot struct {
@@ -141,16 +149,17 @@ func (r *SnapshotRepo) Upsert(ctx context.Context, s *Snapshot) error {
 }
 
 // upsertTS writes to TS Prisma schema (camelCase columns, no total_trades/total_volume/total_fees).
-// TS always has the label column.
+// TS always has the label column. Generates a CUID-like id (Prisma doesn't use UUID defaults).
 func (r *SnapshotRepo) upsertTS(ctx context.Context, s *Snapshot, breakdownJSON []byte) error {
 	now := time.Now().UTC()
+	generatedID := generateCUID()
 	query := `
 		INSERT INTO snapshot_data (
-			"userUid", exchange, label, timestamp,
+			id, "userUid", exchange, label, timestamp,
 			"totalEquity", "realizedBalance", "unrealizedPnL",
 			deposits, withdrawals,
 			breakdown_by_market, "createdAt", "updatedAt"
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT ("userUid", exchange, label, timestamp)
 		DO UPDATE SET
 			"totalEquity" = EXCLUDED."totalEquity",
@@ -162,7 +171,7 @@ func (r *SnapshotRepo) upsertTS(ctx context.Context, s *Snapshot, breakdownJSON 
 			"updatedAt" = EXCLUDED."updatedAt"
 		RETURNING id`
 
-	return r.pool.QueryRow(ctx, query,
+	return r.pool.QueryRow(ctx, query, generatedID,
 		s.UserUID, s.Exchange, s.Label, s.Timestamp,
 		s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
 		s.Deposits, s.Withdrawals,
