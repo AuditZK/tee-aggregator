@@ -47,33 +47,30 @@ func Connect(ctx context.Context, databaseURL string, logger *zap.Logger) (*pgxp
 }
 
 func auditSchemaColumns(ctx context.Context, pool *pgxpool.Pool, logger *zap.Logger) {
+	// Check both Go (snake_case) and TS Prisma (camelCase) column names.
+	// If either exists, the column is present.
 	required := []struct {
-		table  string
-		column string
+		table     string
+		snakeCol  string
+		camelCol  string
 	}{
-		{table: "users", column: "platform_hash"},
-		{table: "exchange_connections", column: "credentials_hash"},
-		{table: "exchange_connections", column: "sync_interval_minutes"},
-		{table: "exchange_connections", column: "exclude_from_report"},
-		{table: "exchange_connections", column: "kyc_level"},
-		{table: "exchange_connections", column: "is_paper"},
-		{table: "snapshot_data", column: "label"},
+		{"users", "platform_hash", "platformHash"},
+		{"exchange_connections", "credentials_hash", "credentialsHash"},
+		{"exchange_connections", "sync_interval_minutes", "syncIntervalMinutes"},
+		{"exchange_connections", "exclude_from_report", "excludeFromReport"},
+		{"exchange_connections", "kyc_level", "kycLevel"},
+		{"exchange_connections", "is_paper", "isPaper"},
+		{"snapshot_data", "label", "label"},
 	}
 
 	for _, rc := range required {
-		exists, err := columnExists(ctx, pool, rc.table, rc.column)
-		if err != nil {
-			logger.Warn("schema audit failed",
-				zap.String("table", rc.table),
-				zap.String("column", rc.column),
-				zap.Error(err),
-			)
-			continue
-		}
-		if !exists {
+		snakeExists, _ := columnExists(ctx, pool, rc.table, rc.snakeCol)
+		camelExists, _ := columnExists(ctx, pool, rc.table, rc.camelCol)
+
+		if !snakeExists && !camelExists {
 			logger.Warn("schema column missing",
 				zap.String("table", rc.table),
-				zap.String("column", rc.column),
+				zap.String("column", rc.snakeCol),
 				zap.String("hint", "apply latest SQL migrations"),
 			)
 		}
