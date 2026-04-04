@@ -118,11 +118,12 @@ type HistoricalSnapshotProvider interface {
 
 // HistoricalSnapshot represents a historical daily equity snapshot from the exchange.
 type HistoricalSnapshot struct {
-	Date            time.Time `json:"date"`
-	TotalEquity     float64   `json:"total_equity"`
-	RealizedBalance float64   `json:"realized_balance"`
-	Deposits        float64   `json:"deposits"`
-	Withdrawals     float64   `json:"withdrawals"`
+	Date            time.Time                  `json:"date"`
+	TotalEquity     float64                    `json:"total_equity"`
+	RealizedBalance float64                    `json:"realized_balance"`
+	Deposits        float64                    `json:"deposits"`
+	Withdrawals     float64                    `json:"withdrawals"`
+	Breakdown       map[string]*MarketBalance  `json:"breakdown,omitempty"` // per-asset breakdown (stocks, options, futures, etc.)
 }
 
 // Balance represents account balance data

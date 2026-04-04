@@ -768,6 +768,30 @@ func (s *SyncService) backfillIbkrIfNeeded(ctx context.Context, connMeta *reposi
 
 	processed := 0
 	for _, hs := range historicalSnapshots {
+		// Build market breakdown from historical data (TS parity)
+		var breakdown *repository.MarketBreakdown
+		if len(hs.Breakdown) > 0 {
+			breakdown = &repository.MarketBreakdown{}
+			for mt, mb := range hs.Breakdown {
+				metrics := &repository.MarketMetrics{
+					Equity:          mb.Equity,
+					AvailableMargin: mb.AvailableMargin,
+				}
+				switch mt {
+				case connector.MarketStocks:
+					breakdown.Stocks = metrics
+				case connector.MarketOptions:
+					breakdown.Options = metrics
+				case connector.MarketFutures:
+					breakdown.Futures = metrics
+				case connector.MarketCFD:
+					breakdown.CFD = metrics
+				case connector.MarketForex:
+					breakdown.Forex = metrics
+				}
+			}
+		}
+
 		snapshot := &repository.Snapshot{
 			UserUID:         connMeta.UserUID,
 			Exchange:        connMeta.Exchange,
@@ -778,6 +802,7 @@ func (s *SyncService) backfillIbkrIfNeeded(ctx context.Context, connMeta *reposi
 			UnrealizedPnL:   hs.TotalEquity - hs.RealizedBalance,
 			Deposits:        hs.Deposits,
 			Withdrawals:     hs.Withdrawals,
+			Breakdown:       breakdown,
 		}
 
 		if err := s.snapshotRepo.Upsert(ctx, snapshot); err != nil {

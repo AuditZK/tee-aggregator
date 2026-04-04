@@ -196,42 +196,182 @@ func (c *CCXTConnector) GetBalance(ctx context.Context) (*Balance, error) {
 		return nil, err
 	}
 
-	res, err := c.call(ctx, func() <-chan interface{} {
+	// Aggregate balance across all market types (spot + swap/futures)
+	// TS parity: EquitySnapshotAggregator fetches balance per market then sums
+	totalEquity := 0.0
+	totalAvailable := 0.0
+	totalUnrealized := 0.0
+	currency := "USD"
+
+	// 1. Swap/futures balance (default)
+	swapRes, err := c.call(ctx, func() <-chan interface{} {
 		return c.core.FetchBalance(map[string]interface{}{})
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	balances := ccxt.NewBalances(res)
-	available, equity, currency := extractStablecoinBalance(balances)
-	if equity == 0 {
-		available, equity = extractAggregateBalance(balances)
-		if currency == "" {
-			currency = "USD"
+	if err == nil {
+		// Try exchange-specific raw format FIRST (MEXC info.data[], Bitget info[])
+		// These contain the real equity from the exchange API, which is more accurate
+		// than CCXT's normalized balance for derivatives.
+		eq, avail := c.extractDerivativesEquity(swapRes)
+		if eq == 0 {
+			// Fallback to CCXT normalized stablecoin balance
+			swapBal := ccxt.NewBalances(swapRes)
+			avail, eq, cur := extractStablecoinBalance(swapBal)
+			if eq == 0 {
+				avail, eq = extractAggregateBalance(swapBal)
+			}
+			totalEquity += eq
+			totalAvailable += avail
+			if cur != "" {
+				currency = cur
+			}
+		} else {
+			totalEquity += eq
+			totalAvailable += avail
 		}
 	}
 
-	unrealized := 0.0
+	// 2. Spot balance (switch defaultType)
+	c.core.ExtendExchangeOptions(map[string]interface{}{"defaultType": "spot"})
+	spotRes, err := c.call(ctx, func() <-chan interface{} {
+		return c.core.FetchBalance(map[string]interface{}{})
+	})
+	c.core.ExtendExchangeOptions(map[string]interface{}{"defaultType": "swap"})
+
+	if err == nil {
+		spotEquity := c.calculateSpotUsdValue(ctx, spotRes)
+		totalEquity += spotEquity
+		totalAvailable += spotEquity
+	}
+
+	// 3. Unrealized PnL from positions
 	positions, posErr := c.fetchPositions(ctx)
 	if posErr == nil {
 		for _, p := range positions {
-			unrealized += p.UnrealizedPnL
+			totalUnrealized += p.UnrealizedPnL
 		}
 	}
-	if equity == 0 && available > 0 {
-		equity = available
-	}
-	if currency == "" {
-		currency = "USD"
+
+	if totalEquity == 0 && totalAvailable > 0 {
+		totalEquity = totalAvailable
 	}
 
 	return &Balance{
-		Available:     available,
-		Equity:        equity,
-		UnrealizedPnL: unrealized,
+		Available:     totalAvailable,
+		Equity:        totalEquity,
+		UnrealizedPnL: totalUnrealized,
 		Currency:      currency,
 	}, nil
+}
+
+// extractDerivativesEquity parses MEXC/Bitget raw info format for derivatives equity.
+// MEXC: info.data[] → { currency, equity, cashBalance, availableBalance }
+// Bitget: info[] → { marginCoin, accountEquity, available }
+func (c *CCXTConnector) extractDerivativesEquity(raw interface{}) (equity, available float64) {
+	rawMap, ok := mapFromAny(raw)
+	if !ok {
+		return 0, 0
+	}
+
+	info, _ := mapFromAny(rawMap["info"])
+	if info == nil {
+		return 0, 0
+	}
+
+	// MEXC format: info.data = [{ currency, equity, cashBalance, availableBalance }]
+	if dataSlice, ok := sliceFromAny(info["data"]); ok {
+		for _, item := range dataSlice {
+			asset, ok := mapFromAny(item)
+			if !ok {
+				continue
+			}
+			cur := firstStringFromMap(asset, "currency")
+			if !isStablecoin(cur) {
+				continue
+			}
+			eq := firstNumericFromMap(asset, "equity")
+			if eq > 0 {
+				equity += eq
+				available += firstNumericFromMap(asset, "availableBalance", "cashBalance")
+			}
+		}
+		if equity > 0 {
+			return equity, available
+		}
+	}
+
+	// Bitget format: info = [{ marginCoin, accountEquity, available }]
+	if infoSlice, ok := sliceFromAny(rawMap["info"]); ok {
+		for _, item := range infoSlice {
+			asset, ok := mapFromAny(item)
+			if !ok {
+				continue
+			}
+			coin := firstStringFromMap(asset, "marginCoin")
+			if !isStablecoin(coin) {
+				continue
+			}
+			eq := firstNumericFromMap(asset, "accountEquity")
+			if eq > 0 {
+				equity += eq
+				available += firstNumericFromMap(asset, "available")
+			}
+		}
+	}
+
+	return equity, available
+}
+
+// calculateSpotUsdValue converts all spot holdings to USD (stablecoins at 1:1, altcoins via ticker).
+func (c *CCXTConnector) calculateSpotUsdValue(ctx context.Context, raw interface{}) float64 {
+	balances := ccxt.NewBalances(raw)
+	totalUsd := 0.0
+
+	// Sum stablecoins directly
+	for _, coin := range ccxtStablecoins {
+		if total := balances.Total[coin]; total != nil && *total > 0 {
+			totalUsd += *total
+		}
+	}
+
+	// Convert altcoins via ticker price
+	for asset, total := range balances.Total {
+		if total == nil || *total <= 0 {
+			continue
+		}
+		assetU := strings.ToUpper(strings.TrimSpace(asset))
+		if isStablecoin(assetU) {
+			continue // Already counted
+		}
+
+		// Try to get price from ticker
+		price := c.fetchTickerPrice(ctx, assetU)
+		if price > 0 {
+			totalUsd += *total * price
+		}
+	}
+
+	return totalUsd
+}
+
+// fetchTickerPrice fetches the USD price for an asset via CCXT ticker.
+func (c *CCXTConnector) fetchTickerPrice(ctx context.Context, asset string) float64 {
+	for _, quote := range []string{"USDT", "USD", "USDC"} {
+		symbol := asset + "/" + quote
+		if !c.hasMarketSymbol(symbol) {
+			continue
+		}
+		res, err := c.call(ctx, func() <-chan interface{} {
+			return c.core.FetchTicker(symbol, map[string]interface{}{})
+		})
+		if err != nil {
+			continue
+		}
+		ticker := ccxt.NewTicker(res)
+		if ticker.Last != nil && *ticker.Last > 0 {
+			return *ticker.Last
+		}
+	}
+	return 0
 }
 
 func (c *CCXTConnector) GetPositions(ctx context.Context) ([]*Position, error) {
@@ -549,10 +689,22 @@ func (c *CCXTConnector) GetBalanceByMarket(ctx context.Context) ([]*MarketBalanc
 			continue
 		}
 
-		bal := ccxt.NewBalances(res)
-		available, equity, _ := extractStablecoinBalance(bal)
-		if equity == 0 {
-			available, equity = extractAggregateBalance(bal)
+		var equity, available float64
+
+		if mt.hint == "spot" {
+			// Spot: convert altcoins to USD (TS parity: getSpotBalanceWithUsdConversion)
+			equity = c.calculateSpotUsdValue(ctx, res)
+			available = equity
+		} else {
+			// Derivatives: try exchange-specific raw format first (MEXC/Bitget)
+			equity, available = c.extractDerivativesEquity(res)
+			if equity == 0 {
+				bal := ccxt.NewBalances(res)
+				available, equity, _ = extractStablecoinBalance(bal)
+				if equity == 0 {
+					available, equity = extractAggregateBalance(bal)
+				}
+			}
 		}
 
 		if equity > 0 {

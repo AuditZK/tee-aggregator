@@ -438,7 +438,7 @@ func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*
 		return nil, err
 	}
 
-	// Parse all daily equity summaries
+	// Parse all daily equity summaries with per-asset breakdown
 	var flex struct {
 		XMLName        xml.Name `xml:"FlexQueryResponse"`
 		FlexStatements struct {
@@ -448,6 +448,9 @@ func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*
 						ReportDate    string `xml:"reportDate,attr"`
 						Total         string `xml:"total,attr"`
 						Cash          string `xml:"cash,attr"`
+						Stock         string `xml:"stock,attr"`
+						Options       string `xml:"options,attr"`
+						Commodities   string `xml:"commodities,attr"`
 						UnrealizedPnL string `xml:"unrealizedPnL,attr"`
 					} `xml:"EquitySummaryByReportDateInBase"`
 				} `xml:"EquitySummaryInBase"`
@@ -488,6 +491,32 @@ func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*
 			continue // Skip zero-equity days
 		}
 		unrealized, _ := strconv.ParseFloat(s.UnrealizedPnL, 64)
+		stockVal, _ := strconv.ParseFloat(s.Stock, 64)
+		optionsVal, _ := strconv.ParseFloat(s.Options, 64)
+		commoditiesVal, _ := strconv.ParseFloat(s.Commodities, 64)
+		cashVal, _ := strconv.ParseFloat(s.Cash, 64)
+
+		// Build per-asset breakdown (TS parity: getHistoricalSummaries)
+		breakdown := make(map[string]*MarketBalance)
+		if stockVal != 0 {
+			breakdown[MarketStocks] = &MarketBalance{
+				MarketType:      MarketStocks,
+				Equity:          stockVal,
+				AvailableMargin: cashVal,
+			}
+		}
+		if optionsVal != 0 {
+			breakdown[MarketOptions] = &MarketBalance{
+				MarketType: MarketOptions,
+				Equity:     optionsVal,
+			}
+		}
+		if commoditiesVal != 0 {
+			breakdown[MarketFutures] = &MarketBalance{
+				MarketType: MarketFutures,
+				Equity:     commoditiesVal,
+			}
+		}
 
 		cf := cashflowsByDate[s.ReportDate]
 		snapshots = append(snapshots, &HistoricalSnapshot{
@@ -496,6 +525,7 @@ func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*
 			RealizedBalance: total - unrealized,
 			Deposits:        cf.deposits,
 			Withdrawals:     cf.withdrawals,
+			Breakdown:       breakdown,
 		})
 	}
 

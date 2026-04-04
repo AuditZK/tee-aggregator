@@ -201,22 +201,14 @@ func (s *ConnectionService) GetDecryptedCredentialsByLabel(ctx context.Context, 
 }
 
 func (s *ConnectionService) decryptConnection(conn *repository.ExchangeConnection) (*Credentials, error) {
-	// Decrypt API key
-	apiKey, err := s.encryption.DecryptString(&encryption.EncryptedData{
-		Ciphertext: conn.EncryptedAPIKey,
-		IV:         conn.APIKeyIV,
-		AuthTag:    conn.APIKeyAuthTag,
-	})
+	// Decrypt API key — try Go format (3 fields base64), fallback to TS format (1 field hex)
+	apiKey, err := s.decryptField(conn.EncryptedAPIKey, conn.APIKeyIV, conn.APIKeyAuthTag)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt api key: %w", err)
 	}
 
 	// Decrypt API secret
-	apiSecret, err := s.encryption.DecryptString(&encryption.EncryptedData{
-		Ciphertext: conn.EncryptedAPISecret,
-		IV:         conn.APISecretIV,
-		AuthTag:    conn.APISecretAuthTag,
-	})
+	apiSecret, err := s.decryptField(conn.EncryptedAPISecret, conn.APISecretIV, conn.APISecretAuthTag)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt api secret: %w", err)
 	}
@@ -224,11 +216,7 @@ func (s *ConnectionService) decryptConnection(conn *repository.ExchangeConnectio
 	// Decrypt passphrase (if present)
 	var passphrase string
 	if conn.EncryptedPassphrase != "" {
-		passphrase, err = s.encryption.DecryptString(&encryption.EncryptedData{
-			Ciphertext: conn.EncryptedPassphrase,
-			IV:         conn.PassphraseIV,
-			AuthTag:    conn.PassphraseAuthTag,
-		})
+		passphrase, err = s.decryptField(conn.EncryptedPassphrase, conn.PassphraseIV, conn.PassphraseAuthTag)
 		if err != nil {
 			return nil, fmt.Errorf("decrypt passphrase: %w", err)
 		}
@@ -274,6 +262,24 @@ func (s *ConnectionService) GetExchangeMetadata(ctx context.Context, userUID str
 		})
 	}
 	return out, nil
+}
+
+// decryptField decrypts a credential field.
+// If iv and authTag are present → Go format (3 fields, base64).
+// If iv and authTag are empty → TS format (single hex string: iv+tag+ciphertext).
+// This allows seamless reading of credentials from both TS and Go enclaves.
+func (s *ConnectionService) decryptField(ciphertext, iv, authTag string) (string, error) {
+	if iv != "" && authTag != "" {
+		// Go format: 3 separate base64 fields
+		return s.encryption.DecryptString(&encryption.EncryptedData{
+			Ciphertext: ciphertext,
+			IV:         iv,
+			AuthTag:    authTag,
+		})
+	}
+
+	// TS format: single hex string (iv_16bytes + tag_16bytes + ciphertext)
+	return s.encryption.DecryptTSString(ciphertext)
 }
 
 func hashCredentials(apiKey, apiSecret, passphrase string) string {
