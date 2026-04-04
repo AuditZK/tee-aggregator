@@ -17,6 +17,7 @@ import (
 	"github.com/trackrecord/enclave/internal/db"
 	"github.com/trackrecord/enclave/internal/encryption"
 	enclaveGrpc "github.com/trackrecord/enclave/internal/grpc"
+	"github.com/trackrecord/enclave/internal/logredact"
 	"github.com/trackrecord/enclave/internal/logstream"
 	"github.com/trackrecord/enclave/internal/metrics"
 	"github.com/trackrecord/enclave/internal/repository"
@@ -55,9 +56,18 @@ func main() {
 		baseLogger, _ = devCfg.Build()
 	}
 
-	// 3. Start log stream server (SSE) and wrap logger with broadcast core
+	// 3. Wrap logger with redaction core (ALWAYS active, TS parity)
+	// SECURITY: All sensitive fields (credentials, user IDs, balances) are redacted
+	// before any log output. Auditors can verify no sensitive data leaks via logs.
+	redactedLogger := zap.New(
+		logredact.NewRedactCore(baseLogger.Core()),
+		zap.AddCaller(),
+		zap.AddStacktrace(zapcore.ErrorLevel),
+	)
+
+	// 4. Start log stream server (SSE) and wrap logger with broadcast core
 	var logStreamServer *logstream.Server
-	logger := baseLogger
+	logger := redactedLogger
 
 	if cfg.LogStreamPort > 0 {
 		logStreamServer = logstream.NewServer(cfg.LogStreamPort, cfg.LogStreamAPIKey, baseLogger)
