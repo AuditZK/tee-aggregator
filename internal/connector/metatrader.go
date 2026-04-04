@@ -157,6 +157,7 @@ func (m *MetaTrader) GetTrades(ctx context.Context, start, end time.Time) ([]*Tr
 		Symbol      string  `json:"symbol"`
 		Side        string  `json:"side"`
 		Size        float64 `json:"size"`
+		OpenPrice   float64 `json:"open_price"`
 		ClosePrice  float64 `json:"close_price"`
 		RealizedPnL float64 `json:"realized_pnl"`
 		Commission  float64 `json:"commission"`
@@ -182,7 +183,7 @@ func (m *MetaTrader) GetTrades(ctx context.Context, start, end time.Time) ([]*Tr
 			ID:          strconv.FormatInt(d.Ticket, 10),
 			Symbol:      d.Symbol,
 			Side:        side,
-			Price:       d.ClosePrice,
+			Price:       priceWithFallback(d.ClosePrice, d.OpenPrice),
 			Quantity:    d.Size,
 			Fee:         mathAbs(d.Commission) + mathAbs(d.Swap),
 			FeeCurrency: "USD",
@@ -294,6 +295,13 @@ func (m *MetaTrader) callBridge(ctx context.Context, method, path string, body a
 	return json.Unmarshal(env.Data, out)
 }
 
+func priceWithFallback(closePrice, openPrice float64) float64 {
+	if closePrice != 0 {
+		return closePrice
+	}
+	return openPrice
+}
+
 func mathAbs(v float64) float64 {
 	if v < 0 {
 		return -v
@@ -317,7 +325,7 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 			Symbol      string  `json:"symbol"`
 			Side        string  `json:"side"`
 			RealizedPnL float64 `json:"realized_pnl"`
-			Timestamp   int64   `json:"timestamp"`
+			CloseTime   string  `json:"close_time"`
 		} `json:"deals"`
 	}
 
@@ -330,7 +338,10 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 		if deal.Symbol != "BALANCE" {
 			continue
 		}
-		ts := time.Unix(deal.Timestamp, 0).UTC()
+		ts, _ := time.Parse(time.RFC3339, deal.CloseTime)
+		if ts.IsZero() {
+			continue
+		}
 		amount := deal.RealizedPnL
 		if deal.Side == "withdrawal" {
 			amount = -mathAbs(amount)
