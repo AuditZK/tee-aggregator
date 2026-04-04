@@ -212,9 +212,10 @@ func (r *ConnectionRepo) getByUserAndExchangeTS(ctx context.Context, userUID, ex
 		WHERE "userUid" = $1 AND exchange = $2 AND "isActive" = true`
 
 	var conn ExchangeConnection
+	var label, encPassphrase *string
 	err := r.pool.QueryRow(ctx, query, userUID, exchange).Scan(
-		&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
-		&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &conn.EncryptedPassphrase,
+		&conn.ID, &conn.UserUID, &conn.Exchange, &label,
+		&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &encPassphrase,
 		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
 	)
 
@@ -225,7 +226,12 @@ func (r *ConnectionRepo) getByUserAndExchangeTS(ctx context.Context, userUID, ex
 		return nil, err
 	}
 
-	// IV and AuthTag stay empty — decryptField detects TS format automatically
+	if label != nil {
+		conn.Label = *label
+	}
+	if encPassphrase != nil {
+		conn.EncryptedPassphrase = *encPassphrase
+	}
 	return &conn, nil
 }
 
@@ -316,9 +322,10 @@ func (r *ConnectionRepo) getActiveByUserTS(ctx context.Context, userUID string, 
 	var connections []*ExchangeConnection
 	for rows.Next() {
 		var conn ExchangeConnection
-		scanArgs := []any{&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label}
+		var label, credHash, kycLevel, encPassphrase *string
+		scanArgs := []any{&conn.ID, &conn.UserUID, &conn.Exchange, &label}
 		if hasCredHash {
-			scanArgs = append(scanArgs, &conn.CredentialsHash)
+			scanArgs = append(scanArgs, &credHash)
 		}
 		if hasSyncMins {
 			scanArgs = append(scanArgs, &conn.SyncIntervalMinutes)
@@ -327,14 +334,14 @@ func (r *ConnectionRepo) getActiveByUserTS(ctx context.Context, userUID string, 
 			scanArgs = append(scanArgs, &conn.ExcludeFromReport)
 		}
 		if hasKYCLevel {
-			scanArgs = append(scanArgs, &conn.KYCLevel)
+			scanArgs = append(scanArgs, &kycLevel)
 		}
 		if hasIsPaper {
 			scanArgs = append(scanArgs, &conn.IsPaper)
 		}
 		// TS: single encrypted field, no IV/AuthTag columns
 		scanArgs = append(scanArgs,
-			&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &conn.EncryptedPassphrase,
+			&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &encPassphrase,
 			&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
 		)
 
@@ -342,6 +349,18 @@ func (r *ConnectionRepo) getActiveByUserTS(ctx context.Context, userUID string, 
 			return nil, err
 		}
 
+		if label != nil {
+			conn.Label = *label
+		}
+		if credHash != nil {
+			conn.CredentialsHash = *credHash
+		}
+		if kycLevel != nil {
+			conn.KYCLevel = *kycLevel
+		}
+		if encPassphrase != nil {
+			conn.EncryptedPassphrase = *encPassphrase
+		}
 		if !hasSyncMins {
 			conn.SyncIntervalMinutes = 1440
 		}
@@ -594,13 +613,17 @@ func (r *ConnectionRepo) GetByUserExchangeLabel(ctx context.Context, userUID, ex
 			WHERE "userUid" = $1 AND exchange = $2 AND label = $3 AND "isActive" = true`
 
 		var conn ExchangeConnection
+		var encPassphrase *string
 		err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(
 			&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
-			&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &conn.EncryptedPassphrase,
+			&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &encPassphrase,
 			&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
+		}
+		if encPassphrase != nil {
+			conn.EncryptedPassphrase = *encPassphrase
 		}
 		return &conn, err
 	}
