@@ -141,7 +141,7 @@ docker run -d \
   --network "$NETWORK" \
   --user root \
   --device /dev/sev-guest:/dev/sev-guest \
-  -v ~/zero-knowledge-aggregator/certs:/etc/enclave:ro \
+  -v ~/tee-aggregator-go/certs:/etc/enclave:ro \
   -v zero-knowledge-aggregator_vcek_cache:/var/cache/enclave/certs \
   -v /etc/letsencrypt:/etc/letsencrypt:ro \
   -p 3050:3050 \
