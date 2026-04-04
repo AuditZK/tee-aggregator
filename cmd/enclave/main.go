@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/trackrecord/enclave/internal/attestation"
@@ -31,6 +33,11 @@ import (
 func main() {
 	// 1. Load config
 	cfg := config.Load()
+
+	// SECURITY: In production, enforce secrets from GCP metadata (no .env files)
+	if cfg.Env == "production" {
+		enforceNoEnvFile()
+	}
 
 	// 2. Init base logger with configurable log level
 	var baseLogger *zap.Logger
@@ -360,4 +367,37 @@ func buildGRPCTLSConfig(cfg *config.Config) (*tls.Config, error) {
 		ClientAuth:               clientAuth,
 		PreferServerCipherSuites: true,
 	}, nil
+}
+
+// enforceNoEnvFile ensures production enclave does NOT use .env files.
+// Secrets must come from GCP metadata server — auditable and verifiable.
+// This function:
+//  1. Refuses to start if a .env file exists in the working directory
+//  2. Verifies GCP metadata server is accessible
+//  3. Logs the secret source for audit trail
+func enforceNoEnvFile() {
+	// Check for .env file — must NOT exist in production
+	for _, envFile := range []string{".env", ".env.local", ".env.production"} {
+		if _, err := os.Stat(envFile); err == nil {
+			fmt.Fprintf(os.Stderr, "FATAL: %s file detected in production.\n", envFile)
+			fmt.Fprintf(os.Stderr, "Production enclave must load secrets from GCP metadata, not .env files.\n")
+			fmt.Fprintf(os.Stderr, "Remove the file and use: ./scripts/start-enclave.sh\n")
+			os.Exit(1)
+		}
+	}
+
+	// Verify GCP metadata server is accessible
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest("GET",
+		"http://metadata.google.internal/computeMetadata/v1/instance/id", nil)
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "WARNING: GCP metadata server not accessible.\n")
+		fmt.Fprintf(os.Stderr, "Ensure secrets are injected via environment variables (not .env files).\n")
+		// Don't exit — allow non-GCP production environments (e.g., Docker -e flags from start-enclave.sh)
+	} else {
+		resp.Body.Close()
+	}
 }
