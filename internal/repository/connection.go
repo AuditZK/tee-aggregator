@@ -323,6 +323,7 @@ func (r *ConnectionRepo) getActiveByUserTS(ctx context.Context, userUID string, 
 	for rows.Next() {
 		var conn ExchangeConnection
 		var label, credHash, kycLevel, encPassphrase *string
+		var isPaper, excludeFromReport *bool
 		scanArgs := []any{&conn.ID, &conn.UserUID, &conn.Exchange, &label}
 		if hasCredHash {
 			scanArgs = append(scanArgs, &credHash)
@@ -331,13 +332,13 @@ func (r *ConnectionRepo) getActiveByUserTS(ctx context.Context, userUID string, 
 			scanArgs = append(scanArgs, &conn.SyncIntervalMinutes)
 		}
 		if hasExclude {
-			scanArgs = append(scanArgs, &conn.ExcludeFromReport)
+			scanArgs = append(scanArgs, &excludeFromReport)
 		}
 		if hasKYCLevel {
 			scanArgs = append(scanArgs, &kycLevel)
 		}
 		if hasIsPaper {
-			scanArgs = append(scanArgs, &conn.IsPaper)
+			scanArgs = append(scanArgs, &isPaper)
 		}
 		// TS: single encrypted field, no IV/AuthTag columns
 		scanArgs = append(scanArgs,
@@ -357,6 +358,12 @@ func (r *ConnectionRepo) getActiveByUserTS(ctx context.Context, userUID string, 
 		}
 		if kycLevel != nil {
 			conn.KYCLevel = *kycLevel
+		}
+		if isPaper != nil {
+			conn.IsPaper = *isPaper
+		}
+		if excludeFromReport != nil {
+			conn.ExcludeFromReport = *excludeFromReport
 		}
 		if encPassphrase != nil {
 			conn.EncryptedPassphrase = *encPassphrase
