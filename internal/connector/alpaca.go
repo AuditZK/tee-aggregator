@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -42,6 +43,12 @@ func NewAlpaca(creds *Credentials) *Alpaca {
 
 func (a *Alpaca) Exchange() string {
 	return "alpaca"
+}
+
+// DetectIsPaper reports whether credentials target Alpaca paper trading.
+// TS parity: keys prefixed with "PK" indicate paper accounts.
+func (a *Alpaca) DetectIsPaper(_ context.Context) (bool, error) {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(a.apiKey)), "PK"), nil
 }
 
 func (a *Alpaca) doRequest(ctx context.Context, baseURL, path string) ([]byte, error) {
@@ -83,14 +90,14 @@ func (a *Alpaca) GetBalance(ctx context.Context) (*Balance, error) {
 	}
 
 	var resp struct {
-		Cash               string `json:"cash"`
-		PortfolioValue     string `json:"portfolio_value"`
-		Equity             string `json:"equity"`
-		BuyingPower        string `json:"buying_power"`
-		LongMarketValue    string `json:"long_market_value"`
-		ShortMarketValue   string `json:"short_market_value"`
-		UnrealizedPL       string `json:"unrealized_pl"`
-		UnrealizedPLPC     string `json:"unrealized_plpc"`
+		Cash             string `json:"cash"`
+		PortfolioValue   string `json:"portfolio_value"`
+		Equity           string `json:"equity"`
+		BuyingPower      string `json:"buying_power"`
+		LongMarketValue  string `json:"long_market_value"`
+		ShortMarketValue string `json:"short_market_value"`
+		UnrealizedPL     string `json:"unrealized_pl"`
+		UnrealizedPLPC   string `json:"unrealized_plpc"`
 	}
 
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -116,13 +123,13 @@ func (a *Alpaca) GetPositions(ctx context.Context) ([]*Position, error) {
 	}
 
 	var resp []struct {
-		Symbol           string `json:"symbol"`
-		Qty              string `json:"qty"`
-		Side             string `json:"side"`
-		AvgEntryPrice    string `json:"avg_entry_price"`
-		CurrentPrice     string `json:"current_price"`
-		UnrealizedPL     string `json:"unrealized_pl"`
-		AssetClass       string `json:"asset_class"`
+		Symbol        string `json:"symbol"`
+		Qty           string `json:"qty"`
+		Side          string `json:"side"`
+		AvgEntryPrice string `json:"avg_entry_price"`
+		CurrentPrice  string `json:"current_price"`
+		UnrealizedPL  string `json:"unrealized_pl"`
+		AssetClass    string `json:"asset_class"`
 	}
 
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -175,11 +182,11 @@ func (a *Alpaca) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade,
 	}
 
 	var resp []struct {
-		ID            string `json:"id"`
-		Symbol        string `json:"symbol"`
-		Side          string `json:"side"`
-		Price         string `json:"price"`
-		Qty           string `json:"qty"`
+		ID              string `json:"id"`
+		Symbol          string `json:"symbol"`
+		Side            string `json:"side"`
+		Price           string `json:"price"`
+		Qty             string `json:"qty"`
 		TransactionTime string `json:"transaction_time"`
 	}
 
@@ -207,4 +214,10 @@ func (a *Alpaca) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade,
 	}
 
 	return trades, nil
+}
+
+// GetCashflows returns deposits/withdrawals. Alpaca does not expose
+// capital flows via API, so this always returns empty (TS parity).
+func (a *Alpaca) GetCashflows(_ context.Context, _ time.Time) ([]*Cashflow, error) {
+	return nil, nil
 }

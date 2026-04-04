@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/trackrecord/enclave/internal/repository"
@@ -52,11 +53,37 @@ func NewMetricsService(snapshotRepo *repository.SnapshotRepo) *MetricsService {
 
 // Calculate computes performance metrics for a user within a date range
 func (s *MetricsService) Calculate(ctx context.Context, userUID string, start, end time.Time) (*PerformanceMetrics, error) {
+	return s.CalculateWithFilters(ctx, userUID, start, end, "", nil)
+}
+
+// CalculateWithExcludedExchanges computes metrics while excluding configured exchanges.
+func (s *MetricsService) CalculateWithExcludedExchanges(
+	ctx context.Context,
+	userUID string,
+	start, end time.Time,
+	excludedConnectionKeys map[string]struct{},
+) (*PerformanceMetrics, error) {
+	return s.CalculateWithFilters(ctx, userUID, start, end, "", excludedConnectionKeys)
+}
+
+// CalculateWithFilters computes metrics with optional exchange inclusion + exclusion filters.
+func (s *MetricsService) CalculateWithFilters(
+	ctx context.Context,
+	userUID string,
+	start, end time.Time,
+	exchange string,
+	excludedConnectionKeys map[string]struct{},
+) (*PerformanceMetrics, error) {
 	snapshots, err := s.snapshotRepo.GetByUserAndDateRange(ctx, userUID, start, end)
 	if err != nil {
 		return nil, err
 	}
 
+	filtered := filterSnapshots(snapshots, exchange, excludedConnectionKeys)
+	return s.calculateFromSnapshots(filtered)
+}
+
+func (s *MetricsService) calculateFromSnapshots(snapshots []*repository.Snapshot) (*PerformanceMetrics, error) {
 	if len(snapshots) < 2 {
 		return nil, errors.New("insufficient data: need at least 2 snapshots")
 	}
@@ -66,8 +93,20 @@ func (s *MetricsService) Calculate(ctx context.Context, userUID string, start, e
 		return snapshots[i].Timestamp.Before(snapshots[j].Timestamp)
 	})
 
-	// Calculate daily returns
-	returns := s.calculateDailyReturns(snapshots)
+	// Use report-aligned TWR conversion to handle multi-exchange snapshots.
+	dailyReturns := convertSnapshotsToDailyReturns(snapshots)
+	if len(dailyReturns) == 0 {
+		return nil, errors.New("insufficient data: need at least 2 daily data points")
+	}
+
+	returns := make([]float64, 0, len(dailyReturns))
+	navSeries := make([]float64, 1, len(dailyReturns)+1)
+	navSeries[0] = 1
+	for _, dr := range dailyReturns {
+		returns = append(returns, dr.netReturn)
+		navSeries = append(navSeries, dr.nav)
+	}
+
 	if len(returns) == 0 {
 		return nil, errors.New("no valid returns calculated")
 	}
@@ -82,16 +121,14 @@ func (s *MetricsService) Calculate(ctx context.Context, userUID string, start, e
 	annualizedVol := stdDev * math.Sqrt(252)
 	annualizedDownside := downsideDev * math.Sqrt(252)
 
-	// Drawdown analysis
-	maxDD, maxDDDuration, currentDD := s.analyzeDrawdown(snapshots)
+	// Drawdown analysis on normalized NAV series.
+	maxDD, maxDDDuration, currentDD := s.analyzeDrawdownNAV(navSeries)
 
 	// Win/Loss analysis
 	winRate, profitFactor, avgWin, avgLoss := s.analyzeWinLoss(returns)
 
-	// Total return
-	firstEquity := snapshots[0].TotalEquity
-	lastEquity := snapshots[len(snapshots)-1].TotalEquity
-	totalReturn := (lastEquity - firstEquity) / firstEquity
+	totalReturn := dailyReturns[len(dailyReturns)-1].cumulativeReturn
+	periodStart, periodEnd, dataPoints := summarizePeriod(snapshots)
 
 	// Risk-adjusted ratios (risk-free rate = 0)
 	sharpe := 0.0
@@ -124,31 +161,33 @@ func (s *MetricsService) Calculate(ctx context.Context, userUID string, start, e
 		AvgLoss:             avgLoss,
 		TotalReturn:         totalReturn,
 		AnnualizedReturn:    annualizedReturn,
-		PeriodStart:         snapshots[0].Timestamp,
-		PeriodEnd:           snapshots[len(snapshots)-1].Timestamp,
-		DataPoints:          len(snapshots),
+		PeriodStart:         periodStart,
+		PeriodEnd:           periodEnd,
+		DataPoints:          dataPoints,
 	}, nil
 }
 
-func (s *MetricsService) calculateDailyReturns(snapshots []*repository.Snapshot) []float64 {
-	returns := make([]float64, 0, len(snapshots)-1)
-
-	for i := 1; i < len(snapshots); i++ {
-		prev := snapshots[i-1].TotalEquity
-		curr := snapshots[i].TotalEquity
-
-		// Adjust for deposits/withdrawals
-		deposits := snapshots[i].Deposits
-		withdrawals := snapshots[i].Withdrawals
-		adjustedPrev := prev + deposits - withdrawals
-
-		if adjustedPrev > 0 {
-			ret := (curr - adjustedPrev) / adjustedPrev
-			returns = append(returns, ret)
+func filterSnapshots(snapshots []*repository.Snapshot, exchange string, excludedConnectionKeys map[string]struct{}) []*repository.Snapshot {
+	normalizedExchange := strings.ToLower(exchange)
+	filtered := make([]*repository.Snapshot, 0, len(snapshots))
+	for _, snap := range snapshots {
+		snapshotExchange := strings.ToLower(snap.Exchange)
+		if normalizedExchange != "" && snapshotExchange != normalizedExchange {
+			continue
 		}
+		if _, excluded := excludedConnectionKeys[snapshotConnectionKey(snap.Exchange, snap.Label)]; excluded {
+			continue
+		}
+		if _, excluded := excludedConnectionKeys[snapshotExchange]; excluded {
+			continue
+		}
+		filtered = append(filtered, snap)
 	}
+	return filtered
+}
 
-	return returns
+func filterSnapshotsByExcludedExchanges(snapshots []*repository.Snapshot, excludedConnectionKeys map[string]struct{}) []*repository.Snapshot {
+	return filterSnapshots(snapshots, "", excludedConnectionKeys)
 }
 
 func (s *MetricsService) downsideDeviation(returns []float64, target float64) float64 {
@@ -170,36 +209,34 @@ func (s *MetricsService) downsideDeviation(returns []float64, target float64) fl
 	return math.Sqrt(sumSquares / float64(count))
 }
 
-func (s *MetricsService) analyzeDrawdown(snapshots []*repository.Snapshot) (maxDD, maxDDDuration float64, currentDD float64) {
-	if len(snapshots) == 0 {
+func (s *MetricsService) analyzeDrawdownNAV(navSeries []float64) (maxDD float64, maxDDDuration int, currentDD float64) {
+	if len(navSeries) == 0 {
 		return 0, 0, 0
 	}
 
-	peak := snapshots[0].TotalEquity
+	peak := navSeries[0]
 	peakIdx := 0
-	maxDDDays := 0
 
-	for i, snap := range snapshots {
-		if snap.TotalEquity > peak {
-			peak = snap.TotalEquity
+	for i, nav := range navSeries {
+		if nav > peak {
+			peak = nav
 			peakIdx = i
 		}
 
-		dd := (peak - snap.TotalEquity) / peak
+		dd := (peak - nav) / peak
 		if dd > maxDD {
 			maxDD = dd
-			maxDDDays = i - peakIdx
+			maxDDDuration = i - peakIdx
 		}
 	}
 
-	// Current drawdown
-	lastEquity := snapshots[len(snapshots)-1].TotalEquity
-	currentDD = (peak - lastEquity) / peak
+	lastNAV := navSeries[len(navSeries)-1]
+	currentDD = (peak - lastNAV) / peak
 	if currentDD < 0 {
 		currentDD = 0
 	}
 
-	return maxDD, float64(maxDDDays), currentDD
+	return maxDD, maxDDDuration, currentDD
 }
 
 func (s *MetricsService) analyzeWinLoss(returns []float64) (winRate, profitFactor, avgWin, avgLoss float64) {
@@ -262,4 +299,29 @@ func stddev(values []float64) float64 {
 		sumSquares += diff * diff
 	}
 	return math.Sqrt(sumSquares / float64(len(values)-1))
+}
+
+func summarizePeriod(snapshots []*repository.Snapshot) (start, end time.Time, dataPoints int) {
+	if len(snapshots) == 0 {
+		return time.Time{}, time.Time{}, 0
+	}
+
+	start = snapshots[0].Timestamp
+	end = snapshots[len(snapshots)-1].Timestamp
+
+	byDate := make(map[string]struct{})
+	for _, snap := range snapshots {
+		byDate[snap.Timestamp.Format("2006-01-02")] = struct{}{}
+	}
+
+	return start, end, len(byDate)
+}
+
+func snapshotConnectionKey(exchange, label string) string {
+	ex := strings.ToLower(strings.TrimSpace(exchange))
+	lb := strings.ToLower(strings.TrimSpace(label))
+	if lb == "" {
+		return ex
+	}
+	return ex + "/" + lb
 }

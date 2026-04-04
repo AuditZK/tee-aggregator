@@ -23,7 +23,11 @@ vendor/
 
 # Environment
 .env
+.env.*
 .env.local
+
+
+.agents/settings.local.json
 
 # OS
 .DS_Store

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/trackrecord/enclave/internal/attestation"
 	"go.uber.org/zap"
 )
 
@@ -26,10 +27,16 @@ type Server struct {
 	logger  *zap.Logger
 	apiKey  string
 	port    int
+	attest  AttestationProvider
 	clients map[chan LogEntry]struct{}
 	logs    []LogEntry
 	mu      sync.RWMutex
 	server  *http.Server
+}
+
+// AttestationProvider describes the subset used by the log server.
+type AttestationProvider interface {
+	GetAttestation(ctx context.Context) (*attestation.AttestationReport, error)
 }
 
 // NewServer creates a new log streaming server.
@@ -42,10 +49,19 @@ func NewServer(port int, apiKey string, logger *zap.Logger) *Server {
 	}
 }
 
+// SetAttestationService configures attestation endpoints backing service.
+func (s *Server) SetAttestationService(provider AttestationProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attest = provider
+}
+
 // Start starts the log streaming HTTP server.
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/attestation", s.handleAttestation)
+	mux.HandleFunc("/attestation/info", s.handleAttestationInfo)
 	mux.HandleFunc("/logs", s.authMiddleware(s.handleLogs))
 	mux.HandleFunc("/logs/stream", s.authMiddleware(s.handleStream))
 	mux.HandleFunc("/logs/clear", s.authMiddleware(s.handleClear))
@@ -100,18 +116,133 @@ func (s *Server) Broadcast(entry LogEntry) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status":"ok","service":"log-stream"}`))
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"service": "enclave-log-server",
+	})
+}
+
+func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mu.RLock()
+	attest := s.attest
+	s.mu.RUnlock()
+	if attest == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"verified":      false,
+			"enclave":       false,
+			"sevSnpEnabled": false,
+			"error":         "Failed to retrieve attestation",
+			"timestamp":     time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		return
+	}
+
+	report, err := attest.GetAttestation(r.Context())
+	if err != nil {
+		s.logger.Error("attestation endpoint failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"verified":      false,
+			"enclave":       false,
+			"sevSnpEnabled": false,
+			"error":         "Failed to retrieve attestation",
+			"timestamp":     time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		return
+	}
+
+	att := report.Attestation
+	if att == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"verified":        false,
+			"enclave":         false,
+			"sevSnpEnabled":   false,
+			"measurement":     nil,
+			"reportData":      nil,
+			"platformVersion": nil,
+			"timestamp":       time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"verified":        att.Verified,
+		"enclave":         report.Platform == "sev-snp",
+		"sevSnpEnabled":   att.SevSnpEnabled,
+		"measurement":     att.Measurement,
+		"reportData":      att.ReportData,
+		"platformVersion": att.PlatformVersion,
+		"errorMessage":    "",
+		"timestamp":       time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+func (s *Server) handleAttestationInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mu.RLock()
+	attest := s.attest
+	s.mu.RUnlock()
+	if attest == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":     "Failed to retrieve attestation info",
+			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		return
+	}
+
+	report, err := attest.GetAttestation(r.Context())
+	if err != nil {
+		s.logger.Error("attestation info endpoint failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":     "Failed to retrieve attestation info",
+			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		return
+	}
+
+	platform := "unknown"
+	attestationMethod := "none"
+	if report.Platform == "sev-snp" {
+		platform = "AMD SEV-SNP"
+		attestationMethod = "hardware"
+	}
+	sevSnpAvailable := report.Attestation != nil && report.Attestation.SevSnpEnabled
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"platform":          platform,
+		"sevSnpAvailable":   sevSnpAvailable,
+		"attestationMethod": attestationMethod,
+		"timestamp":         time.Now().UTC().Format(time.RFC3339Nano),
+	})
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	s.mu.RLock()
 	logs := make([]LogEntry, len(s.logs))
 	copy(logs, s.logs)
 	s.mu.RUnlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(logs)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"logs":  logs,
+		"count": len(logs),
+	})
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
@@ -162,14 +293,18 @@ func (s *Server) handleClear(w http.ResponseWriter, r *http.Request) {
 	s.logs = nil
 	s.mu.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"cleared":true}`))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"message": "Logs cleared",
+	})
 }
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.apiKey == "" {
-			next(w, r)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "Log server not configured. Set LOG_SERVER_API_KEY environment variable.",
+			})
 			return
 		}
 
@@ -179,10 +314,18 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		if key != s.apiKey {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": "Invalid or missing API key. Provide X-Api-Key header or ?apiKey= query param.",
+			})
 			return
 		}
 
 		next(w, r)
 	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
 }

@@ -1,6 +1,7 @@
 package signing
 
 import (
+	"encoding/base64"
 	"testing"
 	"time"
 )
@@ -26,6 +27,10 @@ func TestSignAndVerify(t *testing.T) {
 		BaseCurrency:     "USD",
 		BenchmarkUsed:    "SPY",
 		Exchanges:        []string{"binance", "bybit"},
+		ExchangeDetails: []ExchangeInfo{
+			{Name: "binance", KYCLevel: "basic", IsPaper: false},
+			{Name: "bybit", KYCLevel: "", IsPaper: true},
+		},
 	}
 
 	report, err := signer.Sign(input)
@@ -45,8 +50,17 @@ func TestSignAndVerify(t *testing.T) {
 	if report.PublicKey == "" {
 		t.Error("PublicKey should not be empty")
 	}
-	if report.SignatureAlgorithm != "Ed25519" {
-		t.Errorf("SignatureAlgorithm = %s, want Ed25519", report.SignatureAlgorithm)
+	if report.SignatureAlgorithm != "ECDSA-P256-SHA256" {
+		t.Errorf("SignatureAlgorithm = %s, want ECDSA-P256-SHA256", report.SignatureAlgorithm)
+	}
+	if len(report.ExchangeDetails) != 2 {
+		t.Fatalf("ExchangeDetails count = %d, want 2", len(report.ExchangeDetails))
+	}
+	if report.ExchangeDetails[1].Name != "bybit" || !report.ExchangeDetails[1].IsPaper {
+		t.Fatalf("unexpected exchange detail: %+v", report.ExchangeDetails[1])
+	}
+	if _, err := base64.StdEncoding.DecodeString(report.PublicKey); err != nil {
+		t.Fatalf("PublicKey should be base64 DER, decode failed: %v", err)
 	}
 
 	// Verify the signature
@@ -100,7 +114,7 @@ func TestVerifyWrongPublicKey(t *testing.T) {
 	report, _ := signer1.Sign(input)
 
 	// Verify with wrong public key
-	valid, err := Verify(report.ReportHash, report.Signature, signer2.PublicKeyHex())
+	valid, err := Verify(report.ReportHash, report.Signature, signer2.PublicKey())
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
@@ -125,7 +139,7 @@ func TestSignFromSeed(t *testing.T) {
 		t.Fatalf("NewReportSigner() error = %v", err)
 	}
 
-	if signer1.PublicKeyHex() != signer2.PublicKeyHex() {
+	if signer1.PublicKey() != signer2.PublicKey() {
 		t.Error("same seed should produce same public key")
 	}
 }

@@ -20,12 +20,12 @@ import (
 
 // AttestationReport holds the full attestation response.
 type AttestationReport struct {
-	Attestation     *SevSnpReport `json:"attestation"`
-	TLSBinding      *TLSBinding   `json:"tls_binding"`
-	E2EEncryption   *E2EInfo      `json:"e2e_encryption"`
-	ReportSigning   *SigningInfo   `json:"report_signing"`
-	Security        *SecurityInfo `json:"security"`
-	Platform        string        `json:"platform"` // "sev-snp" or "dev"
+	Attestation   *SevSnpReport `json:"attestation"`
+	TLSBinding    *TLSBinding   `json:"tls_binding"`
+	E2EEncryption *E2EInfo      `json:"e2e_encryption"`
+	ReportSigning *SigningInfo  `json:"report_signing"`
+	Security      *SecurityInfo `json:"security"`
+	Platform      string        `json:"platform"` // "sev-snp" or "dev"
 }
 
 // SevSnpReport contains SEV-SNP hardware attestation data.
@@ -143,7 +143,7 @@ func (s *Service) generateAttestation(ctx context.Context) (*AttestationReport, 
 		},
 		ReportSigning: &SigningInfo{
 			PublicKey: s.signingPubKey,
-			Algorithm: "Ed25519",
+			Algorithm: "ECDSA-P256-SHA256",
 		},
 		Security: &SecurityInfo{
 			TLSMitmProtection: s.tlsFingerprint != "",

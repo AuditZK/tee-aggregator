@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: enclave
       POSTGRES_DB: enclave_go
     ports:
-      - "5437:5432"    # Port différent du TypeScript (5436) et Go prod (5436)
+      - "5436:5432"    # Acces host optionnel; le service Go utilise le reseau Docker interne
     volumes:
       - enclave-go-db-data-dev:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
@@ -24,7 +24,7 @@ services:
       - enclave-go-network-dev
 
   # =============================================
-  # Enclave Go - Development Mode (sans contraintes TEE)
+  # Enclave Go - Development Mode (full local Docker)
   # =============================================
   enclave-go-dev:
     build:
@@ -38,16 +38,24 @@ services:
       - "50052:50052"  # Log Stream (SSE)
       - "9091:9090"    # Prometheus Metrics (9091 pour éviter conflit)
     env_file:
-      - .env
+      - .env.dev
     environment:
       - DATABASE_URL=postgres://enclave:enclave@enclave-go-db:5432/enclave_go?sslmode=disable
       - ENV=development
       - LOG_LEVEL=debug
       - GRPC_INSECURE=true
+      - AUTO_MIGRATE=false
+      - TLS_CERT_PATH=/app/certs/cert.pem
+      - TLS_KEY_PATH=/app/certs/key.pem
+      - TLS_CA_CERT=/app/certs/grpc/ca.crt
+      - TLS_SERVER_CERT=/app/certs/grpc/server.crt
+      - TLS_SERVER_KEY=/app/certs/grpc/server.key
       - CORS_ORIGIN=*
       - METRICS_ENABLED=true
       - ENABLE_DAILY_SYNC=true
       - DATA_RETENTION_DAYS=30
+    volumes:
+      - ./certs:/app/certs:ro
     depends_on:
       enclave-go-db:
         condition: service_healthy
@@ -58,7 +66,7 @@ services:
     networks:
       - enclave-go-network-dev
     healthcheck:
-      test: ["CMD", "wget", "-qO/dev/null", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "--no-check-certificate", "-qO/dev/null", "https://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 3

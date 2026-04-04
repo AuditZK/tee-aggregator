@@ -24,6 +24,11 @@ services:
       - METRICS_ENABLED=true
       - CORS_ORIGIN=*
       - GRPC_INSECURE=false
+      - TLS_CERT_PATH=/etc/enclave/server.crt
+      - TLS_KEY_PATH=/etc/enclave/server.key
+      - TLS_CA_CERT=/etc/enclave/ca.crt
+      - TLS_SERVER_CERT=/etc/enclave/server.crt
+      - TLS_SERVER_KEY=/etc/enclave/server.key
       - ENABLE_DAILY_SYNC=true
       - DATA_RETENTION_DAYS=30
     depends_on:
@@ -37,6 +42,8 @@ services:
     tmpfs:
       - /tmp
       - /var/cache/enclave/certs
+    volumes:
+      - ./certs:/etc/enclave:ro
     deploy:
       resources:
         limits:

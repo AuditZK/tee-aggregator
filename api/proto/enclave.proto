@@ -1,50 +1,77 @@
 syntax = "proto3";
 
 package enclave;
-
 option go_package = "github.com/trackrecord/enclave/api/proto";
 
+
+// The Enclave service provides secure operations for trade synchronization
+// and data aggregation. All operations return only aggregated, safe data.
 service EnclaveService {
+  // Process a synchronization job for a user's exchanges
   rpc ProcessSyncJob(SyncJobRequest) returns (SyncJobResponse);
+
+  // Get aggregated metrics for a user
   rpc GetAggregatedMetrics(AggregatedMetricsRequest) returns (AggregatedMetricsResponse);
+
+  // Get snapshot time series (daily snapshots history)
   rpc GetSnapshotTimeSeries(SnapshotTimeSeriesRequest) returns (SnapshotTimeSeriesResponse);
+
+  // Create a user with exchange connection (auto-generates UID)
   rpc CreateUserConnection(CreateUserConnectionRequest) returns (CreateUserConnectionResponse);
+
+  // Get performance metrics (Sharpe, volatility, drawdown, etc.)
   rpc GetPerformanceMetrics(PerformanceMetricsRequest) returns (PerformanceMetricsResponse);
+
+  // Health check for the enclave
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Generate a cryptographically signed report
   rpc GenerateSignedReport(ReportRequest) returns (SignedReportResponse);
+
+  // Verify a report signature
   rpc VerifyReportSignature(VerifySignatureRequest) returns (VerifySignatureResponse);
 }
 
-// --- Sync ---
-
+// Request to process a synchronization job
+// NOTE: Sync behavior is automatic based on exchange type:
+// - IBKR: Auto-backfill from Flex (365 days) on first sync, then current day only
+// - Crypto: Current snapshot only (DailySyncScheduler handles midnight UTC syncs)
 message SyncJobRequest {
   string user_uid = 1;
-  string exchange = 2;
+  string exchange = 2; // Optional, if not provided syncs all exchanges
+  // DEPRECATED: type is ignored - sync behavior is automatic
+  enum SyncType {
+    INCREMENTAL = 0;
+    HISTORICAL = 1;
+    FULL = 2;
+  }
+  SyncType type = 3; // Deprecated, kept for backwards compatibility
 }
 
+// Response from processing a synchronization job
 message SyncJobResponse {
   bool success = 1;
   string user_uid = 2;
   string exchange = 3;
-  int32 synced = 4;
-  int32 snapshots_generated = 5;
+  int32 synced = 4;                    // Number of trades synced
+  int32 snapshots_generated = 5;       // Number of daily snapshots created
+
+  message Snapshot {
+    double balance = 1;
+    double equity = 2;
+    int64 timestamp = 3;
+  }
   Snapshot latest_snapshot = 6;
   string error = 7;
 }
 
-message Snapshot {
-  double balance = 1;
-  double equity = 2;
-  int64 timestamp = 3;
-}
-
-// --- Metrics ---
-
+// Request for aggregated metrics
 message AggregatedMetricsRequest {
   string user_uid = 1;
-  string exchange = 2;
+  string exchange = 2; // Optional
 }
 
+// Response with aggregated metrics
 message AggregatedMetricsResponse {
   double total_balance = 1;
   double total_equity = 2;
@@ -52,147 +79,171 @@ message AggregatedMetricsResponse {
   double total_unrealized_pnl = 4;
   double total_fees = 5;
   int32 total_trades = 6;
-  int64 last_sync = 7;
+  int64 last_sync = 7; // Unix timestamp, nullable
 }
 
-// --- Snapshots ---
-
+// Request for snapshot time series
 message SnapshotTimeSeriesRequest {
   string user_uid = 1;
-  string exchange = 2;
-  int64 start_date = 3;
-  int64 end_date = 4;
+  string exchange = 2; // Optional
+  int64 start_date = 3; // Unix timestamp (milliseconds), optional
+  int64 end_date = 4;   // Unix timestamp (milliseconds), optional
 }
 
+// Response with snapshot time series
 message SnapshotTimeSeriesResponse {
   repeated DailySnapshot snapshots = 1;
 }
 
+// Daily snapshot data point
 message DailySnapshot {
   string user_uid = 1;
   string exchange = 2;
-  int64 timestamp = 3;
-  double total_equity = 4;
-  double realized_balance = 5;
-  double unrealized_pnl = 6;
-  double deposits = 7;
-  double withdrawals = 8;
-  MarketBreakdown breakdown = 9;
+  int64 timestamp = 3; // Unix timestamp (milliseconds) - daily snapshot at 00:00 UTC
+  double total_equity = 4; // Total account value (realized + unrealized)
+  double realized_balance = 5; // Available cash/balance
+  double unrealized_pnl = 6; // Unrealized P&L from open positions
+  double deposits = 7; // Cash deposited on this day
+  double withdrawals = 8; // Cash withdrawn on this day
+  MarketBreakdown breakdown = 9; // Market breakdown (spot/swap/options)
 }
 
+// Market breakdown for a snapshot
+// Supports both crypto (spot/swap) and traditional (stocks/futures/cfd)
 message MarketBreakdown {
   MarketMetrics global = 1;
+  // Crypto categories
   MarketMetrics spot = 2;
   MarketMetrics swap = 3;
-  MarketMetrics options = 4;
+  // Traditional categories (IBKR, etc.)
   MarketMetrics stocks = 5;
   MarketMetrics futures = 6;
   MarketMetrics cfd = 7;
   MarketMetrics forex = 8;
   MarketMetrics commodities = 9;
+  // Shared
+  MarketMetrics options = 4;
 }
 
+// Metrics per market type
 message MarketMetrics {
   double equity = 1;
   double available_margin = 2;
   double volume = 3;
-  int32 trades = 4;
+  int32 trades = 4;  // Number of executed trades (not orders)
   double trading_fees = 5;
-  double funding_fees = 6;
+  double funding_fees = 6; // Only for swap/perp markets
+  int32 long_trades = 7;   // Number of buy trades
+  int32 short_trades = 8;  // Number of sell trades
+  double long_volume = 9;  // USD volume of buy trades
+  double short_volume = 10; // USD volume of sell trades
 }
 
-// --- Connections ---
-
+// Request to create a user with exchange connection
 message CreateUserConnectionRequest {
-  string user_uid = 1;
-  string exchange = 2;
-  string label = 3;
-  string api_key = 4;
-  string api_secret = 5;
-  string passphrase = 6;
+  string user_uid = 1;           // User UID from Platform (required - ensures Platform/Enclave sync)
+  string exchange = 2;           // Exchange name (e.g., "binance", "coinbase")
+  string label = 3;              // User-friendly label (e.g., "Main Account")
+  string api_key = 4;            // API key (will be encrypted)
+  string api_secret = 5;         // API secret (will be encrypted)
+  string passphrase = 6;         // Optional passphrase (will be encrypted)
+  bool exclude_from_report = 7;  // true = analytics only, excluded from certified report
 }
 
+// Response from creating a user with exchange connection
 message CreateUserConnectionResponse {
   bool success = 1;
-  string user_uid = 2;
-  string error = 3;
+  string user_uid = 2;          // Auto-generated UID for the user
+  string error = 3;             // Error message if success=false
 }
 
-// --- Health ---
-
+// Health check request
 message HealthCheckRequest {}
 
+// Health check response
 message HealthCheckResponse {
-  string status = 1;
-  string version = 2;
-  int64 timestamp = 3;
-  int64 uptime_seconds = 4;
-  bool database = 5;
-  bool enclave = 6;
-  double uptime = 7;
+  enum Status {
+    HEALTHY = 0;
+    UNHEALTHY = 1;
+  }
+  Status status = 1;
+  bool enclave = 2;
+  string version = 3;
+  double uptime = 4;
 }
 
-// --- Performance ---
-
+// Request for performance metrics
 message PerformanceMetricsRequest {
   string user_uid = 1;
-  string exchange = 2;
-  int64 start_date = 3;
-  int64 end_date = 4;
+  string exchange = 2; // Optional - filter by exchange
+  int64 start_date = 3; // Unix timestamp (milliseconds), optional
+  int64 end_date = 4;   // Unix timestamp (milliseconds), optional
 }
 
+// Response with performance metrics
 message PerformanceMetricsResponse {
+  // Risk-adjusted returns
   double sharpe_ratio = 1;
   double sortino_ratio = 2;
   double calmar_ratio = 3;
-  double volatility = 4;
+
+  // Volatility metrics
+  double volatility = 4; // Annualized
   double downside_deviation = 5;
-  double max_drawdown = 6;
-  int32 max_drawdown_duration = 7;
+
+  // Drawdown metrics
+  double max_drawdown = 6; // Percentage
+  int32 max_drawdown_duration = 7; // Days
   double current_drawdown = 8;
-  double win_rate = 9;
+
+  // Win/Loss metrics
+  double win_rate = 9; // Percentage
   double profit_factor = 10;
   double avg_win = 11;
   double avg_loss = 12;
-  int64 period_start = 13;
-  int64 period_end = 14;
+
+  // Period info
+  int64 period_start = 13; // Unix timestamp
+  int64 period_end = 14;   // Unix timestamp
   int32 data_points = 15;
+
+  // Error handling
   bool success = 16;
   string error = 17;
 }
 
-// --- Report ---
+// ============================================================================
+// Signed Report Messages
+// ============================================================================
 
+// Request to generate a cryptographically signed report
 message ReportRequest {
   string user_uid = 1;
-  string start_date = 2;
-  string end_date = 3;
-  string benchmark = 4;
+  string start_date = 2;        // YYYY-MM-DD (optional, defaults to first snapshot)
+  string end_date = 3;          // YYYY-MM-DD (optional, defaults to last snapshot)
+  string benchmark = 4;         // "SPY" | "BTC-USD" | "" (optional)
   bool include_risk_metrics = 5;
   bool include_drawdown = 6;
   string report_name = 7;
-  string base_currency = 8;
-  string manager = 9;
-  string firm = 10;
+  string base_currency = 8;     // USD, EUR, etc. (default: USD)
 }
 
+// Response with cryptographically signed report
 message SignedReportResponse {
   bool success = 1;
   string error = 2;
 
-  // Identification
+  // Report metadata
   string report_id = 10;
   string user_uid = 11;
   string report_name = 12;
-  string generated_at = 13;
-  string period_start = 14;
-  string period_end = 15;
-
-  // Context
+  string generated_at = 13;     // ISO 8601
+  string period_start = 14;     // ISO 8601
+  string period_end = 15;       // ISO 8601
   string base_currency = 16;
   string benchmark = 17;
   int32 data_points = 18;
-  repeated string exchanges = 19;
+  repeated string exchanges = 19;  // Connected exchanges (cryptographically signed)
 
   // Core metrics
   double total_return = 20;
@@ -202,97 +253,88 @@ message SignedReportResponse {
   double sortino_ratio = 24;
   double max_drawdown = 25;
   double calmar_ratio = 26;
-  double win_rate = 27;
-  double profit_factor = 28;
 
-  // Risk metrics
-  RiskMetricsData risk_metrics = 30;
+  // Risk metrics (optional, if include_risk_metrics=true)
+  double var_95 = 30;
+  double var_99 = 31;
+  double expected_shortfall = 32;
+  double skewness = 33;
+  double kurtosis = 34;
 
-  // Benchmark comparison
-  BenchmarkMetricsData benchmark_metrics = 40;
+  // Benchmark metrics (optional, if benchmark provided)
+  double alpha = 40;
+  double beta = 41;
+  double information_ratio = 42;
+  double tracking_error = 43;
+  double correlation = 44;
 
-  // Drawdown analysis
-  DrawdownAnalysisData drawdown_data = 50;
+  // Drawdown data (optional, if include_drawdown=true)
+  int32 max_drawdown_duration = 50;
+  double current_drawdown = 51;
+  repeated DrawdownPeriodData drawdown_periods = 52;
 
   // Chart data
   repeated DailyReturnData daily_returns = 60;
   repeated MonthlyReturnData monthly_returns = 61;
 
-  // Signature
-  string signature = 70;
-  string public_key = 71;
-  string signature_algorithm = 72;
-  string report_hash = 73;
+  // Cryptographic signature
+  string signature = 70;          // Base64 encoded ECDSA signature
+  string public_key = 71;         // Base64 encoded public key for verification
+  string signature_algorithm = 72; // e.g., "ECDSA-P256-SHA256"
+  string report_hash = 73;        // SHA-256 hash of report data
 
-  // Enclave info
+  // Exchange details with KYC
+  repeated ExchangeInfo exchange_details = 90;
+
+  // Enclave attestation
   string enclave_version = 80;
-  string attestation_id = 81;
-  string enclave_mode = 82;
-
-  // Display params (NOT signed)
-  string manager = 90;
-  string firm = 91;
+  string attestation_id = 81;     // SEV-SNP attestation ID (if available)
+  string enclave_mode = 82;       // "production" | "development"
 }
 
-// --- Report sub-messages ---
+// Exchange info with KYC and paper status
+message ExchangeInfo {
+  string name = 1;
+  string kyc_level = 2; // "none", "basic", "intermediate", "advanced", or "" (unsupported)
+  bool is_paper = 3;    // true = paper/testnet, false = live
+}
 
+// Daily return data for charts
 message DailyReturnData {
-  string date = 1;
-  double net_return = 2;
-  double benchmark_return = 3;
-  double outperformance = 4;
-  double cumulative_return = 5;
-  double nav = 6;
+  string date = 1;              // YYYY-MM-DD
+  double net_return = 2;        // Daily return in %
+  double benchmark_return = 3;  // Benchmark return in %
+  double outperformance = 4;    // Portfolio - Benchmark
+  double cumulative_return = 5; // Cumulative return factor
+  double nav = 6;               // Net Asset Value
 }
 
+// Monthly return data for tables
 message MonthlyReturnData {
-  string date = 1;
-  double net_return = 2;
-  double benchmark_return = 3;
-  double outperformance = 4;
-  double aum = 5;
+  string date = 1;              // YYYY-MM
+  double net_return = 2;        // Monthly return in %
+  double benchmark_return = 3;  // Benchmark return in %
+  double outperformance = 4;    // Portfolio - Benchmark
+  double aum = 5;               // Assets Under Management
 }
 
-message RiskMetricsData {
-  double var_95 = 1;
-  double var_99 = 2;
-  double expected_shortfall = 3;
-  double skewness = 4;
-  double kurtosis = 5;
-}
-
-message BenchmarkMetricsData {
-  string benchmark_name = 1;
-  double benchmark_return = 2;
-  double alpha = 3;
-  double beta = 4;
-  double information_ratio = 5;
-  double tracking_error = 6;
-  double correlation = 7;
-}
-
-message DrawdownAnalysisData {
-  double current_drawdown = 1;
-  int32 max_drawdown_duration = 2;
-  repeated DrawdownPeriodData periods = 3;
-}
-
+// Drawdown period data
 message DrawdownPeriodData {
   string start_date = 1;
   string end_date = 2;
-  double depth = 3;
-  int32 duration = 4;
+  double depth = 3;             // Max drawdown during period (%)
+  int32 duration = 4;           // Days
   bool recovered = 5;
 }
 
-// --- Signature Verification ---
-
+// Request to verify a report signature
 message VerifySignatureRequest {
   string report_hash = 1;
   string signature = 2;
   string public_key = 3;
 }
 
+// Response from signature verification
 message VerifySignatureResponse {
   bool valid = 1;
   string error = 2;

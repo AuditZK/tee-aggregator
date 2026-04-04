@@ -40,5 +40,59 @@ func Connect(ctx context.Context, databaseURL string, logger *zap.Logger) (*pgxp
 		zap.Int32("max_conns", config.MaxConns),
 	)
 
+	// Audit critical parity columns at startup.
+	auditSchemaColumns(ctx, pool, logger)
+
 	return pool, nil
+}
+
+func auditSchemaColumns(ctx context.Context, pool *pgxpool.Pool, logger *zap.Logger) {
+	required := []struct {
+		table  string
+		column string
+	}{
+		{table: "users", column: "platform_hash"},
+		{table: "exchange_connections", column: "credentials_hash"},
+		{table: "exchange_connections", column: "sync_interval_minutes"},
+		{table: "exchange_connections", column: "exclude_from_report"},
+		{table: "exchange_connections", column: "kyc_level"},
+		{table: "exchange_connections", column: "is_paper"},
+		{table: "snapshot_data", column: "label"},
+	}
+
+	for _, rc := range required {
+		exists, err := columnExists(ctx, pool, rc.table, rc.column)
+		if err != nil {
+			logger.Warn("schema audit failed",
+				zap.String("table", rc.table),
+				zap.String("column", rc.column),
+				zap.Error(err),
+			)
+			continue
+		}
+		if !exists {
+			logger.Warn("schema column missing",
+				zap.String("table", rc.table),
+				zap.String("column", rc.column),
+				zap.String("hint", "apply latest SQL migrations"),
+			)
+		}
+	}
+}
+
+func columnExists(ctx context.Context, pool *pgxpool.Pool, tableName, columnName string) (bool, error) {
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = $1
+			  AND column_name = $2
+		)`
+
+	var exists bool
+	if err := pool.QueryRow(ctx, query, tableName, columnName).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }

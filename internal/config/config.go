@@ -9,7 +9,7 @@ import (
 
 type Config struct {
 	GRPCPort      int
-	GRPCInsecure  bool   // Allow insecure gRPC (no TLS) in dev mode
+	GRPCInsecure  bool // Allow insecure gRPC (no TLS) in dev mode
 	RESTPort      int
 	DatabaseURL   string
 	EncryptionKey []byte // 32 bytes for AES-256
@@ -36,7 +36,20 @@ type Config struct {
 	DataRetentionDays int
 
 	// Feature toggles
-	EnableDailySync bool
+	EnableDailySync  bool
+	EnableLegacyREST bool
+
+	// Migrations
+	AutoMigrate   bool
+	MigrationsDir string
+
+	// TLS
+	TLSCertPath       string // REST TLS cert path (TS: TLS_CERT_PATH)
+	TLSKeyPath        string // REST TLS key path (TS: TLS_KEY_PATH)
+	TLSCACertPath     string // gRPC TLS CA cert path (TS: TLS_CA_CERT)
+	TLSServerCertPath string // gRPC TLS server cert path (TS: TLS_SERVER_CERT)
+	TLSServerKeyPath  string // gRPC TLS server key path (TS: TLS_SERVER_KEY)
+	RequireClientCert bool   // gRPC mTLS toggle (TS: REQUIRE_CLIENT_CERT)
 }
 
 func Load() *Config {
@@ -63,7 +76,18 @@ func Load() *Config {
 
 		DataRetentionDays: getEnvInt("DATA_RETENTION_DAYS", 30),
 
-		EnableDailySync: getEnvBool("ENABLE_DAILY_SYNC", true),
+		EnableDailySync:  getEnvBool("ENABLE_DAILY_SYNC", true),
+		EnableLegacyREST: getEnvBool("ENABLE_LEGACY_REST", false),
+
+		AutoMigrate:   getEnvBool("AUTO_MIGRATE", false),
+		MigrationsDir: getEnv("MIGRATIONS_DIR", "migrations"),
+
+		TLSCertPath:       getEnv("TLS_CERT_PATH", "/app/certs/cert.pem"),
+		TLSKeyPath:        getEnv("TLS_KEY_PATH", "/app/certs/key.pem"),
+		TLSCACertPath:     getEnv("TLS_CA_CERT", "/etc/enclave/ca.crt"),
+		TLSServerCertPath: getEnv("TLS_SERVER_CERT", "/etc/enclave/server.crt"),
+		TLSServerKeyPath:  getEnv("TLS_SERVER_KEY", "/etc/enclave/server.key"),
+		RequireClientCert: getEnvBool("REQUIRE_CLIENT_CERT", false),
 	}
 }
 

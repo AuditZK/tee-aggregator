@@ -36,6 +36,38 @@ func (i *IBKR) Exchange() string {
 	return "ibkr"
 }
 
+// DetectIsPaper mirrors TS behavior:
+// IBKR paper accounts typically use DU/DF account ID prefixes.
+func (i *IBKR) DetectIsPaper(ctx context.Context) (bool, error) {
+	refCode, err := i.requestFlexReport(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	report, err := i.getFlexReport(ctx, refCode)
+	if err != nil {
+		return false, err
+	}
+
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				AccountID string `xml:"accountId,attr"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return false, fmt.Errorf("parse flex account id: %w", err)
+	}
+
+	accountID := strings.ToUpper(strings.TrimSpace(flex.FlexStatements.FlexStatement.AccountID))
+	if accountID == "" {
+		return false, nil
+	}
+	return strings.HasPrefix(accountID, "DU") || strings.HasPrefix(accountID, "DF"), nil
+}
+
 func (i *IBKR) TestConnection(ctx context.Context) error {
 	_, err := i.requestFlexReport(ctx)
 	return err
@@ -167,6 +199,74 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 	}, nil
 }
 
+// GetBalanceByMarket returns per-asset-class equity breakdown from IBKR Flex.
+func (i *IBKR) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance, error) {
+	refCode, err := i.requestFlexReport(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	report, err := i.getFlexReport(ctx, refCode)
+	if err != nil {
+		return nil, err
+	}
+
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				EquitySummaryInBase struct {
+					EquitySummaryByReportDateInBase []struct {
+						Stock       string `xml:"stock,attr"`
+						Options     string `xml:"options,attr"`
+						Commodities string `xml:"commodities,attr"`
+						Cash        string `xml:"cash,attr"`
+					} `xml:"EquitySummaryByReportDateInBase"`
+				} `xml:"EquitySummaryInBase"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return nil, fmt.Errorf("parse flex balance breakdown: %w", err)
+	}
+
+	summaries := flex.FlexStatements.FlexStatement.EquitySummaryInBase.EquitySummaryByReportDateInBase
+	if len(summaries) == 0 {
+		return nil, nil
+	}
+
+	latest := summaries[len(summaries)-1]
+	stockVal, _ := strconv.ParseFloat(latest.Stock, 64)
+	optionsVal, _ := strconv.ParseFloat(latest.Options, 64)
+	commoditiesVal, _ := strconv.ParseFloat(latest.Commodities, 64)
+	cashVal, _ := strconv.ParseFloat(latest.Cash, 64)
+
+	var balances []*MarketBalance
+	if stockVal != 0 {
+		balances = append(balances, &MarketBalance{
+			MarketType:      MarketStocks,
+			Equity:          stockVal,
+			AvailableMargin: cashVal, // IBKR: cash is available margin
+		})
+	}
+	if optionsVal != 0 {
+		balances = append(balances, &MarketBalance{
+			MarketType: MarketOptions,
+			Equity:     optionsVal,
+		})
+	}
+	if commoditiesVal != 0 {
+		// IBKR uses 'commodities' for futures + commodities
+		balances = append(balances, &MarketBalance{
+			MarketType: MarketFutures,
+			Equity:     commoditiesVal,
+		})
+	}
+
+	return balances, nil
+}
+
 func (i *IBKR) GetPositions(ctx context.Context) ([]*Position, error) {
 	refCode, err := i.requestFlexReport(ctx)
 	if err != nil {
@@ -188,12 +288,12 @@ func (i *IBKR) parsePositionsFromReport(report []byte) ([]*Position, error) {
 			FlexStatement struct {
 				OpenPositions struct {
 					OpenPosition []struct {
-						Symbol           string `xml:"symbol,attr"`
-						Position         string `xml:"position,attr"`
-						MarkPrice        string `xml:"markPrice,attr"`
-						CostBasisMoney   string `xml:"costBasisMoney,attr"`
+						Symbol            string `xml:"symbol,attr"`
+						Position          string `xml:"position,attr"`
+						MarkPrice         string `xml:"markPrice,attr"`
+						CostBasisMoney    string `xml:"costBasisMoney,attr"`
 						FifoPnlUnrealized string `xml:"fifoPnlUnrealized,attr"`
-						AssetCategory    string `xml:"assetCategory,attr"`
+						AssetCategory     string `xml:"assetCategory,attr"`
 					} `xml:"OpenPosition"`
 				} `xml:"OpenPositions"`
 			} `xml:"FlexStatement"`
@@ -226,16 +326,16 @@ func (i *IBKR) parsePositionsFromReport(report []byte) ([]*Position, error) {
 			entryPrice = costBasis / size
 		}
 
-		marketType := "stocks"
+		marketType := MarketStocks
 		switch p.AssetCategory {
 		case "FUT":
-			marketType = "futures"
+			marketType = MarketFutures
 		case "OPT":
-			marketType = "options"
+			marketType = MarketOptions
 		case "CFD":
-			marketType = "cfd"
+			marketType = MarketCFD
 		case "CASH":
-			marketType = "forex"
+			marketType = MarketForex
 		}
 
 		positions = append(positions, &Position{
@@ -250,6 +350,156 @@ func (i *IBKR) parsePositionsFromReport(report []byte) ([]*Position, error) {
 	}
 
 	return positions, nil
+}
+
+// GetCashflows returns deposits and withdrawals since the given date.
+// Uses IBKR Flex CashTransactions.
+func (i *IBKR) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
+	refCode, err := i.requestFlexReport(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	report, err := i.getFlexReport(ctx, refCode)
+	if err != nil {
+		return nil, err
+	}
+
+	return i.parseCashflowsFromReport(report, since)
+}
+
+func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, error) {
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				CashTransactions struct {
+					CashTransaction []struct {
+						Type     string `xml:"type,attr"`
+						Amount   string `xml:"amount,attr"`
+						Currency string `xml:"currency,attr"`
+						DateTime string `xml:"dateTime,attr"`
+					} `xml:"CashTransaction"`
+				} `xml:"CashTransactions"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return nil, fmt.Errorf("parse flex cashflows: %w", err)
+	}
+
+	var cashflows []*Cashflow
+	for _, tx := range flex.FlexStatements.FlexStatement.CashTransactions.CashTransaction {
+		ts, err := time.Parse("20060102;150405", tx.DateTime)
+		if err != nil {
+			// Try date-only format
+			ts, err = time.Parse("20060102", tx.DateTime)
+			if err != nil {
+				continue
+			}
+		}
+		if ts.Before(since) {
+			continue
+		}
+
+		amount, _ := strconv.ParseFloat(tx.Amount, 64)
+		if amount == 0 {
+			continue
+		}
+
+		isDeposit := tx.Type == "Deposits" || (tx.Type == "Deposits/Withdrawals" && amount > 0)
+		isWithdrawal := tx.Type == "Withdrawals" || (tx.Type == "Deposits/Withdrawals" && amount < 0)
+
+		if !isDeposit && !isWithdrawal {
+			continue
+		}
+
+		cashflows = append(cashflows, &Cashflow{
+			Amount:    amount, // positive=deposit, negative=withdrawal
+			Currency:  tx.Currency,
+			Timestamp: ts,
+		})
+	}
+
+	return cashflows, nil
+}
+
+// GetHistoricalSnapshots returns daily equity snapshots from IBKR Flex (up to 365 days).
+// Used for backfill on first sync.
+func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*HistoricalSnapshot, error) {
+	refCode, err := i.requestFlexReport(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	report, err := i.getFlexReport(ctx, refCode)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse all daily equity summaries
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				EquitySummaryInBase struct {
+					EquitySummaryByReportDateInBase []struct {
+						ReportDate    string `xml:"reportDate,attr"`
+						Total         string `xml:"total,attr"`
+						Cash          string `xml:"cash,attr"`
+						UnrealizedPnL string `xml:"unrealizedPnL,attr"`
+					} `xml:"EquitySummaryByReportDateInBase"`
+				} `xml:"EquitySummaryInBase"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return nil, fmt.Errorf("parse flex historical: %w", err)
+	}
+
+	// Parse cashflows grouped by date for deposit/withdrawal assignment
+	cashflows, _ := i.parseCashflowsFromReport(report, since)
+	cashflowsByDate := make(map[string]struct{ deposits, withdrawals float64 })
+	for _, cf := range cashflows {
+		dateKey := cf.Timestamp.Format("20060102")
+		entry := cashflowsByDate[dateKey]
+		if cf.Amount > 0 {
+			entry.deposits += cf.Amount
+		} else {
+			entry.withdrawals += -cf.Amount
+		}
+		cashflowsByDate[dateKey] = entry
+	}
+
+	var snapshots []*HistoricalSnapshot
+	for _, s := range flex.FlexStatements.FlexStatement.EquitySummaryInBase.EquitySummaryByReportDateInBase {
+		date, err := time.Parse("20060102", s.ReportDate)
+		if err != nil {
+			continue
+		}
+		if date.Before(since) {
+			continue
+		}
+
+		total, _ := strconv.ParseFloat(s.Total, 64)
+		if total == 0 {
+			continue // Skip zero-equity days
+		}
+		unrealized, _ := strconv.ParseFloat(s.UnrealizedPnL, 64)
+
+		cf := cashflowsByDate[s.ReportDate]
+		snapshots = append(snapshots, &HistoricalSnapshot{
+			Date:            time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC),
+			TotalEquity:     total,
+			RealizedBalance: total - unrealized,
+			Deposits:        cf.deposits,
+			Withdrawals:     cf.withdrawals,
+		})
+	}
+
+	return snapshots, nil
 }
 
 func (i *IBKR) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
@@ -273,15 +523,15 @@ func (i *IBKR) parseTradesFromReport(report []byte, start, end time.Time) ([]*Tr
 			FlexStatement struct {
 				Trades struct {
 					Trade []struct {
-						TradeID       string `xml:"tradeID,attr"`
-						Symbol        string `xml:"symbol,attr"`
-						BuySell       string `xml:"buySell,attr"`
-						TradePrice    string `xml:"tradePrice,attr"`
-						Quantity      string `xml:"quantity,attr"`
-						IbCommission  string `xml:"ibCommission,attr"`
-						Currency      string `xml:"currency,attr"`
-						DateTime      string `xml:"dateTime,attr"`
-						AssetCategory string `xml:"assetCategory,attr"`
+						TradeID         string `xml:"tradeID,attr"`
+						Symbol          string `xml:"symbol,attr"`
+						BuySell         string `xml:"buySell,attr"`
+						TradePrice      string `xml:"tradePrice,attr"`
+						Quantity        string `xml:"quantity,attr"`
+						IbCommission    string `xml:"ibCommission,attr"`
+						Currency        string `xml:"currency,attr"`
+						DateTime        string `xml:"dateTime,attr"`
+						AssetCategory   string `xml:"assetCategory,attr"`
 						FifoPnlRealized string `xml:"fifoPnlRealized,attr"`
 					} `xml:"Trade"`
 				} `xml:"Trades"`
@@ -322,16 +572,16 @@ func (i *IBKR) parseTradesFromReport(report []byte, start, end time.Time) ([]*Tr
 			side = "sell"
 		}
 
-		marketType := "stocks"
+		marketType := MarketStocks
 		switch t.AssetCategory {
 		case "FUT":
-			marketType = "futures"
+			marketType = MarketFutures
 		case "OPT":
-			marketType = "options"
+			marketType = MarketOptions
 		case "CFD":
-			marketType = "cfd"
+			marketType = MarketCFD
 		case "CASH":
-			marketType = "forex"
+			marketType = MarketForex
 		}
 
 		trades = append(trades, &Trade{

@@ -81,7 +81,7 @@ func NewKeyGenerator() (*KeyGenerator, error) {
 	for i, b := range hash {
 		parts[i] = fmt.Sprintf("%02X", b)
 	}
-	fingerprint := "SHA-256:" + strings.Join(parts, ":")
+	fingerprint := strings.Join(parts, ":")
 
 	return &KeyGenerator{
 		privateKey:  privateKey,
@@ -115,11 +115,9 @@ func (k *KeyGenerator) FingerprintBytes() []byte {
 
 // Cleanup wipes the private key from memory.
 func (k *KeyGenerator) Cleanup() {
-	if k.privateKey != nil {
-		// Zero out key PEM
-		for i := range k.keyPEM {
-			k.keyPEM[i] = 0
-		}
-		k.privateKey = nil
+	// Zero out key PEM bytes regardless of key source (generated or file-loaded).
+	for i := range k.keyPEM {
+		k.keyPEM[i] = 0
 	}
+	k.privateKey = nil
 }

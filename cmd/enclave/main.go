@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -65,15 +68,20 @@ func main() {
 	memProtect := security.NewMemoryProtection(logger)
 	memProtect.Apply()
 
-	// 5. TLS key generation (ECDSA P-256 self-signed cert)
-	tlsKeygen, err := tlspkg.NewKeyGenerator()
+	// 5. REST TLS certificate loading (mandatory, TS parity)
+	tlsKeygen, err := tlspkg.NewKeyGeneratorFromFiles(cfg.TLSCertPath, cfg.TLSKeyPath)
 	if err != nil {
-		logger.Error("TLS keygen failed, continuing without TLS binding", zap.Error(err))
-	} else {
-		logger.Info("TLS certificate generated",
-			zap.String("fingerprint", tlsKeygen.Fingerprint()[:16]+"..."),
+		logger.Fatal("REST TLS certificates not found or invalid (server refuses to start)",
+			zap.String("cert_path", cfg.TLSCertPath),
+			zap.String("key_path", cfg.TLSKeyPath),
+			zap.Error(err),
 		)
 	}
+	logger.Info("REST TLS certificate loaded",
+		zap.String("cert_path", cfg.TLSCertPath),
+		zap.String("key_path", cfg.TLSKeyPath),
+		zap.String("fingerprint", tlsKeygen.Fingerprint()[:16]+"..."),
+	)
 
 	// 6. ECIES service (E2E encryption)
 	eciesSvc, err := encryption.NewECIES()
@@ -124,6 +132,9 @@ func main() {
 	if pool != nil {
 		connSvc = service.NewConnectionService(connRepo, enc)
 		syncSvc = service.NewSyncService(connSvc, snapshotRepo, logger)
+		if syncStatusRepo != nil {
+			syncSvc.SetSyncStatusRepo(syncStatusRepo)
+		}
 		metricsSvc = service.NewMetricsService(snapshotRepo)
 
 		if rateLimitRepo != nil {
@@ -133,9 +144,10 @@ func main() {
 
 	// 12. Init report signer (ephemeral key per startup)
 	signer := signing.NewReportSignerGenerate()
+	signingPubKey := signer.PublicKey()
 	logger.Info("report signer initialized",
 		zap.String("algorithm", signing.SignatureAlgorithm),
-		zap.String("public_key", signer.PublicKeyHex()[:16]+"..."),
+		zap.String("public_key", signingPubKey[:16]+"..."),
 	)
 
 	if metricsSvc != nil && snapshotRepo != nil {
@@ -143,6 +155,9 @@ func main() {
 			metricsSvc, snapshotRepo, signedReportRepo,
 			signer, benchmarkSvc, logger,
 		)
+		if connSvc != nil {
+			reportSvc.SetConnectionService(connSvc)
+		}
 	}
 
 	// 13. Attestation service
@@ -158,14 +173,25 @@ func main() {
 		if eciesSvc != nil {
 			opts.E2EPublicKey = eciesSvc.PublicKeyPEM()
 		}
-		opts.SigningPubKey = signer.PublicKeyHex()
+		opts.SigningPubKey = signingPubKey
 		attestSvc = attestation.NewService(opts)
+		if logStreamServer != nil {
+			logStreamServer.SetAttestationService(attestSvc)
+		}
 	}
 
 	// 14. Start gRPC server
+	grpcTLSConfig, err := buildGRPCTLSConfig(cfg)
+	if err != nil {
+		logger.Fatal("invalid gRPC TLS configuration", zap.Error(err))
+	}
+	if grpcTLSConfig == nil {
+		logger.Warn("gRPC running without TLS (development mode with GRPC_INSECURE=true)")
+	}
+
 	grpcServer := enclaveGrpc.NewServer(logger, connSvc, syncSvc, metricsSvc, reportSvc, snapshotRepo, userRepo)
 	go func() {
-		if err := grpcServer.Start(cfg.GRPCPort); err != nil {
+		if err := grpcServer.Start(cfg.GRPCPort, grpcTLSConfig); err != nil {
 			logger.Fatal("gRPC server failed", zap.Error(err))
 		}
 	}()
@@ -232,7 +258,6 @@ func main() {
 
 	// Suppress unused variable warnings for services used only indirectly
 	_ = rateLimiterSvc
-	_ = syncStatusRepo
 
 	// 19. Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
@@ -275,5 +300,62 @@ func connectDatabase(ctx context.Context, cfg *config.Config, logger *zap.Logger
 		return nil
 	}
 
+	if cfg.AutoMigrate {
+		if err := db.ApplyMigrations(ctx, pool, cfg.MigrationsDir, logger); err != nil {
+			logger.Error("auto-migrate failed, running without database",
+				zap.String("dir", cfg.MigrationsDir),
+				zap.Error(err),
+			)
+			pool.Close()
+			return nil
+		}
+	}
+
 	return pool
+}
+
+func buildGRPCTLSConfig(cfg *config.Config) (*tls.Config, error) {
+	if cfg.GRPCInsecure {
+		if !cfg.IsDevelopment() {
+			return nil, fmt.Errorf("GRPC_INSECURE=true is only allowed in development")
+		}
+		return nil, nil
+	}
+
+	rootCA, err := os.ReadFile(cfg.TLSCACertPath)
+	if err != nil {
+		return nil, fmt.Errorf("read gRPC CA cert %s: %w", cfg.TLSCACertPath, err)
+	}
+	certPEM, err := os.ReadFile(cfg.TLSServerCertPath)
+	if err != nil {
+		return nil, fmt.Errorf("read gRPC server cert %s: %w", cfg.TLSServerCertPath, err)
+	}
+	keyPEM, err := os.ReadFile(cfg.TLSServerKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read gRPC server key %s: %w", cfg.TLSServerKeyPath, err)
+	}
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse gRPC server keypair (cert=%s key=%s): %w", cfg.TLSServerCertPath, cfg.TLSServerKeyPath, err)
+	}
+
+	clientCAPool := x509.NewCertPool()
+	if ok := clientCAPool.AppendCertsFromPEM(rootCA); !ok {
+		return nil, fmt.Errorf("parse gRPC CA cert PEM (%s): no certificates found", cfg.TLSCACertPath)
+	}
+
+	requireClientCert := !cfg.IsDevelopment() || cfg.RequireClientCert
+	clientAuth := tls.NoClientCert
+	if requireClientCert {
+		clientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return &tls.Config{
+		MinVersion:               tls.VersionTLS12,
+		Certificates:             []tls.Certificate{cert},
+		ClientCAs:                clientCAPool,
+		ClientAuth:               clientAuth,
+		PreferServerCipherSuites: true,
+	}, nil
 }

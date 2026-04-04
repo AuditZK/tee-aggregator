@@ -10,9 +10,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// SyncScheduler ticks every hour and syncs users based on their per-user sync_interval.
-// - "hourly" users are synced every tick
-// - "daily" users are synced only at the 00:00 UTC tick
+// SyncScheduler fires once per day at 00:00 UTC and syncs all users atomically.
+// CRITICAL: Forces UTC timezone to prevent snapshot manipulation (TS parity).
 type SyncScheduler struct {
 	syncSvc  *service.SyncService
 	userRepo *repository.UserRepo
@@ -22,7 +21,7 @@ type SyncScheduler struct {
 	wg     sync.WaitGroup
 }
 
-// NewSyncScheduler creates a scheduler that ticks every hour.
+// NewSyncScheduler creates a scheduler.
 func NewSyncScheduler(
 	syncSvc *service.SyncService,
 	userRepo *repository.UserRepo,
@@ -36,30 +35,30 @@ func NewSyncScheduler(
 	}
 }
 
-// Start begins the scheduler
+// Start begins the daily scheduler. Fires at next 00:00 UTC, then every 24h.
 func (s *SyncScheduler) Start() {
 	s.wg.Add(1)
 	go s.run()
 
-	next := s.timeUntilNextHour()
-	s.logger.Info("sync scheduler started",
-		zap.String("tick", "every hour at :00"),
-		zap.String("policy", "per-user sync_interval (hourly/daily)"),
-		zap.Duration("next_tick_in", next),
+	next := timeUntilMidnightUTC()
+	s.logger.Info("daily sync scheduler started",
+		zap.String("policy", "once per day at 00:00 UTC"),
+		zap.Duration("next_sync_in", next),
+		zap.String("next_sync_at", time.Now().UTC().Add(next).Format(time.RFC3339)),
 	)
 }
 
-// Stop gracefully stops the scheduler
+// Stop gracefully stops the scheduler.
 func (s *SyncScheduler) Stop() {
 	close(s.stopCh)
 	s.wg.Wait()
-	s.logger.Info("sync scheduler stopped")
+	s.logger.Info("daily sync scheduler stopped")
 }
 
 func (s *SyncScheduler) run() {
 	defer s.wg.Done()
 
-	timer := time.NewTimer(s.timeUntilNextHour())
+	timer := time.NewTimer(timeUntilMidnightUTC())
 
 	for {
 		select {
@@ -68,32 +67,31 @@ func (s *SyncScheduler) run() {
 			return
 
 		case <-timer.C:
-			s.executeSync()
-			timer.Reset(s.timeUntilNextHour())
+			s.executeDailySync()
+			// Next tick: 24h from now (handles DST-free UTC correctly)
+			timer.Reset(timeUntilMidnightUTC())
 		}
 	}
 }
 
-func (s *SyncScheduler) timeUntilNextHour() time.Duration {
+// timeUntilMidnightUTC returns the duration until the next 00:00 UTC.
+func timeUntilMidnightUTC() time.Duration {
 	now := time.Now().UTC()
-	nextHour := now.Truncate(time.Hour).Add(time.Hour)
-	return nextHour.Sub(now)
+	nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+	return nextMidnight.Sub(now)
 }
 
-func (s *SyncScheduler) executeSync() {
+func (s *SyncScheduler) executeDailySync() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	now := time.Now().UTC()
-	isMidnight := now.Hour() == 0
-
-	s.logger.Info("sync tick", zap.Bool("is_midnight", isMidnight))
+	s.logger.Info("daily sync started", zap.String("time", now.Format(time.RFC3339)))
 	start := time.Now()
 
-	// Get all users with active connections (includes sync_interval)
 	users, err := s.userRepo.GetAllWithConnections(ctx)
 	if err != nil {
-		s.logger.Error("failed to get users for sync", zap.Error(err))
+		s.logger.Error("failed to get users for daily sync", zap.Error(err))
 		return
 	}
 
@@ -102,41 +100,19 @@ func (s *SyncScheduler) executeSync() {
 		return
 	}
 
-	// Filter: hourly users always, daily users only at midnight
-	var toSync []*repository.User
-	for _, u := range users {
-		if u.SyncInterval == "daily" {
-			if isMidnight {
-				toSync = append(toSync, u)
-			}
-		} else {
-			// "hourly" (default)
-			toSync = append(toSync, u)
-		}
-	}
-
-	if len(toSync) == 0 {
-		s.logger.Info("no users due for sync this tick",
-			zap.Int("total_users", len(users)),
-		)
-		return
-	}
-
-	s.logger.Info("syncing users",
-		zap.Int("to_sync", len(toSync)),
-		zap.Int("total_users", len(users)),
-	)
+	s.logger.Info("syncing all users", zap.Int("users", len(users)))
 
 	var (
-		successCount int
-		failCount    int
-		mu           sync.Mutex
-		wg           sync.WaitGroup
+		userSyncedCount int
+		successCount    int
+		failCount       int
+		mu              sync.Mutex
+		wg              sync.WaitGroup
 	)
 
-	sem := make(chan struct{}, 10)
+	sem := make(chan struct{}, 10) // Max 10 concurrent user syncs
 
-	for _, user := range toSync {
+	for _, user := range users {
 		wg.Add(1)
 		go func(u *repository.User) {
 			defer wg.Done()
@@ -144,7 +120,7 @@ func (s *SyncScheduler) executeSync() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			results, err := s.syncSvc.SyncUserScheduled(ctx, u.UID)
+			results, err := s.syncSvc.SyncUserScheduledDueAtomic(ctx, u.UID, now)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -153,10 +129,13 @@ func (s *SyncScheduler) executeSync() {
 				failCount++
 				s.logger.Error("user sync failed",
 					zap.String("user_uid", u.UID),
-					zap.String("sync_interval", u.SyncInterval),
 					zap.Error(err),
 				)
 				return
+			}
+
+			if len(results) > 0 {
+				userSyncedCount++
 			}
 
 			for _, r := range results {
@@ -171,15 +150,16 @@ func (s *SyncScheduler) executeSync() {
 
 	wg.Wait()
 
-	s.logger.Info("sync tick completed",
-		zap.Int("synced", len(toSync)),
-		zap.Int("success", successCount),
-		zap.Int("failed", failCount),
+	s.logger.Info("daily sync completed",
+		zap.Int("users_synced", userSyncedCount),
+		zap.Int("total_users", len(users)),
+		zap.Int("snapshots_success", successCount),
+		zap.Int("snapshots_failed", failCount),
 		zap.Duration("duration", time.Since(start)),
 	)
 }
 
-// RunNow executes sync immediately for all eligible users
+// RunNow executes sync immediately for all users (for manual trigger / testing).
 func (s *SyncScheduler) RunNow() {
-	s.executeSync()
+	s.executeDailySync()
 }

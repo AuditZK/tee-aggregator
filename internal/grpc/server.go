@@ -2,17 +2,23 @@ package grpc
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"time"
 
+	pb "github.com/trackrecord/enclave/api/proto"
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/service"
+	"github.com/trackrecord/enclave/internal/signing"
 	"github.com/trackrecord/enclave/internal/validation"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 )
@@ -20,11 +26,14 @@ import (
 var startTime = time.Now()
 
 const version = "1.0.0-go"
+const genericInternalError = "Internal server error"
 
-// Server implements the gRPC EnclaveService
+// Server implements the protobuf EnclaveService.
 type Server struct {
+	pb.UnimplementedEnclaveServiceServer
+
 	logger       *zap.Logger
-	connSvc      *service.ConnectionService
+	connSvc      connectionService
 	syncSvc      *service.SyncService
 	metricsSvc   *service.MetricsService
 	reportSvc    *service.ReportService
@@ -33,10 +42,16 @@ type Server struct {
 	grpcServer   *grpc.Server
 }
 
-// NewServer creates a new gRPC server
+type connectionService interface {
+	Create(ctx context.Context, req *service.CreateConnectionRequest) error
+	GetExcludedConnectionKeys(ctx context.Context, userUID string) (map[string]struct{}, error)
+	GetActiveConnections(ctx context.Context, userUID string) ([]*repository.ExchangeConnection, error)
+}
+
+// NewServer creates a new gRPC server.
 func NewServer(
 	logger *zap.Logger,
-	connSvc *service.ConnectionService,
+	connSvc connectionService,
 	syncSvc *service.SyncService,
 	metricsSvc *service.MetricsService,
 	reportSvc *service.ReportService,
@@ -54,26 +69,36 @@ func NewServer(
 	}
 }
 
-// Start starts the gRPC server
-func (s *Server) Start(port int) error {
+// Start starts the gRPC server. If tlsConfig is nil, the server runs in insecure mode.
+func (s *Server) Start(port int, tlsConfig *tls.Config) error {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 
-	s.grpcServer = grpc.NewServer(
+	serverOpts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(s.loggingInterceptor),
-	)
+	}
+	if tlsConfig != nil {
+		serverOpts = append(serverOpts, grpc.Creds(credentials.NewTLS(tlsConfig)))
+	}
 
-	// Register service with manual service descriptor
-	s.grpcServer.RegisterService(&EnclaveService_ServiceDesc, s)
+	s.grpcServer = grpc.NewServer(serverOpts...)
+	pb.RegisterEnclaveServiceServer(s.grpcServer, s)
 	reflection.Register(s.grpcServer)
 
-	s.logger.Info("gRPC server starting", zap.Int("port", port))
+	mode := "insecure"
+	if tlsConfig != nil {
+		mode = "tls"
+	}
+	s.logger.Info("gRPC server starting",
+		zap.Int("port", port),
+		zap.String("mode", mode),
+	)
 	return s.grpcServer.Serve(lis)
 }
 
-// Stop gracefully stops the server
+// Stop gracefully stops the server.
 func (s *Server) Stop() {
 	if s.grpcServer != nil {
 		s.grpcServer.GracefulStop()
@@ -96,150 +121,200 @@ func (s *Server) loggingInterceptor(
 	return resp, err
 }
 
-// HealthCheck implements EnclaveService
-func (s *Server) HealthCheck(ctx context.Context, req *HealthCheckRequest) (*HealthCheckResponse, error) {
-	uptime := time.Since(startTime).Seconds()
-	return &HealthCheckResponse{
-		Status:        "healthy",
-		Version:       version,
-		Timestamp:     time.Now().Unix(),
-		UptimeSeconds: int64(uptime),
-		Database:      s.connSvc != nil,
-		Enclave:       true,
-		Uptime:        uptime,
-	}, nil
+func (s *Server) isProduction() bool {
+	env := strings.ToLower(os.Getenv("ENV"))
+	nodeEnv := strings.ToLower(os.Getenv("NODE_ENV"))
+	return env == "production" || nodeEnv == "production"
 }
 
-// CreateUserConnection implements EnclaveService
-func (s *Server) CreateUserConnection(ctx context.Context, req *CreateUserConnectionRequest) (*CreateUserConnectionResponse, error) {
-	if s.connSvc == nil {
-		return &CreateUserConnectionResponse{
-			Success: false,
-			Error:   "database not configured",
-		}, nil
+func (s *Server) sanitizeErrorForClient(err error) string {
+	if err == nil {
+		return ""
 	}
+	return s.sanitizeMessageForClient(err.Error())
+}
 
-	if err := validation.ValidateCreateConnection(&validation.CreateConnectionRequest{
-		UserUID:   req.UserUid,
-		Exchange:  req.Exchange,
-		Label:     req.Label,
-		APIKey:    req.ApiKey,
-		APISecret: req.ApiSecret,
-	}); err != nil {
-		return &CreateUserConnectionResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, nil
+func (s *Server) sanitizeMessageForClient(msg string) string {
+	if msg == "" {
+		return ""
 	}
+	if s.isProduction() {
+		return genericInternalError
+	}
+	return msg
+}
 
-	// Upsert user first
-	if s.userRepo != nil {
-		if _, err := s.userRepo.GetOrCreate(ctx, req.UserUid); err != nil {
-			s.logger.Error("user upsert failed", zap.Error(err))
-			return &CreateUserConnectionResponse{
-				Success: false,
-				Error:   "failed to create user",
-			}, nil
+func currentEnclaveMode() string {
+	env := strings.ToLower(os.Getenv("ENV"))
+	nodeEnv := strings.ToLower(os.Getenv("NODE_ENV"))
+	if env == "production" || nodeEnv == "production" {
+		return "production"
+	}
+	return "development"
+}
+
+// HealthCheck implements EnclaveService.
+// Verifies database connectivity (TS parity).
+func (s *Server) HealthCheck(ctx context.Context, req *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
+	uptime := time.Since(startTime).Seconds()
+
+	st := pb.HealthCheckResponse_HEALTHY
+	if s.snapshotRepo != nil {
+		// Test DB connectivity by running a lightweight query
+		_, err := s.snapshotRepo.GetByUserAndDateRange(ctx, "__healthcheck__",
+			time.Now().Add(-time.Hour), time.Now())
+		if err != nil {
+			s.logger.Error("health check failed - database connectivity issue", zap.Error(err))
+			st = pb.HealthCheckResponse_UNHEALTHY
 		}
 	}
 
-	err := s.connSvc.Create(ctx, &service.CreateConnectionRequest{
+	return &pb.HealthCheckResponse{
+		Status:  st,
+		Enclave: true,
+		Version: version,
+		Uptime:  uptime,
+	}, nil
+}
+
+// CreateUserConnection implements EnclaveService.
+func (s *Server) CreateUserConnection(ctx context.Context, req *pb.CreateUserConnectionRequest) (*pb.CreateUserConnectionResponse, error) {
+	if err := validation.ValidateCreateConnection(&validation.CreateConnectionRequest{
 		UserUID:    req.UserUid,
 		Exchange:   req.Exchange,
 		Label:      req.Label,
 		APIKey:     req.ApiKey,
 		APISecret:  req.ApiSecret,
 		Passphrase: req.Passphrase,
-	})
+	}); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 
-	if err != nil {
-		s.logger.Error("create connection failed", zap.Error(err))
-		return &CreateUserConnectionResponse{
+	if s.connSvc == nil {
+		return &pb.CreateUserConnectionResponse{
 			Success: false,
-			Error:   "failed to create connection",
+			UserUid: req.UserUid,
+			Error:   s.sanitizeMessageForClient("database not configured"),
 		}, nil
 	}
 
-	return &CreateUserConnectionResponse{
-		Success: true,
-		UserUid: req.UserUid,
-	}, nil
+	if s.userRepo != nil {
+		if _, err := s.userRepo.GetOrCreate(ctx, req.UserUid); err != nil {
+			s.logger.Error("user upsert failed", zap.Error(err))
+			return &pb.CreateUserConnectionResponse{
+				Success: false,
+				UserUid: req.UserUid,
+				Error:   s.sanitizeMessageForClient("failed to create user"),
+			}, nil
+		}
+	}
+
+	err := s.connSvc.Create(ctx, &service.CreateConnectionRequest{
+		UserUID:           req.UserUid,
+		Exchange:          req.Exchange,
+		Label:             req.Label,
+		APIKey:            req.ApiKey,
+		APISecret:         req.ApiSecret,
+		Passphrase:        req.Passphrase,
+		ExcludeFromReport: req.ExcludeFromReport,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrConnectionAlreadyExists) {
+			return &pb.CreateUserConnectionResponse{
+				Success: true,
+				UserUid: req.UserUid,
+				Error:   service.ExistingConnectionNoopMessage,
+			}, nil
+		}
+		s.logger.Error("create connection failed", zap.Error(err))
+		return &pb.CreateUserConnectionResponse{
+			Success: false,
+			UserUid: req.UserUid,
+			Error:   s.sanitizeMessageForClient("failed to create connection"),
+		}, nil
+	}
+
+	return &pb.CreateUserConnectionResponse{Success: true, UserUid: req.UserUid}, nil
 }
 
-// ProcessSyncJob implements EnclaveService
-func (s *Server) ProcessSyncJob(ctx context.Context, req *SyncJobRequest) (*SyncJobResponse, error) {
-	if s.syncSvc == nil {
-		return &SyncJobResponse{
-			Success: false,
-			Error:   "sync service not available",
-		}, nil
-	}
+// ProcessSyncJob implements EnclaveService.
+func (s *Server) ProcessSyncJob(ctx context.Context, req *pb.SyncJobRequest) (*pb.SyncJobResponse, error) {
+	rawExchange := req.Exchange
 
 	if err := validation.ValidateSyncRequest(&validation.SyncJobRequest{
 		UserUID:  req.UserUid,
-		Exchange: req.Exchange,
+		Exchange: rawExchange,
 	}); err != nil {
-		return &SyncJobResponse{
-			Success: false,
-			Error:   err.Error(),
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	exchange := strings.ToLower(rawExchange)
+
+	if s.syncSvc == nil {
+		return &pb.SyncJobResponse{
+			Success:  false,
+			UserUid:  req.UserUid,
+			Exchange: exchange,
+			Error:    s.sanitizeMessageForClient("sync service not available"),
 		}, nil
 	}
 
-	var result *service.SyncResult
-	if req.Exchange != "" {
-		result = s.syncSvc.SyncExchange(ctx, req.UserUid, req.Exchange)
+	var (
+		results []*service.SyncResult
+		err     error
+	)
+	if exchange != "" {
+		results = []*service.SyncResult{s.syncSvc.SyncExchange(ctx, req.UserUid, exchange)}
 	} else {
-		results, err := s.syncSvc.SyncUser(ctx, req.UserUid)
+		results, err = s.syncSvc.SyncUser(ctx, req.UserUid)
 		if err != nil {
-			return &SyncJobResponse{
-				Success: false,
-				UserUid: req.UserUid,
-				Error:   err.Error(),
+			return &pb.SyncJobResponse{
+				Success:  false,
+				UserUid:  req.UserUid,
+				Exchange: exchange,
+				Error:    s.sanitizeErrorForClient(err),
 			}, nil
 		}
-		if len(results) > 0 {
-			result = results[0]
-		}
 	}
 
-	if result == nil {
-		return &SyncJobResponse{
-			Success: false,
-			UserUid: req.UserUid,
-			Error:   "no results",
-		}, nil
+	if len(results) == 0 {
+		return &pb.SyncJobResponse{Success: false, UserUid: req.UserUid, Error: "no results"}, nil
 	}
 
-	return &SyncJobResponse{
-		Success:            result.Success,
-		UserUid:            result.UserUID,
-		Exchange:           result.Exchange,
-		Synced:             int32(result.TradeCount),
-		SnapshotsGenerated: 1,
-		LatestSnapshot: &Snapshot{
-			Equity:    result.SnapshotEquity,
-			Timestamp: result.SnapshotTimestamp.Unix(),
-		},
-		Error: result.Error,
+	success, synced, snapshotsGenerated, latestSnapshot, resultErr := aggregateSyncResultsForSyncJobResponse(results)
+	if resultErr != "" {
+		resultErr = s.sanitizeMessageForClient(resultErr)
+	}
+
+	return &pb.SyncJobResponse{
+		Success:            success,
+		UserUid:            req.UserUid,
+		Exchange:           exchange,
+		Synced:             synced,
+		SnapshotsGenerated: snapshotsGenerated,
+		LatestSnapshot:     latestSnapshot,
+		Error:              resultErr,
 	}, nil
 }
 
-// GetPerformanceMetrics implements EnclaveService
-func (s *Server) GetPerformanceMetrics(ctx context.Context, req *PerformanceMetricsRequest) (*PerformanceMetricsResponse, error) {
+// GetPerformanceMetrics implements EnclaveService.
+func (s *Server) GetPerformanceMetrics(ctx context.Context, req *pb.PerformanceMetricsRequest) (*pb.PerformanceMetricsResponse, error) {
 	if s.metricsSvc == nil {
-		return &PerformanceMetricsResponse{
-			Success: false,
-			Error:   "metrics service not available",
-		}, nil
+		return &pb.PerformanceMetricsResponse{Success: false, Error: "metrics service not available"}, nil
 	}
+	rawExchange := req.Exchange
 
 	if err := validation.ValidateUserUID(req.UserUid); err != nil {
-		return &PerformanceMetricsResponse{Success: false, Error: err.Error()}, nil
+		return &pb.PerformanceMetricsResponse{Success: false, Error: err.Error()}, nil
 	}
+	if rawExchange != "" {
+		if err := validation.ValidateExchange(rawExchange); err != nil {
+			return &pb.PerformanceMetricsResponse{Success: false, Error: err.Error()}, nil
+		}
+	}
+	exchange := strings.ToLower(rawExchange)
 
 	start := time.UnixMilli(req.StartDate)
 	end := time.UnixMilli(req.EndDate)
-
 	if req.StartDate == 0 {
 		start = time.Now().AddDate(-1, 0, 0)
 	}
@@ -247,15 +322,21 @@ func (s *Server) GetPerformanceMetrics(ctx context.Context, req *PerformanceMetr
 		end = time.Now()
 	}
 
-	metrics, err := s.metricsSvc.Calculate(ctx, req.UserUid, start, end)
-	if err != nil {
-		return &PerformanceMetricsResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, nil
+	excludedConnectionKeys := map[string]struct{}{}
+	if s.connSvc != nil {
+		excluded, err := s.connSvc.GetExcludedConnectionKeys(ctx, req.UserUid)
+		if err != nil {
+			return &pb.PerformanceMetricsResponse{Success: false, Error: s.sanitizeErrorForClient(err)}, nil
+		}
+		excludedConnectionKeys = excluded
 	}
 
-	return &PerformanceMetricsResponse{
+	metrics, err := s.metricsSvc.CalculateWithFilters(ctx, req.UserUid, start, end, exchange, excludedConnectionKeys)
+	if err != nil {
+		return &pb.PerformanceMetricsResponse{Success: false, Error: s.sanitizeErrorForClient(err)}, nil
+	}
+
+	return &pb.PerformanceMetricsResponse{
 		SharpeRatio:         metrics.SharpeRatio,
 		SortinoRatio:        metrics.SortinoRatio,
 		CalmarRatio:         metrics.CalmarRatio,
@@ -268,26 +349,46 @@ func (s *Server) GetPerformanceMetrics(ctx context.Context, req *PerformanceMetr
 		ProfitFactor:        metrics.ProfitFactor,
 		AvgWin:              metrics.AvgWin,
 		AvgLoss:             metrics.AvgLoss,
-		PeriodStart:         metrics.PeriodStart.Unix(),
-		PeriodEnd:           metrics.PeriodEnd.Unix(),
+		PeriodStart:         metrics.PeriodStart.UnixMilli(),
+		PeriodEnd:           metrics.PeriodEnd.UnixMilli(),
 		DataPoints:          int32(metrics.DataPoints),
 		Success:             true,
 	}, nil
 }
 
-// GetSnapshotTimeSeries implements EnclaveService
-func (s *Server) GetSnapshotTimeSeries(ctx context.Context, req *SnapshotTimeSeriesRequest) (*SnapshotTimeSeriesResponse, error) {
+// GetSnapshotTimeSeries implements EnclaveService.
+func (s *Server) GetSnapshotTimeSeries(ctx context.Context, req *pb.SnapshotTimeSeriesRequest) (*pb.SnapshotTimeSeriesResponse, error) {
 	if s.snapshotRepo == nil {
 		return nil, status.Error(codes.Unavailable, "database not configured")
 	}
+	rawExchange := req.Exchange
 
 	if err := validation.ValidateUserUID(req.UserUid); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	if rawExchange != "" {
+		if err := validation.ValidateExchange(rawExchange); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+	}
+	if err := validation.ValidateOptionalTimestampMillis(req.StartDate, "start_date"); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := validation.ValidateOptionalTimestampMillis(req.EndDate, "end_date"); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if req.StartDate != 0 && req.EndDate != 0 {
+		if req.StartDate >= req.EndDate {
+			return nil, status.Error(codes.InvalidArgument, "end_date must be after start_date")
+		}
+		if err := validation.ValidateTimestampRange(time.UnixMilli(req.StartDate), time.UnixMilli(req.EndDate)); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+	}
+	exchange := strings.ToLower(rawExchange)
 
 	start := time.UnixMilli(req.StartDate)
 	end := time.UnixMilli(req.EndDate)
-
 	if req.StartDate == 0 {
 		start = time.Now().AddDate(-1, 0, 0)
 	}
@@ -297,15 +398,27 @@ func (s *Server) GetSnapshotTimeSeries(ctx context.Context, req *SnapshotTimeSer
 
 	snapshots, err := s.snapshotRepo.GetByUserAndDateRange(ctx, req.UserUid, start, end)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, s.sanitizeErrorForClient(err))
 	}
 
-	resp := &SnapshotTimeSeriesResponse{
-		Snapshots: make([]*DailySnapshot, 0, len(snapshots)),
+	excludedConnectionKeys := map[string]struct{}{}
+	if s.connSvc != nil {
+		excluded, err := s.connSvc.GetExcludedConnectionKeys(ctx, req.UserUid)
+		if err != nil {
+			return nil, status.Error(codes.Internal, s.sanitizeErrorForClient(err))
+		}
+		excludedConnectionKeys = excluded
 	}
 
+	resp := &pb.SnapshotTimeSeriesResponse{Snapshots: make([]*pb.DailySnapshot, 0, len(snapshots))}
 	for _, snap := range snapshots {
-		resp.Snapshots = append(resp.Snapshots, &DailySnapshot{
+		if isConnectionExcluded(excludedConnectionKeys, snap.Exchange, snap.Label) {
+			continue
+		}
+		if exchange != "" && strings.ToLower(snap.Exchange) != exchange {
+			continue
+		}
+		resp.Snapshots = append(resp.Snapshots, &pb.DailySnapshot{
 			UserUid:         snap.UserUID,
 			Exchange:        snap.Exchange,
 			Timestamp:       snap.Timestamp.UnixMilli(),
@@ -314,76 +427,69 @@ func (s *Server) GetSnapshotTimeSeries(ctx context.Context, req *SnapshotTimeSer
 			UnrealizedPnl:   snap.UnrealizedPnL,
 			Deposits:        snap.Deposits,
 			Withdrawals:     snap.Withdrawals,
+			Breakdown:       mapMarketBreakdown(snap.Breakdown),
 		})
 	}
 
 	return resp, nil
 }
 
-// GetAggregatedMetrics implements EnclaveService
-// Aggregates metrics across all exchange connections for the user
-func (s *Server) GetAggregatedMetrics(ctx context.Context, req *AggregatedMetricsRequest) (*AggregatedMetricsResponse, error) {
+// GetAggregatedMetrics implements EnclaveService.
+func (s *Server) GetAggregatedMetrics(ctx context.Context, req *pb.AggregatedMetricsRequest) (*pb.AggregatedMetricsResponse, error) {
 	if s.snapshotRepo == nil {
 		return nil, status.Error(codes.Unavailable, "database not configured")
 	}
+	rawExchange := req.Exchange
 
 	if err := validation.ValidateUserUID(req.UserUid); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	if req.Exchange != "" {
-		if err := validation.ValidateExchange(req.Exchange); err != nil {
+	if rawExchange != "" {
+		if err := validation.ValidateExchange(rawExchange); err != nil {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 	}
+	exchange := strings.ToLower(rawExchange)
 
-	// Get all active connections for the user
 	if s.connSvc == nil {
-		// Fallback to single snapshot
 		snapshot, err := s.snapshotRepo.GetLatestByUser(ctx, req.UserUid)
 		if err != nil {
-			return &AggregatedMetricsResponse{}, nil
+			return &pb.AggregatedMetricsResponse{}, nil
 		}
-		return &AggregatedMetricsResponse{
+		return &pb.AggregatedMetricsResponse{
 			TotalBalance:       snapshot.RealizedBalance,
 			TotalEquity:        snapshot.TotalEquity,
 			TotalUnrealizedPnl: snapshot.UnrealizedPnL,
 			TotalFees:          snapshot.TotalFees,
 			TotalTrades:        int32(snapshot.TotalTrades),
-			LastSync:           snapshot.Timestamp.Unix(),
+			LastSync:           snapshot.Timestamp.UnixMilli(),
 		}, nil
+	}
+
+	excludedConnectionKeys, err := s.connSvc.GetExcludedConnectionKeys(ctx, req.UserUid)
+	if err != nil {
+		return nil, status.Error(codes.Internal, s.sanitizeErrorForClient(err))
 	}
 
 	connections, err := s.connSvc.GetActiveConnections(ctx, req.UserUid)
 	if err != nil || len(connections) == 0 {
-		return &AggregatedMetricsResponse{}, nil
+		return &pb.AggregatedMetricsResponse{}, nil
 	}
 
-	resp := &AggregatedMetricsResponse{}
+	resp := &pb.AggregatedMetricsResponse{}
 	var lastSync time.Time
 
 	for _, conn := range connections {
-		// Filter by exchange if specified
-		if req.Exchange != "" && conn.Exchange != req.Exchange {
+		if isConnectionExcluded(excludedConnectionKeys, conn.Exchange, conn.Label) {
+			continue
+		}
+		if exchange != "" && strings.ToLower(conn.Exchange) != exchange {
 			continue
 		}
 
-		snapshot, err := s.snapshotRepo.GetByUserExchangeAndDate(ctx, req.UserUid, conn.Exchange, time.Time{})
+		snapshot, err := s.snapshotRepo.GetLatestByUserExchangeLabel(ctx, req.UserUid, conn.Exchange, conn.Label)
 		if err != nil {
-			// Try latest by user for this exchange
-			latestSnapshots, err := s.snapshotRepo.GetByUserAndDateRange(ctx, req.UserUid, time.Now().AddDate(-1, 0, 0), time.Now())
-			if err != nil {
-				continue
-			}
-			// Find latest for this exchange
-			for i := len(latestSnapshots) - 1; i >= 0; i-- {
-				if latestSnapshots[i].Exchange == conn.Exchange {
-					snapshot = latestSnapshots[i]
-					break
-				}
-			}
-			if snapshot == nil {
-				continue
-			}
+			continue
 		}
 
 		resp.TotalBalance += snapshot.RealizedBalance
@@ -398,19 +504,16 @@ func (s *Server) GetAggregatedMetrics(ctx context.Context, req *AggregatedMetric
 	}
 
 	if !lastSync.IsZero() {
-		resp.LastSync = lastSync.Unix()
+		resp.LastSync = lastSync.UnixMilli()
 	}
 
 	return resp, nil
 }
 
-// GenerateSignedReport implements EnclaveService
-func (s *Server) GenerateSignedReport(ctx context.Context, req *ReportRequest) (*SignedReportResponse, error) {
+// GenerateSignedReport implements EnclaveService.
+func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest) (*pb.SignedReportResponse, error) {
 	if s.reportSvc == nil {
-		return &SignedReportResponse{
-			Success: false,
-			Error:   "report service not available",
-		}, nil
+		return &pb.SignedReportResponse{Success: false, Error: "report service not available"}, nil
 	}
 
 	if err := validation.ValidateReportRequest(&validation.ReportRequest{
@@ -419,23 +522,48 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *ReportRequest) (
 		EndDate:   req.EndDate,
 		Benchmark: req.Benchmark,
 	}); err != nil {
-		return &SignedReportResponse{Success: false, Error: err.Error()}, nil
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	startDate, err := time.Parse("2006-01-02", req.StartDate)
-	if err != nil {
-		return &SignedReportResponse{
-			Success: false,
-			Error:   "invalid start_date format (use YYYY-MM-DD)",
-		}, nil
+	var (
+		startDate time.Time
+		endDate   time.Time
+		err       error
+	)
+
+	if req.StartDate != "" {
+		startDate, err = time.Parse("2006-01-02", req.StartDate)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid start_date format (use YYYY-MM-DD)")
+		}
+	}
+	if req.EndDate != "" {
+		endDate, err = time.Parse("2006-01-02", req.EndDate)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid end_date format (use YYYY-MM-DD)")
+		}
 	}
 
-	endDate, err := time.Parse("2006-01-02", req.EndDate)
-	if err != nil {
-		return &SignedReportResponse{
-			Success: false,
-			Error:   "invalid end_date format (use YYYY-MM-DD)",
-		}, nil
+	excludedConnectionKeys := map[string]struct{}{}
+	if s.connSvc != nil {
+		excluded, err := s.connSvc.GetExcludedConnectionKeys(ctx, req.UserUid)
+		if err != nil {
+			return &pb.SignedReportResponse{Success: false, Error: s.sanitizeErrorForClient(err)}, nil
+		}
+		excludedConnectionKeys = excluded
+	}
+
+	if startDate.IsZero() || endDate.IsZero() {
+		defaultStart, defaultEnd, err := s.resolveReportPeriod(ctx, req.UserUid, excludedConnectionKeys, startDate, endDate)
+		if err != nil {
+			return &pb.SignedReportResponse{Success: false, Error: s.sanitizeErrorForClient(err)}, nil
+		}
+		if startDate.IsZero() {
+			startDate = defaultStart
+		}
+		if endDate.IsZero() {
+			endDate = defaultEnd
+		}
 	}
 
 	report, err := s.reportSvc.GenerateReport(ctx, &service.GenerateReportRequest{
@@ -447,18 +575,16 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *ReportRequest) (
 		BaseCurrency:       req.BaseCurrency,
 		IncludeRiskMetrics: req.IncludeRiskMetrics,
 		IncludeDrawdown:    req.IncludeDrawdown,
-		Manager:            req.Manager,
-		Firm:               req.Firm,
+		ExcludedExchanges:  excludedConnectionKeys,
+		Manager:            "",
+		Firm:               "",
 	})
 	if err != nil {
 		s.logger.Error("generate report failed", zap.Error(err))
-		return &SignedReportResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, nil
+		return &pb.SignedReportResponse{Success: false, Error: s.sanitizeErrorForClient(err)}, nil
 	}
 
-	resp := &SignedReportResponse{
+	resp := &pb.SignedReportResponse{
 		Success:            true,
 		ReportId:           report.ReportID,
 		UserUid:            report.UserUID,
@@ -466,342 +592,330 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *ReportRequest) (
 		GeneratedAt:        report.GeneratedAt,
 		PeriodStart:        report.PeriodStart,
 		PeriodEnd:          report.PeriodEnd,
-		TotalReturn:        report.TotalReturn,
-		AnnualizedReturn:   report.AnnualizedReturn,
-		SharpeRatio:        report.SharpeRatio,
-		SortinoRatio:       report.SortinoRatio,
-		CalmarRatio:        report.CalmarRatio,
-		MaxDrawdown:        report.MaxDrawdown,
-		Volatility:         report.Volatility,
-		WinRate:            report.WinRate,
-		ProfitFactor:       report.ProfitFactor,
-		DataPoints:         report.DataPoints,
 		BaseCurrency:       report.BaseCurrency,
 		Benchmark:          report.Benchmark,
+		DataPoints:         int32(report.DataPoints),
 		Exchanges:          report.Exchanges,
+		TotalReturn:        report.TotalReturn,
+		AnnualizedReturn:   report.AnnualizedReturn,
+		Volatility:         report.Volatility,
+		SharpeRatio:        report.SharpeRatio,
+		SortinoRatio:       report.SortinoRatio,
+		MaxDrawdown:        report.MaxDrawdown,
+		CalmarRatio:        report.CalmarRatio,
 		Signature:          report.Signature,
 		PublicKey:          report.PublicKey,
 		SignatureAlgorithm: report.SignatureAlgorithm,
 		ReportHash:         report.ReportHash,
 		EnclaveVersion:     report.EnclaveVersion,
+		EnclaveMode:        currentEnclaveMode(),
 	}
+	resp.ExchangeDetails = mapExchangeDetails(report.ExchangeDetails, report.Exchanges)
 
-	// Map daily returns
 	if len(report.DailyReturns) > 0 {
-		resp.DailyReturns = make([]ReportDailyReturn, len(report.DailyReturns))
-		for i, dr := range report.DailyReturns {
-			resp.DailyReturns[i] = ReportDailyReturn{
+		resp.DailyReturns = make([]*pb.DailyReturnData, 0, len(report.DailyReturns))
+		for _, dr := range report.DailyReturns {
+			resp.DailyReturns = append(resp.DailyReturns, &pb.DailyReturnData{
 				Date:             dr.Date,
 				NetReturn:        dr.NetReturn,
 				BenchmarkReturn:  dr.BenchmarkReturn,
 				Outperformance:   dr.Outperformance,
 				CumulativeReturn: dr.CumulativeReturn,
-				NAV:              dr.NAV,
-			}
+				Nav:              dr.NAV,
+			})
 		}
 	}
 
-	// Map monthly returns
 	if len(report.MonthlyReturns) > 0 {
-		resp.MonthlyReturns = make([]ReportMonthlyReturn, len(report.MonthlyReturns))
-		for i, mr := range report.MonthlyReturns {
-			resp.MonthlyReturns[i] = ReportMonthlyReturn{
+		resp.MonthlyReturns = make([]*pb.MonthlyReturnData, 0, len(report.MonthlyReturns))
+		for _, mr := range report.MonthlyReturns {
+			resp.MonthlyReturns = append(resp.MonthlyReturns, &pb.MonthlyReturnData{
 				Date:            mr.Date,
 				NetReturn:       mr.NetReturn,
 				BenchmarkReturn: mr.BenchmarkReturn,
 				Outperformance:  mr.Outperformance,
-				AUM:             mr.AUM,
-			}
+				Aum:             mr.AUM,
+			})
 		}
 	}
 
-	// Map risk metrics
 	if report.RiskMetrics != nil {
-		resp.RiskMetrics = &ReportRiskMetrics{
-			VaR95:             report.RiskMetrics.VaR95,
-			VaR99:             report.RiskMetrics.VaR99,
-			ExpectedShortfall: report.RiskMetrics.ExpectedShortfall,
-			Skewness:          report.RiskMetrics.Skewness,
-			Kurtosis:          report.RiskMetrics.Kurtosis,
-		}
+		resp.Var_95 = report.RiskMetrics.VaR95
+		resp.Var_99 = report.RiskMetrics.VaR99
+		resp.ExpectedShortfall = report.RiskMetrics.ExpectedShortfall
+		resp.Skewness = report.RiskMetrics.Skewness
+		resp.Kurtosis = report.RiskMetrics.Kurtosis
 	}
 
-	// Map drawdown data
+	if report.BenchmarkMetrics != nil {
+		resp.Alpha = report.BenchmarkMetrics.Alpha
+		resp.Beta = report.BenchmarkMetrics.Beta
+		resp.InformationRatio = report.BenchmarkMetrics.InformationRatio
+		resp.TrackingError = report.BenchmarkMetrics.TrackingError
+		resp.Correlation = report.BenchmarkMetrics.Correlation
+	}
+
 	if report.DrawdownData != nil {
-		resp.DrawdownData = &ReportDrawdownData{
-			CurrentDrawdown:     report.DrawdownData.CurrentDrawdown,
-			MaxDrawdownDuration: report.DrawdownData.MaxDrawdownDuration,
-		}
+		resp.CurrentDrawdown = report.DrawdownData.CurrentDrawdown
+		resp.MaxDrawdownDuration = int32(report.DrawdownData.MaxDrawdownDuration)
+		resp.DrawdownPeriods = make([]*pb.DrawdownPeriodData, 0, len(report.DrawdownData.Periods))
 		for _, p := range report.DrawdownData.Periods {
-			resp.DrawdownData.Periods = append(resp.DrawdownData.Periods, &ReportDrawdownPeriod{
+			resp.DrawdownPeriods = append(resp.DrawdownPeriods, &pb.DrawdownPeriodData{
 				StartDate: p.StartDate,
 				EndDate:   p.EndDate,
 				Depth:     p.Depth,
-				Duration:  p.Duration,
+				Duration:  int32(p.Duration),
 				Recovered: p.Recovered,
 			})
 		}
 	}
 
-	// Map benchmark metrics
-	if report.BenchmarkMetrics != nil {
-		resp.BenchmarkMetrics = &ReportBenchmarkMetrics{
-			BenchmarkName:    report.BenchmarkMetrics.BenchmarkName,
-			BenchmarkReturn:  report.BenchmarkMetrics.BenchmarkReturn,
-			Alpha:            report.BenchmarkMetrics.Alpha,
-			Beta:             report.BenchmarkMetrics.Beta,
-			InformationRatio: report.BenchmarkMetrics.InformationRatio,
-			TrackingError:    report.BenchmarkMetrics.TrackingError,
-			Correlation:      report.BenchmarkMetrics.Correlation,
-		}
-	}
-
-	// Display params (not signed)
-	resp.Manager = report.Manager
-	resp.Firm = report.Firm
-
 	return resp, nil
 }
 
-// VerifyReportSignature implements EnclaveService
-func (s *Server) VerifyReportSignature(ctx context.Context, req *VerifySignatureRequest) (*VerifySignatureResponse, error) {
+// VerifyReportSignature implements EnclaveService.
+func (s *Server) VerifyReportSignature(ctx context.Context, req *pb.VerifySignatureRequest) (*pb.VerifySignatureResponse, error) {
 	if s.reportSvc == nil {
-		return &VerifySignatureResponse{
-			Valid: false,
-			Error: "report service not available",
-		}, nil
+		return nil, status.Error(codes.Internal, s.sanitizeMessageForClient("report service not available"))
 	}
-
 	if req.ReportHash == "" || req.Signature == "" || req.PublicKey == "" {
-		return &VerifySignatureResponse{
-			Valid: false,
-			Error: "report_hash, signature, and public_key are required",
-		}, nil
+		return nil, status.Error(codes.InvalidArgument, "report_hash, signature, and public_key are required")
 	}
 
 	valid, err := s.reportSvc.VerifySignature(req.ReportHash, req.Signature, req.PublicKey)
 	if err != nil {
-		return &VerifySignatureResponse{
-			Valid: false,
-			Error: err.Error(),
-		}, nil
+		return nil, status.Error(codes.Internal, s.sanitizeErrorForClient(err))
 	}
 
-	return &VerifySignatureResponse{
-		Valid: valid,
-	}, nil
+	return &pb.VerifySignatureResponse{Valid: valid}, nil
 }
 
-// Service descriptor for manual gRPC registration
-var EnclaveService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "enclave.EnclaveService",
-	HandlerType: (*EnclaveServiceServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "HealthCheck",
-			Handler:    _EnclaveService_HealthCheck_Handler,
-		},
-		{
-			MethodName: "CreateUserConnection",
-			Handler:    _EnclaveService_CreateUserConnection_Handler,
-		},
-		{
-			MethodName: "ProcessSyncJob",
-			Handler:    _EnclaveService_ProcessSyncJob_Handler,
-		},
-		{
-			MethodName: "GetPerformanceMetrics",
-			Handler:    _EnclaveService_GetPerformanceMetrics_Handler,
-		},
-		{
-			MethodName: "GetSnapshotTimeSeries",
-			Handler:    _EnclaveService_GetSnapshotTimeSeries_Handler,
-		},
-		{
-			MethodName: "GetAggregatedMetrics",
-			Handler:    _EnclaveService_GetAggregatedMetrics_Handler,
-		},
-		{
-			MethodName: "GenerateSignedReport",
-			Handler:    _EnclaveService_GenerateSignedReport_Handler,
-		},
-		{
-			MethodName: "VerifyReportSignature",
-			Handler:    _EnclaveService_VerifyReportSignature_Handler,
-		},
-	},
-	Streams:  []grpc.StreamDesc{},
-	Metadata: "enclave.proto",
+// resolveReportPeriod returns the effective [start,end] period from snapshots.
+// This mirrors TS behavior where report dates are optional:
+// - no dates => first and last available snapshot
+// - one date => infer the missing bound from available snapshots in that range
+func (s *Server) resolveReportPeriod(
+	ctx context.Context,
+	userUID string,
+	excludedConnectionKeys map[string]struct{},
+	startHint time.Time,
+	endHint time.Time,
+) (time.Time, time.Time, error) {
+	if s.snapshotRepo == nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("database not configured")
+	}
+
+	rangeStart := time.Unix(0, 0).UTC()
+	rangeEnd := time.Now().UTC().AddDate(100, 0, 0)
+
+	if !startHint.IsZero() {
+		rangeStart = startHint
+	}
+	if !endHint.IsZero() {
+		rangeEnd = endHint
+	}
+	if rangeEnd.Before(rangeStart) {
+		return time.Time{}, time.Time{}, fmt.Errorf("end_date must be after start_date")
+	}
+
+	snapshots, err := s.snapshotRepo.GetByUserAndDateRange(ctx, userUID, rangeStart, rangeEnd)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+
+	var (
+		earliest time.Time
+		latest   time.Time
+	)
+	for _, snap := range snapshots {
+		if isConnectionExcluded(excludedConnectionKeys, snap.Exchange, snap.Label) {
+			continue
+		}
+		if earliest.IsZero() || snap.Timestamp.Before(earliest) {
+			earliest = snap.Timestamp
+		}
+		if latest.IsZero() || snap.Timestamp.After(latest) {
+			latest = snap.Timestamp
+		}
+	}
+
+	if earliest.IsZero() || latest.IsZero() {
+		return time.Time{}, time.Time{}, fmt.Errorf("no snapshot data found for the specified period")
+	}
+
+	return earliest, latest, nil
 }
 
-// EnclaveServiceServer is the server API for EnclaveService
-type EnclaveServiceServer interface {
-	HealthCheck(context.Context, *HealthCheckRequest) (*HealthCheckResponse, error)
-	CreateUserConnection(context.Context, *CreateUserConnectionRequest) (*CreateUserConnectionResponse, error)
-	ProcessSyncJob(context.Context, *SyncJobRequest) (*SyncJobResponse, error)
-	GetPerformanceMetrics(context.Context, *PerformanceMetricsRequest) (*PerformanceMetricsResponse, error)
-	GetSnapshotTimeSeries(context.Context, *SnapshotTimeSeriesRequest) (*SnapshotTimeSeriesResponse, error)
-	GetAggregatedMetrics(context.Context, *AggregatedMetricsRequest) (*AggregatedMetricsResponse, error)
-	GenerateSignedReport(context.Context, *ReportRequest) (*SignedReportResponse, error)
-	VerifyReportSignature(context.Context, *VerifySignatureRequest) (*VerifySignatureResponse, error)
+func mapMarketBreakdown(in *repository.MarketBreakdown) *pb.MarketBreakdown {
+	if in == nil {
+		return nil
+	}
+
+	global := aggregateMarketMetrics(
+		in.Stocks,
+		in.Spot,
+		in.Swap,
+		in.Options,
+		in.Futures,
+		in.CFD,
+		in.Forex,
+		in.Commodities,
+		in.Margin,
+		in.Earn,
+	)
+
+	return &pb.MarketBreakdown{
+		Global:      global,
+		Spot:        mapMarketMetrics(in.Spot),
+		Swap:        mapMarketMetrics(in.Swap),
+		Options:     mapMarketMetrics(in.Options),
+		Stocks:      mapMarketMetrics(in.Stocks),
+		Futures:     mapMarketMetrics(in.Futures),
+		Cfd:         mapMarketMetrics(in.CFD),
+		Forex:       mapMarketMetrics(in.Forex),
+		Commodities: mapMarketMetrics(in.Commodities),
+	}
 }
 
-// Handlers using JSON codec for simplicity (can be replaced with protobuf codec)
-func _EnclaveService_HealthCheck_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(HealthCheckRequest)
-	if err := dec(in); err != nil {
-		return nil, err
+func connectionKey(exchange, label string) string {
+	ex := strings.ToLower(strings.TrimSpace(exchange))
+	lb := strings.ToLower(strings.TrimSpace(label))
+	if lb == "" {
+		return ex
 	}
-	if interceptor == nil {
-		return srv.(EnclaveServiceServer).HealthCheck(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/enclave.EnclaveService/HealthCheck",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EnclaveServiceServer).HealthCheck(ctx, req.(*HealthCheckRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+	return ex + "/" + lb
 }
 
-func _EnclaveService_CreateUserConnection_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateUserConnectionRequest)
-	if err := dec(in); err != nil {
-		return nil, err
+func isConnectionExcluded(excluded map[string]struct{}, exchange, label string) bool {
+	if len(excluded) == 0 {
+		return false
 	}
-	if interceptor == nil {
-		return srv.(EnclaveServiceServer).CreateUserConnection(ctx, in)
+	if _, ok := excluded[connectionKey(exchange, label)]; ok {
+		return true
 	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/enclave.EnclaveService/CreateUserConnection",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EnclaveServiceServer).CreateUserConnection(ctx, req.(*CreateUserConnectionRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+	_, ok := excluded[strings.ToLower(strings.TrimSpace(exchange))]
+	return ok
 }
 
-func _EnclaveService_ProcessSyncJob_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(SyncJobRequest)
-	if err := dec(in); err != nil {
-		return nil, err
+func mapMarketMetrics(in *repository.MarketMetrics) *pb.MarketMetrics {
+	if in == nil {
+		return nil
 	}
-	if interceptor == nil {
-		return srv.(EnclaveServiceServer).ProcessSyncJob(ctx, in)
+	return &pb.MarketMetrics{
+		Equity:          in.Equity,
+		AvailableMargin: in.AvailableMargin,
+		Volume:          in.Volume,
+		Trades:          int32(in.Trades),
+		TradingFees:     in.TradingFees,
+		FundingFees:     in.FundingFees,
+		LongTrades:      int32(in.LongTrades),
+		ShortTrades:     int32(in.ShortTrades),
+		LongVolume:      in.LongVolume,
+		ShortVolume:     in.ShortVolume,
 	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/enclave.EnclaveService/ProcessSyncJob",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EnclaveServiceServer).ProcessSyncJob(ctx, req.(*SyncJobRequest))
-	}
-	return interceptor(ctx, in, info, handler)
 }
 
-func _EnclaveService_GetPerformanceMetrics_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PerformanceMetricsRequest)
-	if err := dec(in); err != nil {
-		return nil, err
+func aggregateMarketMetrics(metrics ...*repository.MarketMetrics) *pb.MarketMetrics {
+	out := &pb.MarketMetrics{}
+	hasData := false
+	for _, m := range metrics {
+		if m == nil {
+			continue
+		}
+		hasData = true
+		out.Equity += m.Equity
+		out.AvailableMargin += m.AvailableMargin
+		out.Volume += m.Volume
+		out.Trades += int32(m.Trades)
+		out.TradingFees += m.TradingFees
+		out.FundingFees += m.FundingFees
+		out.LongTrades += int32(m.LongTrades)
+		out.ShortTrades += int32(m.ShortTrades)
+		out.LongVolume += m.LongVolume
+		out.ShortVolume += m.ShortVolume
 	}
-	if interceptor == nil {
-		return srv.(EnclaveServiceServer).GetPerformanceMetrics(ctx, in)
+	if !hasData {
+		return nil
 	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/enclave.EnclaveService/GetPerformanceMetrics",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EnclaveServiceServer).GetPerformanceMetrics(ctx, req.(*PerformanceMetricsRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+	return out
 }
 
-func _EnclaveService_GetSnapshotTimeSeries_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(SnapshotTimeSeriesRequest)
-	if err := dec(in); err != nil {
-		return nil, err
+func mapExchangeDetails(details []signing.ExchangeInfo, exchanges []string) []*pb.ExchangeInfo {
+	if len(details) > 0 {
+		out := make([]*pb.ExchangeInfo, 0, len(details))
+		for _, ex := range details {
+			out = append(out, &pb.ExchangeInfo{
+				Name:     ex.Name,
+				KycLevel: ex.KYCLevel,
+				IsPaper:  ex.IsPaper,
+			})
+		}
+		return out
 	}
-	if interceptor == nil {
-		return srv.(EnclaveServiceServer).GetSnapshotTimeSeries(ctx, in)
+
+	if len(exchanges) == 0 {
+		return nil
 	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/enclave.EnclaveService/GetSnapshotTimeSeries",
+
+	// Backward-compatible fallback for cached reports generated before exchange_details support.
+	out := make([]*pb.ExchangeInfo, 0, len(exchanges))
+	for _, ex := range exchanges {
+		out = append(out, &pb.ExchangeInfo{
+			Name:     ex,
+			KycLevel: "",
+			IsPaper:  false,
+		})
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EnclaveServiceServer).GetSnapshotTimeSeries(ctx, req.(*SnapshotTimeSeriesRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+	return out
 }
 
-func _EnclaveService_GetAggregatedMetrics_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(AggregatedMetricsRequest)
-	if err := dec(in); err != nil {
-		return nil, err
+func aggregateSyncResultsForSyncJobResponse(results []*service.SyncResult) (bool, int32, int32, *pb.SyncJobResponse_Snapshot, string) {
+	if len(results) == 0 {
+		return false, 0, 0, nil, "no results"
 	}
-	if interceptor == nil {
-		return srv.(EnclaveServiceServer).GetAggregatedMetrics(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/enclave.EnclaveService/GetAggregatedMetrics",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EnclaveServiceServer).GetAggregatedMetrics(ctx, req.(*AggregatedMetricsRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
 
-func _EnclaveService_GenerateSignedReport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReportRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(EnclaveServiceServer).GenerateSignedReport(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/enclave.EnclaveService/GenerateSignedReport",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EnclaveServiceServer).GenerateSignedReport(ctx, req.(*ReportRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
+	var (
+		success          bool
+		synced           int32
+		snapshots        int32
+		latestSnapshot   *pb.SyncJobResponse_Snapshot
+		latestTimestamp  time.Time
+		aggregatedErrors []string
+	)
 
-func _EnclaveService_VerifyReportSignature_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(VerifySignatureRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(EnclaveServiceServer).VerifyReportSignature(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/enclave.EnclaveService/VerifyReportSignature",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EnclaveServiceServer).VerifyReportSignature(ctx, req.(*VerifySignatureRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
+	for _, r := range results {
+		if r == nil {
+			continue
+		}
 
-// JSON codec for gRPC (alternative to protobuf)
-type JSONCodec struct{}
+		if r.Success {
+			success = true
+			synced += int32(r.TradeCount)
+			snapshots++
+			if latestSnapshot == nil || r.SnapshotTimestamp.After(latestTimestamp) {
+				latestTimestamp = r.SnapshotTimestamp
+				latestSnapshot = &pb.SyncJobResponse_Snapshot{
+					Balance:   r.SnapshotEquity,
+					Equity:    r.SnapshotEquity,
+					Timestamp: r.SnapshotTimestamp.UnixMilli(),
+				}
+			}
+		}
 
-func (JSONCodec) Marshal(v interface{}) ([]byte, error) {
-	return json.Marshal(v)
-}
+		if r.Error != "" {
+			if r.Label != "" {
+				aggregatedErrors = append(aggregatedErrors, fmt.Sprintf("%s/%s: %s", r.Exchange, r.Label, r.Error))
+			} else if r.Exchange != "" {
+				aggregatedErrors = append(aggregatedErrors, fmt.Sprintf("%s: %s", r.Exchange, r.Error))
+			} else {
+				aggregatedErrors = append(aggregatedErrors, r.Error)
+			}
+		}
+	}
 
-func (JSONCodec) Unmarshal(data []byte, v interface{}) error {
-	return json.Unmarshal(data, v)
-}
+	if !success && len(aggregatedErrors) == 0 {
+		aggregatedErrors = append(aggregatedErrors, "sync failed for all connections")
+	}
 
-func (JSONCodec) Name() string {
-	return "json"
+	return success, synced, snapshots, latestSnapshot, strings.Join(aggregatedErrors, " | ")
 }

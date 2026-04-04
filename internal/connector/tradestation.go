@@ -40,6 +40,33 @@ func (t *TradeStation) Exchange() string {
 	return "tradestation"
 }
 
+// DetectIsPaper mirrors TS behavior: all accounts must be simulation ("Sim*").
+func (t *TradeStation) DetectIsPaper(ctx context.Context) (bool, error) {
+	body, err := t.doRequest(ctx, "/brokerage/accounts")
+	if err != nil {
+		return false, err
+	}
+
+	var accountsResp struct {
+		Accounts []struct {
+			AccountType string `json:"AccountType"`
+		} `json:"Accounts"`
+	}
+	if err := json.Unmarshal(body, &accountsResp); err != nil {
+		return false, err
+	}
+	if len(accountsResp.Accounts) == 0 {
+		return false, nil
+	}
+
+	for _, acct := range accountsResp.Accounts {
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(acct.AccountType)), "sim") {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func (t *TradeStation) refreshAccessToken(ctx context.Context) error {
 	if t.accessToken != "" && time.Now().Before(t.tokenExpiry) {
 		return nil
@@ -284,15 +311,15 @@ func (t *TradeStation) GetTrades(ctx context.Context, start, end time.Time) ([]*
 
 	var ordersResp struct {
 		Orders []struct {
-			OrderID       string  `json:"OrderID"`
-			Symbol        string  `json:"Symbol"`
-			BuyOrSell     string  `json:"BuyOrSell"`
-			FilledPrice   float64 `json:"FilledPrice"`
-			FilledQty     float64 `json:"FilledQty"`
-			Status        string  `json:"Status"`
-			ClosedDateTime string `json:"ClosedDateTime"`
-			AssetType     string  `json:"AssetType"`
-			Commission    float64 `json:"Commission"`
+			OrderID        string  `json:"OrderID"`
+			Symbol         string  `json:"Symbol"`
+			BuyOrSell      string  `json:"BuyOrSell"`
+			FilledPrice    float64 `json:"FilledPrice"`
+			FilledQty      float64 `json:"FilledQty"`
+			Status         string  `json:"Status"`
+			ClosedDateTime string  `json:"ClosedDateTime"`
+			AssetType      string  `json:"AssetType"`
+			Commission     float64 `json:"Commission"`
 		} `json:"Orders"`
 	}
 
@@ -340,4 +367,10 @@ func (t *TradeStation) GetTrades(ctx context.Context, start, end time.Time) ([]*
 	}
 
 	return trades, nil
+}
+
+// GetCashflows returns deposits/withdrawals. TradeStation does not reliably
+// expose capital flows via API, so this returns empty (TS parity).
+func (t *TradeStation) GetCashflows(_ context.Context, _ time.Time) ([]*Cashflow, error) {
+	return nil, nil
 }

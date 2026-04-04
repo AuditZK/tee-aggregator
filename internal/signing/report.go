@@ -1,58 +1,101 @@
 package signing
 
 import (
+	"bytes"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
 )
 
 const (
-	SignatureAlgorithm = "Ed25519"
+	SignatureAlgorithm = "ECDSA-P256-SHA256"
 	EnclaveVersion     = "1.0.0-go"
 )
 
-// ReportSigner signs performance reports
+// ReportSigner signs performance reports.
 type ReportSigner struct {
-	privateKey ed25519.PrivateKey
-	publicKey  ed25519.PublicKey
+	privateKey      *ecdsa.PrivateKey
+	publicKeyBase64 string
 }
 
-// NewReportSigner creates a signer from a seed (32 bytes)
+// NewReportSigner creates a signer from a deterministic seed (32 bytes).
 func NewReportSigner(seed []byte) (*ReportSigner, error) {
-	if len(seed) != ed25519.SeedSize {
-		return nil, fmt.Errorf("seed must be %d bytes", ed25519.SeedSize)
+	if len(seed) != 32 {
+		return nil, fmt.Errorf("seed must be 32 bytes")
 	}
 
-	privateKey := ed25519.NewKeyFromSeed(seed)
-	publicKey := privateKey.Public().(ed25519.PublicKey)
+	curve := elliptic.P256()
+	n := curve.Params().N
+
+	seedHash := sha256.Sum256(seed)
+	d := new(big.Int).SetBytes(seedHash[:])
+	one := big.NewInt(1)
+	max := new(big.Int).Sub(n, one)
+	d.Mod(d, max)
+	d.Add(d, one)
+
+	x, y := curve.ScalarBaseMult(d.Bytes())
+	privateKey := &ecdsa.PrivateKey{
+		PublicKey: ecdsa.PublicKey{
+			Curve: curve,
+			X:     x,
+			Y:     y,
+		},
+		D: d,
+	}
+
+	return newReportSignerFromPrivateKey(privateKey)
+}
+
+// NewReportSignerGenerate creates a signer with a new keypair.
+func NewReportSignerGenerate() *ReportSigner {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(fmt.Sprintf("failed to generate report signer keypair: %v", err))
+	}
+
+	signer, err := newReportSignerFromPrivateKey(privateKey)
+	if err != nil {
+		panic(fmt.Sprintf("failed to initialize report signer: %v", err))
+	}
+	return signer
+}
+
+func newReportSignerFromPrivateKey(privateKey *ecdsa.PrivateKey) (*ReportSigner, error) {
+	der, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("marshal public key: %w", err)
+	}
 
 	return &ReportSigner{
-		privateKey: privateKey,
-		publicKey:  publicKey,
+		privateKey:      privateKey,
+		publicKeyBase64: base64.StdEncoding.EncodeToString(der),
 	}, nil
 }
 
-// NewReportSignerGenerate creates a signer with a new keypair
-func NewReportSignerGenerate() *ReportSigner {
-	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
-	return &ReportSigner{
-		privateKey: privateKey,
-		publicKey:  publicKey,
-	}
+// PublicKey returns the report signing public key (base64 DER-encoded SPKI).
+func (s *ReportSigner) PublicKey() string {
+	return s.publicKeyBase64
 }
 
-// PublicKeyHex returns the public key as hex string
+// PublicKeyHex is kept for compatibility; it now returns base64 DER public key.
 func (s *ReportSigner) PublicKeyHex() string {
-	return hex.EncodeToString(s.publicKey)
+	return s.PublicKey()
 }
 
-// DailyReturn represents a single day's return data
+// DailyReturn represents a single day's return data.
 type DailyReturn struct {
 	Date             string  `json:"date"`
 	NetReturn        float64 `json:"net_return"`
@@ -62,7 +105,7 @@ type DailyReturn struct {
 	NAV              float64 `json:"nav"`
 }
 
-// MonthlyReturn represents a single month's return data
+// MonthlyReturn represents a single month's return data.
 type MonthlyReturn struct {
 	Date            string  `json:"date"`
 	NetReturn       float64 `json:"net_return"`
@@ -71,16 +114,16 @@ type MonthlyReturn struct {
 	AUM             float64 `json:"aum"`
 }
 
-// RiskMetrics contains risk analysis data
+// RiskMetrics contains risk analysis data.
 type RiskMetrics struct {
-	VaR95              float64 `json:"var_95"`
-	VaR99              float64 `json:"var_99"`
-	ExpectedShortfall  float64 `json:"expected_shortfall"`
-	Skewness           float64 `json:"skewness"`
-	Kurtosis           float64 `json:"kurtosis"`
+	VaR95             float64 `json:"var_95"`
+	VaR99             float64 `json:"var_99"`
+	ExpectedShortfall float64 `json:"expected_shortfall"`
+	Skewness          float64 `json:"skewness"`
+	Kurtosis          float64 `json:"kurtosis"`
 }
 
-// DrawdownPeriod represents a single drawdown event
+// DrawdownPeriod represents a single drawdown event.
 type DrawdownPeriod struct {
 	StartDate string  `json:"start_date"`
 	EndDate   string  `json:"end_date"`
@@ -89,11 +132,11 @@ type DrawdownPeriod struct {
 	Recovered bool    `json:"recovered"`
 }
 
-// DrawdownData contains drawdown analysis
+// DrawdownData contains drawdown analysis.
 type DrawdownData struct {
-	CurrentDrawdown    float64           `json:"current_drawdown"`
-	MaxDrawdownDuration int              `json:"max_drawdown_duration"`
-	Periods            []*DrawdownPeriod `json:"periods"`
+	CurrentDrawdown     float64           `json:"current_drawdown"`
+	MaxDrawdownDuration int               `json:"max_drawdown_duration"`
+	Periods             []*DrawdownPeriod `json:"periods"`
 }
 
 // BenchmarkMetrics holds benchmark comparison data for the report.
@@ -107,7 +150,14 @@ type BenchmarkMetrics struct {
 	Correlation      float64 `json:"correlation"`
 }
 
-// ReportInput contains the data to include in a signed report
+// ExchangeInfo stores exchange-level metadata included in signed reports.
+type ExchangeInfo struct {
+	Name     string `json:"name"`
+	KYCLevel string `json:"kyc_level"`
+	IsPaper  bool   `json:"is_paper"`
+}
+
+// ReportInput contains the data to include in a signed report.
 type ReportInput struct {
 	UserUID     string
 	ReportName  string
@@ -130,6 +180,7 @@ type ReportInput struct {
 
 	// Extended data
 	Exchanges        []string
+	ExchangeDetails  []ExchangeInfo
 	DailyReturns     []DailyReturn
 	MonthlyReturns   []MonthlyReturn
 	RiskMetrics      *RiskMetrics
@@ -137,7 +188,7 @@ type ReportInput struct {
 	BenchmarkMetrics *BenchmarkMetrics
 }
 
-// SignedReport is the output of signing
+// SignedReport is the output of signing.
 type SignedReport struct {
 	// Identification
 	ReportID    string `json:"report_id"`
@@ -165,13 +216,14 @@ type SignedReport struct {
 
 	// Extended data
 	Exchanges        []string          `json:"exchanges,omitempty"`
+	ExchangeDetails  []ExchangeInfo    `json:"exchange_details,omitempty"`
 	DailyReturns     []DailyReturn     `json:"daily_returns,omitempty"`
 	MonthlyReturns   []MonthlyReturn   `json:"monthly_returns,omitempty"`
 	RiskMetrics      *RiskMetrics      `json:"risk_metrics,omitempty"`
 	DrawdownData     *DrawdownData     `json:"drawdown_data,omitempty"`
 	BenchmarkMetrics *BenchmarkMetrics `json:"benchmark_metrics,omitempty"`
 
-	// Display params (NOT signed — applied per request)
+	// Display params (NOT signed - applied per request)
 	Manager string `json:"manager,omitempty"`
 	Firm    string `json:"firm,omitempty"`
 
@@ -183,62 +235,20 @@ type SignedReport struct {
 	EnclaveVersion     string `json:"enclave_version"`
 }
 
-// reportPayload is the canonical form for hashing
-type reportPayload struct {
-	ReportID         string  `json:"report_id"`
-	UserUID          string  `json:"user_uid"`
-	ReportName       string  `json:"report_name"`
-	GeneratedAt      string  `json:"generated_at"`
-	PeriodStart      string  `json:"period_start"`
-	PeriodEnd        string  `json:"period_end"`
-	TotalReturn      float64 `json:"total_return"`
-	AnnualizedReturn float64 `json:"annualized_return"`
-	SharpeRatio      float64 `json:"sharpe_ratio"`
-	MaxDrawdown      float64 `json:"max_drawdown"`
-	DataPoints       int     `json:"data_points"`
-}
-
-// Sign creates a signed report from input
+// Sign creates a signed report from input.
+// TS parity:
+// 1. Build financial data
+// 2. Deterministically serialize with sorted keys
+// 3. reportHash = SHA-256(financialDataJSON) hex
+// 4. signature = ECDSA-SHA256 sign(reportHash string)
 func (s *ReportSigner) Sign(input *ReportInput) (*SignedReport, error) {
-	reportID := uuid.New().String()
-	generatedAt := time.Now().UTC().Format(time.RFC3339)
-
-	// Create canonical payload for hashing
-	payload := reportPayload{
-		ReportID:         reportID,
-		UserUID:          input.UserUID,
-		ReportName:       input.ReportName,
-		GeneratedAt:      generatedAt,
-		PeriodStart:      input.PeriodStart.Format("2006-01-02"),
-		PeriodEnd:        input.PeriodEnd.Format("2006-01-02"),
-		TotalReturn:      input.TotalReturn,
-		AnnualizedReturn: input.AnnualizedReturn,
-		SharpeRatio:      input.SharpeRatio,
-		MaxDrawdown:      input.MaxDrawdown,
-		DataPoints:       input.DataPoints,
-	}
-
-	// JSON encode for deterministic hashing
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("marshal payload: %w", err)
-	}
-
-	// SHA-256 hash
-	hash := sha256.Sum256(payloadBytes)
-	hashHex := hex.EncodeToString(hash[:])
-
-	// Sign the hash
-	signature := ed25519.Sign(s.privateKey, hash[:])
-	signatureB64 := base64.StdEncoding.EncodeToString(signature)
-
-	return &SignedReport{
-		ReportID:           reportID,
+	report := &SignedReport{
+		ReportID:           uuid.New().String(),
 		UserUID:            input.UserUID,
 		ReportName:         input.ReportName,
-		GeneratedAt:        generatedAt,
-		PeriodStart:        input.PeriodStart.Format("2006-01-02"),
-		PeriodEnd:          input.PeriodEnd.Format("2006-01-02"),
+		GeneratedAt:        formatISO8601(time.Now().UTC()),
+		PeriodStart:        formatISO8601(input.PeriodStart),
+		PeriodEnd:          formatISO8601(input.PeriodEnd),
 		TotalReturn:        input.TotalReturn,
 		AnnualizedReturn:   input.AnnualizedReturn,
 		SharpeRatio:        input.SharpeRatio,
@@ -252,24 +262,235 @@ func (s *ReportSigner) Sign(input *ReportInput) (*SignedReport, error) {
 		BaseCurrency:       input.BaseCurrency,
 		Benchmark:          input.BenchmarkUsed,
 		Exchanges:          input.Exchanges,
+		ExchangeDetails:    input.ExchangeDetails,
 		DailyReturns:       input.DailyReturns,
 		MonthlyReturns:     input.MonthlyReturns,
 		RiskMetrics:        input.RiskMetrics,
 		DrawdownData:       input.DrawdownData,
 		BenchmarkMetrics:   input.BenchmarkMetrics,
-		Signature:          signatureB64,
-		PublicKey:          s.PublicKeyHex(),
+		PublicKey:          s.PublicKey(),
 		SignatureAlgorithm: SignatureAlgorithm,
-		ReportHash:         hashHex,
 		EnclaveVersion:     EnclaveVersion,
-	}, nil
+	}
+
+	financialPayload := buildFinancialPayload(report)
+	financialJSON, err := marshalSortedJSON(financialPayload)
+	if err != nil {
+		return nil, fmt.Errorf("serialize financial payload: %w", err)
+	}
+
+	hash := sha256.Sum256(financialJSON)
+	report.ReportHash = hex.EncodeToString(hash[:])
+
+	reportHashDigest := sha256.Sum256([]byte(report.ReportHash))
+	signatureDER, err := ecdsa.SignASN1(rand.Reader, s.privateKey, reportHashDigest[:])
+	if err != nil {
+		return nil, fmt.Errorf("sign report hash: %w", err)
+	}
+	report.Signature = base64.StdEncoding.EncodeToString(signatureDER)
+
+	return report, nil
 }
 
-// Verify checks a signature against a report hash
-func Verify(reportHash, signatureB64, publicKeyHex string) (bool, error) {
+func formatISO8601(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+func buildFinancialPayload(report *SignedReport) map[string]any {
+	payload := map[string]any{
+		"reportId":     report.ReportID,
+		"userUid":      report.UserUID,
+		"generatedAt":  report.GeneratedAt,
+		"periodStart":  report.PeriodStart,
+		"periodEnd":    report.PeriodEnd,
+		"baseCurrency": report.BaseCurrency,
+		"dataPoints":   report.DataPoints,
+		"exchanges":    report.Exchanges,
+		"metrics": map[string]any{
+			"totalReturn":      report.TotalReturn,
+			"annualizedReturn": report.AnnualizedReturn,
+			"volatility":       report.Volatility,
+			"sharpeRatio":      report.SharpeRatio,
+			"sortinoRatio":     report.SortinoRatio,
+			"maxDrawdown":      report.MaxDrawdown,
+			"calmarRatio":      report.CalmarRatio,
+		},
+		"dailyReturns":   toDailyReturnsPayload(report.DailyReturns),
+		"monthlyReturns": toMonthlyReturnsPayload(report.MonthlyReturns),
+	}
+
+	if report.Benchmark != "" {
+		payload["benchmark"] = report.Benchmark
+	}
+	if len(report.ExchangeDetails) > 0 {
+		payload["exchangeDetails"] = toExchangeDetailsPayload(report.ExchangeDetails)
+	}
+	if report.RiskMetrics != nil {
+		payload["metrics"].(map[string]any)["riskMetrics"] = map[string]any{
+			"var95":             report.RiskMetrics.VaR95,
+			"var99":             report.RiskMetrics.VaR99,
+			"expectedShortfall": report.RiskMetrics.ExpectedShortfall,
+			"skewness":          report.RiskMetrics.Skewness,
+			"kurtosis":          report.RiskMetrics.Kurtosis,
+		}
+	}
+	if report.BenchmarkMetrics != nil {
+		payload["metrics"].(map[string]any)["benchmarkMetrics"] = map[string]any{
+			"alpha":            report.BenchmarkMetrics.Alpha,
+			"beta":             report.BenchmarkMetrics.Beta,
+			"informationRatio": report.BenchmarkMetrics.InformationRatio,
+			"trackingError":    report.BenchmarkMetrics.TrackingError,
+			"correlation":      report.BenchmarkMetrics.Correlation,
+		}
+	}
+	if report.DrawdownData != nil {
+		payload["metrics"].(map[string]any)["drawdownData"] = map[string]any{
+			"maxDrawdownDuration": report.DrawdownData.MaxDrawdownDuration,
+			"currentDrawdown":     report.DrawdownData.CurrentDrawdown,
+			"drawdownPeriods":     toDrawdownPeriodsPayload(report.DrawdownData.Periods),
+		}
+	}
+
+	return payload
+}
+
+func toExchangeDetailsPayload(in []ExchangeInfo) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, ex := range in {
+		out = append(out, map[string]any{
+			"name":     ex.Name,
+			"kycLevel": ex.KYCLevel,
+			"isPaper":  ex.IsPaper,
+		})
+	}
+	return out
+}
+
+func toDailyReturnsPayload(in []DailyReturn) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, dr := range in {
+		out = append(out, map[string]any{
+			"date":             dr.Date,
+			"netReturn":        dr.NetReturn,
+			"benchmarkReturn":  dr.BenchmarkReturn,
+			"outperformance":   dr.Outperformance,
+			"cumulativeReturn": dr.CumulativeReturn,
+			"nav":              dr.NAV,
+		})
+	}
+	return out
+}
+
+func toMonthlyReturnsPayload(in []MonthlyReturn) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, mr := range in {
+		out = append(out, map[string]any{
+			"date":            mr.Date,
+			"netReturn":       mr.NetReturn,
+			"benchmarkReturn": mr.BenchmarkReturn,
+			"outperformance":  mr.Outperformance,
+			"aum":             mr.AUM,
+		})
+	}
+	return out
+}
+
+func toDrawdownPeriodsPayload(in []*DrawdownPeriod) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, p := range in {
+		out = append(out, map[string]any{
+			"startDate": p.StartDate,
+			"endDate":   p.EndDate,
+			"depth":     p.Depth,
+			"duration":  p.Duration,
+			"recovered": p.Recovered,
+		})
+	}
+	return out
+}
+
+func marshalSortedJSON(v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	var normalized any
+	if err := json.Unmarshal(raw, &normalized); err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	if err := writeSortedJSON(&buf, normalized); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func writeSortedJSON(buf *bytes.Buffer, v any) error {
+	switch t := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		buf.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			keyBytes, _ := json.Marshal(k)
+			buf.Write(keyBytes)
+			buf.WriteByte(':')
+			if err := writeSortedJSON(buf, t[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+		return nil
+	case []any:
+		buf.WriteByte('[')
+		for i, item := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeSortedJSON(buf, item); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+		return nil
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return err
+		}
+		buf.Write(b)
+		return nil
+	}
+}
+
+// Verify checks a signature against a report hash.
+func Verify(reportHash, signatureB64, publicKey string) (bool, error) {
+	// Preferred path: TS parity ECDSA (base64 DER public key).
+	signatureDER, sigErr := base64.StdEncoding.DecodeString(signatureB64)
+	publicKeyDER, pubErr := base64.StdEncoding.DecodeString(publicKey)
+	if sigErr == nil && pubErr == nil {
+		parsed, parseErr := x509.ParsePKIXPublicKey(publicKeyDER)
+		if parseErr == nil {
+			if ecdsaKey, ok := parsed.(*ecdsa.PublicKey); ok {
+				reportHashDigest := sha256.Sum256([]byte(reportHash))
+				return ecdsa.VerifyASN1(ecdsaKey, reportHashDigest[:], signatureDER), nil
+			}
+		}
+	}
+
+	// Backward compatibility for cached reports signed with legacy Ed25519.
 	hash, err := hex.DecodeString(reportHash)
 	if err != nil {
-		return false, fmt.Errorf("invalid hash: %w", err)
+		return false, fmt.Errorf("invalid report hash: %w", err)
 	}
 
 	signature, err := base64.StdEncoding.DecodeString(signatureB64)
@@ -277,14 +498,13 @@ func Verify(reportHash, signatureB64, publicKeyHex string) (bool, error) {
 		return false, fmt.Errorf("invalid signature: %w", err)
 	}
 
-	publicKey, err := hex.DecodeString(publicKeyHex)
+	publicKeyBytes, err := hex.DecodeString(publicKey)
 	if err != nil {
 		return false, fmt.Errorf("invalid public key: %w", err)
 	}
-
-	if len(publicKey) != ed25519.PublicKeySize {
-		return false, fmt.Errorf("public key wrong size")
+	if len(publicKeyBytes) != ed25519.PublicKeySize {
+		return false, fmt.Errorf("invalid public key format")
 	}
 
-	return ed25519.Verify(publicKey, hash, signature), nil
+	return ed25519.Verify(publicKeyBytes, hash, signature), nil
 }

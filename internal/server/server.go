@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -47,6 +48,7 @@ func New(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool, signer *sig
 
 			if signer != nil {
 				reportSvc = service.NewReportService(metricsSvc, snapshotRepo, signer)
+				reportSvc.SetConnectionService(connSvc)
 			}
 		}
 	}
@@ -70,29 +72,31 @@ func (s *Server) Start(ctx context.Context) error {
 	// Credential rate limiter: 5 requests per 15 minutes per IP
 	credRateLimiter := NewIPRateLimiter(5, 15*time.Minute)
 
-	// Existing routes
+	// TS parity routes (always enabled)
 	mux.HandleFunc("/health", s.handler.HealthCheck)
-	if s.cfg.IsDevelopment() {
-		// Plaintext credential endpoint — dev only; use /api/v1/credentials/connect in production
-		mux.HandleFunc("/api/v1/connection", s.handler.CreateUserConnection)
-	} else {
-		mux.HandleFunc("/api/v1/connection", func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(w, http.StatusGone, map[string]any{
-				"success": false,
-				"error":   "plaintext credential submission is disabled in production; use /api/v1/credentials/connect with E2E encryption",
-			})
-		})
-	}
-	mux.HandleFunc("/api/v1/sync", s.handler.ProcessSyncJob)
-	mux.HandleFunc("/api/v1/metrics", s.handler.GetMetrics)
-	mux.HandleFunc("/api/v1/snapshots", s.handler.GetSnapshots)
-	mux.HandleFunc("/api/v1/report", s.handler.GenerateReport)
-	mux.HandleFunc("/api/v1/verify", s.handler.VerifySignature)
-
-	// New routes
 	mux.HandleFunc("/api/v1/tls/fingerprint", s.handler.GetTLSFingerprint)
 	mux.HandleFunc("/api/v1/attestation", s.handler.GetAttestation)
 	mux.HandleFunc("/api/v1/credentials/connect", credRateLimiter.Middleware(s.handler.ConnectCredentials))
+
+	// Legacy REST routes are disabled by default for strict TS parity.
+	if s.cfg.EnableLegacyREST {
+		if s.cfg.IsDevelopment() {
+			// Plaintext credential endpoint — legacy only; use /api/v1/credentials/connect.
+			mux.HandleFunc("/api/v1/connection", s.handler.CreateUserConnection)
+		} else {
+			mux.HandleFunc("/api/v1/connection", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, http.StatusGone, map[string]any{
+					"success": false,
+					"error":   "plaintext credential submission is disabled in production; use /api/v1/credentials/connect with E2E encryption",
+				})
+			})
+		}
+		mux.HandleFunc("/api/v1/sync", s.handler.ProcessSyncJob)
+		mux.HandleFunc("/api/v1/metrics", s.handler.GetMetrics)
+		mux.HandleFunc("/api/v1/snapshots", s.handler.GetSnapshots)
+		mux.HandleFunc("/api/v1/report", s.handler.GenerateReport)
+		mux.HandleFunc("/api/v1/verify", s.handler.VerifySignature)
+	}
 
 	// Apply CORS then logging middleware
 	var handler http.Handler = mux
@@ -118,8 +122,27 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 
-	s.logger.Info("server starting", zap.String("addr", s.http.Addr))
-	return s.http.ListenAndServe()
+	if s.handler == nil || s.handler.tlsKeygen == nil {
+		return fmt.Errorf("REST TLS credentials are required (tls key generator not configured)")
+	}
+
+	cert, err := tls.X509KeyPair(s.handler.tlsKeygen.CertPEM(), s.handler.tlsKeygen.KeyPEM())
+	if err != nil {
+		return fmt.Errorf("failed to parse REST TLS keypair: %w", err)
+	}
+
+	s.http.TLSConfig = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}
+
+	s.logger.Info("server starting",
+		zap.String("addr", s.http.Addr),
+		zap.Bool("https", true),
+		zap.Bool("legacy_rest", s.cfg.EnableLegacyREST),
+	)
+
+	return s.http.ListenAndServeTLS("", "")
 }
 
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {

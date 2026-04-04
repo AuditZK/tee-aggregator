@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/trackrecord/enclave/internal/repository"
@@ -20,10 +21,16 @@ const tradingDaysPerYear = 252
 type ReportService struct {
 	metricsSvc       *MetricsService
 	snapshotRepo     *repository.SnapshotRepo
+	connSvc          *ConnectionService
 	signedReportRepo *repository.SignedReportRepo
 	signer           *signing.ReportSigner
 	benchmarkSvc     *BenchmarkService
 	logger           *zap.Logger
+}
+
+// SetConnectionService configures optional exchange metadata enrichment.
+func (s *ReportService) SetConnectionService(connSvc *ConnectionService) {
+	s.connSvc = connSvc
 }
 
 // NewReportService creates a new report service
@@ -64,6 +71,7 @@ type GenerateReportRequest struct {
 	BaseCurrency       string
 	IncludeRiskMetrics bool
 	IncludeDrawdown    bool
+	ExcludedExchanges  map[string]struct{} // keys: "exchange" or "exchange/label"
 	// Display params (NOT signed, applied per request)
 	Manager string
 	Firm    string
@@ -129,6 +137,8 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 		return nil, fmt.Errorf("fetch snapshots: %w", err)
 	}
 
+	snapshots = filterSnapshotsByExcludedExchanges(snapshots, req.ExcludedExchanges)
+
 	if len(snapshots) < 2 {
 		return nil, fmt.Errorf("insufficient data: need at least 2 snapshots, got %d", len(snapshots))
 	}
@@ -142,7 +152,7 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 	dailyReturns := convertSnapshotsToDailyReturns(snapshots)
 
 	// 3. Calculate core metrics
-	metrics, err := s.metricsSvc.Calculate(ctx, req.UserUID, req.StartDate, req.EndDate)
+	metrics, err := s.metricsSvc.CalculateWithExcludedExchanges(ctx, req.UserUID, req.StartDate, req.EndDate, req.ExcludedExchanges)
 	if err != nil {
 		return nil, fmt.Errorf("calculate metrics: %w", err)
 	}
@@ -180,6 +190,7 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 		BaseCurrency:     req.BaseCurrency,
 		BenchmarkUsed:    req.Benchmark,
 		Exchanges:        exchanges,
+		ExchangeDetails:  s.buildExchangeDetails(ctx, req.UserUID, exchanges),
 		DailyReturns:     toSigningDailyReturns(dailyReturns),
 		MonthlyReturns:   toSigningMonthlyReturns(monthlyReturns),
 	}
@@ -257,6 +268,10 @@ func (s *ReportService) checkReportCache(ctx context.Context, req *GenerateRepor
 	if s.signedReportRepo == nil {
 		return nil
 	}
+	// Current cache key does not include exclusions; skip cache for filtered reports.
+	if len(req.ExcludedExchanges) > 0 {
+		return nil
+	}
 
 	cached, err := s.signedReportRepo.GetCached(ctx, req.UserUID, req.StartDate, req.EndDate, req.Benchmark)
 	if err != nil {
@@ -280,6 +295,10 @@ func (s *ReportService) checkReportCache(ctx context.Context, req *GenerateRepor
 // cacheReport stores a signed report for deduplication.
 func (s *ReportService) cacheReport(ctx context.Context, req *GenerateReportRequest, report *signing.SignedReport) {
 	if s.signedReportRepo == nil {
+		return
+	}
+	// Current cache key does not include exclusions; avoid storing filtered variants.
+	if len(req.ExcludedExchanges) > 0 {
 		return
 	}
 
@@ -310,9 +329,9 @@ func (s *ReportService) cacheReport(ctx context.Context, req *GenerateReportRequ
 	}
 }
 
-// convertSnapshotsToDailyReturns implements TWR with multi-exchange support.
-// Groups snapshots by date and exchange, handles virtual deposits when new exchanges appear,
-// and forward-fills missing exchange data.
+// convertSnapshotsToDailyReturns implements TWR with multi-connection support.
+// Groups snapshots by date and connection key (exchange/label), handles virtual
+// deposits when new connections appear, and forward-fills missing connection data.
 func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyReturn {
 	if len(snapshots) == 0 {
 		return nil
@@ -340,7 +359,7 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 			dateMap[dateStr] = dg
 			dateOrder = append(dateOrder, dateStr)
 		}
-		dg.exchanges[snap.Exchange] = snap
+		dg.exchanges[snapshotConnectionKey(snap.Exchange, snap.Label)] = snap
 	}
 
 	sort.Strings(dateOrder)
@@ -349,8 +368,8 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 		return nil
 	}
 
-	// Track known exchanges and their last known equity
-	knownExchanges := make(map[string]float64) // exchange -> last equity
+	// Track known connection keys and their last known equity.
+	knownExchanges := make(map[string]float64) // connection key -> last equity
 	var returns []dailyReturn
 	cumulativeReturn := 0.0
 	nav := 1.0
@@ -396,10 +415,10 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 			}
 		}
 
-		// Check for new exchanges appearing today
+		// Check for new connection keys appearing today.
 		for ex, snap := range dg.exchanges {
 			if _, known := knownExchanges[ex]; !known {
-				// New exchange - treat as virtual deposit
+				// New connection - treat as virtual deposit.
 				virtualDeposits += snap.TotalEquity
 				knownExchanges[ex] = snap.TotalEquity
 			}
@@ -713,6 +732,66 @@ func toSigningDrawdownData(dd *drawdownData) *signing.DrawdownData {
 	}
 }
 
+func buildDefaultExchangeDetails(exchanges []string) []signing.ExchangeInfo {
+	if len(exchanges) == 0 {
+		return nil
+	}
+
+	details := make([]signing.ExchangeInfo, 0, len(exchanges))
+	for _, ex := range exchanges {
+		details = append(details, signing.ExchangeInfo{
+			Name:     ex,
+			KYCLevel: "",
+			IsPaper:  false,
+		})
+	}
+	return details
+}
+
+func (s *ReportService) buildExchangeDetails(ctx context.Context, userUID string, exchanges []string) []signing.ExchangeInfo {
+	defaultDetails := buildDefaultExchangeDetails(exchanges)
+	if s.connSvc == nil {
+		return defaultDetails
+	}
+
+	metadata, err := s.connSvc.GetExchangeMetadata(ctx, userUID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed to load exchange metadata; using defaults", zap.Error(err))
+		}
+		return defaultDetails
+	}
+	if len(metadata) == 0 {
+		return defaultDetails
+	}
+
+	metaByExchange := make(map[string]*ExchangeMetadata, len(metadata))
+	for _, m := range metadata {
+		key := strings.ToLower(strings.TrimSpace(m.Exchange))
+		metaByExchange[key] = m
+	}
+
+	merged := make([]signing.ExchangeInfo, 0, len(exchanges))
+	for _, ex := range exchanges {
+		key := strings.ToLower(strings.TrimSpace(ex))
+		if md, ok := metaByExchange[key]; ok {
+			merged = append(merged, signing.ExchangeInfo{
+				Name:     ex,
+				KYCLevel: md.KYCLevel,
+				IsPaper:  md.IsPaper,
+			})
+			continue
+		}
+		merged = append(merged, signing.ExchangeInfo{
+			Name:     ex,
+			KYCLevel: "",
+			IsPaper:  false,
+		})
+	}
+
+	return merged
+}
+
 // VerifySignature checks if a report signature is valid
 func (s *ReportService) VerifySignature(reportHash, signature, publicKey string) (bool, error) {
 	return signing.Verify(reportHash, signature, publicKey)
@@ -720,5 +799,5 @@ func (s *ReportService) VerifySignature(reportHash, signature, publicKey string)
 
 // PublicKey returns the signer's public key
 func (s *ReportService) PublicKey() string {
-	return s.signer.PublicKeyHex()
+	return s.signer.PublicKey()
 }

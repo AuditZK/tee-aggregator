@@ -39,11 +39,18 @@ func TestValidateExchange(t *testing.T) {
 	}{
 		{"empty", "", true},
 		{"binance", "binance", false},
+		{"binance_futures", "binance_futures", false},
+		{"binanceusdm", "binanceusdm", false},
 		{"bybit", "bybit", false},
+		{"kraken", "kraken", false},
+		{"deribit", "deribit", false},
+		{"mt4", "mt4", false},
+		{"mt5", "mt5", false},
 		{"mock", "mock", false},
-		{"unsupported", "kraken", true},
+		{"valid unknown", "bitstamp", false},
 		{"invalid chars", "bin@nce!", true},
-		{"case insensitive", "Binance", false},
+		{"too long", strings.Repeat("x", 51), true},
+		{"uppercase rejected", "Binance", true},
 	}
 
 	for _, tt := range tests {
@@ -57,14 +64,14 @@ func TestValidateExchange(t *testing.T) {
 }
 
 func TestValidateLabel(t *testing.T) {
-	if err := ValidateLabel(""); err != nil {
-		t.Error("empty label should be valid")
+	if err := ValidateLabel(""); err == nil {
+		t.Error("empty label should be invalid")
 	}
 	if err := ValidateLabel("my-account"); err != nil {
 		t.Error("normal label should be valid")
 	}
-	if err := ValidateLabel(strings.Repeat("x", 256)); err == nil {
-		t.Error("label > 255 chars should be invalid")
+	if err := ValidateLabel(strings.Repeat("x", 101)); err == nil {
+		t.Error("label > 100 chars should be invalid")
 	}
 }
 
@@ -74,6 +81,54 @@ func TestValidateAPIKey(t *testing.T) {
 	}
 	if err := ValidateAPIKey(strings.Repeat("x", 501)); err == nil {
 		t.Error("key > 500 chars should be invalid")
+	}
+}
+
+func TestValidateAPISecret(t *testing.T) {
+	if err := ValidateAPISecret(""); err != nil {
+		t.Error("empty secret should be valid")
+	}
+	if err := ValidateAPISecret("normal-secret"); err != nil {
+		t.Error("normal secret should be valid")
+	}
+	if err := ValidateAPISecret(strings.Repeat("x", 501)); err == nil {
+		t.Error("secret > 500 chars should be invalid")
+	}
+}
+
+func TestValidatePassphrase(t *testing.T) {
+	if err := ValidatePassphrase(""); err != nil {
+		t.Error("empty passphrase should be valid")
+	}
+	if err := ValidatePassphrase("normal-passphrase"); err != nil {
+		t.Error("normal passphrase should be valid")
+	}
+	if err := ValidatePassphrase(strings.Repeat("x", 501)); err == nil {
+		t.Error("passphrase > 500 chars should be invalid")
+	}
+}
+
+func TestValidateSyncIntervalMinutes(t *testing.T) {
+	tests := []struct {
+		name    string
+		minutes int
+		wantErr bool
+	}{
+		{"not provided", 0, false},
+		{"valid low", 5, false},
+		{"valid common", 60, false},
+		{"valid high", 10080, false},
+		{"too low", 4, true},
+		{"too high", 10081, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSyncIntervalMinutes(tt.minutes)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateSyncIntervalMinutes(%d) error = %v, wantErr %v", tt.minutes, err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -87,7 +142,8 @@ func TestValidateCreateConnection(t *testing.T) {
 			"valid CEX",
 			&CreateConnectionRequest{
 				UserUID: "user_abc1234567890", Exchange: "binance",
-				APIKey: "key123", APISecret: "secret456",
+				Label:  "main",
+				APIKey: "key123", APISecret: "secret456", SyncIntervalMinutes: 60,
 			},
 			false,
 		},
@@ -95,6 +151,7 @@ func TestValidateCreateConnection(t *testing.T) {
 			"valid DEX",
 			&CreateConnectionRequest{
 				UserUID: "user_abc1234567890", Exchange: "hyperliquid",
+				Label:  "wallet-1",
 				APIKey: "0xWalletAddress",
 			},
 			false,
@@ -103,22 +160,54 @@ func TestValidateCreateConnection(t *testing.T) {
 			"valid mock",
 			&CreateConnectionRequest{
 				UserUID: "user_abc1234567890", Exchange: "mock",
+				Label:  "stress",
 				APIKey: "test",
 			},
 			false,
 		},
 		{
-			"missing api_secret for CEX",
+			"missing label",
 			&CreateConnectionRequest{
 				UserUID: "user_abc1234567890", Exchange: "binance",
-				APIKey: "key123",
+				APIKey: "key123", APISecret: "secret456",
 			},
 			true,
+		},
+		{
+			"missing api_secret allowed (TS parity)",
+			&CreateConnectionRequest{
+				UserUID: "user_abc1234567890", Exchange: "binance",
+				Label:  "main",
+				APIKey: "key123",
+			},
+			false,
 		},
 		{
 			"missing api_key",
 			&CreateConnectionRequest{
 				UserUID: "user_abc1234567890", Exchange: "binance",
+				Label: "main",
+			},
+			true,
+		},
+		{
+			"api_secret too long",
+			&CreateConnectionRequest{
+				UserUID: "user_abc1234567890", Exchange: "binance",
+				Label:     "main",
+				APIKey:    "key",
+				APISecret: strings.Repeat("x", 501),
+			},
+			true,
+		},
+		{
+			"passphrase too long",
+			&CreateConnectionRequest{
+				UserUID: "user_abc1234567890", Exchange: "binance",
+				Label:      "main",
+				APIKey:     "key",
+				APISecret:  "secret",
+				Passphrase: strings.Repeat("x", 501),
 			},
 			true,
 		},
@@ -126,7 +215,17 @@ func TestValidateCreateConnection(t *testing.T) {
 			"invalid user",
 			&CreateConnectionRequest{
 				UserUID: "bad", Exchange: "binance",
+				Label:  "main",
 				APIKey: "key", APISecret: "secret",
+			},
+			true,
+		},
+		{
+			"invalid sync interval",
+			&CreateConnectionRequest{
+				UserUID: "user_abc1234567890", Exchange: "binance",
+				Label:  "main",
+				APIKey: "key", APISecret: "secret", SyncIntervalMinutes: 1,
 			},
 			true,
 		},
@@ -156,11 +255,25 @@ func TestValidateReportRequest(t *testing.T) {
 			false,
 		},
 		{
-			"missing start",
+			"missing start (optional)",
 			&ReportRequest{
 				UserUID: "user_abc1234567890", EndDate: "2025-12-31",
 			},
-			true,
+			false,
+		},
+		{
+			"missing end (optional)",
+			&ReportRequest{
+				UserUID: "user_abc1234567890", StartDate: "2025-01-01",
+			},
+			false,
+		},
+		{
+			"both missing (optional)",
+			&ReportRequest{
+				UserUID: "user_abc1234567890",
+			},
+			false,
 		},
 		{
 			"end before start",
@@ -214,6 +327,30 @@ func TestValidateTimestampRange(t *testing.T) {
 			err := ValidateTimestampRange(start, end)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateTimestampRange() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateOptionalTimestampMillis(t *testing.T) {
+	now := time.Now().UnixMilli()
+	tests := []struct {
+		name    string
+		ts      int64
+		field   string
+		wantErr bool
+	}{
+		{name: "optional zero", ts: 0, field: "start_date", wantErr: false},
+		{name: "valid now", ts: now, field: "start_date", wantErr: false},
+		{name: "negative invalid", ts: -1, field: "start_date", wantErr: true},
+		{name: "too future invalid", ts: now + (25 * 60 * 60 * 1000), field: "end_date", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateOptionalTimestampMillis(tt.ts, tt.field)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateOptionalTimestampMillis(%d, %q) error = %v, wantErr %v", tt.ts, tt.field, err, tt.wantErr)
 			}
 		})
 	}

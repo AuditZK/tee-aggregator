@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -32,6 +33,11 @@ func NewHyperliquid(creds *Credentials) *Hyperliquid {
 }
 
 func (h *Hyperliquid) Exchange() string { return "hyperliquid" }
+
+// DetectIsPaper mirrors TS behavior: Hyperliquid connector targets mainnet.
+func (h *Hyperliquid) DetectIsPaper(_ context.Context) (bool, error) {
+	return false, nil
+}
 
 func (h *Hyperliquid) TestConnection(ctx context.Context) error {
 	_, err := h.GetBalance(ctx)
@@ -103,13 +109,13 @@ func (h *Hyperliquid) GetPositions(ctx context.Context) ([]*Position, error) {
 	var state struct {
 		AssetPositions []struct {
 			Position struct {
-				Coin           string `json:"coin"`
-				Szi            string `json:"szi"`
-				EntryPx        string `json:"entryPx"`
-				PositionValue  string `json:"positionValue"`
-				UnrealizedPnl  string `json:"unrealizedPnl"`
-				LiquidationPx  string `json:"liquidationPx"`
-				Leverage       struct {
+				Coin          string `json:"coin"`
+				Szi           string `json:"szi"`
+				EntryPx       string `json:"entryPx"`
+				PositionValue string `json:"positionValue"`
+				UnrealizedPnl string `json:"unrealizedPnl"`
+				LiquidationPx string `json:"liquidationPx"`
+				Leverage      struct {
 					Value int `json:"value"`
 				} `json:"leverage"`
 			} `json:"position"`
@@ -243,4 +249,106 @@ func (h *Hyperliquid) postInfo(ctx context.Context, body interface{}) (json.RawM
 	}
 
 	return data, nil
+}
+
+// GetCashflows returns deposits/withdrawals from Hyperliquid ledger.
+func (h *Hyperliquid) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
+	respBody, err := h.postInfo(ctx, map[string]interface{}{
+		"type":      "userNonFundingLedgerUpdates",
+		"user":      h.walletAddress,
+		"startTime": since.UnixMilli(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var updates []struct {
+		Time  int64 `json:"time"`
+		Delta struct {
+			Type string `json:"type"`
+			Usdc string `json:"usdc"`
+		} `json:"delta"`
+	}
+
+	if err := json.Unmarshal(respBody, &updates); err != nil {
+		return nil, err
+	}
+
+	var cashflows []*Cashflow
+	for _, u := range updates {
+		ts := time.UnixMilli(u.Time).UTC()
+		amount, _ := strconv.ParseFloat(u.Delta.Usdc, 64)
+		if amount == 0 {
+			continue
+		}
+
+		switch u.Delta.Type {
+		case "deposit":
+			cashflows = append(cashflows, &Cashflow{
+				Amount:    math.Abs(amount),
+				Currency:  "USDC",
+				Timestamp: ts,
+			})
+		case "withdraw":
+			cashflows = append(cashflows, &Cashflow{
+				Amount:    -math.Abs(amount),
+				Currency:  "USDC",
+				Timestamp: ts,
+			})
+		}
+	}
+
+	return cashflows, nil
+}
+
+// GetBalanceByMarket returns per-market equity (swap for perps, spot if available).
+func (h *Hyperliquid) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance, error) {
+	respBody, err := h.postInfo(ctx, map[string]interface{}{
+		"type": "clearinghouseState",
+		"user": h.walletAddress,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var state struct {
+		MarginSummary struct {
+			AccountValue string `json:"accountValue"`
+		} `json:"marginSummary"`
+	}
+	if err := json.Unmarshal(respBody, &state); err != nil {
+		return nil, err
+	}
+
+	var balances []*MarketBalance
+	perpEquity, _ := strconv.ParseFloat(state.MarginSummary.AccountValue, 64)
+	if perpEquity > 0 {
+		balances = append(balances, &MarketBalance{MarketType: MarketSwap, Equity: perpEquity})
+	}
+
+	// Spot balance
+	spotResp, err := h.postInfo(ctx, map[string]interface{}{
+		"type": "spotClearinghouseState",
+		"user": h.walletAddress,
+	})
+	if err == nil {
+		var spotState struct {
+			Balances []struct {
+				Token string `json:"token"`
+				Total string `json:"total"`
+			} `json:"balances"`
+		}
+		if json.Unmarshal(spotResp, &spotState) == nil {
+			spotTotal := 0.0
+			for _, b := range spotState.Balances {
+				val, _ := strconv.ParseFloat(b.Total, 64)
+				spotTotal += val
+			}
+			if spotTotal > 0 {
+				balances = append(balances, &MarketBalance{MarketType: MarketSpot, Equity: spotTotal})
+			}
+		}
+	}
+
+	return balances, nil
 }

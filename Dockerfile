@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 # Go build stage
 FROM golang:1.24-alpine AS builder
 
@@ -8,13 +10,20 @@ RUN apk add --no-cache git ca-certificates tzdata
 
 # Copy go mod files
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 
 # Copy source
-COPY . .
+COPY cmd ./cmd
+COPY internal ./internal
+COPY api ./api
+COPY migrations ./migrations
 
 # Build with -trimpath for reproducible builds
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -trimpath \
     -ldflags="-w -s" \
     -o /enclave \
@@ -47,7 +56,7 @@ EXPOSE 8080 50051 50052 9090
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO/dev/null http://localhost:8080/health || exit 1
+    CMD wget --no-check-certificate -qO/dev/null https://localhost:8080/health || exit 1
 
 # Run
 ENTRYPOINT ["/app/enclave"]

@@ -1,10 +1,14 @@
 package server
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/trackrecord/enclave/internal/attestation"
@@ -12,32 +16,28 @@ import (
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/service"
 	tlspkg "github.com/trackrecord/enclave/internal/tls"
+	"github.com/trackrecord/enclave/internal/validation"
 	"go.uber.org/zap"
 )
 
-var startTime = time.Now()
-
-const version = "1.0.0-go"
-
 type Handler struct {
 	logger       *zap.Logger
-	connSvc      *service.ConnectionService
+	connSvc      connectionService
 	syncSvc      *service.SyncService
 	metricsSvc   *service.MetricsService
 	reportSvc    *service.ReportService
 	snapshotRepo *repository.SnapshotRepo
 	userRepo     *repository.UserRepo
-	dbReady      bool
 
 	// New services for attestation, TLS, and E2E encryption
-	tlsKeygen  *tlspkg.KeyGenerator
-	attestSvc  *attestation.Service
-	eciesSvc   *encryption.ECIESService
+	tlsKeygen *tlspkg.KeyGenerator
+	attestSvc *attestation.Service
+	eciesSvc  *encryption.ECIESService
 }
 
 type HandlerOptions struct {
 	Logger       *zap.Logger
-	ConnSvc      *service.ConnectionService
+	ConnSvc      connectionService
 	SyncSvc      *service.SyncService
 	MetricsSvc   *service.MetricsService
 	ReportSvc    *service.ReportService
@@ -48,9 +48,14 @@ type HandlerOptions struct {
 	ECIESSvc     *encryption.ECIESService
 }
 
+type connectionService interface {
+	Create(ctx context.Context, req *service.CreateConnectionRequest) error
+	GetExcludedConnectionKeys(ctx context.Context, userUID string) (map[string]struct{}, error)
+}
+
 func NewHandler(
 	logger *zap.Logger,
-	connSvc *service.ConnectionService,
+	connSvc connectionService,
 	syncSvc *service.SyncService,
 	metricsSvc *service.MetricsService,
 	reportSvc *service.ReportService,
@@ -65,7 +70,6 @@ func NewHandler(
 		reportSvc:    reportSvc,
 		snapshotRepo: snapshotRepo,
 		userRepo:     userRepo,
-		dbReady:      connSvc != nil,
 	}
 }
 
@@ -79,7 +83,6 @@ func NewHandlerWithOptions(opts HandlerOptions) *Handler {
 		reportSvc:    opts.ReportSvc,
 		snapshotRepo: opts.SnapshotRepo,
 		userRepo:     opts.UserRepo,
-		dbReady:      opts.ConnSvc != nil,
 		tlsKeygen:    opts.TLSKeygen,
 		attestSvc:    opts.AttestSvc,
 		eciesSvc:     opts.ECIESSvc,
@@ -95,7 +98,7 @@ func (h *Handler) GetTLSFingerprint(w http.ResponseWriter, r *http.Request) {
 
 	if h.tlsKeygen == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": "TLS not configured",
+			"error": "TLS not initialized",
 		})
 		return
 	}
@@ -103,7 +106,7 @@ func (h *Handler) GetTLSFingerprint(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"fingerprint": h.tlsKeygen.Fingerprint(),
 		"algorithm":   "SHA-256",
-		"usage":       "Compare with attestation reportData to verify TLS binding",
+		"usage":       "Compare with attestation report to verify TLS cert authenticity",
 	})
 }
 
@@ -130,7 +133,96 @@ func (h *Handler) GetAttestation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, report)
+	var (
+		verified        bool
+		sevSnpEnabled   bool
+		vcekVerified    bool
+		measurement     string
+		reportData      string
+		platformVersion string
+	)
+	if report.Attestation != nil {
+		verified = report.Attestation.Verified
+		sevSnpEnabled = report.Attestation.SevSnpEnabled
+		vcekVerified = report.Attestation.VcekVerified
+		measurement = report.Attestation.Measurement
+		reportData = report.Attestation.ReportData
+		platformVersion = report.Attestation.PlatformVersion
+	}
+
+	e2ePublicKey := ""
+	if report.E2EEncryption != nil {
+		e2ePublicKey = report.E2EEncryption.PublicKey
+	}
+	e2ePublicKeyFingerprint := ""
+	if e2ePublicKey != "" {
+		sum := sha256.Sum256([]byte(e2ePublicKey))
+		e2ePublicKeyFingerprint = hex.EncodeToString(sum[:])
+	}
+
+	reportSigningPublicKey := ""
+	reportSigningAlgorithm := ""
+	if report.ReportSigning != nil {
+		reportSigningPublicKey = report.ReportSigning.PublicKey
+		reportSigningAlgorithm = report.ReportSigning.Algorithm
+	}
+	reportSigningFingerprint := ""
+	if reportSigningPublicKey != "" {
+		sum := sha256.Sum256([]byte(reportSigningPublicKey))
+		full := hex.EncodeToString(sum[:])
+		if len(full) > 16 {
+			reportSigningFingerprint = full[:16]
+		} else {
+			reportSigningFingerprint = full
+		}
+	}
+
+	tlsFingerprint := ""
+	if report.TLSBinding != nil {
+		tlsFingerprint = report.TLSBinding.Fingerprint
+	}
+	if tlsFingerprint == "" && h.tlsKeygen != nil {
+		tlsFingerprint = h.tlsKeygen.Fingerprint()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"attestation": map[string]any{
+			"verified":        verified,
+			"sevSnpEnabled":   sevSnpEnabled,
+			"vcekVerified":    vcekVerified,
+			"measurement":     measurement,
+			"reportData":      reportData,
+			"platformVersion": platformVersion,
+		},
+		"tlsBinding": map[string]any{
+			"fingerprint":  tlsFingerprint,
+			"algorithm":    "SHA-256",
+			"bound":        reportData != "",
+			"verification": "reportData should equal SHA-256(TLS certificate)",
+		},
+		"e2eEncryption": map[string]any{
+			"publicKey":            e2ePublicKey,
+			"publicKeyFingerprint": e2ePublicKeyFingerprint,
+			"algorithm":            "ECIES (ECDH P-256 + AES-256-GCM)",
+			"usage":                "Encrypt credentials with this key before sending for maximum security",
+		},
+		"reportSigning": map[string]any{
+			"publicKey":            reportSigningPublicKey,
+			"publicKeyFingerprint": reportSigningFingerprint,
+			"algorithm":            reportSigningAlgorithm,
+			"usage":                "Verify track record reports are signed by this enclave",
+		},
+		"security": map[string]any{
+			"tlsMitmProtection": reportData != "",
+			"e2eMitmProtection": e2ePublicKey != "",
+			"message": func() string {
+				if reportData != "" {
+					return "Double encryption: TLS for transport + E2E for application layer"
+				}
+				return "WARNING: TLS fingerprint not bound - MITM possible"
+			}(),
+		},
+	})
 }
 
 // ConnectCredentials - POST /api/v1/credentials/connect
@@ -150,12 +242,16 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		UserUID           string `json:"user_uid"`
-		Exchange          string `json:"exchange"`
-		Label             string `json:"label"`
-		EphemeralPubKey   string `json:"ephemeral_public_key"`
-		IV                string `json:"iv"`
-		Ciphertext        string `json:"ciphertext"`
+		UserUID   string `json:"user_uid"`
+		Exchange  string `json:"exchange"`
+		Label     string `json:"label"`
+		Encrypted *struct {
+			EphemeralPublicKey string `json:"ephemeralPublicKey"`
+			IV                 string `json:"iv"`
+			Ciphertext         string `json:"ciphertext"`
+			Tag                string `json:"tag"`
+		} `json:"encrypted"`
+		ExcludeFromReport bool `json:"exclude_from_report"`
 	}
 
 	if err := readJSON(r, &req); err != nil {
@@ -166,54 +262,94 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.UserUID == "" || req.Exchange == "" || req.Ciphertext == "" {
+	if req.Encrypted == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "user_uid, exchange, and encrypted credentials are required",
+			"error":   "E2E encryption required. Plaintext credentials are not accepted.",
+			"hint":    "Fetch /api/v1/attestation to get the E2E public key, then encrypt credentials client-side before submission.",
 		})
 		return
 	}
 
-	// Decode hex components
-	ephPubKeyBytes, err := hexDecode(req.EphemeralPubKey)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": "invalid ephemeral_public_key"})
+	if req.UserUID == "" || req.Exchange == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   "user_uid and exchange are required",
+		})
 		return
 	}
-	ivBytes, err := hexDecode(req.IV)
+
+	if req.Encrypted.EphemeralPublicKey == "" || req.Encrypted.IV == "" || req.Encrypted.Ciphertext == "" || req.Encrypted.Tag == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   "encrypted payload must include ephemeralPublicKey, iv, ciphertext, and tag",
+		})
+		return
+	}
+
+	// TS sends ephemeralPublicKey as PEM; ECIES parser handles PEM and raw bytes.
+	ephPubKeyBytes := []byte(req.Encrypted.EphemeralPublicKey)
+
+	ivBytes, err := hexDecode(req.Encrypted.IV)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": "invalid iv"})
 		return
 	}
-	ciphertextBytes, err := hexDecode(req.Ciphertext)
+	ciphertextBytes, err := hexDecode(req.Encrypted.Ciphertext)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": "invalid ciphertext"})
 		return
 	}
+	tagBytes, err := hexDecode(req.Encrypted.Tag)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": "invalid tag"})
+		return
+	}
+	ciphertextWithTag := make([]byte, 0, len(ciphertextBytes)+len(tagBytes))
+	ciphertextWithTag = append(ciphertextWithTag, ciphertextBytes...)
+	ciphertextWithTag = append(ciphertextWithTag, tagBytes...)
 
 	// Decrypt inside enclave
-	plaintext, err := h.eciesSvc.Decrypt(ephPubKeyBytes, ivBytes, ciphertextBytes)
+	plaintext, err := h.eciesSvc.Decrypt(ephPubKeyBytes, ivBytes, ciphertextWithTag)
 	if err != nil {
 		h.logger.Error("E2E decryption failed", zap.Error(err))
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "decryption failed",
+			"error":   "Failed to decrypt credentials. Ensure you are using the correct E2E public key from /api/v1/attestation.",
 		})
 		return
 	}
 
 	// Parse decrypted credentials
 	var creds struct {
-		APIKey     string `json:"api_key"`
-		APISecret  string `json:"api_secret"`
-		Passphrase string `json:"passphrase"`
+		APIKey     string  `json:"api_key"`
+		APISecret  *string `json:"api_secret"`
+		Passphrase *string `json:"passphrase"`
 	}
 	if err := json.Unmarshal(plaintext, &creds); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "invalid credential format",
+			"error":   "Decrypted payload is not valid JSON. Expected: { api_key, api_secret, passphrase? }",
 		})
 		return
+	}
+	if creds.APIKey == "" || creds.APISecret == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   "Decrypted payload missing required fields: api_key and api_secret",
+		})
+		return
+	}
+
+	apiSecret := *creds.APISecret
+	passphrase := ""
+	if creds.Passphrase != nil {
+		passphrase = *creds.Passphrase
+	}
+
+	label := strings.TrimSpace(req.Label)
+	if label == "" {
+		label = strings.TrimSpace(req.Exchange) + " account"
 	}
 
 	// Upsert user
@@ -224,15 +360,40 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create connection
-	err = h.connSvc.Create(r.Context(), &service.CreateConnectionRequest{
+	if err := validation.ValidateCreateConnection(&validation.CreateConnectionRequest{
 		UserUID:    req.UserUID,
 		Exchange:   req.Exchange,
-		Label:      req.Label,
+		Label:      label,
 		APIKey:     creds.APIKey,
-		APISecret:  creds.APISecret,
-		Passphrase: creds.Passphrase,
+		APISecret:  apiSecret,
+		Passphrase: passphrase,
+	}); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	err = h.connSvc.Create(r.Context(), &service.CreateConnectionRequest{
+		UserUID:           req.UserUID,
+		Exchange:          req.Exchange,
+		Label:             label,
+		APIKey:            creds.APIKey,
+		APISecret:         apiSecret,
+		Passphrase:        passphrase,
+		ExcludeFromReport: req.ExcludeFromReport,
 	})
 	if err != nil {
+		if errors.Is(err, service.ErrConnectionAlreadyExists) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success":  true,
+				"user_uid": req.UserUID,
+				"exchange": req.Exchange,
+				"error":    service.ExistingConnectionNoopMessage,
+			})
+			return
+		}
 		h.logger.Error("create connection from E2E failed", zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"success": false,
@@ -244,11 +405,33 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":  true,
 		"user_uid": req.UserUID,
+		"exchange": req.Exchange,
+		"message":  "Credentials encrypted and stored in enclave",
 	})
 }
 
 func hexDecode(s string) ([]byte, error) {
 	return hex.DecodeString(s)
+}
+
+func connectionKey(exchange, label string) string {
+	ex := strings.ToLower(strings.TrimSpace(exchange))
+	lb := strings.ToLower(strings.TrimSpace(label))
+	if lb == "" {
+		return ex
+	}
+	return ex + "/" + lb
+}
+
+func isConnectionExcluded(excluded map[string]struct{}, exchange, label string) bool {
+	if len(excluded) == 0 {
+		return false
+	}
+	if _, ok := excluded[connectionKey(exchange, label)]; ok {
+		return true
+	}
+	_, ok := excluded[strings.ToLower(strings.TrimSpace(exchange))]
+	return ok
 }
 
 // HealthCheck - GET /health
@@ -259,11 +442,9 @@ func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":         "healthy",
-		"version":        version,
-		"timestamp":      time.Now().Unix(),
-		"uptime_seconds": int64(time.Since(startTime).Seconds()),
-		"database":       h.dbReady,
+		"status":  "ok",
+		"service": "enclave-rest",
+		"tls":     h.tlsKeygen != nil,
 	})
 }
 
@@ -275,12 +456,14 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		UserUID    string `json:"user_uid"`
-		Exchange   string `json:"exchange"`
-		Label      string `json:"label"`
-		APIKey     string `json:"api_key"`
-		APISecret  string `json:"api_secret"`
-		Passphrase string `json:"passphrase"`
+		UserUID             string `json:"user_uid"`
+		Exchange            string `json:"exchange"`
+		Label               string `json:"label"`
+		APIKey              string `json:"api_key"`
+		APISecret           string `json:"api_secret"`
+		Passphrase          string `json:"passphrase"`
+		SyncIntervalMinutes int    `json:"sync_interval_minutes"`
+		ExcludeFromReport   bool   `json:"exclude_from_report"`
 	}
 
 	if err := readJSON(r, &req); err != nil {
@@ -295,6 +478,22 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
 			"error":   "user_uid, exchange, and api_key are required",
+		})
+		return
+	}
+
+	if err := validation.ValidateCreateConnection(&validation.CreateConnectionRequest{
+		UserUID:             req.UserUID,
+		Exchange:            req.Exchange,
+		Label:               req.Label,
+		APIKey:              req.APIKey,
+		APISecret:           req.APISecret,
+		Passphrase:          req.Passphrase,
+		SyncIntervalMinutes: req.SyncIntervalMinutes,
+	}); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   err.Error(),
 		})
 		return
 	}
@@ -320,15 +519,25 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err := h.connSvc.Create(r.Context(), &service.CreateConnectionRequest{
-		UserUID:    req.UserUID,
-		Exchange:   req.Exchange,
-		Label:      req.Label,
-		APIKey:     req.APIKey,
-		APISecret:  req.APISecret,
-		Passphrase: req.Passphrase,
+		UserUID:             req.UserUID,
+		Exchange:            req.Exchange,
+		Label:               req.Label,
+		APIKey:              req.APIKey,
+		APISecret:           req.APISecret,
+		Passphrase:          req.Passphrase,
+		SyncIntervalMinutes: req.SyncIntervalMinutes,
+		ExcludeFromReport:   req.ExcludeFromReport,
 	})
 
 	if err != nil {
+		if errors.Is(err, service.ErrConnectionAlreadyExists) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success":  true,
+				"user_uid": req.UserUID,
+				"error":    service.ExistingConnectionNoopMessage,
+			})
+			return
+		}
 		h.logger.Error("create connection failed",
 			zap.String("user_uid", req.UserUID),
 			zap.String("exchange", req.Exchange),
@@ -380,6 +589,19 @@ func (h *Handler) ProcessSyncJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rawExchange := req.Exchange
+	if err := validation.ValidateSyncRequest(&validation.SyncJobRequest{
+		UserUID:  req.UserUID,
+		Exchange: rawExchange,
+	}); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+	req.Exchange = strings.ToLower(rawExchange)
+
 	if h.syncSvc == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"success": false,
@@ -420,7 +642,7 @@ func (h *Handler) ProcessSyncJob(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetMetrics - GET /api/v1/metrics?user_uid=xxx&start=xxx&end=xxx
+// GetMetrics - GET /api/v1/metrics?user_uid=xxx&exchange=xxx&start=xxx&end=xxx
 func (h *Handler) GetMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -444,6 +666,18 @@ func (h *Handler) GetMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rawExchange := r.URL.Query().Get("exchange")
+	if rawExchange != "" {
+		if err := validation.ValidateExchange(rawExchange); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"success": false,
+				"error":   err.Error(),
+			})
+			return
+		}
+	}
+	exchange := strings.ToLower(rawExchange)
+
 	// Parse date range (milliseconds)
 	start := time.Now().AddDate(-1, 0, 0) // Default: 1 year ago
 	end := time.Now()
@@ -459,7 +693,20 @@ func (h *Handler) GetMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	metrics, err := h.metricsSvc.Calculate(r.Context(), userUID, start, end)
+	excludedConnectionKeys := map[string]struct{}{}
+	if h.connSvc != nil {
+		excluded, err := h.connSvc.GetExcludedConnectionKeys(r.Context(), userUID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"success": false,
+				"error":   "failed to load exclusion rules",
+			})
+			return
+		}
+		excludedConnectionKeys = excluded
+	}
+
+	metrics, err := h.metricsSvc.CalculateWithFilters(r.Context(), userUID, start, end, exchange, excludedConnectionKeys)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"success": false,
@@ -538,16 +785,42 @@ func (h *Handler) GetSnapshots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	excludedConnectionKeys := map[string]struct{}{}
+	if h.connSvc != nil {
+		excludedConnectionKeys, err = h.connSvc.GetExcludedConnectionKeys(r.Context(), userUID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"success": false,
+				"error":   "failed to load exclusion rules",
+			})
+			return
+		}
+	}
+
 	// Filter by exchange if specified
-	exchange := r.URL.Query().Get("exchange")
+	rawExchange := r.URL.Query().Get("exchange")
+	if rawExchange != "" {
+		if err := validation.ValidateExchange(rawExchange); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"success": false,
+				"error":   err.Error(),
+			})
+			return
+		}
+	}
+	exchange := strings.ToLower(rawExchange)
 	var result []map[string]any
 	for _, snap := range snapshots {
-		if exchange != "" && snap.Exchange != exchange {
+		if isConnectionExcluded(excludedConnectionKeys, snap.Exchange, snap.Label) {
+			continue
+		}
+		if exchange != "" && strings.ToLower(snap.Exchange) != exchange {
 			continue
 		}
 		result = append(result, map[string]any{
 			"user_uid":         snap.UserUID,
 			"exchange":         snap.Exchange,
+			"label":            snap.Label,
 			"timestamp":        snap.Timestamp.UnixMilli(),
 			"total_equity":     snap.TotalEquity,
 			"realized_balance": snap.RealizedBalance,
@@ -631,6 +904,18 @@ func (h *Handler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	excludedConnectionKeys := map[string]struct{}{}
+	if h.connSvc != nil {
+		excludedConnectionKeys, err = h.connSvc.GetExcludedConnectionKeys(r.Context(), req.UserUID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"success": false,
+				"error":   "failed to load exclusion rules",
+			})
+			return
+		}
+	}
+
 	report, err := h.reportSvc.GenerateReport(r.Context(), &service.GenerateReportRequest{
 		UserUID:            req.UserUID,
 		StartDate:          startDate,
@@ -640,6 +925,7 @@ func (h *Handler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 		BaseCurrency:       req.BaseCurrency,
 		IncludeRiskMetrics: req.IncludeRiskMetrics,
 		IncludeDrawdown:    req.IncludeDrawdown,
+		ExcludedExchanges:  excludedConnectionKeys,
 		Manager:            req.Manager,
 		Firm:               req.Firm,
 	})
