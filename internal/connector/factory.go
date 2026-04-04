@@ -21,17 +21,16 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 	exchange := strings.ToLower(strings.TrimSpace(creds.Exchange))
 
 	switch exchange {
-	// Crypto exchanges
-	case "binance":
-		return NewBinance(creds), nil
-	case "binance_futures", "binanceusdm":
-		return NewBinance(creds), nil
+	// Crypto exchanges — all via CCXT for full feature parity
+	// (BalanceByMarket, FundingFees, EarnBalance, MarketDetect, DetectIsPaper, CashflowFetcher)
+	case "binance", "binance_futures", "binanceusdm":
+		return NewCCXT("binance", creds)
 	case "bybit":
-		return NewBybit(creds), nil
+		return NewCCXT(exchange, creds)
 	case "okx":
-		return NewOKX(creds), nil
+		return NewCCXT(exchange, creds)
 	case "kraken":
-		return NewKraken(creds), nil
+		return NewCCXT(exchange, creds)
 	case "deribit":
 		return NewDeribit(creds), nil
 	case "bitget", "mexc", "kucoin", "coinbase", "gate", "bingx", "huobi":
