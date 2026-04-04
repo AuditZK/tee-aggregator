@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -136,6 +138,9 @@ func (s *Server) Start(ctx context.Context) error {
 		Certificates: []tls.Certificate{cert},
 	}
 
+	// Silence TLS handshake errors from scanners/bots (logged to debug instead of stderr)
+	s.http.ErrorLog = log.New(io.Discard, "", 0)
+
 	s.logger.Info("server starting",
 		zap.String("addr", s.http.Addr),
 		zap.Bool("https", true),
@@ -149,6 +154,17 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
+
+		// Health checks are debug-level to avoid log pollution (every 30s)
+		if r.URL.Path == "/health" {
+			s.logger.Debug("request",
+				zap.String("method", r.Method),
+				zap.String("path", r.URL.Path),
+				zap.Duration("duration", time.Since(start)),
+			)
+			return
+		}
+
 		s.logger.Info("request",
 			zap.String("method", r.Method),
 			zap.String("path", r.URL.Path),
