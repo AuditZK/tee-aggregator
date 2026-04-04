@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/trackrecord/enclave/internal/cache"
 	"github.com/trackrecord/enclave/internal/connector"
 	"github.com/trackrecord/enclave/internal/repository"
 	"go.uber.org/zap"
@@ -18,6 +19,7 @@ type SyncService struct {
 	snapshotRepo *repository.SnapshotRepo
 	syncStatus   *repository.SyncStatusRepo
 	factory      *connector.Factory
+	connCache    *cache.ConnectorCache
 	logger       *zap.Logger
 }
 
@@ -25,12 +27,14 @@ type SyncService struct {
 func NewSyncService(
 	connSvc *ConnectionService,
 	snapshotRepo *repository.SnapshotRepo,
+	connCache *cache.ConnectorCache,
 	logger *zap.Logger,
 ) *SyncService {
 	return &SyncService{
 		connSvc:      connSvc,
 		snapshotRepo: snapshotRepo,
 		factory:      connector.NewFactory(),
+		connCache:    connCache,
 		logger:       logger,
 	}
 }
@@ -265,13 +269,8 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		return result
 	}
 
-	// 2. Create connector
-	conn, err := s.factory.Create(&connector.Credentials{
-		Exchange:   connMeta.Exchange,
-		APIKey:     creds.APIKey,
-		APISecret:  creds.APISecret,
-		Passphrase: creds.Passphrase,
-	})
+	// 2. Get or create connector (cached, TS parity: UniversalConnectorCache)
+	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, creds)
 	if err != nil {
 		result.Error = fmt.Sprintf("create connector: %v", err)
 		return result
@@ -525,12 +524,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		return result
 	}
 
-	conn, err := s.factory.Create(&connector.Credentials{
-		Exchange:   connMeta.Exchange,
-		APIKey:     creds.APIKey,
-		APISecret:  creds.APISecret,
-		Passphrase: creds.Passphrase,
-	})
+	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, creds)
 	if err != nil {
 		result.Error = fmt.Sprintf("create connector: %v", err)
 		return result
@@ -906,6 +900,37 @@ func (m *marketAgg) toRepoMetrics() *repository.MarketMetrics {
 		LongVolume:      m.longVolume,
 		ShortVolume:     m.shortVolume,
 	}
+}
+
+// getOrCreateConnector returns a cached connector or creates a new one.
+// TS parity: UniversalConnectorCache with SHA-256 credentials hash.
+func (s *SyncService) getOrCreateConnector(exchange, userUID string, creds *Credentials) (connector.Connector, error) {
+	credsHash := cache.HashCredentials(creds.APIKey, creds.APISecret, creds.Passphrase)
+
+	// Check cache first
+	if s.connCache != nil {
+		if cached := s.connCache.Get(exchange, userUID, credsHash); cached != nil {
+			return cached, nil
+		}
+	}
+
+	// Create new connector
+	conn, err := s.factory.Create(&connector.Credentials{
+		Exchange:   exchange,
+		APIKey:     creds.APIKey,
+		APISecret:  creds.APISecret,
+		Passphrase: creds.Passphrase,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Store in cache
+	if s.connCache != nil {
+		s.connCache.Put(exchange, userUID, credsHash, conn)
+	}
+
+	return conn, nil
 }
 
 func appendUnique(slice []string, s string) []string {

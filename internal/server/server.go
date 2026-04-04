@@ -43,7 +43,7 @@ func New(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool, signer *sig
 			userRepo = repository.NewUserRepo(pool)
 
 			connSvc = service.NewConnectionService(connRepo, enc)
-			syncSvc = service.NewSyncService(connSvc, snapshotRepo, logger)
+			syncSvc = service.NewSyncService(connSvc, snapshotRepo, nil, logger)
 			metricsSvc = service.NewMetricsService(snapshotRepo)
 
 			if signer != nil {

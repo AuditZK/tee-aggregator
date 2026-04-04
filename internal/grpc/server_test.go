@@ -121,7 +121,7 @@ func TestProcessSyncJob_InvalidUser_IsRejected(t *testing.T) {
 	srv := NewServer(
 		zap.NewNop(),
 		nil,
-		service.NewSyncService(nil, nil, zap.NewNop()),
+		service.NewSyncService(nil, nil, nil, zap.NewNop()),
 		nil,
 		nil,
 		nil,

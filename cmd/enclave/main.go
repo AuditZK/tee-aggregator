@@ -16,6 +16,7 @@ import (
 	"github.com/trackrecord/enclave/internal/config"
 	"github.com/trackrecord/enclave/internal/db"
 	"github.com/trackrecord/enclave/internal/encryption"
+	"github.com/trackrecord/enclave/internal/cache"
 	enclaveGrpc "github.com/trackrecord/enclave/internal/grpc"
 	"github.com/trackrecord/enclave/internal/logredact"
 	"github.com/trackrecord/enclave/internal/logstream"
@@ -148,9 +149,13 @@ func main() {
 	var rateLimiterSvc *service.RateLimiterService
 	benchmarkSvc := service.NewBenchmarkService()
 
+	// 11b. Init connector cache (TS parity: UniversalConnectorCache)
+	connectorCache := cache.NewConnectorCache()
+	defer connectorCache.Stop()
+
 	if pool != nil {
 		connSvc = service.NewConnectionService(connRepo, enc)
-		syncSvc = service.NewSyncService(connSvc, snapshotRepo, logger)
+		syncSvc = service.NewSyncService(connSvc, snapshotRepo, connectorCache, logger)
 		if syncStatusRepo != nil {
 			syncSvc.SetSyncStatusRepo(syncStatusRepo)
 		}
