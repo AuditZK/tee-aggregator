@@ -210,28 +210,71 @@ func (s *Service) buildReportData() string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-var measurementRegex = regexp.MustCompile(`measurement:\s*([0-9a-fA-F]+)`)
-var reportDataRegex = regexp.MustCompile(`report_data:\s*([0-9a-fA-F]+)`)
+var measurementRegex = regexp.MustCompile(`(?i)measurement[:\s]+([0-9a-fA-F]+)`)
+var reportDataRegex = regexp.MustCompile(`(?i)report_data[:\s]+([0-9a-fA-F]+)`)
+var platformVersionRegex = regexp.MustCompile(`(?i)platform_version[:\s]+([0-9a-fA-F]+)`)
 
 func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*SevSnpReport, error) {
-	// Check if snpguest binary exists
 	snpguestPath := "/usr/bin/snpguest"
 	if _, err := os.Stat(snpguestPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("snpguest not found")
 	}
 
-	// Generate attestation report
-	cmd := exec.CommandContext(ctx, snpguestPath, "report", "--request-data", reportData)
-	output, err := cmd.CombinedOutput()
+	// Create temp directory for report files (TS parity)
+	tmpDir, err := os.MkdirTemp("", "snp-attestation-*")
 	if err != nil {
-		return nil, fmt.Errorf("snpguest report: %w: %s", err, string(output))
+		return nil, fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	reportPath := filepath.Join(tmpDir, "report.bin")
+	requestPath := filepath.Join(tmpDir, "request.bin")
+	certsDir := filepath.Join(tmpDir, "certs")
+	os.MkdirAll(certsDir, 0700)
+
+	// Write request data (TLS fingerprint padded to 64 bytes)
+	requestBytes := make([]byte, 64)
+	if decoded, err := hex.DecodeString(reportData); err == nil {
+		copy(requestBytes, decoded)
+	}
+	if err := os.WriteFile(requestPath, requestBytes, 0600); err != nil {
+		return nil, fmt.Errorf("write request data: %w", err)
 	}
 
-	// Fetch and verify VCEK
-	vcekVerified := s.fetchAndCacheVCEK(ctx)
+	// Step 1: Generate attestation report
+	cmd := exec.CommandContext(ctx, snpguestPath, "report", reportPath, requestPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Retry with --random flag
+		cmd = exec.CommandContext(ctx, snpguestPath, "report", reportPath, requestPath, "--random")
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("snpguest report: %w: %s", err, string(output))
+		}
+	}
 
-	// Parse output
-	outputStr := string(output)
+	// Step 2: Fetch and verify VCEK certificates
+	vcekVerified := s.fetchAndCacheVCEK(ctx, reportPath, certsDir)
+
+	// Step 3: Verify attestation with VCEK
+	if vcekVerified {
+		verifyCmd := exec.CommandContext(ctx, snpguestPath, "verify", "attestation", certsDir, reportPath)
+		if verifyOut, err := verifyCmd.CombinedOutput(); err != nil {
+			s.logger.Warn("snpguest verify failed", zap.String("output", string(verifyOut)))
+			vcekVerified = false
+		} else {
+			s.logger.Info("snpguest VCEK verification successful")
+		}
+	}
+
+	// Step 4: Display and parse the report
+	displayCmd := exec.CommandContext(ctx, snpguestPath, "display", "report", reportPath)
+	displayOutput, err := displayCmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("snpguest display: %w: %s", err, string(displayOutput))
+	}
+
+	outputStr := string(displayOutput)
 	report := &SevSnpReport{
 		Verified:      true,
 		SevSnpEnabled: true,
@@ -244,27 +287,54 @@ func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*Se
 	if matches := reportDataRegex.FindStringSubmatch(outputStr); len(matches) > 1 {
 		report.ReportData = matches[1]
 	}
+	if matches := platformVersionRegex.FindStringSubmatch(outputStr); len(matches) > 1 {
+		report.PlatformVersion = matches[1]
+	}
 
 	return report, nil
 }
 
-func (s *Service) fetchAndCacheVCEK(ctx context.Context) bool {
+func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir string) bool {
 	// Check cache first
 	vcekPath := filepath.Join(s.vcekCacheDir, "vcek.pem")
 	if info, err := os.Stat(vcekPath); err == nil {
 		if time.Since(info.ModTime()) < s.vcekTTL {
+			// Copy cached certs to temp certsDir for verification
+			copyFile(vcekPath, filepath.Join(certsDir, "vcek.pem"))
+			caPath := filepath.Join(s.vcekCacheDir, "ask.pem")
+			if _, err := os.Stat(caPath); err == nil {
+				copyFile(caPath, filepath.Join(certsDir, "ask.pem"))
+			}
 			return true
 		}
 	}
 
-	// Fetch from AMD KDS (via snpguest)
-	cmd := exec.CommandContext(ctx, "/usr/bin/snpguest", "fetch", "vcek", "DER", s.vcekCacheDir)
+	// Fetch from AMD KDS via snpguest (TS parity: fetch vcek pem + ca pem)
+	cmd := exec.CommandContext(ctx, "/usr/bin/snpguest", "fetch", "vcek", "pem", certsDir, reportPath)
 	if err := cmd.Run(); err != nil {
 		s.logger.Warn("failed to fetch VCEK certificate", zap.Error(err))
 		return false
 	}
 
+	caCmd := exec.CommandContext(ctx, "/usr/bin/snpguest", "fetch", "ca", "pem", certsDir,
+		"--endorser", "vcek", "-r", reportPath)
+	if err := caCmd.Run(); err != nil {
+		s.logger.Warn("failed to fetch CA certificate", zap.Error(err))
+	}
+
+	// Cache for next time
+	copyFile(filepath.Join(certsDir, "vcek.pem"), vcekPath)
+	copyFile(filepath.Join(certsDir, "ask.pem"), filepath.Join(s.vcekCacheDir, "ask.pem"))
+
 	return true
+}
+
+func copyFile(src, dst string) {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return
+	}
+	os.WriteFile(dst, data, 0600)
 }
 
 func (s *Service) fetchFromAzure(ctx context.Context) (*SevSnpReport, error) {
