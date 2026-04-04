@@ -122,6 +122,15 @@ func getEnvBool(key string, fallback bool) bool {
 }
 
 func getEncryptionKey() []byte {
+	// DEK_OVERRIDE takes priority — used when migrating from TS enclave
+	// (TS derived master key from measurement, unwrapped DEK; we use the DEK directly)
+	if dekHex := os.Getenv("DEK_OVERRIDE"); dekHex != "" {
+		key, err := hex.DecodeString(dekHex)
+		if err == nil && len(key) == 32 {
+			return key
+		}
+	}
+
 	keyHex := os.Getenv("ENCRYPTION_KEY")
 	if keyHex != "" {
 		key, err := hex.DecodeString(keyHex)

@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 )
@@ -109,22 +110,22 @@ func (s *Service) DecryptTSFormat(hexData string) ([]byte, error) {
 		return nil, fmt.Errorf("ts encrypted data too short: %d chars", len(hexData))
 	}
 
-	// Parse hex-encoded components
+	// Parse hex-encoded components using stdlib hex.DecodeString
 	ivHex := hexData[:tsIVLen*2]                           // first 32 hex chars = 16 bytes IV
 	tagHex := hexData[tsIVLen*2 : (tsIVLen+tsTagLen)*2]    // next 32 hex chars = 16 bytes tag
 	ciphertextHex := hexData[(tsIVLen+tsTagLen)*2:]        // remainder = ciphertext
 
-	iv, err := hexDecode(ivHex)
+	iv, err := hex.DecodeString(ivHex)
 	if err != nil {
 		return nil, fmt.Errorf("decode ts iv: %w", err)
 	}
 
-	authTag, err := hexDecode(tagHex)
+	authTag, err := hex.DecodeString(tagHex)
 	if err != nil {
 		return nil, fmt.Errorf("decode ts auth tag: %w", err)
 	}
 
-	ciphertext, err := hexDecode(ciphertextHex)
+	ciphertext, err := hex.DecodeString(ciphertextHex)
 	if err != nil {
 		return nil, fmt.Errorf("decode ts ciphertext: %w", err)
 	}
