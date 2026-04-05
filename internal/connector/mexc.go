@@ -118,20 +118,24 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 	futBody, err2 := m.futuresSignedGET(ctx, "/api/v1/private/account/assets", "")
 	if err2 == nil {
 		var futResp struct {
-			Data []struct {
-				Currency         string `json:"currency"`
-				Equity           string `json:"equity"`
-				AvailableBalance string `json:"availableBalance"`
+			Success bool `json:"success"`
+			Data    []struct {
+				Currency         string  `json:"currency"`
+				Equity           float64 `json:"equity"`
+				AvailableBalance float64 `json:"availableBalance"`
+				CashBalance      float64 `json:"cashBalance"`
+				Unrealized       float64 `json:"unrealized"`
+				PositionMargin   float64 `json:"positionMargin"`
 			} `json:"data"`
 		}
-		if json.Unmarshal(futBody, &futResp) == nil {
+		if json.Unmarshal(futBody, &futResp) == nil && futResp.Success {
 			for _, a := range futResp.Data {
-				for _, sc := range stablecoins {
-					if strings.EqualFold(a.Currency, sc) {
-						eq, _ := strconv.ParseFloat(a.Equity, 64)
-						avail, _ := strconv.ParseFloat(a.AvailableBalance, 64)
-						futuresEquity += eq
-						futuresAvailable += avail
+				if a.Equity > 0 {
+					for _, sc := range stablecoins {
+						if strings.EqualFold(a.Currency, sc) {
+							futuresEquity += a.Equity
+							futuresAvailable += a.AvailableBalance
+						}
 					}
 				}
 			}
