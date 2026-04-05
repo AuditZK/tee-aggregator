@@ -444,7 +444,7 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		wg      sync.WaitGroup
 	)
 
-	connSem := make(chan struct{}, 2) // Max 2 concurrent connections per user
+	connSem := make(chan struct{}, 1) // Sequential per user (CCXT loads ~150MB per connector)
 	const connTimeout = 2 * time.Minute  // Max 2 min per connection (IBKR polls can hang)
 
 	for _, conn := range connections {
