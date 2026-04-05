@@ -21,18 +21,19 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 	exchange := strings.ToLower(strings.TrimSpace(creds.Exchange))
 
 	switch exchange {
-	// Crypto exchanges — all via CCXT for full feature parity
-	// (BalanceByMarket, FundingFees, EarnBalance, MarketDetect, DetectIsPaper, CashflowFetcher)
+	// Major crypto exchanges — native connectors (5MB vs CCXT's 150MB per LoadMarkets)
+	// Native connectors use direct HTTP with HMAC signing, no market loading.
 	case "binance", "binance_futures", "binanceusdm":
-		return NewCCXT("binance", creds)
+		return NewBinance(creds), nil
 	case "bybit":
-		return NewCCXT(exchange, creds)
+		return NewBybit(creds), nil
 	case "okx":
-		return NewCCXT(exchange, creds)
+		return NewOKX(creds), nil
 	case "kraken":
-		return NewCCXT(exchange, creds)
+		return NewKraken(creds), nil
 	case "deribit":
 		return NewDeribit(creds), nil
+	// Minor crypto exchanges — via CCXT (no native connector available)
 	case "bitget", "mexc", "kucoin", "coinbase", "gate", "bingx", "huobi":
 		return NewCCXT(exchange, creds)
 
