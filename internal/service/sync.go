@@ -325,13 +325,20 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	}
 	if len(trades) == 0 {
 		trades, _ = conn.GetTrades(ctx, startOfDay, now)
+		// Collect swap symbols from fallback trades for funding fee fetch
+		for _, t := range trades {
+			if t.MarketType == connector.MarketSwap {
+				swapSymbols = appendUnique(swapSymbols, t.Symbol)
+			}
+		}
 	}
 
 	// 5. Aggregate trades by market type
 	breakdown := s.aggregateTrades(trades)
 
-	// 5a. Fetch funding fees for swap positions
-	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok && len(swapSymbols) > 0 {
+	// 5a. Fetch funding fees for swap positions (always if supported — funding
+	// applies to all open positions, not just those traded today)
+	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
 		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, startOfDay); err == nil {
 			totalFunding := 0.0
 			for _, f := range fees {
@@ -598,11 +605,17 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	}
 	if len(trades) == 0 {
 		trades, _ = conn.GetTrades(ctx, startOfDay, now)
+		// Collect swap symbols from fallback trades for funding fee fetch
+		for _, t := range trades {
+			if t.MarketType == connector.MarketSwap {
+				swapSymbols = appendUnique(swapSymbols, t.Symbol)
+			}
+		}
 	}
 
 	breakdown := s.aggregateTrades(trades)
 
-	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok && len(swapSymbols) > 0 {
+	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
 		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, startOfDay); err == nil {
 			total := 0.0
 			for _, f := range fees {

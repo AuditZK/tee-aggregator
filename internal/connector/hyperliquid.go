@@ -356,23 +356,23 @@ func (h *Hyperliquid) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance,
 // GetFundingFees returns funding fee history from Hyperliquid.
 // Uses the userFunding endpoint (read-only, no signing needed).
 func (h *Hyperliquid) GetFundingFees(ctx context.Context, symbols []string, since time.Time) ([]*FundingFee, error) {
-	body, _ := json.Marshal(map[string]interface{}{
+	respBody, err := h.postInfo(ctx, map[string]interface{}{
 		"type":      "userFunding",
 		"user":      h.walletAddress,
 		"startTime": since.UnixMilli(),
 	})
-
-	respBody, err := h.postInfo(ctx, body)
 	if err != nil {
 		return nil, err
 	}
 
 	var entries []struct {
-		Time    int64  `json:"time"`
-		Coin    string `json:"coin"`
-		Usdc    string `json:"usdc"`
-		Szi     string `json:"szi"`
-		FundingRate string `json:"fundingRate"`
+		Time  int64 `json:"time"`
+		Delta struct {
+			Type        string `json:"type"`
+			Coin        string `json:"coin"`
+			Usdc        string `json:"usdc"`
+			FundingRate string `json:"fundingRate"`
+		} `json:"delta"`
 	}
 
 	if err := json.Unmarshal(respBody, &entries); err != nil {
@@ -381,13 +381,13 @@ func (h *Hyperliquid) GetFundingFees(ctx context.Context, symbols []string, sinc
 
 	var fees []*FundingFee
 	for _, e := range entries {
-		amount, _ := strconv.ParseFloat(e.Usdc, 64)
+		amount, _ := strconv.ParseFloat(e.Delta.Usdc, 64)
 		if amount == 0 {
 			continue
 		}
 		fees = append(fees, &FundingFee{
 			Amount:    amount,
-			Symbol:    e.Coin,
+			Symbol:    e.Delta.Coin,
 			Timestamp: time.UnixMilli(e.Time).UTC(),
 		})
 	}
