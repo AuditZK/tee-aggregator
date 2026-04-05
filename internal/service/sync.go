@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -456,7 +457,10 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		go func(c *repository.ExchangeConnection) {
 			defer wg.Done()
 			connSem <- struct{}{}
-			defer func() { <-connSem }()
+			defer func() {
+				<-connSem
+				runtime.GC() // Free CCXT market data after each connection (~150MB)
+			}()
 
 			connCtx, cancel := context.WithTimeout(ctx, connTimeout)
 			defer cancel()
