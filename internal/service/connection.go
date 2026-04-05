@@ -88,7 +88,7 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 	if err != nil {
 		return fmt.Errorf("invalid credentials: unsupported exchange %s", normalizedExchange)
 	}
-	if _, err := testConn.GetBalance(ctx); err != nil {
+	if err := testConn.TestConnection(ctx); err != nil {
 		return fmt.Errorf("invalid credentials: %w", err)
 	}
 

@@ -205,6 +205,15 @@ func (c *CTrader) DetectIsPaper(_ context.Context) (bool, error) {
 }
 
 func (c *CTrader) TestConnection(ctx context.Context) error {
+	// Pre-refresh the access token if we have a refresh token.
+	// cTrader access tokens expire in ~1h, so on first connection
+	// the stored token is likely expired. Refresh before connecting.
+	if strings.TrimSpace(c.refreshToken) != "" {
+		if err := c.refreshAccessToken(ctx); err != nil {
+			return fmt.Errorf("token refresh failed: %w", err)
+		}
+	}
+
 	accounts, err := c.getAccounts(ctx)
 	if err != nil {
 		return err
