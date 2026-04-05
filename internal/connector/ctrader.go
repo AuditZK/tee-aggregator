@@ -981,7 +981,10 @@ func isAccessTokenInvalid(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "CH_ACCESS_TOKEN_INVALID")
+	msg := err.Error()
+	return strings.Contains(msg, "CH_ACCESS_TOKEN_INVALID") ||
+		strings.Contains(msg, "CANT_ROUTE_REQUEST") ||
+		strings.Contains(msg, "ALREADY_LOGGED_IN")
 }
 
 // detectCTraderMarketType guesses market type from symbol name.
