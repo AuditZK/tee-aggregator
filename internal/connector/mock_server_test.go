@@ -138,7 +138,7 @@ func TestNativeConnectorMemory_Lighter(t *testing.T) {
 	})
 }
 
-// TestMultipleConnectorsMemory creates 10 native connectors simultaneously
+// TestMultipleConnectorsMemory creates 11 native connectors simultaneously
 // and verifies total memory stays under 50MB (vs 1.5GB for CCXT)
 func TestMultipleConnectorsMemory(t *testing.T) {
 	runtime.GC()
@@ -158,16 +158,17 @@ func TestMultipleConnectorsMemory(t *testing.T) {
 		NewLighter(&Credentials{Exchange: "lighter", WalletAddress: "0x1234"}),
 		NewIBKR(&Credentials{Exchange: "ibkr", APIKey: "token", APISecret: "queryid"}),
 		NewMock(),
+		NewMEXC(&Credentials{Exchange: "mexc", APIKey: "k", APISecret: "s"}),
 	)
 
 	var after runtime.MemStats
 	runtime.ReadMemStats(&after)
 
 	allocMB := (after.Alloc - before.Alloc) / 1024 / 1024
-	t.Logf("10 native connectors: %d MB allocated", allocMB)
+	t.Logf("11 native connectors: %d MB allocated", allocMB)
 
 	if allocMB > 50 {
-		t.Fatalf("10 native connectors should use < 50MB, used %d MB", allocMB)
+		t.Fatalf("11 native connectors should use < 50MB, used %d MB", allocMB)
 	}
 
 	// Keep reference to prevent GC
@@ -218,10 +219,21 @@ func TestFactoryCreatesNativeConnectors(t *testing.T) {
 	}
 }
 
+// TestNativeConnectorMemory_MEXC benchmarks MEXC native connector memory usage
+func TestNativeConnectorMemory_MEXC(t *testing.T) {
+	measureConnectorMemory(t, "mexc", func() Connector {
+		return NewMEXC(&Credentials{
+			Exchange:  "mexc",
+			APIKey:    "test_key_not_real",
+			APISecret: "test_secret_not_real",
+		})
+	})
+}
+
 // TestCCXTOnlyForMinorExchanges verifies CCXT is used only for minor exchanges
 func TestCCXTOnlyForMinorExchanges(t *testing.T) {
 	factory := NewFactory()
-	ccxtExchanges := []string{"bitget", "mexc", "kucoin", "coinbase", "gate", "bingx", "huobi"}
+	ccxtExchanges := []string{"bitget", "kucoin", "coinbase", "gate", "bingx", "huobi"}
 
 	for _, ex := range ccxtExchanges {
 		t.Run(ex, func(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 // TestAllConnectorsImplementInterface verifies every connector type
 // satisfies the Connector interface at compile time.
 func TestAllConnectorsImplementInterface(t *testing.T) {
+	var _ Connector = (*MEXC)(nil)
 	var _ Connector = (*Binance)(nil)
 	var _ Connector = (*Bybit)(nil)
 	var _ Connector = (*OKX)(nil)
