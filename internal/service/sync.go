@@ -445,6 +445,7 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 	)
 
 	connSem := make(chan struct{}, 2) // Max 2 concurrent connections per user
+	const connTimeout = 2 * time.Minute  // Max 2 min per connection (IBKR polls can hang)
 
 	for _, conn := range connections {
 		if !s.isConnectionDue(ctx, conn, now) {
@@ -457,7 +458,10 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 			connSem <- struct{}{}
 			defer func() { <-connSem }()
 
-			result := s.buildConnectionSnapshot(ctx, c)
+			connCtx, cancel := context.WithTimeout(ctx, connTimeout)
+			defer cancel()
+
+			result := s.buildConnectionSnapshot(connCtx, c)
 			mu.Lock()
 			results = append(results, result)
 			mu.Unlock()
