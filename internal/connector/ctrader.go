@@ -985,7 +985,6 @@ func isAccessTokenInvalid(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "CH_ACCESS_TOKEN_INVALID") ||
-		strings.Contains(msg, "CANT_ROUTE_REQUEST") ||
 		strings.Contains(msg, "ALREADY_LOGGED_IN")
 }
 
