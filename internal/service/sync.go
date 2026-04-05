@@ -380,6 +380,11 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	if bmFetcher, ok := conn.(connector.BalanceByMarketFetcher); ok {
 		if marketBalances, err := bmFetcher.GetBalanceByMarket(ctx); err == nil {
 			s.enrichBreakdownWithBalances(breakdown, marketBalances)
+		} else {
+			s.logger.Debug("balance by market fetch failed (non-critical)",
+				zap.String("exchange", connMeta.Exchange),
+				zap.Error(err),
+			)
 		}
 	}
 
@@ -648,6 +653,11 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	if bmFetcher, ok := conn.(connector.BalanceByMarketFetcher); ok {
 		if marketBalances, err := bmFetcher.GetBalanceByMarket(ctx); err == nil {
 			s.enrichBreakdownWithBalances(breakdown, marketBalances)
+		} else {
+			s.logger.Debug("balance by market fetch failed (non-critical)",
+				zap.String("exchange", connMeta.Exchange),
+				zap.Error(err),
+			)
 		}
 	}
 

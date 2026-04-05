@@ -21,6 +21,9 @@ type IBKR struct {
 	token   string // Flex Web Service Token
 	queryID string // Flex Query ID
 	client  *http.Client
+
+	// Cached breakdown from last GetBalance call (avoids 2nd Flex request for GetBalanceByMarket)
+	cachedBreakdown []*MarketBalance
 }
 
 // NewIBKR creates a new IBKR connector
@@ -169,6 +172,7 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 						Total         string `xml:"total,attr"`
 						Cash          string `xml:"cash,attr"`
 						Stock         string `xml:"stock,attr"`
+						Options       string `xml:"options,attr"`
 						Commodities   string `xml:"commodities,attr"`
 						UnrealizedPnL string `xml:"unrealizedPnL,attr"`
 					} `xml:"EquitySummaryByReportDateInBase"`
@@ -190,6 +194,27 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 	total, _ := strconv.ParseFloat(summary.Total, 64)
 	cash, _ := strconv.ParseFloat(summary.Cash, 64)
 	unrealized, _ := strconv.ParseFloat(summary.UnrealizedPnL, 64)
+	stockVal, _ := strconv.ParseFloat(summary.Stock, 64)
+	optionsVal, _ := strconv.ParseFloat(summary.Options, 64)
+	commoditiesVal, _ := strconv.ParseFloat(summary.Commodities, 64)
+
+	// Cache breakdown for GetBalanceByMarket (avoids 2nd Flex API call)
+	i.cachedBreakdown = nil
+	if stockVal != 0 {
+		i.cachedBreakdown = append(i.cachedBreakdown, &MarketBalance{
+			MarketType: MarketStocks, Equity: stockVal, AvailableMargin: cash,
+		})
+	}
+	if optionsVal != 0 {
+		i.cachedBreakdown = append(i.cachedBreakdown, &MarketBalance{
+			MarketType: MarketOptions, Equity: optionsVal,
+		})
+	}
+	if commoditiesVal != 0 {
+		i.cachedBreakdown = append(i.cachedBreakdown, &MarketBalance{
+			MarketType: MarketFutures, Equity: commoditiesVal,
+		})
+	}
 
 	return &Balance{
 		Available:     cash,
@@ -200,71 +225,10 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 }
 
 // GetBalanceByMarket returns per-asset-class equity breakdown from IBKR Flex.
-func (i *IBKR) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance, error) {
-	refCode, err := i.requestFlexReport(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	report, err := i.getFlexReport(ctx, refCode)
-	if err != nil {
-		return nil, err
-	}
-
-	var flex struct {
-		XMLName        xml.Name `xml:"FlexQueryResponse"`
-		FlexStatements struct {
-			FlexStatement struct {
-				EquitySummaryInBase struct {
-					EquitySummaryByReportDateInBase []struct {
-						Stock       string `xml:"stock,attr"`
-						Options     string `xml:"options,attr"`
-						Commodities string `xml:"commodities,attr"`
-						Cash        string `xml:"cash,attr"`
-					} `xml:"EquitySummaryByReportDateInBase"`
-				} `xml:"EquitySummaryInBase"`
-			} `xml:"FlexStatement"`
-		} `xml:"FlexStatements"`
-	}
-
-	if err := xml.Unmarshal(report, &flex); err != nil {
-		return nil, fmt.Errorf("parse flex balance breakdown: %w", err)
-	}
-
-	summaries := flex.FlexStatements.FlexStatement.EquitySummaryInBase.EquitySummaryByReportDateInBase
-	if len(summaries) == 0 {
-		return nil, nil
-	}
-
-	latest := summaries[len(summaries)-1]
-	stockVal, _ := strconv.ParseFloat(latest.Stock, 64)
-	optionsVal, _ := strconv.ParseFloat(latest.Options, 64)
-	commoditiesVal, _ := strconv.ParseFloat(latest.Commodities, 64)
-	cashVal, _ := strconv.ParseFloat(latest.Cash, 64)
-
-	var balances []*MarketBalance
-	if stockVal != 0 {
-		balances = append(balances, &MarketBalance{
-			MarketType:      MarketStocks,
-			Equity:          stockVal,
-			AvailableMargin: cashVal, // IBKR: cash is available margin
-		})
-	}
-	if optionsVal != 0 {
-		balances = append(balances, &MarketBalance{
-			MarketType: MarketOptions,
-			Equity:     optionsVal,
-		})
-	}
-	if commoditiesVal != 0 {
-		// IBKR uses 'commodities' for futures + commodities
-		balances = append(balances, &MarketBalance{
-			MarketType: MarketFutures,
-			Equity:     commoditiesVal,
-		})
-	}
-
-	return balances, nil
+// GetBalanceByMarket returns cached breakdown from the last GetBalance call.
+// No additional Flex API call needed (avoids IBKR rate limit error 1018).
+func (i *IBKR) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
+	return i.cachedBreakdown, nil
 }
 
 func (i *IBKR) GetPositions(ctx context.Context) ([]*Position, error) {
