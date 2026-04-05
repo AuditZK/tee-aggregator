@@ -19,6 +19,11 @@ const mexcAPI = "https://api.mexc.com"
 // Uses HMAC-SHA256 signing, same as Binance.
 type MEXC struct {
 	base CryptoBase
+
+	// Cached from last GetBalance for GetBalanceByMarket
+	cachedSpotEquity    float64
+	cachedFuturesEquity float64
+	cachedFuturesAvail  float64
 }
 
 // NewMEXC creates a new MEXC connector.
@@ -142,6 +147,11 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 		}
 	}
 
+	// Cache for GetBalanceByMarket
+	m.cachedSpotEquity = spotEquity
+	m.cachedFuturesEquity = futuresEquity
+	m.cachedFuturesAvail = futuresAvailable
+
 	totalEquity := spotEquity + futuresEquity
 	totalAvailable := spotAvailable + futuresAvailable
 
@@ -151,6 +161,68 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 		UnrealizedPnL: futuresEquity - futuresAvailable,
 		Currency:      "USDT",
 	}, nil
+}
+
+// GetBalanceByMarket returns spot and swap equity breakdown (cached from GetBalance).
+func (m *MEXC) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
+	var balances []*MarketBalance
+	if m.cachedSpotEquity > 0 {
+		balances = append(balances, &MarketBalance{
+			MarketType: MarketSpot,
+			Equity:     m.cachedSpotEquity,
+		})
+	}
+	if m.cachedFuturesEquity > 0 {
+		balances = append(balances, &MarketBalance{
+			MarketType:      MarketSwap,
+			Equity:          m.cachedFuturesEquity,
+			AvailableMargin: m.cachedFuturesAvail,
+		})
+	}
+	return balances, nil
+}
+
+// GetFundingFees returns funding fee history from MEXC futures.
+func (m *MEXC) GetFundingFees(ctx context.Context, symbols []string, since time.Time) ([]*FundingFee, error) {
+	params := fmt.Sprintf("page_num=1&page_size=100")
+	body, err := m.futuresSignedGET(ctx, "/api/v1/private/account/funding_records", params)
+	if err != nil {
+		return nil, nil // Futures not available, return empty
+	}
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			ResultList []struct {
+				Symbol      string  `json:"symbol"`
+				FundingRate float64 `json:"fundingRate"`
+				SettleTime  int64   `json:"settleTime"`
+				Funding     float64 `json:"funding"`
+			} `json:"resultList"`
+		} `json:"data"`
+	}
+
+	if json.Unmarshal(body, &resp) != nil || !resp.Success {
+		return nil, nil
+	}
+
+	var fees []*FundingFee
+	for _, f := range resp.Data.ResultList {
+		ts := time.UnixMilli(f.SettleTime)
+		if ts.Before(since) {
+			continue
+		}
+		if f.Funding == 0 {
+			continue
+		}
+		fees = append(fees, &FundingFee{
+			Amount:    f.Funding,
+			Symbol:    f.Symbol,
+			Timestamp: ts,
+		})
+	}
+
+	return fees, nil
 }
 
 // fetchTickerPrice gets the USDT price for an asset from MEXC public ticker.
