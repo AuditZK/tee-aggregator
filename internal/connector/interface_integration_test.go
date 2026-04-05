@@ -21,7 +21,12 @@ func TestAllConnectorsImplementInterface(t *testing.T) {
 	var _ Connector = (*CTrader)(nil)
 	var _ Connector = (*MetaTrader)(nil)
 	var _ Connector = (*MockConnector)(nil)
-	var _ Connector = (*CCXTConnector)(nil)
+	var _ Connector = (*Bitget)(nil)
+	var _ Connector = (*KuCoin)(nil)
+	var _ Connector = (*Coinbase)(nil)
+	var _ Connector = (*Gate)(nil)
+	var _ Connector = (*BingX)(nil)
+	var _ Connector = (*Huobi)(nil)
 }
 
 // TestOptionalInterfaces verifies which connectors implement optional interfaces
@@ -41,6 +46,7 @@ func TestOptionalInterfaces(t *testing.T) {
 		{"Alpaca", NewAlpaca(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, false, false, true},
 		{"Hyperliquid", NewHyperliquid(&Credentials{WalletAddress: "0x1"}), true, true, true, false, false, true},
 		{"Lighter", NewLighter(&Credentials{WalletAddress: "0x1"}), false, true, false, false, false, true},
+		{"MEXC", NewMEXC(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, false, false, false},
 		{"Mock", NewMock(), false, false, false, false, false, false},
 	}
 
@@ -76,39 +82,6 @@ func TestOptionalInterfaces(t *testing.T) {
 				t.Errorf("PaperAccountDetector: got %v, want %v", hasPD, tt.paper)
 			}
 		})
-	}
-}
-
-// TestCCXTOptionalInterfaces verifies CCXT connector implements all optional interfaces
-func TestCCXTOptionalInterfaces(t *testing.T) {
-	conn, err := NewCCXT("mexc", &Credentials{Exchange: "mexc", APIKey: "k", APISecret: "s"})
-	if err != nil {
-		t.Fatalf("NewCCXT failed: %v", err)
-	}
-
-	if _, ok := conn.(CashflowFetcher); !ok {
-		t.Error("CCXT should implement CashflowFetcher")
-	}
-	if _, ok := conn.(BalanceByMarketFetcher); !ok {
-		t.Error("CCXT should implement BalanceByMarketFetcher")
-	}
-	if _, ok := conn.(FundingFeesFetcher); !ok {
-		t.Error("CCXT should implement FundingFeesFetcher")
-	}
-	if _, ok := conn.(EarnBalanceFetcher); !ok {
-		t.Error("CCXT should implement EarnBalanceFetcher")
-	}
-	if _, ok := conn.(MarketTypeDetector); !ok {
-		t.Error("CCXT should implement MarketTypeDetector")
-	}
-	if _, ok := conn.(PerMarketTradeFetcher); !ok {
-		t.Error("CCXT should implement PerMarketTradeFetcher")
-	}
-	if _, ok := conn.(PaperAccountDetector); !ok {
-		t.Error("CCXT should implement PaperAccountDetector")
-	}
-	if _, ok := conn.(KYCLevelFetcher); !ok {
-		t.Error("CCXT should implement KYCLevelFetcher")
 	}
 }
 

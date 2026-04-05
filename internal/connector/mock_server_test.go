@@ -254,9 +254,9 @@ func TestAllExchangesAreNative(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Create(%s) failed: %v", ex, err)
 			}
-			// Verify it's NOT a CCXTConnector
-			if _, ok := conn.(*CCXTConnector); ok {
-				t.Fatalf("%s should use native connector, not CCXT", ex)
+			// Verify connector is not nil and implements Exchange()
+			if conn.Exchange() == "" {
+				t.Fatalf("%s returned empty exchange name", ex)
 			}
 		})
 	}
