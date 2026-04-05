@@ -22,8 +22,9 @@ type IBKR struct {
 	queryID string // Flex Query ID
 	client  *http.Client
 
-	// Cached breakdown from last GetBalance call (avoids 2nd Flex request for GetBalanceByMarket)
+	// Cached from last GetBalance call (avoids extra Flex requests)
 	cachedBreakdown []*MarketBalance
+	cachedIsPaper   *bool
 }
 
 // NewIBKR creates a new IBKR connector
@@ -41,38 +42,18 @@ func (i *IBKR) Exchange() string {
 
 // DetectIsPaper mirrors TS behavior:
 // IBKR paper accounts typically use DU/DF account ID prefixes.
-func (i *IBKR) DetectIsPaper(ctx context.Context) (bool, error) {
-	refCode, err := i.requestFlexReport(ctx)
-	if err != nil {
-		return false, err
+// Uses cached result from GetBalance to avoid extra Flex API call.
+func (i *IBKR) DetectIsPaper(_ context.Context) (bool, error) {
+	if i.cachedIsPaper != nil {
+		return *i.cachedIsPaper, nil
 	}
-
-	report, err := i.getFlexReport(ctx, refCode)
-	if err != nil {
-		return false, err
-	}
-
-	var flex struct {
-		XMLName        xml.Name `xml:"FlexQueryResponse"`
-		FlexStatements struct {
-			FlexStatement struct {
-				AccountID string `xml:"accountId,attr"`
-			} `xml:"FlexStatement"`
-		} `xml:"FlexStatements"`
-	}
-	if err := xml.Unmarshal(report, &flex); err != nil {
-		return false, fmt.Errorf("parse flex account id: %w", err)
-	}
-
-	accountID := strings.ToUpper(strings.TrimSpace(flex.FlexStatements.FlexStatement.AccountID))
-	if accountID == "" {
-		return false, nil
-	}
-	return strings.HasPrefix(accountID, "DU") || strings.HasPrefix(accountID, "DF"), nil
+	return false, nil
 }
 
 func (i *IBKR) TestConnection(ctx context.Context) error {
-	_, err := i.requestFlexReport(ctx)
+	// Use GetBalance instead of just requestFlexReport — this also caches
+	// the account ID (for paper detection) and breakdown (for GetBalanceByMarket).
+	_, err := i.GetBalance(ctx)
 	return err
 }
 
@@ -167,6 +148,7 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 		XMLName        xml.Name `xml:"FlexQueryResponse"`
 		FlexStatements struct {
 			FlexStatement struct {
+				AccountID       string `xml:"accountId,attr"`
 				EquitySummaryInBase struct {
 					EquitySummaryByReportDateInBase []struct {
 						Total         string `xml:"total,attr"`
@@ -197,6 +179,13 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 	stockVal, _ := strconv.ParseFloat(summary.Stock, 64)
 	optionsVal, _ := strconv.ParseFloat(summary.Options, 64)
 	commoditiesVal, _ := strconv.ParseFloat(summary.Commodities, 64)
+
+	// Cache paper detection from account ID (avoids extra Flex call for DetectIsPaper)
+	accountID := strings.ToUpper(strings.TrimSpace(flex.FlexStatements.FlexStatement.AccountID))
+	if accountID != "" {
+		isPaper := strings.HasPrefix(accountID, "DU") || strings.HasPrefix(accountID, "DF")
+		i.cachedIsPaper = &isPaper
+	}
 
 	// Cache breakdown for GetBalanceByMarket (avoids 2nd Flex API call)
 	i.cachedBreakdown = nil
