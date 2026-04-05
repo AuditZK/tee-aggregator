@@ -182,9 +182,6 @@ func (c *CCXTConnector) fetchKucoinKYCLevel(ctx context.Context) (string, error)
 }
 
 func (c *CCXTConnector) TestConnection(ctx context.Context) error {
-	if err := c.ensureMarkets(ctx); err != nil {
-		return err
-	}
 	_, err := c.call(ctx, func() <-chan interface{} {
 		return c.core.FetchBalance(map[string]interface{}{})
 	})
@@ -192,9 +189,9 @@ func (c *CCXTConnector) TestConnection(ctx context.Context) error {
 }
 
 func (c *CCXTConnector) GetBalance(ctx context.Context) (*Balance, error) {
-	if err := c.ensureMarkets(ctx); err != nil {
-		return nil, err
-	}
+	// NOTE: No ensureMarkets() here — FetchBalance doesn't need markets loaded.
+	// Markets are loaded lazily only when needed (GetTrades, GetPositions, etc.)
+	// This saves ~150MB of RAM per connector.
 
 	// Aggregate balance across all market types (spot + swap/futures)
 	// TS parity: EquitySnapshotAggregator fetches balance per market then sums
@@ -436,9 +433,6 @@ func (c *CCXTConnector) fetchPositions(ctx context.Context) ([]*Position, error)
 // GetCashflows returns deposits and withdrawals since the given date.
 // Uses CCXT fetchDeposits + fetchWithdrawals.
 func (c *CCXTConnector) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
-	if err := c.ensureMarkets(ctx); err != nil {
-		return nil, err
-	}
 
 	var cashflows []*Cashflow
 
@@ -663,9 +657,6 @@ func (c *CCXTConnector) discoverActiveSymbols(ctx context.Context) []string {
 // GetBalanceByMarket returns per-market equity breakdown.
 // Switches defaultType for each market and fetches balance.
 func (c *CCXTConnector) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance, error) {
-	if err := c.ensureMarkets(ctx); err != nil {
-		return nil, err
-	}
 
 	marketTypes := []struct {
 		hint      string
@@ -792,9 +783,6 @@ func (c *CCXTConnector) GetTradesByMarket(ctx context.Context, marketType string
 
 // GetFundingFees fetches funding fee history for perpetual/swap positions.
 func (c *CCXTConnector) GetFundingFees(ctx context.Context, symbols []string, since time.Time) ([]*FundingFee, error) {
-	if err := c.ensureMarkets(ctx); err != nil {
-		return nil, err
-	}
 
 	var fees []*FundingFee
 	for _, symbol := range symbols {
@@ -824,9 +812,6 @@ func (c *CCXTConnector) GetFundingFees(ctx context.Context, symbols []string, si
 
 // GetEarnBalance returns the total earn/staking balance if supported.
 func (c *CCXTConnector) GetEarnBalance(ctx context.Context) (float64, error) {
-	if err := c.ensureMarkets(ctx); err != nil {
-		return 0, err
-	}
 
 	c.core.ExtendExchangeOptions(map[string]interface{}{"defaultType": "earn"})
 	defer c.core.ExtendExchangeOptions(map[string]interface{}{"defaultType": "swap"})
