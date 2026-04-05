@@ -35,9 +35,18 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 		return NewDeribit(creds), nil
 	case "mexc":
 		return NewMEXC(creds), nil
-	// Minor crypto exchanges — via CCXT (no native connector available)
-	case "bitget", "kucoin", "coinbase", "gate", "bingx", "huobi":
-		return NewCCXT(exchange, creds)
+	case "bitget":
+		return NewBitget(creds), nil
+	case "kucoin":
+		return NewKuCoin(creds), nil
+	case "coinbase":
+		return NewCoinbase(creds), nil
+	case "gate":
+		return NewGate(creds), nil
+	case "bingx":
+		return NewBingX(creds), nil
+	case "huobi":
+		return NewHuobi(creds), nil
 
 	// Traditional brokers
 	case "ibkr":

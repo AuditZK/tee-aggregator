@@ -230,24 +230,33 @@ func TestNativeConnectorMemory_MEXC(t *testing.T) {
 	})
 }
 
-// TestCCXTOnlyForMinorExchanges verifies CCXT is used only for minor exchanges
-func TestCCXTOnlyForMinorExchanges(t *testing.T) {
+// TestAllExchangesAreNative verifies no exchange uses CCXT anymore
+func TestAllExchangesAreNative(t *testing.T) {
 	factory := NewFactory()
-	ccxtExchanges := []string{"bitget", "kucoin", "coinbase", "gate", "bingx", "huobi"}
+	allExchanges := []string{
+		"binance", "bybit", "okx", "kraken", "deribit",
+		"mexc", "bitget", "kucoin", "coinbase", "gate", "bingx", "huobi",
+		"ibkr", "alpaca", "tradestation",
+		"hyperliquid", "lighter",
+		"ctrader", "mt4", "mt5",
+		"mock",
+	}
 
-	for _, ex := range ccxtExchanges {
+	for _, ex := range allExchanges {
 		t.Run(ex, func(t *testing.T) {
 			conn, err := factory.Create(&Credentials{
-				Exchange:  ex,
-				APIKey:    "test",
-				APISecret: "test",
+				Exchange:      ex,
+				APIKey:        "test",
+				APISecret:     "dGVzdA==",
+				Passphrase:    "test",
+				WalletAddress: "0x1234",
 			})
 			if err != nil {
 				t.Fatalf("Create(%s) failed: %v", ex, err)
 			}
-			// Verify it's a CCXTConnector
-			if _, ok := conn.(*CCXTConnector); !ok {
-				t.Fatalf("expected CCXTConnector for %s, got %T", ex, conn)
+			// Verify it's NOT a CCXTConnector
+			if _, ok := conn.(*CCXTConnector); ok {
+				t.Fatalf("%s should use native connector, not CCXT", ex)
 			}
 		})
 	}
