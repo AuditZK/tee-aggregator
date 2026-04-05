@@ -460,10 +460,19 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 
 	wg.Wait()
 
-	// Phase 2: Collect successful snapshots
+	// Phase 2: Collect successful snapshots, log failures
 	var snapshots []*repository.Snapshot
 	for _, r := range results {
-		if r.snapshot != nil && r.Error == "" {
+		if r.Error != "" {
+			s.logger.Error("connection sync failed",
+				zap.String("user_uid", userUID),
+				zap.String("exchange", r.Exchange),
+				zap.String("label", r.Label),
+				zap.String("error", r.Error),
+			)
+			continue
+		}
+		if r.snapshot != nil {
 			snapshots = append(snapshots, r.snapshot)
 		}
 	}
