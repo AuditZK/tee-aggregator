@@ -82,6 +82,8 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 	spotEquity := 0.0
 	spotAvailable := 0.0
 	stablecoins := []string{"USDT", "USDC", "USD", "BUSD", "DAI", "FDUSD"}
+
+	// Sum stablecoins + convert altcoins to USD via ticker
 	for _, b := range spotResp.Balances {
 		free, _ := strconv.ParseFloat(b.Free, 64)
 		locked, _ := strconv.ParseFloat(b.Locked, 64)
@@ -89,44 +91,51 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 		if total <= 0 {
 			continue
 		}
+
+		isStable := false
 		for _, sc := range stablecoins {
 			if strings.EqualFold(b.Asset, sc) {
+				isStable = true
 				spotEquity += total
 				spotAvailable += free
+				break
+			}
+		}
+
+		// Convert altcoins to USD via MEXC ticker
+		if !isStable {
+			price := m.fetchTickerPrice(ctx, b.Asset)
+			if price > 0 {
+				spotEquity += total * price
+				spotAvailable += free * price
 			}
 		}
 	}
 
-	// Futures balance
+	// Futures balance via contract.mexc.com
 	futuresEquity := 0.0
 	futuresAvailable := 0.0
-	futBody, err := m.signedGET(ctx, "/api/v3/account", "")
-	if err == nil {
-		// Try futures-specific endpoint
-		futBody2, err2 := m.futuresSignedGET(ctx, "/api/v1/private/account/assets", "")
-		if err2 == nil {
-			var futResp struct {
-				Data []struct {
-					Currency         string `json:"currency"`
-					Equity           string `json:"equity"`
-					AvailableBalance string `json:"availableBalance"`
-					CashBalance      string `json:"cashBalance"`
-				} `json:"data"`
-			}
-			if json.Unmarshal(futBody2, &futResp) == nil {
-				for _, a := range futResp.Data {
-					for _, sc := range stablecoins {
-						if strings.EqualFold(a.Currency, sc) {
-							eq, _ := strconv.ParseFloat(a.Equity, 64)
-							avail, _ := strconv.ParseFloat(a.AvailableBalance, 64)
-							futuresEquity += eq
-							futuresAvailable += avail
-						}
+	futBody, err2 := m.futuresSignedGET(ctx, "/api/v1/private/account/assets", "")
+	if err2 == nil {
+		var futResp struct {
+			Data []struct {
+				Currency         string `json:"currency"`
+				Equity           string `json:"equity"`
+				AvailableBalance string `json:"availableBalance"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(futBody, &futResp) == nil {
+			for _, a := range futResp.Data {
+				for _, sc := range stablecoins {
+					if strings.EqualFold(a.Currency, sc) {
+						eq, _ := strconv.ParseFloat(a.Equity, 64)
+						avail, _ := strconv.ParseFloat(a.AvailableBalance, 64)
+						futuresEquity += eq
+						futuresAvailable += avail
 					}
 				}
 			}
 		}
-		_ = futBody
 	}
 
 	totalEquity := spotEquity + futuresEquity
@@ -135,21 +144,51 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 	return &Balance{
 		Equity:        totalEquity,
 		Available:     totalAvailable,
-		UnrealizedPnL: futuresEquity - futuresAvailable, // approximate
+		UnrealizedPnL: futuresEquity - futuresAvailable,
 		Currency:      "USDT",
 	}, nil
 }
 
+// fetchTickerPrice gets the USDT price for an asset from MEXC public ticker.
+func (m *MEXC) fetchTickerPrice(ctx context.Context, asset string) float64 {
+	asset = strings.ToUpper(asset)
+	for _, quote := range []string{"USDT", "USDC"} {
+		symbol := asset + quote
+		url := m.base.BaseURL + "/api/v3/ticker/price?symbol=" + symbol
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			continue
+		}
+		body, err := m.base.DoRequest(req)
+		if err != nil {
+			continue
+		}
+		var ticker struct {
+			Price string `json:"price"`
+		}
+		if json.Unmarshal(body, &ticker) == nil {
+			price, _ := strconv.ParseFloat(ticker.Price, 64)
+			if price > 0 {
+				return price
+			}
+		}
+	}
+	return 0
+}
+
 func (m *MEXC) futuresSignedGET(ctx context.Context, path, params string) ([]byte, error) {
 	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	queryString := params
-	if queryString != "" {
-		queryString += "&"
-	}
-	queryString += "timestamp=" + ts
 
-	signature := m.sign(queryString)
-	url := "https://contract.mexc.com" + path + "?" + queryString + "&signature=" + signature
+	// MEXC futures signature: HMAC-SHA256(apiKey + timestamp + params)
+	signPayload := m.base.APIKey + ts + params
+	mac := hmac.New(sha256.New, []byte(m.base.APISecret))
+	mac.Write([]byte(signPayload))
+	signature := hex.EncodeToString(mac.Sum(nil))
+
+	url := "https://contract.mexc.com" + path
+	if params != "" {
+		url += "?" + params
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
