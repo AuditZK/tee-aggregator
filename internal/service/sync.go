@@ -436,12 +436,15 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		return nil, fmt.Errorf("no active connections for user %s", userUID)
 	}
 
-	// Phase 1: Build all snapshots in memory (parallel)
+	// Phase 1: Build snapshots with limited concurrency (max 2 per user).
+	// CCXT connectors load markets (~40MB each), so 10 in parallel = OOM on small VMs.
 	var (
-		results   []*SyncResult
-		mu        sync.Mutex
-		wg        sync.WaitGroup
+		results []*SyncResult
+		mu      sync.Mutex
+		wg      sync.WaitGroup
 	)
+
+	connSem := make(chan struct{}, 2) // Max 2 concurrent connections per user
 
 	for _, conn := range connections {
 		if !s.isConnectionDue(ctx, conn, now) {
@@ -451,6 +454,9 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		wg.Add(1)
 		go func(c *repository.ExchangeConnection) {
 			defer wg.Done()
+			connSem <- struct{}{}
+			defer func() { <-connSem }()
+
 			result := s.buildConnectionSnapshot(ctx, c)
 			mu.Lock()
 			results = append(results, result)
