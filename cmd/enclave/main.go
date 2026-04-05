@@ -267,6 +267,7 @@ func main() {
 	if syncSvc != nil && userRepo != nil {
 		syncScheduler = scheduler.NewSyncScheduler(syncSvc, userRepo, logger)
 		syncScheduler.Start()
+		restServer.SetScheduler(syncScheduler)
 	}
 
 	logger.Info("enclave worker ready",

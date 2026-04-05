@@ -19,12 +19,23 @@ import (
 	"go.uber.org/zap"
 )
 
+// SyncSchedulerRunner can trigger a sync immediately.
+type SyncSchedulerRunner interface {
+	RunNow()
+}
+
 type Server struct {
-	cfg     *config.Config
-	logger  *zap.Logger
-	handler *Handler
-	http    *http.Server
-	pool    *pgxpool.Pool
+	cfg       *config.Config
+	logger    *zap.Logger
+	handler   *Handler
+	http      *http.Server
+	pool      *pgxpool.Pool
+	scheduler SyncSchedulerRunner
+}
+
+// SetScheduler attaches the scheduler for admin sync trigger.
+func (s *Server) SetScheduler(sched SyncSchedulerRunner) {
+	s.scheduler = sched
 }
 
 func New(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool, signer *signing.ReportSigner) *Server {
@@ -94,6 +105,7 @@ func (s *Server) Start(ctx context.Context) error {
 			})
 		}
 		mux.HandleFunc("/api/v1/sync", s.handler.ProcessSyncJob)
+		mux.HandleFunc("/api/v1/admin/sync-now", s.handleAdminSyncNow)
 		mux.HandleFunc("/api/v1/metrics", s.handler.GetMetrics)
 		mux.HandleFunc("/api/v1/snapshots", s.handler.GetSnapshots)
 		mux.HandleFunc("/api/v1/report", s.handler.GenerateReport)
@@ -148,6 +160,23 @@ func (s *Server) Start(ctx context.Context) error {
 	)
 
 	return s.http.ListenAndServeTLS("", "")
+}
+
+// handleAdminSyncNow triggers the daily sync immediately (admin only).
+func (s *Server) handleAdminSyncNow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "scheduler not configured"})
+		return
+	}
+
+	s.logger.Info("admin sync-now triggered")
+	go s.scheduler.RunNow()
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "sync triggered, check logs"})
 }
 
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
