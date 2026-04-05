@@ -91,6 +91,9 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/attestation", s.handler.GetAttestation)
 	mux.HandleFunc("/api/v1/credentials/connect", credRateLimiter.Middleware(s.handler.ConnectCredentials))
 
+	// Admin endpoint (always available, localhost only)
+	mux.HandleFunc("/api/v1/admin/sync-now", s.handleAdminSyncNow)
+
 	// Legacy REST routes are disabled by default for strict TS parity.
 	if s.cfg.EnableLegacyREST {
 		if s.cfg.IsDevelopment() {
@@ -105,7 +108,6 @@ func (s *Server) Start(ctx context.Context) error {
 			})
 		}
 		mux.HandleFunc("/api/v1/sync", s.handler.ProcessSyncJob)
-		mux.HandleFunc("/api/v1/admin/sync-now", s.handleAdminSyncNow)
 		mux.HandleFunc("/api/v1/metrics", s.handler.GetMetrics)
 		mux.HandleFunc("/api/v1/snapshots", s.handler.GetSnapshots)
 		mux.HandleFunc("/api/v1/report", s.handler.GenerateReport)
