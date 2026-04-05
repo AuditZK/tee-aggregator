@@ -543,11 +543,11 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 			now := time.Now().UTC()
 			_, err = tx.Exec(ctx, `
 				INSERT INTO snapshot_data (
-					"userUid", exchange, label, timestamp,
+					id, "userUid", exchange, label, timestamp,
 					"totalEquity", "realizedBalance", "unrealizedPnL",
 					deposits, withdrawals,
 					breakdown_by_market, "createdAt", "updatedAt"
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 				ON CONFLICT ("userUid", exchange, label, timestamp)
 				DO UPDATE SET
 					"totalEquity" = EXCLUDED."totalEquity",
@@ -557,6 +557,7 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 					withdrawals = EXCLUDED.withdrawals,
 					breakdown_by_market = EXCLUDED.breakdown_by_market,
 					"updatedAt" = EXCLUDED."updatedAt"`,
+				generateCUID(),
 				s.UserUID, s.Exchange, s.Label, s.Timestamp,
 				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
 				s.Deposits, s.Withdrawals,
