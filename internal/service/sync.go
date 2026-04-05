@@ -531,6 +531,13 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 
 // buildConnectionSnapshot builds a snapshot without saving (for atomic batch).
 func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *repository.ExchangeConnection) *SyncResult {
+	start := time.Now()
+	s.logger.Info("building snapshot",
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("label", connMeta.Label),
+	)
+
 	result := &SyncResult{
 		UserUID:  connMeta.UserUID,
 		Exchange: connMeta.Exchange,
@@ -540,20 +547,24 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
 	if err != nil {
 		result.Error = fmt.Sprintf("get credentials: %v", err)
+		s.logger.Error("snapshot build failed", zap.String("exchange", connMeta.Exchange), zap.String("step", "decrypt"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return result
 	}
 
 	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, creds)
 	if err != nil {
 		result.Error = fmt.Sprintf("create connector: %v", err)
+		s.logger.Error("snapshot build failed", zap.String("exchange", connMeta.Exchange), zap.String("step", "connector"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return result
 	}
 
 	balance, err := conn.GetBalance(ctx)
 	if err != nil {
 		result.Error = fmt.Sprintf("get balance: %v", err)
+		s.logger.Error("snapshot build failed", zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.String("step", "get_balance"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return result
 	}
+	s.logger.Info("balance fetched", zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.Duration("elapsed", time.Since(start)))
 
 	now := time.Now().UTC()
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
