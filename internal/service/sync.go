@@ -734,6 +734,15 @@ func isDueByInterval(lastSync *time.Time, intervalMinutes int, now time.Time) bo
 		return false
 	}
 
+	// Daily sync (1440 min): use calendar-day comparison instead of 24h delta.
+	// This prevents drift when sync runs at 00:58 then 01:15 then 01:30 etc.
+	// A connection is due if the current UTC date is after the last sync UTC date.
+	if intervalMinutes >= 1440 {
+		lastDate := last.Truncate(24 * time.Hour)
+		currentDate := current.Truncate(24 * time.Hour)
+		return currentDate.After(lastDate)
+	}
+
 	return current.Sub(last) >= time.Duration(intervalMinutes)*time.Minute
 }
 

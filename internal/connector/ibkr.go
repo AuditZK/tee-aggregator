@@ -43,7 +43,14 @@ func (i *IBKR) Exchange() string {
 // DetectIsPaper mirrors TS behavior:
 // IBKR paper accounts typically use DU/DF account ID prefixes.
 // Uses cached result from GetBalance to avoid extra Flex API call.
-func (i *IBKR) DetectIsPaper(_ context.Context) (bool, error) {
+func (i *IBKR) DetectIsPaper(ctx context.Context) (bool, error) {
+	if i.cachedIsPaper != nil {
+		return *i.cachedIsPaper, nil
+	}
+	// Cache empty — call GetBalance to populate it (parses accountId from XML)
+	if _, err := i.GetBalance(ctx); err != nil {
+		return false, err
+	}
 	if i.cachedIsPaper != nil {
 		return *i.cachedIsPaper, nil
 	}
@@ -151,14 +158,21 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 				AccountID       string `xml:"accountId,attr"`
 				EquitySummaryInBase struct {
 					EquitySummaryByReportDateInBase []struct {
-						Total         string `xml:"total,attr"`
-						Cash          string `xml:"cash,attr"`
-						Stock         string `xml:"stock,attr"`
-						Options       string `xml:"options,attr"`
-						Commodities   string `xml:"commodities,attr"`
-						UnrealizedPnL string `xml:"unrealizedPnL,attr"`
+						Total                string `xml:"total,attr"`
+						Cash                 string `xml:"cash,attr"`
+						Stock                string `xml:"stock,attr"`
+						Options              string `xml:"options,attr"`
+						Commodities          string `xml:"commodities,attr"`
+						UnrealizedPnL        string `xml:"unrealizedPnL,attr"`
+						CfdUnrealizedPl      string `xml:"cfdUnrealizedPl,attr"`
+						ForexCfdUnrealizedPl string `xml:"forexCfdUnrealizedPl,attr"`
 					} `xml:"EquitySummaryByReportDateInBase"`
 				} `xml:"EquitySummaryInBase"`
+				OpenPositions struct {
+					OpenPosition []struct {
+						FifoPnlUnrealized string `xml:"fifoPnlUnrealized,attr"`
+					} `xml:"OpenPosition"`
+				} `xml:"OpenPositions"`
 			} `xml:"FlexStatement"`
 		} `xml:"FlexStatements"`
 	}
@@ -176,6 +190,21 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 	total, _ := strconv.ParseFloat(summary.Total, 64)
 	cash, _ := strconv.ParseFloat(summary.Cash, 64)
 	unrealized, _ := strconv.ParseFloat(summary.UnrealizedPnL, 64)
+
+	// IBKR EquitySummary only has cfd/forexCfd unrealized fields — not stocks/futures.
+	// Sum fifoPnlUnrealized from OpenPositions for the complete picture.
+	if unrealized == 0 {
+		for _, pos := range flex.FlexStatements.FlexStatement.OpenPositions.OpenPosition {
+			pnl, _ := strconv.ParseFloat(pos.FifoPnlUnrealized, 64)
+			unrealized += pnl
+		}
+	}
+	// Fallback to CFD fields if no open positions in the report
+	if unrealized == 0 {
+		cfdUnreal, _ := strconv.ParseFloat(summary.CfdUnrealizedPl, 64)
+		fxCfdUnreal, _ := strconv.ParseFloat(summary.ForexCfdUnrealizedPl, 64)
+		unrealized = cfdUnreal + fxCfdUnreal
+	}
 	stockVal, _ := strconv.ParseFloat(summary.Stock, 64)
 	optionsVal, _ := strconv.ParseFloat(summary.Options, 64)
 	commoditiesVal, _ := strconv.ParseFloat(summary.Commodities, 64)

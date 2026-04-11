@@ -77,7 +77,7 @@ func TestIsDueByInterval(t *testing.T) {
 	before45m := now.Add(-45 * time.Minute)
 	before30m := now.Add(-30 * time.Minute)
 	before1d := now.Add(-24 * time.Hour)
-	before23h := now.Add(-23 * time.Hour)
+	sameDayEarlier := time.Date(2026, 2, 28, 1, 0, 0, 0, time.UTC) // same calendar day
 	future := now.Add(10 * time.Minute)
 
 	tests := []struct {
@@ -117,8 +117,8 @@ func TestIsDueByInterval(t *testing.T) {
 			want:            true,
 		},
 		{
-			name:            "default interval not reached",
-			lastSync:        &before23h,
+			name:            "default interval not reached (same calendar day)",
+			lastSync:        &sameDayEarlier,
 			intervalMinutes: -5,
 			want:            false,
 		},

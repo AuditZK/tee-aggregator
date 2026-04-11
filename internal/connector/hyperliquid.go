@@ -56,17 +56,27 @@ func (h *Hyperliquid) GetBalance(ctx context.Context) (*Balance, error) {
 
 	var state struct {
 		MarginSummary struct {
-			AccountValue    string `json:"accountValue"`
-			TotalMarginUsed string `json:"totalMarginUsed"`
+			AccountValue string `json:"accountValue"`
 		} `json:"marginSummary"`
-		CrossMaintenanceMarginUsed string `json:"crossMaintenanceMarginUsed"`
+		AssetPositions []struct {
+			Position struct {
+				UnrealizedPnl string `json:"unrealizedPnl"`
+			} `json:"position"`
+		} `json:"assetPositions"`
 	}
 	if err := json.Unmarshal(resp, &state); err != nil {
 		return nil, fmt.Errorf("parse clearinghouse state: %w", err)
 	}
 
 	equity, _ := strconv.ParseFloat(state.MarginSummary.AccountValue, 64)
-	marginUsed, _ := strconv.ParseFloat(state.MarginSummary.TotalMarginUsed, 64)
+
+	// Sum unrealized PnL from open positions to derive realized balance.
+	// accountValue = realized_cash + unrealizedPnL, so realized_cash = accountValue - unrealizedPnL.
+	var unrealizedPnL float64
+	for _, ap := range state.AssetPositions {
+		v, _ := strconv.ParseFloat(ap.Position.UnrealizedPnl, 64)
+		unrealizedPnL += v
+	}
 
 	// Also check spot balances
 	spotResp, err := h.postInfo(ctx, map[string]interface{}{
@@ -91,9 +101,10 @@ func (h *Hyperliquid) GetBalance(ctx context.Context) (*Balance, error) {
 	}
 
 	return &Balance{
-		Equity:    equity,
-		Available: equity - marginUsed,
-		Currency:  "USD",
+		Equity:        equity,
+		Available:     equity - unrealizedPnL,
+		UnrealizedPnL: unrealizedPnL,
+		Currency:      "USD",
 	}, nil
 }
 

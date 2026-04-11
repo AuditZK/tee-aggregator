@@ -656,6 +656,19 @@ func (c *CTrader) sendWithTokenRefresh(ctx context.Context, call func() (json.Ra
 	if err == nil {
 		return raw, nil
 	}
+
+	// ALREADY_LOGGED_IN: previous WS session still active — just reconnect, no token refresh.
+	if isAlreadyLoggedIn(err) {
+		c.disconnect(errors.New("cTrader reconnect: ALREADY_LOGGED_IN"))
+		if err := c.ensureConnected(ctx); err != nil {
+			return nil, err
+		}
+		if err := c.authenticateApp(ctx); err != nil {
+			return nil, err
+		}
+		return call()
+	}
+
 	if !isAccessTokenInvalid(err) || strings.TrimSpace(c.refreshToken) == "" {
 		return nil, err
 	}
@@ -710,8 +723,11 @@ func (c *CTrader) refreshAccessToken(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("cTrader token refresh rate-limited (429), retry later")
+	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Token refresh failed: %s", strings.TrimSpace(string(body)))
+		return fmt.Errorf("Token refresh failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var tokenResp struct {
@@ -984,8 +1000,13 @@ func isAccessTokenInvalid(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "CH_ACCESS_TOKEN_INVALID") ||
-		strings.Contains(msg, "ALREADY_LOGGED_IN")
+	// Only refresh on truly invalid tokens. ALREADY_LOGGED_IN means the
+	// previous WS session is still active — reconnecting fixes it, no refresh needed.
+	return strings.Contains(msg, "CH_ACCESS_TOKEN_INVALID")
+}
+
+func isAlreadyLoggedIn(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "ALREADY_LOGGED_IN")
 }
 
 // detectCTraderMarketType guesses market type from symbol name.
