@@ -1,0 +1,60 @@
+# Fast test Dockerfile for parallel TEE deployment.
+#
+# Difference from Dockerfile.production:
+#   - NO Rust build stage (saves ~10 minutes of rebuild time).
+#   - snpguest is copied from ./bin/snpguest on the build host.
+#   - Operator must extract snpguest from an existing TS enclave container
+#     before building:
+#
+#       docker cp enclave_service:/usr/bin/snpguest ./bin/snpguest
+#       chmod +x ./bin/snpguest
+#
+# This dockerfile is ONLY intended for the parallel test stack
+# (docker-compose.parallel-test.yml). Production deployments must continue
+# to use Dockerfile.production which builds snpguest from source.
+
+# Go build stage
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+
+RUN apk add --no-cache git ca-certificates tzdata
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -trimpath \
+    -ldflags="-w -s" \
+    -o /enclave \
+    ./cmd/enclave
+
+# Runtime stage
+FROM alpine:3.20
+
+WORKDIR /app
+
+RUN apk add --no-cache ca-certificates tzdata wget
+
+# Copy prebuilt snpguest from the host (must be placed in ./bin/snpguest
+# before `docker compose build` is invoked).
+COPY bin/snpguest /usr/local/bin/snpguest
+RUN chmod +x /usr/local/bin/snpguest
+
+# Copy Go binary
+COPY --from=builder /enclave /app/enclave
+
+# Copy migrations
+COPY --from=builder /app/migrations /app/migrations
+
+# Cache directory for VCEK certs (runs as root for /dev/sev-guest access).
+RUN mkdir -p /var/cache/enclave/certs
+
+EXPOSE 3060 50061 50062 9093
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-check-certificate --no-verbose --tries=1 --spider https://localhost:3060/health || exit 1
+
+ENTRYPOINT ["/app/enclave"]
