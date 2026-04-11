@@ -38,7 +38,13 @@ type Snapshot struct {
 	CreatedAt       time.Time        `json:"created_at"`
 }
 
-// MarketBreakdown holds metrics per market type
+// MarketBreakdown holds metrics per market type.
+//
+// The "global" field is a TS-compat aggregate written by the TS enclave:
+// it contains the totals across all markets (trades, volume, fees). When
+// loading snapshots from a TS Prisma DB where top-level totals columns
+// don't exist (total_trades, total_volume, total_fees), we recover them
+// from breakdown.global — see scanSnapshotsTS.
 type MarketBreakdown struct {
 	Stocks      *MarketMetrics `json:"stocks,omitempty"`
 	Spot        *MarketMetrics `json:"spot,omitempty"`
@@ -50,6 +56,7 @@ type MarketBreakdown struct {
 	CFD         *MarketMetrics `json:"cfd,omitempty"`
 	Forex       *MarketMetrics `json:"forex,omitempty"`
 	Commodities *MarketMetrics `json:"commodities,omitempty"`
+	Global      *MarketMetrics `json:"global,omitempty"`
 }
 
 // MarketMetrics holds trading metrics for a market type
@@ -585,7 +592,7 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 				s.UserUID, s.Exchange, s.Label, s.Timestamp,
 				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
 				s.Deposits, s.Withdrawals, s.TotalTrades, s.TotalVolume, s.TotalFees,
-				breakdownJSON, s.CreatedAt,
+				breakdownJSON, time.Now().UTC(),
 			)
 		} else {
 			_, err = tx.Exec(ctx, `
@@ -609,7 +616,7 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 				s.UserUID, s.Exchange, s.Timestamp,
 				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
 				s.Deposits, s.Withdrawals, s.TotalTrades, s.TotalVolume, s.TotalFees,
-				breakdownJSON, s.CreatedAt,
+				breakdownJSON, time.Now().UTC(),
 			)
 		}
 
@@ -654,8 +661,17 @@ func (r *SnapshotRepo) scanSnapshots(rows pgx.Rows, hasLabel bool) ([]*Snapshot,
 	return snapshots, rows.Err()
 }
 
-// scanSnapshotsTS scans rows from TS Prisma schema (camelCase columns, no total_trades/total_volume/total_fees).
-// TS always has the label column. Go-only fields default to zero.
+// scanSnapshotsTS scans rows from TS Prisma schema (camelCase columns).
+//
+// The TS schema does not have top-level total_trades/total_volume/total_fees
+// columns — those aggregates live inside the breakdown_by_market JSONB under
+// the "global" key, which is how the TS enclave writes them. To keep parity
+// with the TS GetAggregatedMetrics response, we unmarshal the breakdown and
+// lift breakdown.global.* into the top-level Snapshot fields.
+//
+// TS always has the label column. If breakdown.global is missing (very old
+// rows predating the global aggregate), the totals fall back to zero, which
+// matches TS behaviour for those same rows.
 func (r *SnapshotRepo) scanSnapshotsTS(rows pgx.Rows) ([]*Snapshot, error) {
 	var snapshots []*Snapshot
 
@@ -673,13 +689,19 @@ func (r *SnapshotRepo) scanSnapshotsTS(rows pgx.Rows) ([]*Snapshot, error) {
 			return nil, err
 		}
 
-		// Go-only columns not present in TS schema — default to zero
+		// Default to zero; will be overwritten from breakdown.global below
+		// if present.
 		s.TotalTrades = 0
 		s.TotalVolume = 0
 		s.TotalFees = 0
 
 		if len(breakdownJSON) > 0 {
-			json.Unmarshal(breakdownJSON, &s.Breakdown)
+			if err := json.Unmarshal(breakdownJSON, &s.Breakdown); err == nil && s.Breakdown != nil && s.Breakdown.Global != nil {
+				g := s.Breakdown.Global
+				s.TotalTrades = g.Trades
+				s.TotalVolume = g.Volume
+				s.TotalFees = g.TradingFees + g.FundingFees
+			}
 		}
 
 		snapshots = append(snapshots, &s)
