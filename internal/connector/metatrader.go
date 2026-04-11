@@ -38,7 +38,10 @@ type MetaTrader struct {
 func NewMetaTrader(creds *Credentials) *MetaTrader {
 	login, _ := strconv.Atoi(strings.TrimSpace(creds.APIKey))
 	exchange := strings.ToLower(strings.TrimSpace(creds.Exchange))
-	if exchange != "mt5" {
+	switch exchange {
+	case "mt5", "exness":
+		exchange = "mt5"
+	default:
 		exchange = "mt4"
 	}
 
@@ -67,6 +70,12 @@ func (m *MetaTrader) TestConnection(ctx context.Context) error {
 	return err
 }
 
+// DetectIsPaper checks if the MT server name contains "Demo" or "Trial" (case-insensitive).
+func (m *MetaTrader) DetectIsPaper(_ context.Context) (bool, error) {
+	lower := strings.ToLower(m.server)
+	return strings.Contains(lower, "demo") || strings.Contains(lower, "trial"), nil
+}
+
 func (m *MetaTrader) GetBalance(ctx context.Context) (*Balance, error) {
 	sessionID, err := m.ensureSession(ctx)
 	if err != nil {
@@ -85,8 +94,15 @@ func (m *MetaTrader) GetBalance(ctx context.Context) (*Balance, error) {
 	}
 
 	unreal := info.UnrealizedPnL
-	if unreal == 0 {
-		unreal = info.Equity - info.Balance
+
+	// Parity with TS connector: when unrealized PnL is available (from position-level data),
+	// always derive equity as balance + unrealized. This avoids relying on accProfit from
+	// the binary account-info frame, which reads the wrong offset on some brokers (e.g. Exness).
+	var equity float64
+	if unreal != 0 {
+		equity = info.Balance + unreal
+	} else {
+		equity = info.Equity
 	}
 
 	currency := strings.TrimSpace(info.Currency)
@@ -94,9 +110,11 @@ func (m *MetaTrader) GetBalance(ctx context.Context) (*Balance, error) {
 		currency = "USD"
 	}
 
+	// Use balance (realized cash) as Available, not margin_free.
+	// margin_free = equity - margin_used and can be deeply negative on leveraged CFD accounts.
 	return &Balance{
-		Available:     info.MarginFree,
-		Equity:        info.Equity,
+		Available:     info.Balance,
+		Equity:        equity,
 		UnrealizedPnL: unreal,
 		Currency:      currency,
 	}, nil
@@ -173,6 +191,10 @@ func (m *MetaTrader) GetTrades(ctx context.Context, start, end time.Time) ([]*Tr
 		ts, _ := time.Parse(time.RFC3339, d.CloseTime)
 		if ts.IsZero() {
 			ts = start
+		}
+		// Bridge ignores from/to params — filter client-side
+		if ts.Before(start) || ts.After(end) {
+			continue
 		}
 		side := strings.ToLower(strings.TrimSpace(d.Side))
 		if side != "sell" {
@@ -295,6 +317,20 @@ func (m *MetaTrader) callBridge(ctx context.Context, method, path string, body a
 	return json.Unmarshal(env.Data, out)
 }
 
+// isBalanceSymbol returns true for symbols that represent balance operations.
+// Standard MT5: empty symbol → bridge maps to "BALANCE".
+// Demo accounts: brokers credit virtual funds via "Bonus"/"Credit" deals — these
+// are the demo equivalent of deposits and must be counted as cashflows.
+func isBalanceSymbol(symbol string, isDemo bool) bool {
+	if symbol == "BALANCE" {
+		return true
+	}
+	if isDemo && (symbol == "Bonus" || symbol == "Credit") {
+		return true
+	}
+	return false
+}
+
 func priceWithFallback(closePrice, openPrice float64) float64 {
 	if closePrice != 0 {
 		return closePrice
@@ -320,34 +356,41 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 	path := fmt.Sprintf("/api/v1/sessions/%s/history-deals?from=%d&to=%d",
 		sessionID, since.Unix(), now.Unix())
 
-	var resp struct {
-		Deals []struct {
-			Symbol      string  `json:"symbol"`
-			Side        string  `json:"side"`
-			RealizedPnL float64 `json:"realized_pnl"`
-			CloseTime   string  `json:"close_time"`
-		} `json:"deals"`
+	// Bridge returns a direct array of deals (same format as GetTrades)
+	var deals []struct {
+		Symbol      string  `json:"symbol"`
+		Side        string  `json:"side"`
+		RealizedPnl float64 `json:"realized_pnl"`
+		CloseTime   string  `json:"close_time"`
 	}
 
-	if err := m.callBridge(ctx, "GET", path, nil, &resp); err != nil {
+	if err := m.callBridge(ctx, "GET", path, nil, &deals); err != nil {
 		return nil, err
 	}
 
+
 	var cashflows []*Cashflow
-	for _, deal := range resp.Deals {
-		if deal.Symbol != "BALANCE" {
+	for _, deal := range deals {
+		isDemo := strings.Contains(strings.ToLower(m.server), "demo")
+		if !isBalanceSymbol(deal.Symbol, isDemo) {
 			continue
 		}
 		ts, _ := time.Parse(time.RFC3339, deal.CloseTime)
-		if ts.IsZero() {
+		if ts.IsZero() || ts.Before(since) {
 			continue
 		}
-		amount := deal.RealizedPnL
-		if deal.Side == "withdrawal" {
-			amount = -mathAbs(amount)
-		} else if deal.Side == "deposit" {
-			amount = mathAbs(amount)
-		} else {
+		// Standard brokers: side="deposit"/"withdrawal"
+		// Some brokers (e.g. Headway): side="buy"/"sell" — use sign of realized_pnl instead
+		var amount float64
+		switch deal.Side {
+		case "deposit", "buy":
+			amount = mathAbs(deal.RealizedPnl)
+		case "withdrawal", "sell":
+			amount = -mathAbs(deal.RealizedPnl)
+		default:
+			continue
+		}
+		if amount == 0 {
 			continue
 		}
 		cashflows = append(cashflows, &Cashflow{

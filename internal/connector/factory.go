@@ -65,7 +65,7 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 	// CFD/Forex brokers
 	case "ctrader":
 		return NewCTrader(creds), nil
-	case "mt4", "mt5":
+	case "mt4", "mt5", "exness":
 		return NewMetaTrader(creds), nil
 
 	// Testing
@@ -107,6 +107,7 @@ func (f *Factory) SupportedExchanges() []string {
 		"ctrader",
 		"mt4",
 		"mt5",
+		"exness",
 		"mock",
 	}
 }

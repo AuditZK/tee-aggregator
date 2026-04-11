@@ -145,23 +145,14 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 
 	// TS parity: capture exchange metadata (KYC level + paper/live status)
 	// after successful connection creation; failures are non-blocking.
-	s.captureExchangeMetadata(ctx, conn.ID, &connector.Credentials{
-		Exchange:   normalizedExchange,
-		APIKey:     req.APIKey,
-		APISecret:  req.APISecret,
-		Passphrase: req.Passphrase,
-	})
+	// Reuse testConn — it already has cached state from TestConnection (e.g. IBKR paper detection).
+	s.captureExchangeMetadata(ctx, conn.ID, testConn)
 
 	return nil
 }
 
-func (s *ConnectionService) captureExchangeMetadata(ctx context.Context, connectionID string, creds *connector.Credentials) {
-	if s.repo == nil || s.factory == nil || strings.TrimSpace(connectionID) == "" || creds == nil {
-		return
-	}
-
-	exchangeConn, err := s.factory.Create(creds)
-	if err != nil {
+func (s *ConnectionService) captureExchangeMetadata(ctx context.Context, connectionID string, exchangeConn connector.Connector) {
+	if s.repo == nil || strings.TrimSpace(connectionID) == "" || exchangeConn == nil {
 		return
 	}
 
@@ -296,7 +287,15 @@ func normalizeSyncIntervalMinutes(value int) int {
 }
 
 func normalizeExchange(exchange string) string {
-	return strings.ToLower(strings.TrimSpace(exchange))
+	e := strings.ToLower(strings.TrimSpace(exchange))
+	// Normalize broker aliases to their underlying platform name
+	switch e {
+	case "exness":
+		return "mt5"
+	case "binanceusdm":
+		return "binance_futures"
+	}
+	return e
 }
 
 func normalizeKYCLevel(level string) string {
