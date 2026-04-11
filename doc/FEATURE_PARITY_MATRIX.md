@@ -157,7 +157,7 @@ The Go version exposes sync/metrics/snapshots/report/verify via **both** REST an
 |-----------|-----------|-----|----------------|-------|
 | Credential encryption (AES-256-GCM) | ✅ Node crypto | ✅ crypto/aes + cipher.NewGCM | ✅ | Different storage format (single hex vs separate fields) |
 | ECIES (E2E encryption) | ✅ ECDH P-256 + HKDF + AES-256-GCM | ✅ ecdh.P256 + HKDF + AES-256-GCM | ✅ | Same HKDF info string: "enclave-e2e-encryption" |
-| Report signing | ✅ **ECDSA P-256** with SHA-256 | ✅ **Ed25519** | **INTENTIONAL CHANGE** | Go uses Ed25519 per AGENTS.md |
+| Report signing | ✅ **ECDSA P-256** with SHA-256 | ✅ **Ed25519** | **INTENTIONAL CHANGE** | Go uses Ed25519 per project crypto policy |
 | TLS certificates | ✅ ECDSA P-256 | ✅ ECDSA P-256 | ✅ | Both generate self-signed at startup |
 | Key derivation (HKDF) | ✅ crypto.hkdfSync | ✅ golang.org/x/crypto/hkdf | ✅ | — |
 | HMAC-SHA256 (exchange signing) | ✅ crypto.createHmac | ✅ crypto/hmac | ✅ | Used in connector implementations |
@@ -168,7 +168,7 @@ The Go version exposes sync/metrics/snapshots/report/verify via **both** REST an
 ### Signing Algorithm Divergence (INTENTIONAL)
 - TypeScript: ECDSA P-256 (secp256r1) with SHA-256 — `createSign('SHA256')`
 - Go: Ed25519 — `ed25519.Sign()`
-- **Justification**: AGENTS.md specifies Ed25519 for report signing. This is a deliberate upgrade.
+- **Justification**: project crypto policy specifies Ed25519 for report signing. This is a deliberate upgrade.
 - **Impact**: Reports signed by TS cannot be verified by Go and vice versa. This is acceptable as they are separate instances.
 
 ---

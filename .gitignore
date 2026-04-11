@@ -26,8 +26,9 @@ vendor/
 .env.*
 .env.local
 
-
-.agents/settings.local.json
+# Local AI assistant configuration (never commit, never push)
+.agents/
+.agents/
 
 # OS
 .DS_Store
