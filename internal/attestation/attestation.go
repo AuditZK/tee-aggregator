@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -243,9 +244,12 @@ func (s *Service) buildReportData() string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-var measurementRegex = regexp.MustCompile(`(?i)measurement[:\s]+([0-9a-fA-F]+)`)
-var reportDataRegex = regexp.MustCompile(`(?i)report_data[:\s]+([0-9a-fA-F]+)`)
-var platformVersionRegex = regexp.MustCompile(`(?i)platform_version[:\s]+([0-9a-fA-F]+)`)
+// hexLineRegex matches a line that is part of a multi-line hex dump from
+// `snpguest display report`, e.g. "12 06 83 61 36 9c f9 17 ...".
+// snpguest 0.10+ emits one field header per section ("Measurement:"), then
+// one or more lines of space-separated hex bytes, so we need a state-machine
+// parser (see parseSnpguestReport) rather than single-line regexes.
+var hexLineRegex = regexp.MustCompile(`(?i)^[0-9a-f]{2}(\s+[0-9a-f]{2})+\s*$`)
 
 func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*SevSnpReport, error) {
 	snpguestPath := s.snpguestPath
@@ -274,16 +278,28 @@ func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*Se
 		return nil, fmt.Errorf("write request data: %w", err)
 	}
 
-	// Step 1: Generate attestation report
+	// Step 1: Generate attestation report. The report embeds our 64-byte
+	// request data (TLS fingerprint SHA-256) in its REPORT_DATA field; this
+	// is what lets clients verify that the TLS cert they connect to is
+	// bound to the attestation report.
 	cmd := exec.CommandContext(ctx, snpguestPath, "report", reportPath, requestPath)
 	output, err := cmd.CombinedOutput()
+	reportBoundToRequest := true
 	if err != nil {
-		// Retry with --random flag
+		// Fallback: retry with --random. snpguest will fill REPORT_DATA with
+		// random bytes, which means we LOSE the TLS binding for this report.
+		// We surface this loudly so operators can diagnose why the primary
+		// path failed instead of silently serving an unbound attestation.
+		s.logger.Warn("snpguest report with request data failed, falling back to --random (TLS binding will be lost for this report)",
+			zap.Error(err),
+			zap.String("output", string(output)),
+		)
 		cmd = exec.CommandContext(ctx, snpguestPath, "report", reportPath, requestPath, "--random")
 		output, err = cmd.CombinedOutput()
 		if err != nil {
 			return nil, fmt.Errorf("snpguest report: %w: %s", err, string(output))
 		}
+		reportBoundToRequest = false
 	}
 
 	// Step 2: Fetch and verify VCEK certificates
@@ -307,24 +323,111 @@ func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*Se
 		return nil, fmt.Errorf("snpguest display: %w: %s", err, string(displayOutput))
 	}
 
-	outputStr := string(displayOutput)
 	report := &SevSnpReport{
 		Verified:      true,
 		SevSnpEnabled: true,
 		VcekVerified:  vcekVerified,
 	}
+	parseSnpguestReport(string(displayOutput), report)
 
-	if matches := measurementRegex.FindStringSubmatch(outputStr); len(matches) > 1 {
-		report.Measurement = matches[1]
+	if report.Measurement == "" {
+		return nil, fmt.Errorf("failed to parse measurement from snpguest output")
 	}
-	if matches := reportDataRegex.FindStringSubmatch(outputStr); len(matches) > 1 {
-		report.ReportData = matches[1]
-	}
-	if matches := platformVersionRegex.FindStringSubmatch(outputStr); len(matches) > 1 {
-		report.PlatformVersion = matches[1]
+
+	// Fallback: if display-report didn't emit the Report Data section (older
+	// snpguest builds, or unexpected output format), recover it from the
+	// request file we wrote ourselves. TS parity: sev-snp-attestation.service.ts
+	// calls readRequestDataFile() for exactly the same reason.
+	//
+	// Only do this when we know the report IS bound to the request (i.e. we
+	// didn't fall back to --random). Otherwise the file would lie about the
+	// binding.
+	if report.ReportData == "" && reportBoundToRequest {
+		if rawRequest, err := os.ReadFile(requestPath); err == nil {
+			report.ReportData = hex.EncodeToString(rawRequest)
+			s.logger.Debug("recovered report_data from request file (display output had no Report Data section)")
+		}
 	}
 
 	return report, nil
+}
+
+// parseSnpguestReport parses the multi-line output of `snpguest display report`.
+//
+// snpguest 0.10+ emits one section header per field (e.g. "Measurement:") then
+// one or more lines of space-separated hex bytes. The previous single-line
+// regex implementation only captured the first 2 hex chars. We mirror the TS
+// parser (src/services/sev-snp-attestation.service.ts) by running a small
+// state machine that accumulates hex bytes until a new field header is seen.
+//
+// Example input:
+//
+//	Version: 2
+//	Guest SVN: 7
+//	Measurement:
+//	12 06 83 61 36 9c f9 17 9b b6 ac 08 57 2b 7e 15
+//	ed 0b c8 ab b6 98 cb 04 d4 f5 84 f7 ff 51 2a 4c
+//	20 81 c1 f5 b1 05 35 1d bd 45 c0 35 a7 d6 a3 a5
+//	Report Data:
+//	...
+func parseSnpguestReport(output string, report *SevSnpReport) {
+	var currentField string
+	var hexBuffer []string
+
+	flush := func() {
+		if currentField == "" || len(hexBuffer) == 0 {
+			return
+		}
+		// Join and strip all whitespace
+		combined := strings.Join(hexBuffer, "")
+		combined = strings.ReplaceAll(combined, " ", "")
+		combined = strings.ReplaceAll(combined, "\t", "")
+		switch currentField {
+		case "measurement":
+			report.Measurement = combined
+		case "report_data":
+			report.ReportData = combined
+		case "platform_version":
+			report.PlatformVersion = combined
+		}
+		hexBuffer = hexBuffer[:0]
+	}
+
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+
+		// If we're inside a known field and this line is a hex dump row,
+		// accumulate it.
+		if currentField != "" && hexLineRegex.MatchString(line) {
+			hexBuffer = append(hexBuffer, line)
+			continue
+		}
+
+		// Otherwise, a new header starts — flush the previous field and
+		// detect the new one.
+		flush()
+
+		switch {
+		case strings.HasPrefix(line, "Measurement:"):
+			currentField = "measurement"
+		case strings.HasPrefix(line, "Report Data:"):
+			currentField = "report_data"
+		case strings.HasPrefix(line, "Platform Version:"), strings.HasPrefix(line, "Platform_version:"):
+			currentField = "platform_version"
+		default:
+			// Any other "Foo: value" line ends the current field without
+			// starting a new tracked one.
+			if strings.Contains(line, ":") {
+				currentField = ""
+			}
+		}
+	}
+
+	// Final flush for the last field in the file.
+	flush()
 }
 
 func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir string) bool {
