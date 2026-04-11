@@ -72,6 +72,9 @@ type Service struct {
 	devMode        bool
 	logger         *zap.Logger
 
+	// Resolved snpguest binary path (empty if not found on PATH)
+	snpguestPath string
+
 	// VCEK cert caching
 	vcekCacheDir string
 	vcekTTL      time.Duration
@@ -94,6 +97,12 @@ type Options struct {
 }
 
 // NewService creates a new attestation service.
+//
+// Resolves the snpguest binary at construction time by checking a list of
+// well-known paths and falling back to $PATH lookup. This matters because
+// Dockerfile.production installs snpguest to /usr/local/bin while older
+// setups placed it in /usr/bin — without resolution the service would
+// silently fall back to dev mode on the TEE.
 func NewService(opts Options) *Service {
 	return &Service{
 		tlsFingerprint: opts.TLSFingerprint,
@@ -101,10 +110,34 @@ func NewService(opts Options) *Service {
 		signingPubKey:  opts.SigningPubKey,
 		devMode:        opts.DevMode,
 		logger:         opts.Logger,
+		snpguestPath:   resolveSnpguestPath(opts.Logger),
 		vcekCacheDir:   "/var/cache/enclave/certs",
 		vcekTTL:        7 * 24 * time.Hour,
 		attestTTL:      5 * time.Second,
 	}
+}
+
+// resolveSnpguestPath returns the first snpguest binary found on disk.
+// Returns "" if none is found — callers must treat that as "SEV-SNP unavailable".
+func resolveSnpguestPath(logger *zap.Logger) string {
+	candidates := []string{
+		"/usr/local/bin/snpguest",
+		"/usr/bin/snpguest",
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	if p, err := exec.LookPath("snpguest"); err == nil {
+		return p
+	}
+	if logger != nil {
+		logger.Warn("snpguest binary not found — SEV-SNP attestation will fall back to dev mode",
+			zap.Strings("searched", candidates),
+		)
+	}
+	return ""
 }
 
 // GetAttestation returns the current attestation report (cached for 5s).
@@ -215,9 +248,9 @@ var reportDataRegex = regexp.MustCompile(`(?i)report_data[:\s]+([0-9a-fA-F]+)`)
 var platformVersionRegex = regexp.MustCompile(`(?i)platform_version[:\s]+([0-9a-fA-F]+)`)
 
 func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*SevSnpReport, error) {
-	snpguestPath := "/usr/bin/snpguest"
-	if _, err := os.Stat(snpguestPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("snpguest not found")
+	snpguestPath := s.snpguestPath
+	if snpguestPath == "" {
+		return nil, fmt.Errorf("snpguest not found on this system")
 	}
 
 	// Create temp directory for report files (TS parity)
@@ -300,41 +333,83 @@ func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir st
 	if info, err := os.Stat(vcekPath); err == nil {
 		if time.Since(info.ModTime()) < s.vcekTTL {
 			// Copy cached certs to temp certsDir for verification
-			copyFile(vcekPath, filepath.Join(certsDir, "vcek.pem"))
+			if err := copyFile(vcekPath, filepath.Join(certsDir, "vcek.pem")); err != nil {
+				s.logger.Warn("failed to copy cached VCEK cert to temp dir",
+					zap.String("src", vcekPath),
+					zap.Error(err),
+				)
+				return false
+			}
 			caPath := filepath.Join(s.vcekCacheDir, "ask.pem")
 			if _, err := os.Stat(caPath); err == nil {
-				copyFile(caPath, filepath.Join(certsDir, "ask.pem"))
+				if err := copyFile(caPath, filepath.Join(certsDir, "ask.pem")); err != nil {
+					s.logger.Warn("failed to copy cached CA cert to temp dir",
+						zap.String("src", caPath),
+						zap.Error(err),
+					)
+					return false
+				}
 			}
 			return true
 		}
 	}
 
+	// Ensure cache dir exists before writing (silent-create failure was masking errors)
+	if err := os.MkdirAll(s.vcekCacheDir, 0700); err != nil {
+		s.logger.Warn("failed to create VCEK cache dir (continuing without cache)",
+			zap.String("dir", s.vcekCacheDir),
+			zap.Error(err),
+		)
+	}
+
+	if s.snpguestPath == "" {
+		return false
+	}
+
 	// Fetch from AMD KDS via snpguest (TS parity: fetch vcek pem + ca pem)
-	cmd := exec.CommandContext(ctx, "/usr/bin/snpguest", "fetch", "vcek", "pem", certsDir, reportPath)
+	cmd := exec.CommandContext(ctx, s.snpguestPath, "fetch", "vcek", "pem", certsDir, reportPath)
 	if err := cmd.Run(); err != nil {
 		s.logger.Warn("failed to fetch VCEK certificate", zap.Error(err))
 		return false
 	}
 
-	caCmd := exec.CommandContext(ctx, "/usr/bin/snpguest", "fetch", "ca", "pem", certsDir,
+	caCmd := exec.CommandContext(ctx, s.snpguestPath, "fetch", "ca", "pem", certsDir,
 		"--endorser", "vcek", "-r", reportPath)
 	if err := caCmd.Run(); err != nil {
 		s.logger.Warn("failed to fetch CA certificate", zap.Error(err))
 	}
 
-	// Cache for next time
-	copyFile(filepath.Join(certsDir, "vcek.pem"), vcekPath)
-	copyFile(filepath.Join(certsDir, "ask.pem"), filepath.Join(s.vcekCacheDir, "ask.pem"))
+	// Cache for next time (non-fatal: failure just means next boot refetches)
+	if err := copyFile(filepath.Join(certsDir, "vcek.pem"), vcekPath); err != nil {
+		s.logger.Warn("failed to cache VCEK certificate (next boot will refetch)",
+			zap.String("dst", vcekPath),
+			zap.Error(err),
+		)
+	}
+	askSrc := filepath.Join(certsDir, "ask.pem")
+	if _, err := os.Stat(askSrc); err == nil {
+		if err := copyFile(askSrc, filepath.Join(s.vcekCacheDir, "ask.pem")); err != nil {
+			s.logger.Warn("failed to cache ASK certificate (next boot will refetch)",
+				zap.Error(err),
+			)
+		}
+	}
 
 	return true
 }
 
-func copyFile(src, dst string) {
+// copyFile copies src to dst with 0600 perms. Returns an error on any failure
+// instead of silently discarding it — callers must log/handle the error so
+// VCEK cache issues are observable.
+func copyFile(src, dst string) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
-		return
+		return fmt.Errorf("read %s: %w", src, err)
 	}
-	os.WriteFile(dst, data, 0600)
+	if err := os.WriteFile(dst, data, 0600); err != nil {
+		return fmt.Errorf("write %s: %w", dst, err)
+	}
+	return nil
 }
 
 func (s *Service) fetchFromAzure(ctx context.Context) (*SevSnpReport, error) {

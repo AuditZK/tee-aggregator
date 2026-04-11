@@ -263,7 +263,7 @@ func TestGetAggregatedMetrics_InvalidExchange_ReturnsInvalidArgument(t *testing.
 }
 
 func TestVerifyReportSignature_MissingFields_ReturnsInvalidArgument(t *testing.T) {
-	reportSvc := service.NewReportService(nil, nil, signing.NewReportSignerGenerate())
+	reportSvc := service.NewReportService(nil, nil, signing.MustNewReportSignerGenerate())
 	srv := NewServer(zap.NewNop(), nil, nil, nil, reportSvc, nil, nil)
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()

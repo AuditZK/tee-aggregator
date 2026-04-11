@@ -1,0 +1,78 @@
+# Docker Compose - Parallel Go enclave test on TEE
+# Runs ALONGSIDE the existing TS enclave on the same SEV-SNP Milan VM.
+# Uses offset ports (+10) so nothing collides with the TS production stack.
+#
+# Start:
+#   docker compose -f docker-compose.parallel-test.yml up -d
+#
+# Stop:
+#   docker compose -f docker-compose.parallel-test.yml down
+#
+# Required env vars (inject via `docker compose ... up` or an env file NOT
+# committed to git):
+#   DATABASE_URL     - points at the test clone (enclave_db_go_test on backend VPS)
+#   ENCRYPTION_KEY   - same key as TS prod so DEK unwrap works on cloned data
+#   TLS_CERT_PATH    - path on host to TLS cert
+#   TLS_KEY_PATH     - path on host to TLS key
+
+services:
+  enclave-go-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    image: enclave-go:parallel-test
+    container_name: enclave_go_test
+    restart: "no"  # manual control during testing
+    user: root
+    environment:
+      - ENV=production
+      # Offset ports (+10) to coexist with TS enclave
+      - GRPC_PORT=50061
+      - REST_PORT=3060
+      - LOG_STREAM_PORT=50062
+      - METRICS_ENABLED=true
+      - METRICS_PORT=9093
+      - GRPC_INSECURE=false
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      - LOG_LEVEL=debug
+      # CRITICAL: disable cron sync to avoid interfering with TS prod cron
+      - ENABLE_DAILY_SYNC=false
+      - AUTO_MIGRATE=true
+      - LOG_STREAM_API_KEY=${LOG_STREAM_API_KEY:-}
+      - BENCHMARK_SERVICE_URL=${BENCHMARK_SERVICE_URL:-}
+      - CTRADER_CLIENT_ID=${CTRADER_CLIENT_ID:-}
+      - CTRADER_CLIENT_SECRET=${CTRADER_CLIENT_SECRET:-}
+      - EXCHANGE_HTTP_PROXY=${EXCHANGE_HTTP_PROXY:-}
+      - PROXY_EXCHANGES=${PROXY_EXCHANGES:-binance}
+      - CORS_ORIGIN=${CORS_ORIGIN:-}
+      - TLS_CERT_PATH=${TLS_CERT_PATH:-/etc/enclave/server.crt}
+      - TLS_KEY_PATH=${TLS_KEY_PATH:-/etc/enclave/server.key}
+      - TLS_CA_CERT=${TLS_CA_CERT:-/etc/enclave/ca.crt}
+      - TLS_SERVER_CERT=${TLS_SERVER_CERT:-/etc/enclave/server.crt}
+      - TLS_SERVER_KEY=${TLS_SERVER_KEY:-/etc/enclave/server.key}
+    ports:
+      - "50061:50061"  # gRPC
+      - "50062:50062"  # Log stream SSE
+      - "3060:3060"    # REST API
+    expose:
+      - "9093"
+    volumes:
+      - ./certs:/etc/enclave:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - vcek_cache_test:/var/cache/enclave/certs
+    devices:
+      - /dev/sev-guest:/dev/sev-guest
+    privileged: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+volumes:
+  vcek_cache_test:

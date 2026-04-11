@@ -7,7 +7,7 @@ import (
 )
 
 func TestSignAndVerify(t *testing.T) {
-	signer := NewReportSignerGenerate()
+	signer := MustNewReportSignerGenerate()
 
 	input := &ReportInput{
 		UserUID:          "user_abc1234567890",
@@ -74,7 +74,7 @@ func TestSignAndVerify(t *testing.T) {
 }
 
 func TestVerifyTamperedHash(t *testing.T) {
-	signer := NewReportSignerGenerate()
+	signer := MustNewReportSignerGenerate()
 
 	input := &ReportInput{
 		UserUID:     "user_abc1234567890",
@@ -99,8 +99,8 @@ func TestVerifyTamperedHash(t *testing.T) {
 }
 
 func TestVerifyWrongPublicKey(t *testing.T) {
-	signer1 := NewReportSignerGenerate()
-	signer2 := NewReportSignerGenerate()
+	signer1 := MustNewReportSignerGenerate()
+	signer2 := MustNewReportSignerGenerate()
 
 	input := &ReportInput{
 		UserUID:     "user_abc1234567890",
@@ -145,7 +145,7 @@ func TestSignFromSeed(t *testing.T) {
 }
 
 func TestReportContainsExtendedData(t *testing.T) {
-	signer := NewReportSignerGenerate()
+	signer := MustNewReportSignerGenerate()
 
 	input := &ReportInput{
 		UserUID:     "user_abc1234567890",

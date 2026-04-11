@@ -167,7 +167,10 @@ func main() {
 	}
 
 	// 12. Init report signer (ephemeral key per startup)
-	signer := signing.NewReportSignerGenerate()
+	signer, err := signing.NewReportSignerGenerate()
+	if err != nil {
+		logger.Fatal("failed to initialize report signer", zap.Error(err))
+	}
 	signingPubKey := signer.PublicKey()
 	logger.Info("report signer initialized",
 		zap.String("algorithm", signing.SignatureAlgorithm),

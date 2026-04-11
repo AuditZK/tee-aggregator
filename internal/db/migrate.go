@@ -22,12 +22,33 @@ type migrationFile struct {
 
 // ApplyMigrations executes SQL migration files from dir in ascending numeric order.
 // File name format must start with a numeric prefix, e.g. "001_init.sql".
+//
+// Schema detection: If the target database was previously managed by the
+// TypeScript enclave (Prisma/camelCase), this function SKIPS all migrations
+// and logs a warning. The TS schema uses "userUid" / "isActive" columns while
+// Go migrations create "user_uid" / "is_active" — applying Go migrations on a
+// TS schema would fail partway through. The Go repositories include dual-schema
+// query support (see connection.go) so the enclave works fine against a TS DB
+// as long as migrations are skipped.
 func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool, dir string, logger *zap.Logger) error {
 	if pool == nil {
 		return fmt.Errorf("pool is nil")
 	}
 	if strings.TrimSpace(dir) == "" {
 		return fmt.Errorf("migrations dir is empty")
+	}
+
+	// Detect legacy TS/Prisma schema before touching anything.
+	tsSchema, err := detectTSPrismaSchema(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("detect schema: %w", err)
+	}
+	if tsSchema {
+		logger.Warn("detected TS/Prisma schema (camelCase columns) — skipping Go migrations",
+			zap.String("reason", "exchange_connections.\"userUid\" column exists"),
+			zap.String("hint", "Go repositories use dual-schema query support; no DDL changes applied"),
+		)
+		return nil
 	}
 
 	files, err := loadMigrationFiles(dir)
@@ -156,6 +177,29 @@ func ensureSchemaMigrationsTable(ctx context.Context, pool *pgxpool.Pool) error 
 		)`
 	_, err := pool.Exec(ctx, q)
 	return err
+}
+
+// detectTSPrismaSchema returns true if the target DB has the legacy
+// TypeScript/Prisma schema, identified by the presence of a "userUid"
+// (camelCase) column on exchange_connections. This is the marker used by
+// repositories/connection.go for dual-schema query routing.
+//
+// Returns (false, nil) if exchange_connections does not exist yet — that's a
+// fresh DB and Go migrations should proceed normally.
+func detectTSPrismaSchema(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+	const q = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'exchange_connections'
+			  AND column_name = 'userUid'
+		)`
+	var exists bool
+	if err := pool.QueryRow(ctx, q).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func getAppliedVersions(ctx context.Context, pool *pgxpool.Pool) (map[int]struct{}, error) {

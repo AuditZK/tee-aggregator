@@ -60,15 +60,28 @@ func NewReportSigner(seed []byte) (*ReportSigner, error) {
 }
 
 // NewReportSignerGenerate creates a signer with a new keypair.
-func NewReportSignerGenerate() *ReportSigner {
+// Returns an error if the system RNG fails or the public key cannot be
+// serialized — callers (typically main.go startup) should treat failure as
+// fatal since without a signer the enclave cannot produce verifiable reports.
+func NewReportSignerGenerate() (*ReportSigner, error) {
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		panic(fmt.Sprintf("failed to generate report signer keypair: %v", err))
+		return nil, fmt.Errorf("generate report signer keypair: %w", err)
 	}
 
 	signer, err := newReportSignerFromPrivateKey(privateKey)
 	if err != nil {
-		panic(fmt.Sprintf("failed to initialize report signer: %v", err))
+		return nil, fmt.Errorf("initialize report signer: %w", err)
+	}
+	return signer, nil
+}
+
+// MustNewReportSignerGenerate is a test-only helper that panics on error.
+// Production code must use NewReportSignerGenerate and handle the error.
+func MustNewReportSignerGenerate() *ReportSigner {
+	signer, err := NewReportSignerGenerate()
+	if err != nil {
+		panic(err)
 	}
 	return signer
 }
