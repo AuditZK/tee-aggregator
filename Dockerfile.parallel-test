@@ -2,12 +2,16 @@
 #
 # Difference from Dockerfile.production:
 #   - NO Rust build stage (saves ~10 minutes of rebuild time).
-#   - snpguest is copied from ./bin/snpguest on the build host.
+#   - snpguest is copied from ./third_party/snpguest on the build host.
 #   - Operator must extract snpguest from an existing TS enclave container
 #     before building:
 #
-#       docker cp enclave_service:/usr/bin/snpguest ./bin/snpguest
-#       chmod +x ./bin/snpguest
+#       mkdir -p third_party
+#       docker cp enclave_service:/usr/bin/snpguest ./third_party/snpguest
+#       chmod +x ./third_party/snpguest
+#
+# NOTE: we use ./third_party/ rather than ./bin/ because .dockerignore
+# excludes bin/ to keep the image clean of local build artefacts.
 #
 # This dockerfile is ONLY intended for the parallel test stack
 # (docker-compose.parallel-test.yml). Production deployments must continue
@@ -38,9 +42,9 @@ WORKDIR /app
 
 RUN apk add --no-cache ca-certificates tzdata wget
 
-# Copy prebuilt snpguest from the host (must be placed in ./bin/snpguest
-# before `docker compose build` is invoked).
-COPY bin/snpguest /usr/local/bin/snpguest
+# Copy prebuilt snpguest from the host (must be placed in
+# ./third_party/snpguest before `docker compose build` is invoked).
+COPY third_party/snpguest /usr/local/bin/snpguest
 RUN chmod +x /usr/local/bin/snpguest
 
 # Copy Go binary
