@@ -36,8 +36,11 @@ services:
       - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
       - LOG_LEVEL=debug
-      # CRITICAL: disable cron sync to avoid interfering with TS prod cron
-      - ENABLE_DAILY_SYNC=false
+      # Daily scheduler: defaults to true (sync at 00:00 UTC) but can be
+      # disabled via .env.parallel-test to run a passive read-only test
+      # alongside the TS prod enclave. Set ENABLE_DAILY_SYNC=false in the
+      # env file to keep the Go enclave as a pure observer.
+      - ENABLE_DAILY_SYNC=${ENABLE_DAILY_SYNC:-true}
       - AUTO_MIGRATE=true
       - LOG_STREAM_API_KEY=${LOG_STREAM_API_KEY:-}
       - BENCHMARK_SERVICE_URL=${BENCHMARK_SERVICE_URL:-}
