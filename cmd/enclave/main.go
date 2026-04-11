@@ -265,12 +265,16 @@ func main() {
 		}
 	}
 
-	// 18. Start sync scheduler
+	// 18. Start sync scheduler (honours ENABLE_DAILY_SYNC)
 	var syncScheduler *scheduler.SyncScheduler
 	if syncSvc != nil && userRepo != nil {
 		syncScheduler = scheduler.NewSyncScheduler(syncSvc, userRepo, logger)
-		syncScheduler.Start()
 		restServer.SetScheduler(syncScheduler)
+		if cfg.EnableDailySync {
+			syncScheduler.Start()
+		} else {
+			logger.Info("daily sync scheduler disabled by ENABLE_DAILY_SYNC=false (manual sync via gRPC still works)")
+		}
 	}
 
 	logger.Info("enclave worker ready",
