@@ -46,7 +46,7 @@ func TestOptionalInterfaces(t *testing.T) {
 		{"Alpaca", NewAlpaca(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, false, false, true},
 		{"Hyperliquid", NewHyperliquid(&Credentials{WalletAddress: "0x1"}), true, true, true, false, false, true},
 		{"Lighter", NewLighter(&Credentials{WalletAddress: "0x1"}), false, true, false, false, false, true},
-		{"MEXC", NewMEXC(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, false, false, false},
+		{"MEXC", NewMEXC(&Credentials{APIKey: "k", APISecret: "s"}), true, true, true, false, false, false},
 		{"Mock", NewMock(), false, false, false, false, false, false},
 	}
 
