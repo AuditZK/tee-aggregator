@@ -269,7 +269,7 @@ func main() {
 		logger.Warn("gRPC running without TLS (development mode with GRPC_INSECURE=true)")
 	}
 
-	grpcServer := enclaveGrpc.NewServer(logger, connSvc, syncSvc, metricsSvc, reportSvc, snapshotRepo, userRepo)
+	grpcServer := enclaveGrpc.NewServer(logger, connSvc, syncSvc, metricsSvc, reportSvc, snapshotRepo, userRepo, attestSvc)
 	go func() {
 		if err := grpcServer.Start(cfg.GRPCPort, grpcTLSConfig); err != nil {
 			logger.Fatal("gRPC server failed", zap.Error(err))
