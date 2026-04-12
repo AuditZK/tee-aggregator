@@ -116,12 +116,65 @@ func main() {
 	// 8. Connect database
 	pool := connectDatabase(ctx, cfg, logger)
 
-	// 9. Init encryption (AES for credentials at rest)
-	// TS prod uses ENCRYPTION_KEY directly (hardware key derivation fails silently).
-	// We match this behavior: use ENCRYPTION_KEY as the AES-256 key.
-	enc, err := encryption.New(cfg.EncryptionKey)
-	if err != nil {
-		logger.Fatal("encryption init failed", zap.Error(err))
+	// 9. Init encryption (AES for credentials at rest).
+	//
+	// Credentials on disk were encrypted with a DEK that lives
+	// wrapped inside data_encryption_keys. To decrypt them we must:
+	//   1. Derive the master key (SEV-SNP measurement or env fallback).
+	//   2. Read the active wrapped DEK from the DB.
+	//   3. Unwrap it with the master key.
+	//   4. Use the unwrapped DEK as the AES-256-GCM key.
+	//
+	// The previous implementation used cfg.EncryptionKey directly as
+	// the AES key, bypassing steps 2 and 3. That path silently
+	// produced a "decryption failed: authentication error" for every
+	// credential on a DB seeded by the TS enclave.
+	//
+	// We fall back to the raw ENCRYPTION_KEY path only when there is
+	// no database pool (dev harness) or when the DB is empty and
+	// auto-seeding is explicitly requested — see the pool != nil
+	// branch below.
+	var enc *encryption.Service
+	if pool != nil {
+		keyDerivation, derivErr := encryption.NewKeyDerivationService(logger)
+		if derivErr != nil {
+			logger.Fatal("key derivation init failed", zap.Error(derivErr))
+		}
+		logger.Info("key derivation initialized",
+			zap.Bool("hardware_sev_snp", keyDerivation.IsHardwareKey()),
+			zap.String("master_key_id", keyDerivation.GetMasterKeyID()),
+		)
+
+		keyMgmt, kmErr := encryption.NewKeyManagementService(pool, encryption.KeyManagementOptions{
+			Derivation:    keyDerivation,
+			Logger:        logger,
+			AllowAutoInit: cfg.IsDevelopment(),
+		})
+		if kmErr != nil {
+			// Hard fail: running against a DB whose DEK we cannot
+			// unwrap means every sync will fail. Bail out early with
+			// a descriptive error instead of silently pretending
+			// ENCRYPTION_KEY works.
+			logger.Fatal("key management init failed (cannot unwrap active DEK)",
+				zap.Error(kmErr),
+				zap.String("hint", "check ENCRYPTION_KEY, SEV-SNP attestation, and data_encryption_keys.master_key_id"),
+			)
+		}
+
+		enc, err = keyMgmt.GetEncryptionService()
+		if err != nil {
+			logger.Fatal("build encryption service from DEK failed", zap.Error(err))
+		}
+		logger.Info("encryption service bound to unwrapped DEK from data_encryption_keys")
+	} else {
+		// No DB: use the env-var key directly. This path is for the
+		// dev harness that runs the enclave without a backing
+		// Postgres, so there is no wrapped DEK to load.
+		logger.Warn("no database pool — initializing encryption with ENCRYPTION_KEY directly (dev harness only)")
+		enc, err = encryption.New(cfg.EncryptionKey)
+		if err != nil {
+			logger.Fatal("encryption init failed", zap.Error(err))
+		}
 	}
 
 	// 10. Init repositories

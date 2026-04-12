@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
 )
 
 // DEK represents a Data Encryption Key
@@ -22,29 +23,69 @@ type DEK struct {
 	RotatedAt    time.Time `json:"rotated_at,omitempty"`
 }
 
-// KeyManagementService manages DEK lifecycle
+// KeyManagementService manages DEK lifecycle.
+//
+// Lifetime rules:
+//   - An instance holds a single unwrapped DEK in memory for the
+//     lifetime of the process. DEKs are never written to disk outside
+//     the data_encryption_keys table (where they live wrapped).
+//   - On startup the service reads the active wrapped DEK from the DB
+//     and unwraps it with the master key from KeyDerivationService.
+//   - If unwrap fails, the service returns an error so the operator
+//     can investigate. It does NOT auto-rotate: auto-rotation would
+//     overwrite a DEK that may still be in use by a sibling enclave
+//     (e.g. the TS prod enclave sharing the same DB), which would
+//     permanently break every credential encrypted with the old DEK.
+//
+// AllowAutoInit controls whether the service is allowed to create a
+// brand-new DEK when no active row exists. This is only safe on a
+// fresh database; reuse against a seeded DB must set it to false.
 type KeyManagementService struct {
 	pool       *pgxpool.Pool
 	derivation *KeyDerivationService
+	logger     *zap.Logger
 
 	currentDEK []byte
 	dekID      string
 	mu         sync.RWMutex
+
+	allowAutoInit bool
 }
 
-// NewKeyManagementService creates a new key management service
-func NewKeyManagementService(pool *pgxpool.Pool) (*KeyManagementService, error) {
-	derivation, err := NewKeyDerivationService()
-	if err != nil {
-		return nil, fmt.Errorf("init key derivation: %w", err)
+// KeyManagementOptions configures NewKeyManagementService.
+type KeyManagementOptions struct {
+	// Derivation provides the master key used to unwrap the DEK. If
+	// nil, the service builds its own via NewKeyDerivationService.
+	Derivation *KeyDerivationService
+
+	// Logger is optional; when non-nil the service records key
+	// lifecycle events.
+	Logger *zap.Logger
+
+	// AllowAutoInit permits the service to write a fresh DEK to the
+	// database when none exists yet. Set false for parallel-test /
+	// shared-DB scenarios to avoid silently reseeding a live schema.
+	AllowAutoInit bool
+}
+
+// NewKeyManagementService creates a new key management service.
+func NewKeyManagementService(pool *pgxpool.Pool, opts KeyManagementOptions) (*KeyManagementService, error) {
+	derivation := opts.Derivation
+	if derivation == nil {
+		var err error
+		derivation, err = NewKeyDerivationService(opts.Logger)
+		if err != nil {
+			return nil, fmt.Errorf("init key derivation: %w", err)
+		}
 	}
 
 	svc := &KeyManagementService{
-		pool:       pool,
-		derivation: derivation,
+		pool:          pool,
+		derivation:    derivation,
+		logger:        opts.Logger,
+		allowAutoInit: opts.AllowAutoInit,
 	}
 
-	// Load or create DEK
 	if err := svc.initializeDEK(context.Background()); err != nil {
 		return nil, fmt.Errorf("init DEK: %w", err)
 	}
@@ -73,35 +114,151 @@ func (s *KeyManagementService) GetEncryptionService() (*Service, error) {
 	return New(dek)
 }
 
-// RotateDEK creates a new DEK and marks the old one as inactive
+// RotateDEK creates a new DEK and marks the old one as inactive.
+// This is an explicit operator-requested action — unlike the broken
+// auto-rotate that used to live inside initializeDEK, callers that
+// invoke this must be sure no sibling enclave depends on the current
+// DEK.
 func (s *KeyManagementService) RotateDEK(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.rotateDEKLocked(ctx)
+}
 
-	// Generate new DEK
+// initializeDEK loads the active DEK from the database, unwraps it
+// with the master key, and caches it in memory.
+//
+// Supports both Go (snake_case) and TS Prisma (camelCase) column
+// names so the service can attach to either schema transparently.
+//
+// On unwrap failure this function does NOT rotate the DEK. Rotating
+// would deactivate the DEK that a sibling TS enclave is still using
+// to decrypt credentials, permanently bricking every existing
+// exchange_connections row. Instead we return a descriptive error so
+// the operator can diagnose the master-key / DEK mismatch.
+func (s *KeyManagementService) initializeDEK(ctx context.Context) error {
+	dek, schema, err := s.loadActiveDEK(ctx)
+	if err != nil {
+		return fmt.Errorf("load active dek: %w", err)
+	}
+
+	if dek == nil {
+		if !s.allowAutoInit {
+			return fmt.Errorf("no active DEK in data_encryption_keys and AllowAutoInit=false — refusing to seed a new DEK on a shared database")
+		}
+		if s.logger != nil {
+			s.logger.Warn("no active DEK in database — seeding a fresh one (AllowAutoInit=true)")
+		}
+		return s.rotateDEKLocked(ctx)
+	}
+
+	if s.logger != nil {
+		s.logger.Info("loaded active DEK from database",
+			zap.String("dek_id", dek.ID),
+			zap.String("schema", schema),
+			zap.String("stored_master_key_id", dek.MasterKeyID),
+			zap.String("current_master_key_id", s.derivation.GetMasterKeyID()),
+		)
+	}
+
+	// Sanity check: warn if the stored master key id does not match
+	// the one we just derived. This usually means the attestation
+	// measurement drifted (kernel / container upgrade) and the TS
+	// enclave has not yet run its migration script.
+	if dek.MasterKeyID != "" && dek.MasterKeyID != s.derivation.GetMasterKeyID() && s.logger != nil {
+		s.logger.Warn("master key id mismatch between derivation and stored DEK — unwrap will likely fail",
+			zap.String("stored", dek.MasterKeyID),
+			zap.String("derived", s.derivation.GetMasterKeyID()),
+		)
+	}
+
+	wrapped := &EncryptedData{
+		Ciphertext: dek.EncryptedDEK,
+		IV:         dek.IV,
+		AuthTag:    dek.AuthTag,
+	}
+
+	unwrapped, err := s.derivation.UnwrapKey(wrapped)
+	if err != nil {
+		return fmt.Errorf(
+			"unwrap active DEK (id=%s, stored_master_key_id=%s, derived_master_key_id=%s): %w — "+
+				"refusing to rotate the DEK automatically; investigate the master-key mismatch manually",
+			dek.ID, dek.MasterKeyID, s.derivation.GetMasterKeyID(), err,
+		)
+	}
+
+	s.currentDEK = unwrapped
+	s.dekID = dek.ID
+	return nil
+}
+
+// loadActiveDEK queries data_encryption_keys for the currently-active
+// row, trying the Go snake_case schema first then the TS Prisma
+// camelCase schema. Returns (nil, "", nil) when neither schema has an
+// active row — this is the signal to seed a new DEK if AllowAutoInit
+// is true.
+func (s *KeyManagementService) loadActiveDEK(ctx context.Context) (*DEK, string, error) {
+	var dek DEK
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, encrypted_dek, iv, auth_tag, master_key_id
+		FROM data_encryption_keys
+		WHERE is_active = true
+		ORDER BY created_at DESC
+		LIMIT 1`).Scan(
+		&dek.ID, &dek.EncryptedDEK, &dek.IV, &dek.AuthTag, &dek.MasterKeyID,
+	)
+	if err == nil {
+		return &dek, "go-snake", nil
+	}
+
+	// Try TS Prisma camelCase schema. We can't easily distinguish
+	// "table has no row" from "column does not exist" at this layer,
+	// so we try the second query unconditionally and only report the
+	// second error.
+	err = s.pool.QueryRow(ctx, `
+		SELECT id, "encryptedDEK", iv, "authTag", "masterKeyId"
+		FROM data_encryption_keys
+		WHERE "isActive" = true
+		ORDER BY "createdAt" DESC
+		LIMIT 1`).Scan(
+		&dek.ID, &dek.EncryptedDEK, &dek.IV, &dek.AuthTag, &dek.MasterKeyID,
+	)
+	if err == nil {
+		return &dek, "ts-camel", nil
+	}
+
+	// pgx reports "no rows" via pgx.ErrNoRows; every other error is
+	// real (missing table, bad schema, etc.) and should surface.
+	if err.Error() == "no rows in result set" {
+		return nil, "", nil
+	}
+	return nil, "", err
+}
+
+// rotateDEKLocked is the internal helper used when we have decided
+// it is safe to write a fresh DEK (either after an explicit Rotate()
+// call or during initial seeding with AllowAutoInit=true). The caller
+// must hold s.mu or be inside the constructor.
+func (s *KeyManagementService) rotateDEKLocked(ctx context.Context) error {
 	newDEK := make([]byte, 32)
 	if _, err := rand.Read(newDEK); err != nil {
 		return fmt.Errorf("generate DEK: %w", err)
 	}
 
-	// Wrap with master key
 	wrapped, err := s.derivation.WrapKey(newDEK)
 	if err != nil {
 		return fmt.Errorf("wrap DEK: %w", err)
 	}
 
-	// Deactivate old DEK
 	if s.dekID != "" {
-		_, err := s.pool.Exec(ctx, `
+		if _, err := s.pool.Exec(ctx, `
 			UPDATE data_encryption_keys
 			SET is_active = false, rotated_at = NOW()
-			WHERE id = $1`, s.dekID)
-		if err != nil {
+			WHERE id = $1`, s.dekID); err != nil {
 			return fmt.Errorf("deactivate old DEK: %w", err)
 		}
 	}
 
-	// Store new DEK
 	var newID string
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO data_encryption_keys
@@ -117,57 +274,13 @@ func (s *KeyManagementService) RotateDEK(ctx context.Context) error {
 
 	s.currentDEK = newDEK
 	s.dekID = newID
-
-	return nil
-}
-
-// initializeDEK loads or creates the initial DEK.
-// Supports both Go (snake_case) and TS Prisma (camelCase) column names.
-func (s *KeyManagementService) initializeDEK(ctx context.Context) error {
-	// Try Go schema first, then TS schema
-	var dek DEK
-	err := s.pool.QueryRow(ctx, `
-		SELECT id, encrypted_dek, iv, auth_tag, master_key_id
-		FROM data_encryption_keys
-		WHERE is_active = true
-		ORDER BY created_at DESC
-		LIMIT 1`).Scan(
-		&dek.ID, &dek.EncryptedDEK, &dek.IV, &dek.AuthTag, &dek.MasterKeyID,
-	)
-
-	if err != nil {
-		// Try TS Prisma camelCase schema
-		err = s.pool.QueryRow(ctx, `
-			SELECT id, "encryptedDEK", iv, "authTag", "masterKeyId"
-			FROM data_encryption_keys
-			WHERE "isActive" = true
-			ORDER BY "createdAt" DESC
-			LIMIT 1`).Scan(
-			&dek.ID, &dek.EncryptedDEK, &dek.IV, &dek.AuthTag, &dek.MasterKeyID,
+	if s.logger != nil {
+		s.logger.Info("wrote fresh DEK",
+			zap.String("dek_id", newID),
+			zap.String("master_key_id", s.derivation.GetMasterKeyID()),
 		)
 	}
-
-	if err == nil {
-		// Unwrap existing DEK
-		wrapped := &EncryptedData{
-			Ciphertext: dek.EncryptedDEK,
-			IV:         dek.IV,
-			AuthTag:    dek.AuthTag,
-		}
-
-		unwrapped, err := s.derivation.UnwrapKey(wrapped)
-		if err != nil {
-			// Master key changed, need to migrate
-			return s.RotateDEK(ctx)
-		}
-
-		s.currentDEK = unwrapped
-		s.dekID = dek.ID
-		return nil
-	}
-
-	// No existing DEK, create new one
-	return s.RotateDEK(ctx)
+	return nil
 }
 
 // IsHardwareKeyAvailable returns true if using hardware-derived master key

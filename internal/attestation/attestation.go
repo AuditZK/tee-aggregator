@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/trackrecord/enclave/internal/snpguest"
 	"go.uber.org/zap"
 )
 
@@ -99,11 +100,12 @@ type Options struct {
 
 // NewService creates a new attestation service.
 //
-// Resolves the snpguest binary at construction time by checking a list of
-// well-known paths and falling back to $PATH lookup. This matters because
-// Dockerfile.production installs snpguest to /usr/local/bin while older
-// setups placed it in /usr/bin — without resolution the service would
-// silently fall back to dev mode on the TEE.
+// Resolves the snpguest binary at construction time via the shared
+// snpguest.ResolvePath helper, which checks /usr/local/bin, /usr/bin,
+// then $PATH. This matters because Dockerfile.production installs
+// snpguest to /usr/local/bin while older setups placed it in /usr/bin —
+// without resolution the service would silently fall back to dev mode
+// on the TEE.
 func NewService(opts Options) *Service {
 	return &Service{
 		tlsFingerprint: opts.TLSFingerprint,
@@ -111,34 +113,11 @@ func NewService(opts Options) *Service {
 		signingPubKey:  opts.SigningPubKey,
 		devMode:        opts.DevMode,
 		logger:         opts.Logger,
-		snpguestPath:   resolveSnpguestPath(opts.Logger),
+		snpguestPath:   snpguest.ResolvePath(opts.Logger),
 		vcekCacheDir:   "/var/cache/enclave/certs",
 		vcekTTL:        7 * 24 * time.Hour,
 		attestTTL:      5 * time.Second,
 	}
-}
-
-// resolveSnpguestPath returns the first snpguest binary found on disk.
-// Returns "" if none is found — callers must treat that as "SEV-SNP unavailable".
-func resolveSnpguestPath(logger *zap.Logger) string {
-	candidates := []string{
-		"/usr/local/bin/snpguest",
-		"/usr/bin/snpguest",
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	if p, err := exec.LookPath("snpguest"); err == nil {
-		return p
-	}
-	if logger != nil {
-		logger.Warn("snpguest binary not found — SEV-SNP attestation will fall back to dev mode",
-			zap.Strings("searched", candidates),
-		)
-	}
-	return ""
 }
 
 // GetAttestation returns the current attestation report (cached for 5s).

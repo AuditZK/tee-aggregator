@@ -1,137 +1,235 @@
 package encryption
 
 import (
-	"crypto/rand"
+	"bytes"
+	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strings"
+	"time"
 
+	"github.com/trackrecord/enclave/internal/snpguest"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/hkdf"
 )
 
 const (
 	sevGuestDevice = "/dev/sev-guest"
 	masterKeySize  = 32
+
+	// hkdfInfoMasterKey must match the TS enclave's HKDF info string
+	// (src/services/key-derivation.service.ts: HKDF_INFO =
+	// 'track-record-enclave-dek'). If this diverges, Go will derive a
+	// different master key from the same SEV-SNP measurement and be
+	// unable to unwrap DEKs produced by the TS enclave.
+	hkdfInfoMasterKey = "track-record-enclave-dek"
 )
 
-// KeyDerivationService derives master keys from hardware measurements
+// KeyDerivationService derives master keys from hardware measurements.
+//
+// On hosts with /dev/sev-guest + snpguest available it reads the SEV-SNP
+// attestation report, extracts the launch measurement, and derives the
+// master key via HKDF-SHA256 with the same parameters as the TS enclave.
+// Without the hardware path, it falls back to interpreting the
+// ENCRYPTION_KEY environment variable as the master key directly — this
+// mirrors the TS enclave's dev-mode behaviour and is only safe for test
+// environments where both TS and Go point at the same pre-seeded key.
 type KeyDerivationService struct {
-	masterKey  []byte
-	isHardware bool
+	masterKey    []byte
+	isHardware   bool
+	snpguestPath string
+	logger       *zap.Logger
 }
 
 // NewKeyDerivationService creates a new key derivation service.
-// Falls back to ENCRYPTION_KEY env var when SEV-SNP hardware is unavailable (TS parity).
-func NewKeyDerivationService() (*KeyDerivationService, error) {
-	svc := &KeyDerivationService{}
+func NewKeyDerivationService(logger *zap.Logger) (*KeyDerivationService, error) {
+	svc := &KeyDerivationService{
+		snpguestPath: snpguest.ResolvePath(logger),
+		logger:       logger,
+	}
 	if err := svc.deriveMasterKey(); err != nil {
 		return nil, err
 	}
 	return svc, nil
 }
 
-// deriveMasterKey derives the master key from SEV-SNP or from ENCRYPTION_KEY env var.
+// deriveMasterKey populates s.masterKey. Preferred path is SEV-SNP
+// hardware. Falls back to the ENCRYPTION_KEY environment variable when
+// hardware is not available.
 func (s *KeyDerivationService) deriveMasterKey() error {
-	// Try to read from SEV-SNP hardware
-	measurement, err := s.getSEVMeasurement()
-	if err != nil {
-		// Fallback: derive from ENCRYPTION_KEY env var (TS parity)
-		envKey := os.Getenv("ENCRYPTION_KEY")
-		if envKey != "" {
-			keyBytes, decErr := hexDecode(envKey)
-			if decErr == nil && len(keyBytes) == 32 {
-				// Derive master key from env key using HKDF (same as TS key-derivation.service.ts)
-				hash := sha256.New
-				reader := hkdf.New(hash, keyBytes, nil, []byte("enclave-master-key-v1"))
-				s.masterKey = make([]byte, masterKeySize)
-				if _, err := io.ReadFull(reader, s.masterKey); err != nil {
-					return fmt.Errorf("derive master key from env: %w", err)
-				}
-				s.isHardware = false
-				return nil
-			}
+	measurement, platformVersion, err := s.getSEVMeasurement()
+	if err == nil && len(measurement) > 0 {
+		// TS parity: HKDF-SHA256(measurement, salt=platformVersion-utf8,
+		// info="track-record-enclave-dek", length=32). The TS enclave
+		// passes Buffer.from(platformVersion, 'utf8') when present and
+		// Buffer.alloc(0) otherwise. Go's hkdf.New treats an empty
+		// []byte identically to nil per RFC 5869.
+		var salt []byte
+		if platformVersion != "" {
+			salt = []byte(platformVersion)
 		}
-
-		// Last resort: random key (development only, cannot read existing DEKs)
+		reader := hkdf.New(sha256.New, measurement, salt, []byte(hkdfInfoMasterKey))
 		s.masterKey = make([]byte, masterKeySize)
-		if _, err := rand.Read(s.masterKey); err != nil {
-			return fmt.Errorf("generate dev key: %w", err)
+		if _, err := io.ReadFull(reader, s.masterKey); err != nil {
+			return fmt.Errorf("derive master key from sev-snp measurement: %w", err)
 		}
-		s.isHardware = false
+		s.isHardware = true
+		if s.logger != nil {
+			s.logger.Info("master key derived from SEV-SNP measurement",
+				zap.String("measurement_prefix", hex.EncodeToString(measurement[:min(8, len(measurement))])),
+				zap.String("master_key_id", s.GetMasterKeyID()),
+			)
+		}
 		return nil
 	}
 
-	// Derive master key using HKDF (TS parity: HKDF_INFO = 'track-record-enclave-dek')
-	hash := sha256.New
-	reader := hkdf.New(hash, measurement, nil, []byte("track-record-enclave-dek"))
-
-	s.masterKey = make([]byte, masterKeySize)
-	if _, err := io.ReadFull(reader, s.masterKey); err != nil {
-		return fmt.Errorf("derive master key: %w", err)
+	// Hardware path unavailable or failed. Fall back to the env-var key.
+	// This matches the TS enclave's dev-mode behaviour where
+	// ENCRYPTION_KEY is interpreted as the 32-byte master key directly
+	// (no HKDF, no hardware derivation). Only safe when the TS and Go
+	// enclaves agree on the same pre-seeded master key.
+	envKey := strings.TrimSpace(os.Getenv("ENCRYPTION_KEY"))
+	if envKey == "" {
+		if err != nil {
+			return fmt.Errorf("cannot derive master key: sev-snp unavailable (%w) and ENCRYPTION_KEY not set", err)
+		}
+		return fmt.Errorf("cannot derive master key: sev-snp unavailable and ENCRYPTION_KEY not set")
 	}
 
-	s.isHardware = true
+	keyBytes, decErr := hex.DecodeString(envKey)
+	if decErr != nil {
+		return fmt.Errorf("ENCRYPTION_KEY is not valid hex: %w", decErr)
+	}
+	if len(keyBytes) != masterKeySize {
+		return fmt.Errorf("ENCRYPTION_KEY must decode to %d bytes, got %d", masterKeySize, len(keyBytes))
+	}
+	s.masterKey = keyBytes
+	s.isHardware = false
+	if s.logger != nil {
+		reason := "sev-snp unavailable"
+		if err != nil {
+			reason = err.Error()
+		}
+		s.logger.Warn("falling back to ENCRYPTION_KEY env var as master key (dev/test mode)",
+			zap.String("reason", reason),
+			zap.String("master_key_id", s.GetMasterKeyID()),
+		)
+	}
 	return nil
 }
 
-// getSEVMeasurement reads the SEV-SNP measurement using snpguest.
-func (s *KeyDerivationService) getSEVMeasurement() ([]byte, error) {
-	// Check if running in SEV-SNP environment
+// getSEVMeasurement extracts the launch measurement from a fresh
+// snpguest attestation report. Returns (measurement, platformVersion).
+// platformVersion is empty for snpguest-derived reports because the
+// standard `snpguest display report` output does not include a
+// "Platform Version" field (the TS enclave also observes this).
+func (s *KeyDerivationService) getSEVMeasurement() ([]byte, string, error) {
 	if _, err := os.Stat(sevGuestDevice); os.IsNotExist(err) {
-		return nil, fmt.Errorf("SEV-SNP not available")
+		return nil, "", fmt.Errorf("sev-snp not available: %s missing", sevGuestDevice)
+	}
+	if s.snpguestPath == "" {
+		return nil, "", fmt.Errorf("snpguest binary not found")
 	}
 
-	// Use snpguest to get the measurement (same as TS attestation flow)
-	snpguestPath := "/usr/bin/snpguest"
-	if _, err := os.Stat(snpguestPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("snpguest not found")
-	}
-
-	// Create temp files for report
-	tmpDir, err := os.MkdirTemp("", "snp-key-*")
+	tmpDir, err := os.MkdirTemp("", "snp-keyderiv-*")
 	if err != nil {
-		return nil, fmt.Errorf("create temp dir: %w", err)
+		return nil, "", fmt.Errorf("create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	reportPath := tmpDir + "/report.bin"
-	requestPath := tmpDir + "/request.bin"
-
-	// Write empty request data
-	os.WriteFile(requestPath, make([]byte, 64), 0600)
-
-	// Generate report
-	cmd := exec.Command(snpguestPath, "report", reportPath, requestPath)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("snpguest report: %w: %s", err, string(output))
+	reportPath := filepath.Join(tmpDir, "report.bin")
+	requestPath := filepath.Join(tmpDir, "request.bin")
+	if err := os.WriteFile(requestPath, make([]byte, 64), 0600); err != nil {
+		return nil, "", fmt.Errorf("write request data: %w", err)
 	}
 
-	// Display and parse measurement
-	displayCmd := exec.Command(snpguestPath, "display", "report", reportPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, s.snpguestPath, "report", reportPath, requestPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		// Retry with --random because some kernels reject empty request
+		// data; the measurement field is independent of the request
+		// data so this does not affect key derivation.
+		retry := exec.CommandContext(ctx, s.snpguestPath, "report", reportPath, requestPath, "--random")
+		if retryOut, retryErr := retry.CombinedOutput(); retryErr != nil {
+			return nil, "", fmt.Errorf("snpguest report: %w: %s / %s", err, string(output), string(retryOut))
+		}
+	}
+
+	displayCmd := exec.CommandContext(ctx, s.snpguestPath, "display", "report", reportPath)
 	output, err := displayCmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("snpguest display: %w", err)
+		return nil, "", fmt.Errorf("snpguest display: %w: %s", err, string(output))
 	}
 
-	// Parse measurement from output
-	re := regexp.MustCompile(`(?i)measurement[:\s]+([0-9a-fA-F]+)`)
-	matches := re.FindSubmatch(output)
-	if len(matches) < 2 {
-		return nil, fmt.Errorf("measurement not found in snpguest output")
+	measurement, platformVersion := parseMeasurementFromDisplay(string(output))
+	if len(measurement) == 0 {
+		return nil, "", fmt.Errorf("measurement not found in snpguest output")
 	}
-
-	measurement, err := hexDecode(string(matches[1]))
-	if err != nil {
-		return nil, fmt.Errorf("decode measurement: %w", err)
-	}
-
-	return measurement, nil
+	return measurement, platformVersion, nil
 }
 
-// WrapKey encrypts a DEK with the master key
+// measurementHeaderRegex matches the "Measurement:" section header.
+// The actual measurement bytes follow on one or more subsequent lines
+// as space-separated hex octets — we collect them with a small state
+// machine in parseMeasurementFromDisplay to mirror the TS parser.
+var measurementHeaderRegex = regexp.MustCompile(`(?i)^measurement:\s*$`)
+
+// hexDumpLineRegex matches a continuation line in a hex dump, e.g.
+// "12 06 83 61 36 9c f9 17 9b b6 ac 08 57 2b 7e 15".
+var hexDumpLineRegex = regexp.MustCompile(`(?i)^[0-9a-f]{2}(\s+[0-9a-f]{2})+\s*$`)
+
+// parseMeasurementFromDisplay extracts the measurement bytes from
+// `snpguest display report` output. Also returns a platformVersion
+// string (currently always empty for snpguest-sourced reports; kept as
+// a return value so the caller can evolve this cleanly without
+// changing the signature).
+func parseMeasurementFromDisplay(output string) ([]byte, string) {
+	var inMeasurement bool
+	var hexBuffer bytes.Buffer
+
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+
+		if measurementHeaderRegex.MatchString(line) {
+			inMeasurement = true
+			continue
+		}
+
+		if inMeasurement {
+			if hexDumpLineRegex.MatchString(line) {
+				// Strip whitespace and accumulate as raw hex.
+				hexBuffer.WriteString(strings.ReplaceAll(line, " ", ""))
+				continue
+			}
+			// First non-hex line after Measurement: ends the section.
+			break
+		}
+	}
+
+	if hexBuffer.Len() == 0 {
+		return nil, ""
+	}
+	bytes, err := hex.DecodeString(hexBuffer.String())
+	if err != nil {
+		return nil, ""
+	}
+	return bytes, ""
+}
+
+// WrapKey encrypts a DEK with the master key using AES-256-GCM.
+// Matches TS key-derivation.service.ts wrapKey() which uses a 12-byte
+// IV and base64 encoding for the three fields.
 func (s *KeyDerivationService) WrapKey(dek []byte) (*EncryptedData, error) {
 	svc, err := New(s.masterKey)
 	if err != nil {
@@ -140,7 +238,10 @@ func (s *KeyDerivationService) WrapKey(dek []byte) (*EncryptedData, error) {
 	return svc.Encrypt(dek)
 }
 
-// UnwrapKey decrypts a DEK with the master key
+// UnwrapKey decrypts a wrapped DEK with the master key. The three
+// base64 fields (IV, ciphertext, auth tag) come from the
+// data_encryption_keys table and were written by the TS enclave using
+// exactly the same layout — see wrapKey() above.
 func (s *KeyDerivationService) UnwrapKey(wrapped *EncryptedData) ([]byte, error) {
 	svc, err := New(s.masterKey)
 	if err != nil {
@@ -149,13 +250,25 @@ func (s *KeyDerivationService) UnwrapKey(wrapped *EncryptedData) ([]byte, error)
 	return svc.Decrypt(wrapped)
 }
 
-// IsHardwareKey returns true if using hardware-derived key
+// IsHardwareKey returns true if the master key came from SEV-SNP
+// attestation, false if it came from the ENCRYPTION_KEY env var
+// fallback.
 func (s *KeyDerivationService) IsHardwareKey() bool {
 	return s.isHardware
 }
 
-// GetMasterKeyID returns a hash of the master key for identification
+// GetMasterKeyID returns the first 8 bytes of SHA-256(masterKey) as hex,
+// matching the TS enclave's getMasterKeyId() so that the
+// data_encryption_keys.master_key_id column is comparable between Go
+// and TS.
 func (s *KeyDerivationService) GetMasterKeyID() string {
 	hash := sha256.Sum256(s.masterKey)
-	return fmt.Sprintf("%x", hash[:8])
+	return hex.EncodeToString(hash[:8])
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
