@@ -120,6 +120,7 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 	// Futures balance via contract.mexc.com
 	futuresEquity := 0.0
 	futuresAvailable := 0.0
+	futuresCash := 0.0
 	futBody, err2 := m.futuresSignedGET(ctx, "/api/v1/private/account/assets", "")
 	if err2 == nil {
 		var futResp struct {
@@ -140,6 +141,11 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 						if strings.EqualFold(a.Currency, sc) {
 							futuresEquity += a.Equity
 							futuresAvailable += a.AvailableBalance
+							// TS parity: realizedBalance = cashBalance (deposited cash +
+							// realised P&L). unrealizedPnL = equity - cashBalance.
+							// Using availableBalance instead overstates unrealized by
+							// positionMargin. See CcxtExchangeConnector.ts extractSwapEquity.
+							futuresCash += a.CashBalance
 						}
 					}
 				}
@@ -158,7 +164,7 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 	return &Balance{
 		Equity:        totalEquity,
 		Available:     totalAvailable,
-		UnrealizedPnL: futuresEquity - futuresAvailable,
+		UnrealizedPnL: futuresEquity - futuresCash,
 		Currency:      "USDT",
 	}, nil
 }
