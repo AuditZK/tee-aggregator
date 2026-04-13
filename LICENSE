@@ -1,0 +1,42 @@
+AuditZK Source-Available License (ASAL) v1.0
+Copyright (c) 2026 AuditZK
+All rights reserved.
+
+1. License Grant
+
+You are granted a limited, non-exclusive, non-transferable,
+non-sublicensable license to:
+
+- View and download the source code
+- Compile the software
+- Execute the software strictly for audit, security review,
+  reproducibility verification, and research purposes
+
+2. No Modification or Redistribution
+
+You may NOT:
+
+- Modify the source code
+- Create derivative works
+- Publish forks
+- Redistribute the source code or binaries
+- Use the software in production
+- Offer it as a service
+- Create any competing product or service
+
+3. Feedback
+
+You may report issues or vulnerabilities privately.
+No right to publish modified versions is granted.
+
+4. Commercial License
+
+Any commercial use requires explicit written authorization.
+
+5. Ownership
+
+All intellectual property rights remain exclusively with AuditZK.
+
+6. Disclaimer
+
+The software is provided "as is", without warranty of any kind.
