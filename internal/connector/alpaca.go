@@ -90,14 +90,10 @@ func (a *Alpaca) GetBalance(ctx context.Context) (*Balance, error) {
 	}
 
 	var resp struct {
-		Cash             string `json:"cash"`
-		PortfolioValue   string `json:"portfolio_value"`
-		Equity           string `json:"equity"`
-		BuyingPower      string `json:"buying_power"`
-		LongMarketValue  string `json:"long_market_value"`
-		ShortMarketValue string `json:"short_market_value"`
-		UnrealizedPL     string `json:"unrealized_pl"`
-		UnrealizedPLPC   string `json:"unrealized_plpc"`
+		Cash           string `json:"cash"`
+		PortfolioValue string `json:"portfolio_value"`
+		Equity         string `json:"equity"`
+		BuyingPower    string `json:"buying_power"`
 	}
 
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -106,7 +102,19 @@ func (a *Alpaca) GetBalance(ctx context.Context) (*Balance, error) {
 
 	equity, _ := strconv.ParseFloat(resp.Equity, 64)
 	cash, _ := strconv.ParseFloat(resp.Cash, 64)
-	unrealized, _ := strconv.ParseFloat(resp.UnrealizedPL, 64)
+
+	// Alpaca's /v2/account response does not expose an aggregate
+	// unrealized_pl field (unlike most exchanges). The per-position
+	// unrealized_pl is only available from /v2/positions. Fetch it
+	// here so balance.UnrealizedPnL is accurate and sync.go can
+	// derive realizedBalance = equity - unrealized correctly.
+	unrealized := 0.0
+	positions, posErr := a.GetPositions(ctx)
+	if posErr == nil {
+		for _, p := range positions {
+			unrealized += p.UnrealizedPnL
+		}
+	}
 
 	return &Balance{
 		Available:     cash,
