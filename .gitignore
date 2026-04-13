@@ -4,7 +4,7 @@
 *.dll
 *.so
 *.dylib
-enclave
+/enclave
 
 # Test binary
 *.test

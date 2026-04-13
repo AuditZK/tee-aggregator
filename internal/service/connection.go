@@ -49,6 +49,12 @@ func NewConnectionService(repo *repository.ConnectionRepo, enc *encryption.Servi
 	}
 }
 
+// SetFactory replaces the connector factory. Used to inject a proxy-aware
+// factory after construction (e.g. when EXCHANGE_HTTP_PROXY is configured).
+func (s *ConnectionService) SetFactory(f *connector.Factory) {
+	s.factory = f
+}
+
 // CreateConnectionRequest is the input for creating a connection
 type CreateConnectionRequest struct {
 	UserUID             string

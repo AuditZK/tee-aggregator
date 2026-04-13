@@ -13,10 +13,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/trackrecord/enclave/internal/attestation"
+	"github.com/trackrecord/enclave/internal/cache"
 	"github.com/trackrecord/enclave/internal/config"
+	"github.com/trackrecord/enclave/internal/connector"
 	"github.com/trackrecord/enclave/internal/db"
 	"github.com/trackrecord/enclave/internal/encryption"
-	"github.com/trackrecord/enclave/internal/cache"
 	enclaveGrpc "github.com/trackrecord/enclave/internal/grpc"
 	"github.com/trackrecord/enclave/internal/logredact"
 	"github.com/trackrecord/enclave/internal/logstream"
@@ -26,6 +27,7 @@ import (
 	"github.com/trackrecord/enclave/internal/security"
 	"github.com/trackrecord/enclave/internal/server"
 	"github.com/trackrecord/enclave/internal/service"
+	proxyPkg "github.com/trackrecord/enclave/internal/proxy"
 	"github.com/trackrecord/enclave/internal/signing"
 	tlspkg "github.com/trackrecord/enclave/internal/tls"
 	"go.uber.org/zap"
@@ -217,6 +219,23 @@ func main() {
 		if rateLimitRepo != nil {
 			rateLimiterSvc = service.NewRateLimiterService(rateLimitRepo, logger)
 		}
+	}
+
+	// 11c. Wire HTTP proxy for geo-restricted exchanges (e.g. Binance from EU).
+	// Set EXCHANGE_HTTP_PROXY=socks5://user:pass@host:port (or http://)
+	// and PROXY_EXCHANGES=binance (comma-separated, default: binance).
+	if cfg.ExchangeHTTPProxy != "" {
+		proxyCfg := proxyPkg.ParseConfig(cfg.ExchangeHTTPProxy, cfg.ProxyExchanges)
+		proxyFactory := connector.NewFactoryWithProxy(proxyCfg)
+		if connSvc != nil {
+			connSvc.SetFactory(proxyFactory)
+		}
+		if syncSvc != nil {
+			syncSvc.SetFactory(proxyFactory)
+		}
+		logger.Info("exchange HTTP proxy configured",
+			zap.String("exchanges", cfg.ProxyExchanges),
+		)
 	}
 
 	// 12. Init report signer (ephemeral key per startup)

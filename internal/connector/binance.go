@@ -31,9 +31,20 @@ func NewBinance(creds *Credentials) *Binance {
 	return &Binance{
 		apiKey:    creds.APIKey,
 		apiSecret: creds.APISecret,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		client:    &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// NewBinanceWithClient creates a Binance connector with a custom HTTP client.
+// Used to inject a proxy-configured transport for geo-restricted regions.
+func NewBinanceWithClient(creds *Credentials, client *http.Client) *Binance {
+	if client.Timeout == 0 {
+		client.Timeout = 30 * time.Second
+	}
+	return &Binance{
+		apiKey:    creds.APIKey,
+		apiSecret: creds.APISecret,
+		client:    client,
 	}
 }
 

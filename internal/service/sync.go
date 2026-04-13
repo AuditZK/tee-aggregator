@@ -45,6 +45,12 @@ func (s *SyncService) SetSyncStatusRepo(repo *repository.SyncStatusRepo) {
 	s.syncStatus = repo
 }
 
+// SetFactory replaces the connector factory. Used to inject a proxy-aware
+// factory after construction (e.g. when EXCHANGE_HTTP_PROXY is configured).
+func (s *SyncService) SetFactory(f *connector.Factory) {
+	s.factory = f
+}
+
 // SyncResult holds the result of a sync operation
 type SyncResult struct {
 	UserUID           string    `json:"user_uid"`

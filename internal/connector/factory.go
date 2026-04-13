@@ -3,17 +3,27 @@ package connector
 import (
 	"fmt"
 	"strings"
+
+	"github.com/trackrecord/enclave/internal/proxy"
 )
 
 // ErrUnsupportedExchange is returned when exchange is not supported
 var ErrUnsupportedExchange = fmt.Errorf("unsupported exchange")
 
 // Factory creates exchange connectors
-type Factory struct{}
+type Factory struct {
+	proxyCfg *proxy.Config
+}
 
-// NewFactory creates a new connector factory
+// NewFactory creates a new connector factory with no proxy.
 func NewFactory() *Factory {
 	return &Factory{}
+}
+
+// NewFactoryWithProxy creates a factory that routes geo-restricted exchanges
+// through the given HTTP proxy (e.g. Binance from EU datacenters).
+func NewFactoryWithProxy(cfg *proxy.Config) *Factory {
+	return &Factory{proxyCfg: cfg}
 }
 
 // Create returns a connector for the given credentials
@@ -24,6 +34,12 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 	// Major crypto exchanges — native connectors (5MB vs CCXT's 150MB per LoadMarkets)
 	// Native connectors use direct HTTP with HMAC signing, no market loading.
 	case "binance", "binance_futures", "binanceusdm":
+		// Route through proxy if configured (Binance geo-blocks EU regions).
+		// proxyCfg.ShouldProxy is nil-safe and returns false when no proxy is set.
+		if f.proxyCfg.ShouldProxy("binance") {
+			client := f.proxyCfg.NewClient("binance")
+			return NewBinanceWithClient(creds, client), nil
+		}
 		return NewBinance(creds), nil
 	case "bybit":
 		return NewBybit(creds), nil
