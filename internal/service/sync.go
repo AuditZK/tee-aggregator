@@ -389,13 +389,17 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	}
 
 	// 8. Create snapshot
+	// TS parity: realizedBalance = equity - unrealizedPnL (preserves the
+	// invariant equity == realized + unrealized). Using balance.Available
+	// (cash) diverges on margin accounts — cash can be deeply negative when
+	// positions are bought on margin, even though equity is positive.
 	snapshot := &repository.Snapshot{
 		UserUID:         connMeta.UserUID,
 		Exchange:        connMeta.Exchange,
 		Label:           connMeta.Label,
 		Timestamp:       startOfDay,
 		TotalEquity:     balance.Equity,
-		RealizedBalance: balance.Available,
+		RealizedBalance: balance.Equity - balance.UnrealizedPnL,
 		UnrealizedPnL:   balance.UnrealizedPnL,
 		Deposits:        deposits,
 		Withdrawals:     withdrawals,
@@ -661,13 +665,15 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		}
 	}
 
+	// TS parity: realizedBalance = equity - unrealizedPnL. See the non-atomic
+	// path above for the full rationale.
 	result.snapshot = &repository.Snapshot{
 		UserUID:         connMeta.UserUID,
 		Exchange:        connMeta.Exchange,
 		Label:           connMeta.Label,
 		Timestamp:       startOfDay,
 		TotalEquity:     balance.Equity,
-		RealizedBalance: balance.Available,
+		RealizedBalance: balance.Equity - balance.UnrealizedPnL,
 		UnrealizedPnL:   balance.UnrealizedPnL,
 		Deposits:        deposits,
 		Withdrawals:     withdrawals,
