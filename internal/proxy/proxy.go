@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"net/http"
 	"net/url"
 	"strings"
@@ -50,9 +51,20 @@ func (c *Config) ConfigureTransport(exchange string) *http.Transport {
 	if !c.ShouldProxy(exchange) {
 		return nil
 	}
-	return &http.Transport{
+	t := &http.Transport{
 		Proxy: http.ProxyURL(c.ProxyURL),
 	}
+	// For HTTPS targets Go uses a CONNECT tunnel. The standard library does
+	// not automatically derive Proxy-Authorization from the proxy URL userinfo
+	// for CONNECT requests — set it explicitly so authenticated proxies work.
+	if c.ProxyURL.User != nil {
+		pass, _ := c.ProxyURL.User.Password()
+		creds := c.ProxyURL.User.Username() + ":" + pass
+		t.ProxyConnectHeader = http.Header{
+			"Proxy-Authorization": []string{"Basic " + base64.StdEncoding.EncodeToString([]byte(creds))},
+		}
+	}
+	return t
 }
 
 // NewClient creates an http.Client with optional proxy for the given exchange.
