@@ -388,6 +388,17 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		}
 	}
 
+	// 7b. TS parity: breakdown_by_market must always carry equity so the
+	// gRPC mapper can build a non-nil global aggregate. Connectors that
+	// implement BalanceByMarketFetcher already populated equity via
+	// enrichBreakdownWithBalances; for all others, assign total equity to
+	// the exchange's primary market type.
+	if !breakdown.hasAnyEquity() {
+		m := breakdown.getOrCreateMarket(primaryMarketType(connMeta.Exchange))
+		m.equity = balance.Equity
+		m.availableMargin = balance.Available
+	}
+
 	// 8. Create snapshot
 	// TS parity: realizedBalance = equity - unrealizedPnL (preserves the
 	// invariant equity == realized + unrealized). Using balance.Available
@@ -663,6 +674,14 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 				zap.Error(err),
 			)
 		}
+	}
+
+	// TS parity: breakdown_by_market must always carry equity (same as
+	// syncConnection step 7b above).
+	if !breakdown.hasAnyEquity() {
+		m := breakdown.getOrCreateMarket(primaryMarketType(connMeta.Exchange))
+		m.equity = balance.Equity
+		m.availableMargin = balance.Available
 	}
 
 	// TS parity: realizedBalance = equity - unrealizedPnL. See the non-atomic
@@ -1012,6 +1031,28 @@ func appendUnique(slice []string, s string) []string {
 		}
 	}
 	return append(slice, s)
+}
+
+// hasAnyEquity reports whether at least one market bucket has equity data.
+// Used to decide whether the breakdown needs a fallback equity assignment.
+func (a *aggregatedBreakdown) hasAnyEquity() bool {
+	return a.stocks.equity > 0 || a.spot.equity > 0 || a.swap.equity > 0 ||
+		a.futures.equity > 0 || a.options.equity > 0 || a.margin.equity > 0 ||
+		a.earn.equity > 0 || a.cfd.equity > 0 || a.forex.equity > 0 || a.commodities.equity > 0
+}
+
+// primaryMarketType returns the canonical market type for a given exchange.
+// Used as fallback when BalanceByMarketFetcher is not implemented — equity is
+// assigned to this bucket so breakdown_by_market.global is never nil.
+func primaryMarketType(exchange string) string {
+	switch strings.ToLower(exchange) {
+	case "alpaca", "ibkr":
+		return connector.MarketStocks
+	case "ctrader", "mt4", "mt5":
+		return connector.MarketCFD
+	default:
+		return connector.MarketSpot
+	}
 }
 
 func (m *marketAgg) hasData() bool {

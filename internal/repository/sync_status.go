@@ -83,11 +83,13 @@ func (r *SyncStatusRepo) Upsert(ctx context.Context, s *SyncStatus) error {
 }
 
 func (r *SyncStatusRepo) upsertTS(ctx context.Context, s *SyncStatus) error {
-	// TS schema: camelCase columns, no default gen_random_uuid() on id
+	// TS schema: camelCase columns. Prisma generates cuid() at the application
+	// layer so there is no DB-level DEFAULT on id. Generate a UUID here so
+	// the INSERT doesn't fail with a NOT NULL violation on first insert.
 	now := time.Now().UTC()
 	query := `
-		INSERT INTO sync_statuses ("userUid", exchange, label, "lastSyncTime", status, "totalTrades", "errorMessage", "createdAt", "updatedAt")
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO sync_statuses (id, "userUid", exchange, label, "lastSyncTime", status, "totalTrades", "errorMessage", "createdAt", "updatedAt")
+		VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT ("userUid", exchange, label)
 		DO UPDATE SET
 			"lastSyncTime" = EXCLUDED."lastSyncTime",
