@@ -59,7 +59,7 @@ EXPOSE 8080 50051 50052 9090
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-check-certificate --no-verbose --tries=1 --spider https://localhost:8080/health || exit 1
+    CMD wget --no-check-certificate -qO/dev/null https://localhost:8080/health || exit 1
 
 # Run
 ENTRYPOINT ["/app/enclave"]
