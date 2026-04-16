@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,12 +23,66 @@ import (
 const (
 	SignatureAlgorithm = "ECDSA-P256-SHA256"
 	EnclaveVersion     = "1.0.0-go"
+	// PayloadVersion bumps whenever the signed payload shape changes.
+	// 1.0 = original (metrics + returns only)
+	// 1.1 = adds enclaveAttestation {measurement, reportData, platform, attested}
+	PayloadVersion = "1.1"
 )
+
+// EnclaveAttestation binds the signed report to a specific SEV-SNP measurement
+// and the report_data field of the attestation quote. A verifier MUST:
+//  1. Verify the ECDSA signature over the canonical payload (proves the
+//     enclave that holds the private key signed this report).
+//  2. Obtain the SEV-SNP attestation quote from GET /api/v1/attestation (or
+//     cached alongside the report).
+//  3. Verify the attestation quote against the AMD root CA via VCEK.
+//  4. Check that attestation.measurement == this.Measurement.
+//  5. Check that attestation.report_data == this.ReportData. The report_data
+//     is defined as SHA256(tlsFingerprint || e2ePublicKey || signingPublicKey),
+//     which cryptographically binds the signing public key to the hardware
+//     measurement.
+//  6. Check that Measurement matches a hash of an audited enclave build
+//     published on the AuditZK GitHub releases.
+//
+// If any step fails, the report MUST NOT be trusted.
+type EnclaveAttestation struct {
+	Measurement string `json:"measurement,omitempty"`
+	ReportData  string `json:"report_data,omitempty"`
+	Platform    string `json:"platform"` // "sev-snp" or "dev"
+	Attested    bool   `json:"attested"`
+}
 
 // ReportSigner signs performance reports.
 type ReportSigner struct {
 	privateKey      *ecdsa.PrivateKey
 	publicKeyBase64 string
+
+	attestMu    sync.RWMutex
+	attestation *EnclaveAttestation
+}
+
+// SetAttestation binds the signer to a SEV-SNP attestation. Every subsequent
+// call to Sign() will include this attestation inside the signed payload so
+// that a verifier can cryptographically link the signed report to an audited
+// enclave build.
+//
+// Called once at startup from main.go after the attestation service has
+// fetched its first measurement. Safe for concurrent use with Sign().
+func (s *ReportSigner) SetAttestation(att *EnclaveAttestation) {
+	s.attestMu.Lock()
+	defer s.attestMu.Unlock()
+	s.attestation = att
+}
+
+// Attestation returns a copy of the current attestation (or nil if none set).
+func (s *ReportSigner) Attestation() *EnclaveAttestation {
+	s.attestMu.RLock()
+	defer s.attestMu.RUnlock()
+	if s.attestation == nil {
+		return nil
+	}
+	copy := *s.attestation
+	return &copy
 }
 
 // NewReportSigner creates a signer from a deterministic seed (32 bytes).
@@ -240,12 +295,18 @@ type SignedReport struct {
 	Manager string `json:"manager,omitempty"`
 	Firm    string `json:"firm,omitempty"`
 
+	// Enclave attestation (SIGNED - binds the report to a specific SEV-SNP
+	// measurement). See EnclaveAttestation docs for the verification
+	// procedure a client must follow.
+	EnclaveAttestation *EnclaveAttestation `json:"enclave_attestation,omitempty"`
+
 	// Signature
 	Signature          string `json:"signature"`
 	PublicKey          string `json:"public_key"`
 	SignatureAlgorithm string `json:"signature_algorithm"`
 	ReportHash         string `json:"report_hash"`
 	EnclaveVersion     string `json:"enclave_version"`
+	PayloadVersion     string `json:"payload_version"`
 }
 
 // Sign creates a signed report from input.
@@ -281,9 +342,11 @@ func (s *ReportSigner) Sign(input *ReportInput) (*SignedReport, error) {
 		RiskMetrics:        input.RiskMetrics,
 		DrawdownData:       input.DrawdownData,
 		BenchmarkMetrics:   input.BenchmarkMetrics,
+		EnclaveAttestation: s.Attestation(),
 		PublicKey:          s.PublicKey(),
 		SignatureAlgorithm: SignatureAlgorithm,
 		EnclaveVersion:     EnclaveVersion,
+		PayloadVersion:     PayloadVersion,
 	}
 
 	financialPayload := buildFinancialPayload(report)
@@ -311,14 +374,15 @@ func formatISO8601(t time.Time) string {
 
 func buildFinancialPayload(report *SignedReport) map[string]any {
 	payload := map[string]any{
-		"reportId":     report.ReportID,
-		"userUid":      report.UserUID,
-		"generatedAt":  report.GeneratedAt,
-		"periodStart":  report.PeriodStart,
-		"periodEnd":    report.PeriodEnd,
-		"baseCurrency": report.BaseCurrency,
-		"dataPoints":   report.DataPoints,
-		"exchanges":    report.Exchanges,
+		"payloadVersion": report.PayloadVersion,
+		"reportId":       report.ReportID,
+		"userUid":        report.UserUID,
+		"generatedAt":    report.GeneratedAt,
+		"periodStart":    report.PeriodStart,
+		"periodEnd":      report.PeriodEnd,
+		"baseCurrency":   report.BaseCurrency,
+		"dataPoints":     report.DataPoints,
+		"exchanges":      report.Exchanges,
 		"metrics": map[string]any{
 			"totalReturn":      report.TotalReturn,
 			"annualizedReturn": report.AnnualizedReturn,
@@ -330,6 +394,18 @@ func buildFinancialPayload(report *SignedReport) map[string]any {
 		},
 		"dailyReturns":   toDailyReturnsPayload(report.DailyReturns),
 		"monthlyReturns": toMonthlyReturnsPayload(report.MonthlyReturns),
+	}
+
+	// enclaveAttestation binds the signed report to a specific SEV-SNP
+	// measurement. Always include when available, even in dev mode — the
+	// platform field lets the verifier distinguish attested from dev.
+	if report.EnclaveAttestation != nil {
+		payload["enclaveAttestation"] = map[string]any{
+			"measurement": report.EnclaveAttestation.Measurement,
+			"reportData":  report.EnclaveAttestation.ReportData,
+			"platform":    report.EnclaveAttestation.Platform,
+			"attested":    report.EnclaveAttestation.Attested,
+		}
 	}
 
 	if report.Benchmark != "" {
@@ -485,7 +561,46 @@ func writeSortedJSON(buf *bytes.Buffer, v any) error {
 	}
 }
 
+// VerifyReport performs the full end-to-end verification of a signed report:
+//
+//  1. Rebuild the canonical signed payload from the SignedReport fields.
+//  2. Recompute SHA-256(canonicalJSON) and compare with report.ReportHash.
+//     This detects any tampering with the report contents (including the
+//     EnclaveAttestation block).
+//  3. Verify the ECDSA signature of the recomputed hash against the
+//     embedded public key.
+//
+// This function does NOT validate the SEV-SNP attestation quote itself —
+// callers must separately verify report.EnclaveAttestation.Measurement
+// against an audited build hash and fetch the quote from the enclave's
+// /api/v1/attestation endpoint to verify the VCEK chain. See the
+// EnclaveAttestation type documentation for the complete verification
+// procedure.
+func VerifyReport(report *SignedReport) (bool, error) {
+	if report == nil {
+		return false, fmt.Errorf("nil report")
+	}
+
+	payload := buildFinancialPayload(report)
+	canonical, err := marshalSortedJSON(payload)
+	if err != nil {
+		return false, fmt.Errorf("rebuild canonical payload: %w", err)
+	}
+
+	recomputed := sha256.Sum256(canonical)
+	if hex.EncodeToString(recomputed[:]) != report.ReportHash {
+		return false, nil
+	}
+
+	return Verify(report.ReportHash, report.Signature, report.PublicKey)
+}
+
 // Verify checks a signature against a report hash.
+//
+// Lower-level primitive: callers that already hold a trusted report hash can
+// use this to check the signature only. For end-to-end verification from a
+// SignedReport (including detection of tampering with the payload), use
+// VerifyReport instead.
 func Verify(reportHash, signatureB64, publicKey string) (bool, error) {
 	// Preferred path: TS parity ECDSA (base64 DER public key).
 	signatureDER, sigErr := base64.StdEncoding.DecodeString(signatureB64)
