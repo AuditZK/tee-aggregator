@@ -15,6 +15,7 @@ services:
       - GRPC_PORT=50051
       - DATABASE_URL=${DATABASE_URL}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:-}
     # SEV-SNP device access (AMD confidential computing)
     devices:
       - /dev/sev-guest:/dev/sev-guest

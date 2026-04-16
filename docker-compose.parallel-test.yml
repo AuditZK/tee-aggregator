@@ -35,6 +35,7 @@ services:
       - GRPC_INSECURE=false
       - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:-}
       - LOG_LEVEL=debug
       # Daily scheduler: defaults to true (sync at 00:00 UTC) but can be
       # disabled via .env.parallel-test to run a passive read-only test
