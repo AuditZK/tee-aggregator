@@ -60,7 +60,7 @@ func newBufconnClient(t *testing.T, srv *Server) (pb.EnclaveServiceClient, func(
 }
 
 func TestHealthCheck_BufconnRoundTrip(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil, ServerOptions{})
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
 
@@ -96,6 +96,7 @@ func TestCreateUserConnection_InvalidExchangeFormat_IsRejected(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		ServerOptions{},
 	)
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
@@ -128,6 +129,7 @@ func TestProcessSyncJob_InvalidUser_IsRejected(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		ServerOptions{},
 	)
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
@@ -156,6 +158,7 @@ func TestProcessSyncJob_UppercaseExchange_IsRejected(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		ServerOptions{},
 	)
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
@@ -176,7 +179,7 @@ func TestProcessSyncJob_UppercaseExchange_IsRejected(t *testing.T) {
 }
 
 func TestGetSnapshotTimeSeries_InvalidExchange_ReturnsInvalidArgument(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, &repository.SnapshotRepo{}, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, &repository.SnapshotRepo{}, nil, nil, ServerOptions{})
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
 
@@ -193,7 +196,7 @@ func TestGetSnapshotTimeSeries_InvalidExchange_ReturnsInvalidArgument(t *testing
 }
 
 func TestGetSnapshotTimeSeries_InvalidTimestamp_ReturnsInvalidArgument(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, &repository.SnapshotRepo{}, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, &repository.SnapshotRepo{}, nil, nil, ServerOptions{})
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
 
@@ -210,7 +213,7 @@ func TestGetSnapshotTimeSeries_InvalidTimestamp_ReturnsInvalidArgument(t *testin
 }
 
 func TestGetSnapshotTimeSeries_EndBeforeStart_ReturnsInvalidArgument(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, &repository.SnapshotRepo{}, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, &repository.SnapshotRepo{}, nil, nil, ServerOptions{})
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
 
@@ -229,7 +232,7 @@ func TestGetSnapshotTimeSeries_EndBeforeStart_ReturnsInvalidArgument(t *testing.
 }
 
 func TestGetSnapshotTimeSeries_RangeTooLarge_ReturnsInvalidArgument(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, &repository.SnapshotRepo{}, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, &repository.SnapshotRepo{}, nil, nil, ServerOptions{})
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
 
@@ -249,7 +252,7 @@ func TestGetSnapshotTimeSeries_RangeTooLarge_ReturnsInvalidArgument(t *testing.T
 }
 
 func TestGetAggregatedMetrics_InvalidExchange_ReturnsInvalidArgument(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, &repository.SnapshotRepo{}, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, &repository.SnapshotRepo{}, nil, nil, ServerOptions{})
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
 
@@ -267,7 +270,7 @@ func TestGetAggregatedMetrics_InvalidExchange_ReturnsInvalidArgument(t *testing.
 
 func TestVerifyReportSignature_MissingFields_ReturnsInvalidArgument(t *testing.T) {
 	reportSvc := service.NewReportService(nil, nil, signing.MustNewReportSignerGenerate())
-	srv := NewServer(zap.NewNop(), nil, nil, nil, reportSvc, nil, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, reportSvc, nil, nil, nil, ServerOptions{})
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
 

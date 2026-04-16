@@ -12,6 +12,7 @@ import (
 
 	pb "github.com/trackrecord/enclave/api/proto"
 	"github.com/trackrecord/enclave/internal/attestation"
+	"github.com/trackrecord/enclave/internal/auth"
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/service"
 	"github.com/trackrecord/enclave/internal/signing"
@@ -20,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 )
@@ -42,12 +44,22 @@ type Server struct {
 	userRepo     *repository.UserRepo
 	attestSvc    *attestation.Service
 	grpcServer   *grpc.Server
+	jwtSecret    []byte // HMAC-SHA256 secret for JWT verification; nil = dev mode (no auth)
 }
 
 type connectionService interface {
 	Create(ctx context.Context, req *service.CreateConnectionRequest) error
 	GetExcludedConnectionKeys(ctx context.Context, userUID string) (map[string]struct{}, error)
 	GetActiveConnections(ctx context.Context, userUID string) ([]*repository.ExchangeConnection, error)
+}
+
+// ServerOptions holds optional configuration for the gRPC server.
+type ServerOptions struct {
+	// JWTSecret is the HMAC-SHA256 secret used to verify bearer tokens sent
+	// by the frontend BFF before reaching the enclave via report-service.
+	// When nil the server operates in dev mode: JWT auth is skipped with a
+	// warning. In production ENCLAVE_JWT_SECRET must be set.
+	JWTSecret []byte
 }
 
 // NewServer creates a new gRPC server.
@@ -64,6 +76,7 @@ func NewServer(
 	snapshotRepo *repository.SnapshotRepo,
 	userRepo *repository.UserRepo,
 	attestSvc *attestation.Service,
+	opts ServerOptions,
 ) *Server {
 	return &Server{
 		logger:       logger,
@@ -74,6 +87,7 @@ func NewServer(
 		snapshotRepo: snapshotRepo,
 		userRepo:     userRepo,
 		attestSvc:    attestSvc,
+		jwtSecret:    opts.JWTSecret,
 	}
 }
 
@@ -85,7 +99,7 @@ func (s *Server) Start(port int, tlsConfig *tls.Config) error {
 	}
 
 	serverOpts := []grpc.ServerOption{
-		grpc.UnaryInterceptor(s.loggingInterceptor),
+		grpc.ChainUnaryInterceptor(s.authInterceptor, s.loggingInterceptor),
 	}
 	if tlsConfig != nil {
 		serverOpts = append(serverOpts, grpc.Creds(credentials.NewTLS(tlsConfig)))
@@ -127,6 +141,69 @@ func (s *Server) loggingInterceptor(
 		zap.Error(err),
 	)
 	return resp, err
+}
+
+// methodsSkipAuth lists gRPC methods that do not require JWT authentication.
+// These methods expose no user-specific data.
+var methodsSkipAuth = map[string]bool{
+	"/enclave.EnclaveService/HealthCheck":           true,
+	"/enclave.EnclaveService/VerifyReportSignature": true,
+}
+
+// authInterceptor verifies the JWT bearer token in gRPC metadata.
+//
+// When jwtSecret is set (production), all methods not in methodsSkipAuth
+// must carry a valid Authorization: Bearer <jwt> header. The JWT sub claim
+// is stored in the context so handlers can use it instead of trusting the
+// user_uid field in the request message.
+//
+// When jwtSecret is nil (dev mode), auth is skipped with a warning so local
+// development works without environment setup.
+func (s *Server) authInterceptor(
+	ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (interface{}, error) {
+	if methodsSkipAuth[info.FullMethod] {
+		return handler(ctx, req)
+	}
+
+	if len(s.jwtSecret) == 0 {
+		s.logger.Warn("JWT auth skipped (ENCLAVE_JWT_SECRET not set)",
+			zap.String("method", info.FullMethod),
+		)
+		return handler(ctx, req)
+	}
+
+	// Extract Authorization header from gRPC metadata
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "missing metadata")
+	}
+
+	authValues := md.Get("authorization")
+	if len(authValues) == 0 {
+		return nil, status.Error(codes.Unauthenticated, "missing authorization header")
+	}
+
+	tokenStr := strings.TrimPrefix(authValues[0], "Bearer ")
+	if tokenStr == authValues[0] {
+		return nil, status.Error(codes.Unauthenticated, "authorization header must use Bearer scheme")
+	}
+
+	claims, err := auth.VerifyHS256(tokenStr, s.jwtSecret)
+	if err != nil {
+		s.logger.Warn("JWT verification failed",
+			zap.String("method", info.FullMethod),
+			zap.Error(err),
+		)
+		return nil, status.Error(codes.Unauthenticated, "invalid or expired token")
+	}
+
+	// Inject verified user UID into context — handlers must use this, not req.UserUid
+	ctx = auth.WithUserUID(ctx, claims.Sub)
+	return handler(ctx, req)
 }
 
 func (s *Server) isProduction() bool {
@@ -524,8 +601,18 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 		return &pb.SignedReportResponse{Success: false, Error: "report service not available"}, nil
 	}
 
+	// Use the JWT-verified uid from context when available.
+	// This prevents IDOR: an attacker who controls report-service cannot request
+	// data for an arbitrary user by setting req.UserUid to a victim's uid.
+	// When jwtSecret is not set (dev mode) the interceptor skips auth and
+	// contextUID is empty, so req.UserUid is used as a fallback.
+	userUID := req.UserUid
+	if contextUID, ok := auth.UserUIDFromContext(ctx); ok {
+		userUID = contextUID
+	}
+
 	if err := validation.ValidateReportRequest(&validation.ReportRequest{
-		UserUID:   req.UserUid,
+		UserUID:   userUID,
 		StartDate: req.StartDate,
 		EndDate:   req.EndDate,
 		Benchmark: req.Benchmark,
@@ -554,7 +641,7 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 
 	excludedConnectionKeys := map[string]struct{}{}
 	if s.connSvc != nil {
-		excluded, err := s.connSvc.GetExcludedConnectionKeys(ctx, req.UserUid)
+		excluded, err := s.connSvc.GetExcludedConnectionKeys(ctx, userUID)
 		if err != nil {
 			return &pb.SignedReportResponse{Success: false, Error: s.sanitizeErrorForClient(err)}, nil
 		}
@@ -562,7 +649,7 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 	}
 
 	if startDate.IsZero() || endDate.IsZero() {
-		defaultStart, defaultEnd, err := s.resolveReportPeriod(ctx, req.UserUid, excludedConnectionKeys, startDate, endDate)
+		defaultStart, defaultEnd, err := s.resolveReportPeriod(ctx, userUID, excludedConnectionKeys, startDate, endDate)
 		if err != nil {
 			return &pb.SignedReportResponse{Success: false, Error: s.sanitizeErrorForClient(err)}, nil
 		}
@@ -575,7 +662,7 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 	}
 
 	report, err := s.reportSvc.GenerateReport(ctx, &service.GenerateReportRequest{
-		UserUID:            req.UserUid,
+		UserUID:            userUID,
 		StartDate:          startDate,
 		EndDate:            endDate,
 		ReportName:         req.ReportName,

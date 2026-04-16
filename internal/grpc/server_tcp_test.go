@@ -54,7 +54,7 @@ func newTCPClient(t *testing.T, srv *Server) (pb.EnclaveServiceClient, func()) {
 }
 
 func TestHealthCheck_TCPRoundTrip(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil, ServerOptions{})
 	client, cleanup := newTCPClient(t, srv)
 	defer cleanup()
 
@@ -71,7 +71,7 @@ func TestHealthCheck_TCPRoundTrip(t *testing.T) {
 }
 
 func TestCreateUserConnection_TCPDatabaseUnavailable(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil, ServerOptions{})
 	client, cleanup := newTCPClient(t, srv)
 	defer cleanup()
 
@@ -97,7 +97,7 @@ func TestCreateUserConnection_TCPDatabaseUnavailable(t *testing.T) {
 }
 
 func TestCreateUserConnection_TCPValidationRunsBeforeServiceCheck(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil, ServerOptions{})
 	client, cleanup := newTCPClient(t, srv)
 	defer cleanup()
 
@@ -117,7 +117,7 @@ func TestCreateUserConnection_TCPValidationRunsBeforeServiceCheck(t *testing.T) 
 }
 
 func TestProcessSyncJob_TCPServiceUnavailableReturnsPayloadError(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil)
+	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil, ServerOptions{})
 	client, cleanup := newTCPClient(t, srv)
 	defer cleanup()
 

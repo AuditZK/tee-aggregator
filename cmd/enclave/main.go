@@ -279,6 +279,44 @@ func main() {
 		}
 	}
 
+	// 13b. Bind the signing key to the SEV-SNP measurement by fetching
+	// the attestation once at startup and storing it in the signer. Every
+	// subsequent Sign() call will include the measurement inside the
+	// canonical signed payload, so a verifier can cryptographically tie
+	// the signed report to an audited enclave build (see
+	// signing.EnclaveAttestation docs for the verification procedure).
+	//
+	// A failure here is non-fatal: the enclave can still sign reports,
+	// but without attestation metadata. Operators are alerted via a
+	// warning log so the missing binding is observable. In production on
+	// SEV-SNP hardware this path must succeed.
+	{
+		attestCtx, cancelAttest := context.WithTimeout(context.Background(), 10*time.Second)
+		attestReport, attestErr := attestSvc.GetAttestation(attestCtx)
+		cancelAttest()
+		if attestErr != nil {
+			logger.Warn("failed to fetch attestation for signer binding (reports will omit enclave_attestation)",
+				zap.Error(attestErr),
+			)
+		} else if attestReport.Attestation != nil {
+			signer.SetAttestation(&signing.EnclaveAttestation{
+				Measurement: attestReport.Attestation.Measurement,
+				ReportData:  attestReport.Attestation.ReportData,
+				Platform:    attestReport.Platform,
+				Attested:    attestReport.Attestation.Verified,
+			})
+			measurementPrefix := attestReport.Attestation.Measurement
+			if len(measurementPrefix) > 16 {
+				measurementPrefix = measurementPrefix[:16] + "..."
+			}
+			logger.Info("report signer bound to SEV-SNP attestation",
+				zap.String("platform", attestReport.Platform),
+				zap.Bool("attested", attestReport.Attestation.Verified),
+				zap.String("measurement_prefix", measurementPrefix),
+			)
+		}
+	}
+
 	// 14. Start gRPC server
 	grpcTLSConfig, err := buildGRPCTLSConfig(cfg)
 	if err != nil {
@@ -288,7 +326,16 @@ func main() {
 		logger.Warn("gRPC running without TLS (development mode with GRPC_INSECURE=true)")
 	}
 
-	grpcServer := enclaveGrpc.NewServer(logger, connSvc, syncSvc, metricsSvc, reportSvc, snapshotRepo, userRepo, attestSvc)
+	jwtSecret := []byte(os.Getenv("ENCLAVE_JWT_SECRET"))
+	if len(jwtSecret) == 0 {
+		logger.Warn("ENCLAVE_JWT_SECRET not set — gRPC JWT auth disabled (dev mode)")
+	} else {
+		logger.Info("gRPC JWT auth enabled")
+	}
+
+	grpcServer := enclaveGrpc.NewServer(logger, connSvc, syncSvc, metricsSvc, reportSvc, snapshotRepo, userRepo, attestSvc,
+		enclaveGrpc.ServerOptions{JWTSecret: jwtSecret},
+	)
 	go func() {
 		if err := grpcServer.Start(cfg.GRPCPort, grpcTLSConfig); err != nil {
 			logger.Fatal("gRPC server failed", zap.Error(err))
