@@ -143,19 +143,22 @@ func (s *Server) loggingInterceptor(
 	return resp, err
 }
 
-// methodsSkipAuth lists gRPC methods that do not require JWT authentication.
-// These methods expose no user-specific data.
-var methodsSkipAuth = map[string]bool{
-	"/enclave.EnclaveService/HealthCheck":           true,
-	"/enclave.EnclaveService/VerifyReportSignature": true,
+// methodsRequireJWT lists gRPC methods where the JWT bearer is the source of
+// truth for the authenticated user. Only GenerateSignedReport is gated here
+// because it's the sole endpoint exposing cryptographically-signed data that
+// could be exfiltrated by a compromised BFF passing arbitrary user_uid.
+// Other RPCs (ProcessSyncJob, CreateUserConnection, metrics, snapshots) are
+// called exclusively by the gateway, which already enforces Clerk auth.
+var methodsRequireJWT = map[string]bool{
+	"/enclave.EnclaveService/GenerateSignedReport": true,
 }
 
 // authInterceptor verifies the JWT bearer token in gRPC metadata.
 //
-// When jwtSecret is set (production), all methods not in methodsSkipAuth
-// must carry a valid Authorization: Bearer <jwt> header. The JWT sub claim
-// is stored in the context so handlers can use it instead of trusting the
-// user_uid field in the request message.
+// When jwtSecret is set (production), methods in methodsRequireJWT must carry
+// a valid Authorization: Bearer <jwt> header. The JWT sub claim is stored in
+// the context so handlers can use it instead of trusting the user_uid field
+// in the request message.
 //
 // When jwtSecret is nil (dev mode), auth is skipped with a warning so local
 // development works without environment setup.
@@ -165,7 +168,7 @@ func (s *Server) authInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
-	if methodsSkipAuth[info.FullMethod] {
+	if !methodsRequireJWT[info.FullMethod] {
 		return handler(ctx, req)
 	}
 
