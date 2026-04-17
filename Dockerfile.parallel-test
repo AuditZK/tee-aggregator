@@ -25,11 +25,17 @@ WORKDIR /app
 RUN apk add --no-cache git ca-certificates tzdata
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+# BuildKit cache mounts make incremental rebuilds ~5× faster by reusing
+# the Go build cache (/root/.cache/go-build) and module cache between runs.
+# Requires DOCKER_BUILDKIT=1 (default on recent Docker / buildx).
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -trimpath \
     -ldflags="-w -s" \
     -o /enclave \
