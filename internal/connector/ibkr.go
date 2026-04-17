@@ -154,6 +154,10 @@ func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	if len(body) == 0 {
+		return "", fmt.Errorf("flex SendRequest returned empty body (HTTP %d) — likely rate-limited or network blip", resp.StatusCode)
+	}
+
 	// Parse XML response
 	var result struct {
 		XMLName       xml.Name `xml:"FlexStatementResponse"`
@@ -164,7 +168,12 @@ func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
 	}
 
 	if err := xml.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("parse flex response: %w", err)
+		// Log the raw body (truncated) so we can diagnose unexpected IBKR responses.
+		preview := string(body)
+		if len(preview) > 300 {
+			preview = preview[:300] + "..."
+		}
+		return "", fmt.Errorf("parse flex response (body=%q): %w", preview, err)
 	}
 
 	if result.Status != "Success" {
