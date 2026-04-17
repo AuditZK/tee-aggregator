@@ -214,22 +214,37 @@ func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error
 			return nil, err
 		}
 
-		// Check if still processing. IBKR returns 3 flavours:
-		//   1. <ErrorCode>1019</ErrorCode> — Statement generation in progress
-		//   2. Text "Statement generation in progress" (older format)
-		//   3. A non-XML "please wait" body
-		bodyStr := string(body)
-		if strings.Contains(bodyStr, "1019") ||
-			strings.Contains(bodyStr, "Statement generation in progress") ||
-			strings.Contains(bodyStr, "<Status>Warn</Status>") {
+		// IBKR returns two root elements:
+		//   - <FlexStatementResponse> → still processing OR hard error
+		//   - <FlexQueryResponse> → the actual report is ready
+		// Substring matching on "1019" was wrong because numeric values inside
+		// a real report can trip it. The root-element distinction is exact.
+		trimmed := strings.TrimSpace(string(body))
+		if strings.HasPrefix(trimmed, "<FlexQueryResponse") {
+			return body, nil
+		}
+		if strings.HasPrefix(trimmed, "<FlexStatementResponse") {
+			// Error if Status="Error", otherwise keep polling.
+			if strings.Contains(trimmed, "<Status>Error</Status>") {
+				return nil, fmt.Errorf("flex report error: %s", preview(trimmed, 300))
+			}
 			time.Sleep(sleep)
 			continue
 		}
-
-		return body, nil
+		// Unknown response shape — surface it.
+		return nil, fmt.Errorf("unexpected flex response: %s", preview(trimmed, 300))
 	}
 
 	return nil, fmt.Errorf("flex report timeout after %d attempts", len(delays))
+}
+
+// preview returns the first n chars of s with an ellipsis when truncated.
+// Used to include a snippet of unexpected IBKR responses in error messages.
+func preview(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func (i *IBKR) GetBalance(ctx context.Context) (*Balance, error) {
