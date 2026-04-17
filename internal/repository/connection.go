@@ -2,6 +2,9 @@ package repository
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -73,6 +76,10 @@ func (r *ConnectionRepo) Create(ctx context.Context, conn *ExchangeConnection) e
 
 	hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper := r.getCapabilityFlags(ctx)
 
+	if r.isTSSchema {
+		return r.createTS(ctx, conn, hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper)
+	}
+
 	columns := []string{
 		"user_uid", "exchange", "label",
 	}
@@ -134,6 +141,115 @@ func (r *ConnectionRepo) Create(ctx context.Context, conn *ExchangeConnection) e
 		return err
 	}
 	return nil
+}
+
+// createTS inserts into the TS/Prisma-shaped exchange_connections: camelCase
+// column names, single encrypted* column per secret (hex-packed iv+tag+ciphertext),
+// and a client-generated id because Prisma's @default(cuid()) isn't a DB default.
+// The service layer hands us Go-format fields (ciphertext/iv/authTag in base64) —
+// we repack them into the TS hex layout so existing TS readers can decrypt.
+func (r *ConnectionRepo) createTS(
+	ctx context.Context,
+	conn *ExchangeConnection,
+	hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper bool,
+) error {
+	encAPIKey, err := repackToTSFormat(conn.EncryptedAPIKey, conn.APIKeyIV, conn.APIKeyAuthTag)
+	if err != nil {
+		return fmt.Errorf("repack api_key for TS: %w", err)
+	}
+	encAPISecret, err := repackToTSFormat(conn.EncryptedAPISecret, conn.APISecretIV, conn.APISecretAuthTag)
+	if err != nil {
+		return fmt.Errorf("repack api_secret for TS: %w", err)
+	}
+	var encPassphrase *string
+	if conn.EncryptedPassphrase != "" {
+		p, err := repackToTSFormat(conn.EncryptedPassphrase, conn.PassphraseIV, conn.PassphraseAuthTag)
+		if err != nil {
+			return fmt.Errorf("repack passphrase for TS: %w", err)
+		}
+		encPassphrase = &p
+	}
+
+	columns := []string{`id`, `"userUid"`, `exchange`, `label`}
+	args := []any{"cuid_" + randomHex(20), conn.UserUID, conn.Exchange, conn.Label}
+
+	if hasCredHash {
+		columns = append(columns, `"credentialsHash"`)
+		args = append(args, conn.CredentialsHash)
+	}
+	if hasSyncMins {
+		columns = append(columns, `"syncIntervalMinutes"`)
+		args = append(args, conn.SyncIntervalMinutes)
+	}
+	if hasExclude {
+		columns = append(columns, `"excludeFromReport"`)
+		args = append(args, conn.ExcludeFromReport)
+	}
+	if hasKYCLevel {
+		columns = append(columns, `"kycLevel"`)
+		args = append(args, conn.KYCLevel)
+	}
+	if hasIsPaper {
+		columns = append(columns, `"isPaper"`)
+		args = append(args, conn.IsPaper)
+	}
+
+	columns = append(columns,
+		`"encryptedApiKey"`, `"encryptedApiSecret"`, `"encryptedPassphrase"`,
+		`"isActive"`, `"createdAt"`, `"updatedAt"`,
+	)
+	args = append(args,
+		encAPIKey, encAPISecret, encPassphrase,
+		conn.IsActive, conn.CreatedAt, conn.UpdatedAt,
+	)
+
+	placeholders := make([]string, len(args))
+	for i := range args {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+	query := fmt.Sprintf(
+		"INSERT INTO exchange_connections (%s) VALUES (%s) RETURNING id",
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "),
+	)
+
+	err = r.pool.QueryRow(ctx, query, args...).Scan(&conn.ID)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ErrAlreadyExists
+		}
+		return err
+	}
+	return nil
+}
+
+// repackToTSFormat converts Go-format encrypted data (base64 ciphertext + base64
+// iv + base64 auth tag) into the TS-enclave's single hex string layout
+// (iv|tag|ciphertext, all hex). Required when the Go enclave writes to the
+// TS/Prisma exchange_connections table, which has one column per secret.
+func repackToTSFormat(ciphertextB64, ivB64, authTagB64 string) (string, error) {
+	ivBytes, err := base64.StdEncoding.DecodeString(ivB64)
+	if err != nil {
+		return "", fmt.Errorf("decode iv: %w", err)
+	}
+	tagBytes, err := base64.StdEncoding.DecodeString(authTagB64)
+	if err != nil {
+		return "", fmt.Errorf("decode auth tag: %w", err)
+	}
+	ctBytes, err := base64.StdEncoding.DecodeString(ciphertextB64)
+	if err != nil {
+		return "", fmt.Errorf("decode ciphertext: %w", err)
+	}
+	return hex.EncodeToString(ivBytes) + hex.EncodeToString(tagBytes) + hex.EncodeToString(ctBytes), nil
+}
+
+// randomHex returns 2n hex characters of random data, used as the random
+// suffix on client-generated cuid-shaped ids.
+func randomHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // ExistsActiveByCredentialsHash checks whether an active connection already exists

@@ -162,6 +162,39 @@ func (s *Service) DecryptTSString(hexData string) (string, error) {
 	return string(plaintext), nil
 }
 
+// EncryptTSFormat produces the single-column hex string used by the TS enclave
+// schema for encrypted credentials: hex(iv_16 || tag_16 || ciphertext).
+// The GCM nonce is 16 bytes to match the TS convention (not the stdlib 12).
+func (s *Service) EncryptTSFormat(plaintext []byte) (string, error) {
+	block, err := aes.NewCipher(s.key)
+	if err != nil {
+		return "", fmt.Errorf("create cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCMWithNonceSize(block, tsIVLen)
+	if err != nil {
+		return "", fmt.Errorf("create gcm with nonce size %d: %w", tsIVLen, err)
+	}
+
+	iv := make([]byte, tsIVLen)
+	if _, err := rand.Read(iv); err != nil {
+		return "", fmt.Errorf("generate iv: %w", err)
+	}
+
+	sealed := gcm.Seal(nil, iv, plaintext, nil)
+	tagSize := gcm.Overhead()
+	ciphertext := sealed[:len(sealed)-tagSize]
+	authTag := sealed[len(sealed)-tagSize:]
+
+	// TS layout: iv(16) + tag(16) + ciphertext, all hex-encoded.
+	return hex.EncodeToString(iv) + hex.EncodeToString(authTag) + hex.EncodeToString(ciphertext), nil
+}
+
+// EncryptTSString is a string-typed convenience wrapper around EncryptTSFormat.
+func (s *Service) EncryptTSString(plaintext string) (string, error) {
+	return s.EncryptTSFormat([]byte(plaintext))
+}
+
 const (
 	tsIVLen  = 16 // TS uses 16-byte IV (non-standard but valid for GCM)
 	tsTagLen = 16 // 16-byte auth tag (standard)
