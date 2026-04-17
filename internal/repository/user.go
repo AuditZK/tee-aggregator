@@ -104,9 +104,14 @@ func (r *UserRepo) GetOrCreate(ctx context.Context, uid string) (*User, error) {
 }
 
 func (r *UserRepo) getOrCreateTS(ctx context.Context, uid string) (*User, error) {
+	// TS/Prisma schema declares id as NOT NULL with a client-side default
+	// (cuid()/uuid()) that Postgres itself doesn't generate. When the Go
+	// enclave writes to this table we must supply an id explicitly; a
+	// server-generated UUID keeps the constraint happy and is stable for
+	// any FK use downstream.
 	query := `
-		INSERT INTO users (uid, "createdAt", "updatedAt")
-		VALUES ($1, NOW(), NOW())
+		INSERT INTO users (id, uid, "createdAt", "updatedAt")
+		VALUES (gen_random_uuid()::text, $1, NOW(), NOW())
 		ON CONFLICT (uid) DO UPDATE SET "updatedAt" = NOW()
 		RETURNING id, uid, "platformHash", "syncIntervalMinutes", "createdAt", "updatedAt"`
 
@@ -146,9 +151,12 @@ func (r *UserRepo) GetOrCreateWithPlatformHash(ctx context.Context, uid, platfor
 }
 
 func (r *UserRepo) getOrCreateWithPlatformHashTS(ctx context.Context, uid, hash string) (*User, error) {
+	// See getOrCreateTS: id is NOT NULL with a Prisma client-side default;
+	// supply a server-generated UUID so the INSERT doesn't violate the
+	// constraint when the Go enclave owns the write.
 	query := `
-		INSERT INTO users (uid, "platformHash", "createdAt", "updatedAt")
-		VALUES ($1, $2, NOW(), NOW())
+		INSERT INTO users (id, uid, "platformHash", "createdAt", "updatedAt")
+		VALUES (gen_random_uuid()::text, $1, $2, NOW(), NOW())
 		ON CONFLICT (uid) DO UPDATE SET
 			"platformHash" = COALESCE(users."platformHash", $2),
 			"updatedAt" = NOW()
