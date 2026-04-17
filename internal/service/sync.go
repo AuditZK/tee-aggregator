@@ -831,34 +831,27 @@ func (s *SyncService) enrichBreakdownWithBalances(agg *aggregatedBreakdown, bala
 	}
 }
 
-// ibkrFlexLookbackDays is the rolling window of Flex-sourced days patched on
-// every sync. IBKR Flex returns the full account history each call, so we
-// reuse that to overwrite the last N days of snapshots — this catches
-// retroactive edits (backdated deposits, equity adjustments, reconciliations
-// that take T+1 to settle) without requiring a full year refresh each time.
-const ibkrFlexLookbackDays = 30
-
-// syncIbkrFromFlex pulls the last ibkrFlexLookbackDays of account history
-// from IBKR Flex and upserts snapshots for each day. Unlike other connectors
-// where we trust the live balance, IBKR Flex is the source of truth and we
-// must refresh it every sync — partly because Flex can return a cached or
-// pinned state for several days, partly because IBKR revises historical
-// valuations (after-hours marks, corporate actions).
+// syncIbkrFromFlex upserts every daily snapshot returned by the user's Flex
+// Query. The Query period is configured user-side (LastBusinessWeek, YTD,
+// custom range…), so we trust whatever window Flex hands back rather than
+// imposing our own cap — a user with 15 days gets 15 days, a user with 360
+// gets 360. IBKR Flex is the source of truth and we must refresh it every
+// sync to catch retroactive edits (backdated deposits, equity adjustments,
+// reconciliations that take T+1 to settle).
 func (s *SyncService) syncIbkrFromFlex(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector) {
 	provider, ok := conn.(connector.HistoricalSnapshotProvider)
 	if !ok {
 		return
 	}
 
-	since := time.Now().UTC().AddDate(0, 0, -ibkrFlexLookbackDays)
 	s.logger.Info("IBKR: syncing account history from Flex",
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
 		zap.String("label", connMeta.Label),
-		zap.Int("lookback_days", ibkrFlexLookbackDays),
 	)
 
-	historicalSnapshots, err := provider.GetHistoricalSnapshots(ctx, since)
+	// Zero time = no client-side filter; upsert whatever Flex returned.
+	historicalSnapshots, err := provider.GetHistoricalSnapshots(ctx, time.Time{})
 	if err != nil {
 		s.logger.Error("IBKR Flex fetch failed",
 			zap.String("user_uid", connMeta.UserUID),
