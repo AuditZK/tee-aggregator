@@ -368,6 +368,15 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 		return nil, err
 	}
 
+	// Temporary debug: log raw deal symbols and sides to diagnose Headway cashflow parsing.
+	symbolCounts := map[string]int{}
+	sideCounts := map[string]int{}
+	for _, d := range deals {
+		symbolCounts[d.Symbol]++
+		sideCounts[d.Side]++
+	}
+	fmt.Printf("[DEBUG GetCashflows] total=%d server=%q symbols=%v sides=%v\n",
+		len(deals), m.server, symbolCounts, sideCounts)
 
 	var cashflows []*Cashflow
 	for _, deal := range deals {
