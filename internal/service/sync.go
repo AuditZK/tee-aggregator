@@ -283,9 +283,13 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		return result
 	}
 
-	// 2b. IBKR: Auto-backfill 365 days on first sync (TS parity)
+	// 2b. IBKR: always sync the last 30 days from Flex.
+	// Flex returns a full history on every call, so each sync upserts the
+	// past month. This catches retroactive corrections (backdated deposits,
+	// equity revisions) and overwrites stale snapshots where Flex was
+	// returning a cached/frozen state for several days.
 	if strings.ToLower(connMeta.Exchange) == "ibkr" {
-		s.backfillIbkrIfNeeded(ctx, connMeta, conn)
+		s.syncIbkrFromFlex(ctx, connMeta, conn)
 	}
 
 	// 3. Get balance
@@ -820,37 +824,36 @@ func (s *SyncService) enrichBreakdownWithBalances(agg *aggregatedBreakdown, bala
 	}
 }
 
-// backfillIbkrIfNeeded checks if this is the first IBKR sync (0 snapshots)
-// and if so, fetches up to 365 days of historical equity data from Flex.
-func (s *SyncService) backfillIbkrIfNeeded(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector) {
-	// Check if any snapshots exist for this connection
-	existing, err := s.snapshotRepo.GetByUserAndDateRange(ctx, connMeta.UserUID,
-		time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
-		time.Now().UTC(),
-	)
-	if err == nil {
-		for _, snap := range existing {
-			if snap.Exchange == connMeta.Exchange && snap.Label == connMeta.Label {
-				return // Snapshots already exist, skip backfill
-			}
-		}
-	}
+// ibkrFlexLookbackDays is the rolling window of Flex-sourced days patched on
+// every sync. IBKR Flex returns the full account history each call, so we
+// reuse that to overwrite the last N days of snapshots — this catches
+// retroactive edits (backdated deposits, equity adjustments, reconciliations
+// that take T+1 to settle) without requiring a full year refresh each time.
+const ibkrFlexLookbackDays = 30
 
+// syncIbkrFromFlex pulls the last ibkrFlexLookbackDays of account history
+// from IBKR Flex and upserts snapshots for each day. Unlike other connectors
+// where we trust the live balance, IBKR Flex is the source of truth and we
+// must refresh it every sync — partly because Flex can return a cached or
+// pinned state for several days, partly because IBKR revises historical
+// valuations (after-hours marks, corporate actions).
+func (s *SyncService) syncIbkrFromFlex(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector) {
 	provider, ok := conn.(connector.HistoricalSnapshotProvider)
 	if !ok {
 		return
 	}
 
-	since := time.Now().UTC().AddDate(-1, 0, 0) // 365 days ago
-	s.logger.Info("IBKR first sync: running historical backfill",
+	since := time.Now().UTC().AddDate(0, 0, -ibkrFlexLookbackDays)
+	s.logger.Info("IBKR: syncing account history from Flex",
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
 		zap.String("label", connMeta.Label),
+		zap.Int("lookback_days", ibkrFlexLookbackDays),
 	)
 
 	historicalSnapshots, err := provider.GetHistoricalSnapshots(ctx, since)
 	if err != nil {
-		s.logger.Error("IBKR backfill failed",
+		s.logger.Error("IBKR Flex fetch failed",
 			zap.String("user_uid", connMeta.UserUID),
 			zap.Error(err),
 		)
@@ -859,28 +862,32 @@ func (s *SyncService) backfillIbkrIfNeeded(ctx context.Context, connMeta *reposi
 
 	processed := 0
 	for _, hs := range historicalSnapshots {
-		// Build market breakdown from historical data (TS parity)
-		var breakdown *repository.MarketBreakdown
-		if len(hs.Breakdown) > 0 {
-			breakdown = &repository.MarketBreakdown{}
-			for mt, mb := range hs.Breakdown {
-				metrics := &repository.MarketMetrics{
-					Equity:          mb.Equity,
-					AvailableMargin: mb.AvailableMargin,
-				}
-				switch mt {
-				case connector.MarketStocks:
-					breakdown.Stocks = metrics
-				case connector.MarketOptions:
-					breakdown.Options = metrics
-				case connector.MarketFutures:
-					breakdown.Futures = metrics
-				case connector.MarketCFD:
-					breakdown.CFD = metrics
-				case connector.MarketForex:
-					breakdown.Forex = metrics
-				}
+		breakdown := &repository.MarketBreakdown{}
+		var totalAvailMargin float64
+		for mt, mb := range hs.Breakdown {
+			metrics := &repository.MarketMetrics{
+				Equity:          mb.Equity,
+				AvailableMargin: mb.AvailableMargin,
 			}
+			totalAvailMargin += mb.AvailableMargin
+			switch mt {
+			case connector.MarketStocks:
+				breakdown.Stocks = metrics
+			case connector.MarketOptions:
+				breakdown.Options = metrics
+			case connector.MarketFutures:
+				breakdown.Futures = metrics
+			case connector.MarketCFD:
+				breakdown.CFD = metrics
+			case connector.MarketForex:
+				breakdown.Forex = metrics
+			}
+		}
+		// TS-compat global aggregate: dashboard reads breakdown.global.equity,
+		// without it the IBKR equity shows as 0 on the frontend.
+		breakdown.Global = &repository.MarketMetrics{
+			Equity:          hs.TotalEquity,
+			AvailableMargin: totalAvailMargin,
 		}
 
 		snapshot := &repository.Snapshot{
@@ -897,7 +904,7 @@ func (s *SyncService) backfillIbkrIfNeeded(ctx context.Context, connMeta *reposi
 		}
 
 		if err := s.snapshotRepo.Upsert(ctx, snapshot); err != nil {
-			s.logger.Warn("IBKR backfill: failed to save snapshot",
+			s.logger.Warn("IBKR Flex: failed to upsert snapshot",
 				zap.String("date", hs.Date.Format("2006-01-02")),
 				zap.Error(err),
 			)
@@ -906,9 +913,9 @@ func (s *SyncService) backfillIbkrIfNeeded(ctx context.Context, connMeta *reposi
 		processed++
 	}
 
-	s.logger.Info("IBKR historical backfill completed",
+	s.logger.Info("IBKR Flex sync completed",
 		zap.String("user_uid", connMeta.UserUID),
-		zap.Int("snapshots_created", processed),
+		zap.Int("snapshots_upserted", processed),
 		zap.Int("total_days", len(historicalSnapshots)),
 	)
 }
