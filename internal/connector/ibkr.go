@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -15,6 +16,22 @@ const (
 	ibkrFlexURL    = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest"
 	ibkrFlexGetURL = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement"
 )
+
+// flexReportEntry holds a cached Flex XML report, shared across IBKR connector
+// instances that use the same token:queryId. Required because IBKR enforces a
+// token-level rate limit (error 1018) and users who link the same Flex
+// credentials would otherwise hammer each other out.
+type flexReportEntry struct {
+	xml       []byte
+	fetchedAt time.Time
+}
+
+var (
+	flexReportCache   = make(map[string]*flexReportEntry)
+	flexReportCacheMu sync.Mutex
+)
+
+const flexReportCacheTTL = 5 * time.Minute
 
 // IBKR implements Connector for Interactive Brokers via Flex Query
 type IBKR struct {
@@ -25,17 +42,7 @@ type IBKR struct {
 	// Cached from last GetBalance call (avoids extra Flex requests)
 	cachedBreakdown []*MarketBalance
 	cachedIsPaper   *bool
-
-	// Flex report cache — a single sync calls GetBalance, GetHistoricalSnapshots
-	// and GetCashflows back to back. Each triggers requestFlexReport + getFlexReport
-	// which hits IBKR's token-level rate limit (error 1018) when multiple users
-	// share the same Flex token. Caching the raw XML for a short window lets all
-	// three calls reuse a single API round-trip.
-	cachedReport    []byte
-	cachedReportAt  time.Time
 }
-
-const flexReportCacheTTL = 5 * time.Minute
 
 // NewIBKR creates a new IBKR connector
 func NewIBKR(creds *Credentials) *IBKR {
@@ -50,9 +57,15 @@ func NewIBKR(creds *Credentials) *IBKR {
 // younger than flexReportCacheTTL. Callers that need fresh data across syncs
 // rely on the daily sync cadence (24h apart, well beyond the cache TTL).
 func (i *IBKR) fetchFlexReport(ctx context.Context) ([]byte, error) {
-	if len(i.cachedReport) > 0 && time.Since(i.cachedReportAt) < flexReportCacheTTL {
-		return i.cachedReport, nil
+	key := i.token + ":" + i.queryID
+
+	flexReportCacheMu.Lock()
+	if entry, ok := flexReportCache[key]; ok && time.Since(entry.fetchedAt) < flexReportCacheTTL {
+		xml := entry.xml
+		flexReportCacheMu.Unlock()
+		return xml, nil
 	}
+	flexReportCacheMu.Unlock()
 
 	refCode, err := i.requestFlexReport(ctx)
 	if err != nil {
@@ -62,8 +75,11 @@ func (i *IBKR) fetchFlexReport(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	i.cachedReport = report
-	i.cachedReportAt = time.Now()
+
+	flexReportCacheMu.Lock()
+	flexReportCache[key] = &flexReportEntry{xml: report, fetchedAt: time.Now()}
+	flexReportCacheMu.Unlock()
+
 	return report, nil
 }
 
