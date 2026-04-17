@@ -599,6 +599,13 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		return result
 	}
 
+	// IBKR: patch the last 30 days of snapshots from Flex (see syncConnection).
+	// The scheduler path goes through buildConnectionSnapshot, not syncConnection,
+	// so we duplicate the call here to cover both manual and scheduled syncs.
+	if strings.ToLower(connMeta.Exchange) == "ibkr" {
+		s.syncIbkrFromFlex(ctx, connMeta, conn)
+	}
+
 	balance, err := conn.GetBalance(ctx)
 	if err != nil {
 		result.Error = fmt.Sprintf("get balance: %v", err)
