@@ -318,16 +318,11 @@ func (m *MetaTrader) callBridge(ctx context.Context, method, path string, body a
 }
 
 // isBalanceSymbol returns true for symbols that represent balance operations.
-// Standard MT5: empty symbol → bridge maps to "BALANCE".
-// Headway and some other brokers emit explicit "Deposit"/"Withdrawal" symbols
-// instead of an empty symbol on BALANCE deals. "Bonus"/"Credit" are broker
-// credits (demo bonuses, real promo credits) which must also count as cashflows.
+// The bridge normalizes all balance deals (empty symbol, "Deposit", "Withdrawal",
+// "Bonus", "Credit") to "BALANCE" with a correct side based on profit sign, so
+// we only need to recognize the canonical form here.
 func isBalanceSymbol(symbol string, _ bool) bool {
-	switch symbol {
-	case "BALANCE", "Deposit", "Withdrawal", "Bonus", "Credit":
-		return true
-	}
-	return false
+	return symbol == "BALANCE"
 }
 
 func priceWithFallback(closePrice, openPrice float64) float64 {
@@ -377,14 +372,16 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 		if ts.IsZero() || ts.Before(since) {
 			continue
 		}
-		// The sign of realized_pnl is the source of truth for direction.
-		// Standard brokers use side="deposit"/"withdrawal" AND have the matching
-		// sign; Headway-style brokers set side="buy" for everything and only
-		// convey direction via realized_pnl sign. Using the raw value works
-		// correctly for both — a withdrawal has a negative profit, a deposit
-		// (or bonus credit) has a positive one, and reversals (bonus clawback
-		// when a withdrawal is made) carry the right sign too.
-		amount := deal.RealizedPnl
+		// Bridge sets side based on profit sign for every balance deal.
+		var amount float64
+		switch deal.Side {
+		case "deposit":
+			amount = mathAbs(deal.RealizedPnl)
+		case "withdrawal":
+			amount = -mathAbs(deal.RealizedPnl)
+		default:
+			continue
+		}
 		if amount == 0 {
 			continue
 		}
