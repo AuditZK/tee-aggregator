@@ -319,13 +319,12 @@ func (m *MetaTrader) callBridge(ctx context.Context, method, path string, body a
 
 // isBalanceSymbol returns true for symbols that represent balance operations.
 // Standard MT5: empty symbol → bridge maps to "BALANCE".
-// Demo accounts: brokers credit virtual funds via "Bonus"/"Credit" deals — these
-// are the demo equivalent of deposits and must be counted as cashflows.
-func isBalanceSymbol(symbol string, isDemo bool) bool {
-	if symbol == "BALANCE" {
-		return true
-	}
-	if isDemo && (symbol == "Bonus" || symbol == "Credit") {
+// Headway and some other brokers emit explicit "Deposit"/"Withdrawal" symbols
+// instead of an empty symbol on BALANCE deals. "Bonus"/"Credit" are broker
+// credits (demo bonuses, real promo credits) which must also count as cashflows.
+func isBalanceSymbol(symbol string, _ bool) bool {
+	switch symbol {
+	case "BALANCE", "Deposit", "Withdrawal", "Bonus", "Credit":
 		return true
 	}
 	return false
@@ -367,16 +366,6 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 	if err := m.callBridge(ctx, "GET", path, nil, &deals); err != nil {
 		return nil, err
 	}
-
-	// Temporary debug: log raw deal symbols and sides to diagnose Headway cashflow parsing.
-	symbolCounts := map[string]int{}
-	sideCounts := map[string]int{}
-	for _, d := range deals {
-		symbolCounts[d.Symbol]++
-		sideCounts[d.Side]++
-	}
-	fmt.Printf("[DEBUG GetCashflows] total=%d server=%q symbols=%v sides=%v\n",
-		len(deals), m.server, symbolCounts, sideCounts)
 
 	var cashflows []*Cashflow
 	for _, deal := range deals {
