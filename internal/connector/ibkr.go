@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -29,6 +31,10 @@ type flexReportEntry struct {
 var (
 	flexReportCache   = make(map[string]*flexReportEntry)
 	flexReportCacheMu sync.Mutex
+	// flexSingleflight coalesces concurrent fetches for the same token:queryId.
+	// Without it, two parallel syncs for users sharing a Flex token both see a
+	// cache miss and race into IBKR, triggering rate limit 1018.
+	flexSingleflight singleflight.Group
 )
 
 const flexReportCacheTTL = 5 * time.Minute
@@ -59,6 +65,7 @@ func NewIBKR(creds *Credentials) *IBKR {
 func (i *IBKR) fetchFlexReport(ctx context.Context) ([]byte, error) {
 	key := i.token + ":" + i.queryID
 
+	// Fast path: fresh cache hit.
 	flexReportCacheMu.Lock()
 	if entry, ok := flexReportCache[key]; ok && time.Since(entry.fetchedAt) < flexReportCacheTTL {
 		xml := entry.xml
@@ -67,20 +74,37 @@ func (i *IBKR) fetchFlexReport(ctx context.Context) ([]byte, error) {
 	}
 	flexReportCacheMu.Unlock()
 
-	refCode, err := i.requestFlexReport(ctx)
+	// Slow path: coalesce concurrent fetches for the same token so parallel
+	// user syncs share one Flex API round-trip.
+	v, err, _ := flexSingleflight.Do(key, func() (interface{}, error) {
+		// Re-check the cache inside the flight in case another goroutine won
+		// the singleflight race and already populated it.
+		flexReportCacheMu.Lock()
+		if entry, ok := flexReportCache[key]; ok && time.Since(entry.fetchedAt) < flexReportCacheTTL {
+			xml := entry.xml
+			flexReportCacheMu.Unlock()
+			return xml, nil
+		}
+		flexReportCacheMu.Unlock()
+
+		refCode, err := i.requestFlexReport(ctx)
+		if err != nil {
+			return nil, err
+		}
+		report, err := i.getFlexReport(ctx, refCode)
+		if err != nil {
+			return nil, err
+		}
+
+		flexReportCacheMu.Lock()
+		flexReportCache[key] = &flexReportEntry{xml: report, fetchedAt: time.Now()}
+		flexReportCacheMu.Unlock()
+		return report, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	report, err := i.getFlexReport(ctx, refCode)
-	if err != nil {
-		return nil, err
-	}
-
-	flexReportCacheMu.Lock()
-	flexReportCache[key] = &flexReportEntry{xml: report, fetchedAt: time.Now()}
-	flexReportCacheMu.Unlock()
-
-	return report, nil
+	return v.([]byte), nil
 }
 
 func (i *IBKR) Exchange() string {
