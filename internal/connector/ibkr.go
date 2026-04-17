@@ -177,8 +177,15 @@ func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
 func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error) {
 	url := fmt.Sprintf("%s?t=%s&q=%s&v=3", ibkrFlexGetURL, i.token, refCode)
 
-	// Poll with retries (Flex reports can take time to generate)
-	for attempt := 0; attempt < 10; attempt++ {
+	// Poll with exponential backoff. Small Flex reports (LastBusinessWeek)
+	// are typically ready in 5-10s; 30-day / YTD reports on busy accounts
+	// can take 1-3 minutes. Total budget here: ~4 minutes.
+	delays := []time.Duration{
+		3 * time.Second, 5 * time.Second, 5 * time.Second, 10 * time.Second, 10 * time.Second,
+		15 * time.Second, 15 * time.Second, 20 * time.Second, 30 * time.Second, 30 * time.Second,
+		30 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second,
+	}
+	for _, sleep := range delays {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
 			return nil, err
@@ -197,14 +204,14 @@ func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error
 
 		// Check if still processing
 		if strings.Contains(string(body), "Statement generation in progress") {
-			time.Sleep(5 * time.Second)
+			time.Sleep(sleep)
 			continue
 		}
 
 		return body, nil
 	}
 
-	return nil, fmt.Errorf("flex report timeout after 10 attempts")
+	return nil, fmt.Errorf("flex report timeout after %d attempts", len(delays))
 }
 
 func (i *IBKR) GetBalance(ctx context.Context) (*Balance, error) {
