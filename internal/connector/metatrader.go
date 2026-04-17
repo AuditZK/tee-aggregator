@@ -367,14 +367,6 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 		return nil, err
 	}
 
-	// Temporary debug: dump each BALANCE deal to diagnose sign direction.
-	for _, d := range deals {
-		if isBalanceSymbol(d.Symbol, true) {
-			fmt.Printf("[BALANCE DEAL] symbol=%q side=%q realized_pnl=%.2f close_time=%s\n",
-				d.Symbol, d.Side, d.RealizedPnl, d.CloseTime)
-		}
-	}
-
 	var cashflows []*Cashflow
 	for _, deal := range deals {
 		isDemo := strings.Contains(strings.ToLower(m.server), "demo")
@@ -385,17 +377,14 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 		if ts.IsZero() || ts.Before(since) {
 			continue
 		}
-		// Standard brokers: side="deposit"/"withdrawal"
-		// Some brokers (e.g. Headway): side="buy"/"sell" — use sign of realized_pnl instead
-		var amount float64
-		switch deal.Side {
-		case "deposit", "buy":
-			amount = mathAbs(deal.RealizedPnl)
-		case "withdrawal", "sell":
-			amount = -mathAbs(deal.RealizedPnl)
-		default:
-			continue
-		}
+		// The sign of realized_pnl is the source of truth for direction.
+		// Standard brokers use side="deposit"/"withdrawal" AND have the matching
+		// sign; Headway-style brokers set side="buy" for everything and only
+		// convey direction via realized_pnl sign. Using the raw value works
+		// correctly for both — a withdrawal has a negative profit, a deposit
+		// (or bonus credit) has a positive one, and reversals (bonus clawback
+		// when a withdrawal is made) carry the right sign too.
+		amount := deal.RealizedPnl
 		if amount == 0 {
 			continue
 		}
