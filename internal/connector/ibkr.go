@@ -202,8 +202,14 @@ func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error
 			return nil, err
 		}
 
-		// Check if still processing
-		if strings.Contains(string(body), "Statement generation in progress") {
+		// Check if still processing. IBKR returns 3 flavours:
+		//   1. <ErrorCode>1019</ErrorCode> — Statement generation in progress
+		//   2. Text "Statement generation in progress" (older format)
+		//   3. A non-XML "please wait" body
+		bodyStr := string(body)
+		if strings.Contains(bodyStr, "1019") ||
+			strings.Contains(bodyStr, "Statement generation in progress") ||
+			strings.Contains(bodyStr, "<Status>Warn</Status>") {
 			time.Sleep(sleep)
 			continue
 		}
