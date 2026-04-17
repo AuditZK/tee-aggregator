@@ -483,7 +483,9 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 	)
 
 	connSem := make(chan struct{}, 1) // Sequential per user (CCXT loads ~150MB per connector)
-	const connTimeout = 2 * time.Minute  // Max 2 min per connection (IBKR polls can hang)
+	// 5min matches the IBKR Flex poll budget (~4min for 30-day/YTD reports) with
+	// a safety margin; other connectors are sub-second so the ceiling never hits.
+	const connTimeout = 5 * time.Minute
 
 	for _, conn := range connections {
 		if !s.isConnectionDue(ctx, conn, now) {
