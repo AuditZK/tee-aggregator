@@ -55,7 +55,10 @@ func NewIBKR(creds *Credentials) *IBKR {
 	return &IBKR{
 		token:   creds.APIKey,
 		queryID: creds.APISecret,
-		client:  &http.Client{Timeout: 120 * time.Second}, // Flex can be slow
+		// 5min per HTTP call — large Flex reports (YTD, 30 days) occasionally
+		// take 1-2min to respond; with poll retries the total budget reaches
+		// ~4min so no individual request should ever hit this ceiling.
+		client: &http.Client{Timeout: 5 * time.Minute},
 	}
 }
 
