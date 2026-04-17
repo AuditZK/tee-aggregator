@@ -93,6 +93,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Admin endpoint (always available, localhost only)
 	mux.HandleFunc("/api/v1/admin/sync-now", s.handleAdminSyncNow)
+	mux.HandleFunc("/api/v1/admin/cashflows", s.handleAdminDumpCashflows)
 
 	// Legacy REST routes are disabled by default for strict TS parity.
 	if s.cfg.EnableLegacyREST {
@@ -179,6 +180,56 @@ func (s *Server) handleAdminSyncNow(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("admin sync-now triggered")
 	go s.scheduler.RunNow()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "sync triggered, check logs"})
+}
+
+// handleAdminDumpCashflows dumps all BALANCE deals for a user/exchange/label since a date.
+// Usage: GET /api/v1/admin/cashflows?user_uid=X&exchange=mt5&label=Y&from=2026-04-01
+//
+// Intended for admin backfills when the normal sync window missed cashflows
+// (e.g. the Headway side=buy/sell bug). Requires a running enclave with the
+// DEK unwrapped so broker credentials can be decrypted.
+func (s *Server) handleAdminDumpCashflows(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "GET only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+	fromStr := q.Get("from")
+
+	if userUID == "" || exchange == "" || fromStr == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "user_uid, exchange, and from (YYYY-MM-DD) are required",
+		})
+		return
+	}
+
+	since, err := time.Parse("2006-01-02", fromStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid from date, use YYYY-MM-DD"})
+		return
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	cashflows, err := s.handler.syncSvc.DumpCashflows(r.Context(), userUID, exchange, label, since)
+	if err != nil {
+		s.logger.Error("dump cashflows failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":   true,
+		"count":     len(cashflows),
+		"cashflows": cashflows,
+	})
 }
 
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {

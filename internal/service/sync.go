@@ -1030,6 +1030,36 @@ func (s *SyncService) getOrCreateConnector(exchange, userUID string, creds *Cred
 	return conn, nil
 }
 
+// DumpCashflows fetches BALANCE deals (deposits/withdrawals) from the broker
+// for a user over a wider date range than the normal daily sync window.
+// Intended for admin backfills after a bug affected cashflow capture.
+func (s *SyncService) DumpCashflows(
+	ctx context.Context,
+	userUID, exchange, label string,
+	since time.Time,
+) ([]*connector.Cashflow, error) {
+	if s.connSvc == nil {
+		return nil, fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build connector: %w", err)
+	}
+
+	cfFetcher, ok := conn.(connector.CashflowFetcher)
+	if !ok {
+		return nil, fmt.Errorf("connector %s does not support cashflow fetching", exchange)
+	}
+
+	return cfFetcher.GetCashflows(ctx, since)
+}
+
 func appendUnique(slice []string, s string) []string {
 	for _, v := range slice {
 		if v == s {
