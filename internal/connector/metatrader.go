@@ -367,6 +367,14 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 		return nil, err
 	}
 
+	// Temporary debug: dump each BALANCE deal to diagnose sign direction.
+	for _, d := range deals {
+		if isBalanceSymbol(d.Symbol, true) {
+			fmt.Printf("[BALANCE DEAL] symbol=%q side=%q realized_pnl=%.2f close_time=%s\n",
+				d.Symbol, d.Side, d.RealizedPnl, d.CloseTime)
+		}
+	}
+
 	var cashflows []*Cashflow
 	for _, deal := range deals {
 		isDemo := strings.Contains(strings.ToLower(m.server), "demo")
