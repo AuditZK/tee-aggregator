@@ -160,7 +160,7 @@ func TestAggregateTrades_SeparatesStocksFromSpot(t *testing.T) {
 	}
 
 	agg := svc.aggregateTrades(trades)
-	repo := agg.toRepo()
+	repo := agg.toRepo(0, 0, 0)
 
 	if repo.Stocks == nil {
 		t.Fatal("expected stocks metrics to be populated")
@@ -407,7 +407,7 @@ func TestToRepo_EmitsMarketsWithEquityButNoTrades(t *testing.T) {
 	agg.futures.equity = 10000
 	agg.futures.availableMargin = 5000
 
-	repo := agg.toRepo()
+	repo := agg.toRepo(0, 0, 0)
 
 	if repo.Futures == nil {
 		t.Fatal("expected Futures to be present when equity > 0 and trades == 0")
@@ -444,7 +444,7 @@ func TestAggregateTrades_FundingFeesCarry(t *testing.T) {
 	}
 	agg := svc.aggregateTrades(trades)
 	agg.swap.fundingFees = 12.5 // Set manually (populated by FundingFeesFetcher in sync)
-	repo := agg.toRepo()
+	repo := agg.toRepo(0, 0, 0)
 	if repo.Swap == nil {
 		t.Fatal("expected swap metrics")
 	}
@@ -456,7 +456,7 @@ func TestAggregateTrades_FundingFeesCarry(t *testing.T) {
 func TestEarnBalanceEnrichment(t *testing.T) {
 	agg := &aggregatedBreakdown{}
 	agg.earn.equity = 5000
-	repo := agg.toRepo()
+	repo := agg.toRepo(0, 0, 0)
 	if repo.Earn == nil {
 		t.Fatal("expected earn in breakdown when equity > 0")
 	}

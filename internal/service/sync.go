@@ -423,7 +423,7 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		TotalTrades:     len(trades),
 		TotalVolume:     breakdown.totalVolume(),
 		TotalFees:       breakdown.totalFees(),
-		Breakdown:       breakdown.toRepo(),
+		Breakdown:       breakdown.toRepo(balance.Equity, balance.Available, len(trades)),
 	}
 
 	result.snapshot = snapshot
@@ -705,7 +705,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		TotalTrades:     len(trades),
 		TotalVolume:     breakdown.totalVolume(),
 		TotalFees:       breakdown.totalFees(),
-		Breakdown:       breakdown.toRepo(),
+		Breakdown:       breakdown.toRepo(balance.Equity, balance.Available, len(trades)),
 	}
 	result.TradeCount = len(trades)
 	result.SnapshotEquity = balance.Equity
@@ -1130,7 +1130,12 @@ func (a *aggregatedBreakdown) totalFees() float64 {
 		a.margin.fees + a.earn.fees + a.cfd.fees + a.forex.fees + a.commodities.fees
 }
 
-func (a *aggregatedBreakdown) toRepo() *repository.MarketBreakdown {
+// toRepo converts the aggregated breakdown to repository format and, if
+// globalEquity > 0, populates the `global` aggregate that TS consumers
+// (frontend dashboard, analytics-service) read to get total equity, volume
+// and fees. Without global, the breakdown is Go-only and the dashboard
+// displays 0 for users synced by the Go enclave.
+func (a *aggregatedBreakdown) toRepo(globalEquity, globalAvailableMargin float64, totalTrades int) *repository.MarketBreakdown {
 	breakdown := &repository.MarketBreakdown{}
 
 	if a.stocks.hasData() {
@@ -1171,6 +1176,19 @@ func (a *aggregatedBreakdown) toRepo() *repository.MarketBreakdown {
 
 	if a.commodities.hasData() {
 		breakdown.Commodities = a.commodities.toRepoMetrics()
+	}
+
+	// TS-compat global aggregate: dashboard reads breakdown.global.equity
+	// (falls back from .totalEquityUsd), so we must always set it when we
+	// know the total equity.
+	if globalEquity > 0 || totalTrades > 0 {
+		breakdown.Global = &repository.MarketMetrics{
+			Equity:          globalEquity,
+			AvailableMargin: globalAvailableMargin,
+			Volume:          a.totalVolume(),
+			Trades:          totalTrades,
+			TradingFees:     a.totalFees(), // toRepoMetrics splits fees by kind; aggregate only keeps total
+		}
 	}
 
 	return breakdown
