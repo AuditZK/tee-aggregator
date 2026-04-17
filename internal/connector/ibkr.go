@@ -158,6 +158,7 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 				AccountID       string `xml:"accountId,attr"`
 				EquitySummaryInBase struct {
 					EquitySummaryByReportDateInBase []struct {
+						Currency             string `xml:"currency,attr"`
 						Total                string `xml:"total,attr"`
 						Cash                 string `xml:"cash,attr"`
 						Stock                string `xml:"stock,attr"`
@@ -187,6 +188,11 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 	}
 
 	summary := summaries[len(summaries)-1] // Latest
+	// Flex reports "in base currency" — the account's denomination, not always USD.
+	currency := summary.Currency
+	if currency == "" {
+		currency = "USD"
+	}
 	total, _ := strconv.ParseFloat(summary.Total, 64)
 	cash, _ := strconv.ParseFloat(summary.Cash, 64)
 	unrealized, _ := strconv.ParseFloat(summary.UnrealizedPnL, 64)
@@ -238,7 +244,7 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 		Available:     cash,
 		Equity:        total,
 		UnrealizedPnL: unrealized,
-		Currency:      "USD",
+		Currency:      currency,
 	}, nil
 }
 
