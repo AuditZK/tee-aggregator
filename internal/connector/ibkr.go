@@ -25,7 +25,17 @@ type IBKR struct {
 	// Cached from last GetBalance call (avoids extra Flex requests)
 	cachedBreakdown []*MarketBalance
 	cachedIsPaper   *bool
+
+	// Flex report cache — a single sync calls GetBalance, GetHistoricalSnapshots
+	// and GetCashflows back to back. Each triggers requestFlexReport + getFlexReport
+	// which hits IBKR's token-level rate limit (error 1018) when multiple users
+	// share the same Flex token. Caching the raw XML for a short window lets all
+	// three calls reuse a single API round-trip.
+	cachedReport    []byte
+	cachedReportAt  time.Time
 }
+
+const flexReportCacheTTL = 5 * time.Minute
 
 // NewIBKR creates a new IBKR connector
 func NewIBKR(creds *Credentials) *IBKR {
@@ -34,6 +44,27 @@ func NewIBKR(creds *Credentials) *IBKR {
 		queryID: creds.APISecret,
 		client:  &http.Client{Timeout: 120 * time.Second}, // Flex can be slow
 	}
+}
+
+// fetchFlexReport returns the raw Flex XML, reusing a cached copy if it is
+// younger than flexReportCacheTTL. Callers that need fresh data across syncs
+// rely on the daily sync cadence (24h apart, well beyond the cache TTL).
+func (i *IBKR) fetchFlexReport(ctx context.Context) ([]byte, error) {
+	if len(i.cachedReport) > 0 && time.Since(i.cachedReportAt) < flexReportCacheTTL {
+		return i.cachedReport, nil
+	}
+
+	refCode, err := i.requestFlexReport(ctx)
+	if err != nil {
+		return nil, err
+	}
+	report, err := i.getFlexReport(ctx, refCode)
+	if err != nil {
+		return nil, err
+	}
+	i.cachedReport = report
+	i.cachedReportAt = time.Now()
+	return report, nil
 }
 
 func (i *IBKR) Exchange() string {
@@ -137,12 +168,11 @@ func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error
 }
 
 func (i *IBKR) GetBalance(ctx context.Context) (*Balance, error) {
-	refCode, err := i.requestFlexReport(ctx)
+	report, err := i.fetchFlexReport(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	report, err := i.getFlexReport(ctx, refCode)
 	if err != nil {
 		return nil, err
 	}
@@ -256,12 +286,11 @@ func (i *IBKR) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
 }
 
 func (i *IBKR) GetPositions(ctx context.Context) ([]*Position, error) {
-	refCode, err := i.requestFlexReport(ctx)
+	report, err := i.fetchFlexReport(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	report, err := i.getFlexReport(ctx, refCode)
 	if err != nil {
 		return nil, err
 	}
@@ -343,12 +372,11 @@ func (i *IBKR) parsePositionsFromReport(report []byte) ([]*Position, error) {
 // GetCashflows returns deposits and withdrawals since the given date.
 // Uses IBKR Flex CashTransactions.
 func (i *IBKR) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
-	refCode, err := i.requestFlexReport(ctx)
+	report, err := i.fetchFlexReport(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	report, err := i.getFlexReport(ctx, refCode)
 	if err != nil {
 		return nil, err
 	}
@@ -416,12 +444,11 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 // GetHistoricalSnapshots returns daily equity snapshots from IBKR Flex (up to 365 days).
 // Used for backfill on first sync.
 func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*HistoricalSnapshot, error) {
-	refCode, err := i.requestFlexReport(ctx)
+	report, err := i.fetchFlexReport(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	report, err := i.getFlexReport(ctx, refCode)
 	if err != nil {
 		return nil, err
 	}
@@ -521,12 +548,11 @@ func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*
 }
 
 func (i *IBKR) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
-	refCode, err := i.requestFlexReport(ctx)
+	report, err := i.fetchFlexReport(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	report, err := i.getFlexReport(ctx, refCode)
 	if err != nil {
 		return nil, err
 	}
