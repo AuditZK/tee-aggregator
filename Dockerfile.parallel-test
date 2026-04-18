@@ -49,6 +49,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -o /admin-update-creds \
     ./cmd/admin-update-creds
 
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -trimpath \
+    -ldflags="-w -s" \
+    -o /admin-probe \
+    ./cmd/admin-probe
+
 # Runtime stage
 FROM alpine:3.20
 
@@ -64,6 +72,7 @@ RUN chmod +x /usr/local/bin/snpguest
 # Copy Go binary
 COPY --from=builder /enclave /app/enclave
 COPY --from=builder /admin-update-creds /app/admin-update-creds
+COPY --from=builder /admin-probe /app/admin-probe
 
 # Copy migrations
 COPY --from=builder /app/migrations /app/migrations
