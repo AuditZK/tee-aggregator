@@ -112,11 +112,16 @@ func loadCredentials(ctx context.Context, dbURL string, a probeArgs) (*connector
 
 	connRepo := repository.NewConnectionRepo(pool)
 	connSvc := service.NewConnectionService(connRepo, enc)
-	creds, err := connSvc.GetDecryptedCredentialsByLabel(ctx, a.userUID, a.exchange, a.label)
+	svcCreds, err := connSvc.GetDecryptedCredentialsByLabel(ctx, a.userUID, a.exchange, a.label)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt credentials: %w", err)
 	}
-	return creds, nil
+	return &connector.Credentials{
+		Exchange:   svcCreds.Exchange,
+		APIKey:     svcCreds.APIKey,
+		APISecret:  svcCreds.APISecret,
+		Passphrase: svcCreds.Passphrase,
+	}, nil
 }
 
 func printHeader(a probeArgs, creds *connector.Credentials) {
