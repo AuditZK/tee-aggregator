@@ -733,7 +733,7 @@ func (r *ConnectionRepo) GetByUserExchangeLabel(ctx context.Context, userUID, ex
 				"encryptedApiKey", "encryptedApiSecret", "encryptedPassphrase",
 				"isActive", "createdAt", "updatedAt"
 			FROM exchange_connections
-			WHERE "userUid" = $1 AND exchange = $2 AND label = $3 AND "isActive" = true`
+			WHERE "userUid" = $1 AND exchange = $2 AND TRIM(label) = TRIM($3) AND "isActive" = true`
 
 		var conn ExchangeConnection
 		var encPassphrase *string
@@ -758,7 +758,7 @@ func (r *ConnectionRepo) GetByUserExchangeLabel(ctx context.Context, userUID, ex
 			encrypted_passphrase, passphrase_iv, passphrase_auth_tag,
 			is_active, created_at, updated_at
 		FROM exchange_connections
-		WHERE user_uid = $1 AND exchange = $2 AND label = $3 AND is_active = true`
+		WHERE user_uid = $1 AND exchange = $2 AND TRIM(label) = TRIM($3) AND is_active = true`
 
 	var conn ExchangeConnection
 	err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(
