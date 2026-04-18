@@ -17,28 +17,41 @@ import (
 const lighterAPI = "https://mainnet.zklighter.elliot.ai"
 
 // Lighter is a read-only DEX connector for the Lighter Protocol.
-// Credentials: apiKey = read-only auth token (ro:ACCOUNT_INDEX:...).
-// The account index is extracted from the token.
+// Credentials: apiKey is either
+//   - a read-only auth token "ro:<account_index>:single:<ts>:<sig>" — enables
+//     both balance and trade history (via /api/v1/export), or
+//   - an L1 wallet address "0x..." — enables balance/positions only, since
+//     /api/v1/export requires a signed token. Trade fetches return empty
+//     when only the wallet address is provided.
 type Lighter struct {
-	authToken    string
-	accountIndex *int
-	client       *http.Client
+	authToken     string
+	walletAddress string
+	accountIndex  *int
+	client        *http.Client
 }
 
 // NewLighter creates a new Lighter connector.
-// creds.APIKey = read-only auth token (e.g. "ro:713194:single:...").
+// Accepts either a "ro:<index>:..." auth token or a "0x..." wallet address
+// as creds.APIKey.
 func NewLighter(creds *Credentials) *Lighter {
 	token := strings.TrimSpace(creds.APIKey)
 
 	l := &Lighter{
-		authToken: token,
-		client:    &http.Client{Timeout: 30 * time.Second},
+		client: &http.Client{Timeout: 30 * time.Second},
 	}
 
-	// Extract account_index from token: "ro:713194:single:..."
-	if parts := strings.SplitN(token, ":", 3); len(parts) >= 2 {
-		if idx, err := strconv.Atoi(parts[1]); err == nil {
-			l.accountIndex = &idx
+	switch {
+	case strings.HasPrefix(strings.ToLower(token), "0x"):
+		// Wallet address form: account_index will be resolved on first
+		// fetchAccount() via the public /api/v1/account?by=l1_address endpoint.
+		l.walletAddress = token
+	default:
+		// Token form "ro:<index>:single:...": extract index directly.
+		l.authToken = token
+		if parts := strings.SplitN(token, ":", 3); len(parts) >= 2 {
+			if idx, err := strconv.Atoi(parts[1]); err == nil {
+				l.accountIndex = &idx
+			}
 		}
 	}
 
@@ -110,6 +123,13 @@ func (l *Lighter) GetPositions(ctx context.Context) ([]*Position, error) {
 }
 
 func (l *Lighter) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
+	// /api/v1/export requires a signed "ro:..." auth token. With only a wallet
+	// address we can still produce balance snapshots; trade history is just
+	// unavailable, so return an empty slice rather than erroring the whole sync.
+	if l.authToken == "" {
+		return nil, nil
+	}
+
 	accountIndex, err := l.getAccountIndex(ctx)
 	if err != nil {
 		return nil, err
@@ -209,7 +229,27 @@ func (l *Lighter) fetchAccount(ctx context.Context) (*lighterAccount, error) {
 		return nil, fmt.Errorf("lighter: could not fetch account (index=%d)", *l.accountIndex)
 	}
 
-	return nil, fmt.Errorf("lighter: no account_index available (check auth token format)")
+	if l.walletAddress != "" {
+		data, err := l.doGet(ctx, "/api/v1/account", map[string]string{
+			"by":    "l1_address",
+			"value": l.walletAddress,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("lighter: lookup by l1_address %s: %w", l.walletAddress, err)
+		}
+		var resp lighterAccountResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return nil, fmt.Errorf("lighter: decode account response: %w", err)
+		}
+		if len(resp.Accounts) == 0 {
+			return nil, fmt.Errorf("lighter: no account found for l1_address %s", l.walletAddress)
+		}
+		idx := resp.Accounts[0].Index
+		l.accountIndex = &idx
+		return &resp.Accounts[0], nil
+	}
+
+	return nil, fmt.Errorf("lighter: credentials must be a ro:<index>:... token or an 0x... wallet address")
 }
 
 // fetchExportTrades uses /api/v1/export to get trade history as CSV.
