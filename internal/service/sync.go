@@ -305,9 +305,14 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		return result
 	}
 
-	// 4. Get trades for today (memory only - will be aggregated then discarded)
+	// 4. Get trades for the 24h window ending at the snapshot boundary.
+	// startOfDay is the snapshot timestamp (today 00:00 UTC). The sync runs
+	// at that moment, so we need to look BACK one day to attribute the last
+	// 24h of trades/cashflows to this snapshot — otherwise GetTrades runs
+	// with a zero-length window and returns nothing.
 	now := time.Now().UTC()
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	activityStart := startOfDay.Add(-24 * time.Hour)
 
 	// 4a. Per-market trade fetching if supported; otherwise fallback to flat GetTrades
 	var trades []*connector.Trade
@@ -316,7 +321,7 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		if detector, ok2 := conn.(connector.MarketTypeDetector); ok2 {
 			if marketTypes, err := detector.DetectMarketTypes(ctx); err == nil {
 				for _, mt := range marketTypes {
-					mtTrades, err := pmFetcher.GetTradesByMarket(ctx, mt, startOfDay)
+					mtTrades, err := pmFetcher.GetTradesByMarket(ctx, mt, activityStart)
 					if err != nil {
 						continue
 					}
@@ -334,7 +339,7 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		}
 	}
 	if len(trades) == 0 {
-		trades, _ = conn.GetTrades(ctx, startOfDay, now)
+		trades, _ = conn.GetTrades(ctx, activityStart, now)
 		// Collect swap symbols from fallback trades for funding fee fetch
 		for _, t := range trades {
 			if t.MarketType == connector.MarketSwap {
@@ -349,7 +354,7 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	// 5a. Fetch funding fees for swap positions (always if supported — funding
 	// applies to all open positions, not just those traded today)
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
-		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, startOfDay); err == nil {
+		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, activityStart); err == nil {
 			totalFunding := 0.0
 			for _, f := range fees {
 				totalFunding += f.Amount
@@ -366,10 +371,10 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		}
 	}
 
-	// 6. Fetch deposits/withdrawals if connector supports it
+	// 6. Fetch deposits/withdrawals for the same 24h window as trades.
 	var deposits, withdrawals float64
 	if cfFetcher, ok := conn.(connector.CashflowFetcher); ok {
-		cashflows, err := cfFetcher.GetCashflows(ctx, startOfDay)
+		cashflows, err := cfFetcher.GetCashflows(ctx, activityStart)
 		if err == nil {
 			for _, cf := range cashflows {
 				if cf.Amount > 0 {
@@ -616,8 +621,12 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	}
 	s.logger.Info("balance fetched", zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.Duration("elapsed", time.Since(start)))
 
+	// Same 24h-window semantics as syncConnection above: the snapshot lands
+	// at startOfDay (today 00:00 UTC), so we pull trades/cashflows from the
+	// preceding 24h window.
 	now := time.Now().UTC()
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	activityStart := startOfDay.Add(-24 * time.Hour)
 
 	var trades []*connector.Trade
 	var swapSymbols []string
@@ -625,7 +634,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		if detector, ok2 := conn.(connector.MarketTypeDetector); ok2 {
 			if marketTypes, err := detector.DetectMarketTypes(ctx); err == nil {
 				for _, mt := range marketTypes {
-					mtTrades, err := pmFetcher.GetTradesByMarket(ctx, mt, startOfDay)
+					mtTrades, err := pmFetcher.GetTradesByMarket(ctx, mt, activityStart)
 					if err != nil {
 						continue
 					}
@@ -643,7 +652,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		}
 	}
 	if len(trades) == 0 {
-		trades, _ = conn.GetTrades(ctx, startOfDay, now)
+		trades, _ = conn.GetTrades(ctx, activityStart, now)
 		// Collect swap symbols from fallback trades for funding fee fetch
 		for _, t := range trades {
 			if t.MarketType == connector.MarketSwap {
@@ -655,7 +664,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	breakdown := s.aggregateTrades(trades)
 
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
-		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, startOfDay); err == nil {
+		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, activityStart); err == nil {
 			total := 0.0
 			for _, f := range fees {
 				total += f.Amount
@@ -673,7 +682,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 
 	var deposits, withdrawals float64
 	if cfFetcher, ok := conn.(connector.CashflowFetcher); ok {
-		if cashflows, err := cfFetcher.GetCashflows(ctx, startOfDay); err == nil {
+		if cashflows, err := cfFetcher.GetCashflows(ctx, activityStart); err == nil {
 			for _, cf := range cashflows {
 				if cf.Amount > 0 {
 					deposits += cf.Amount
