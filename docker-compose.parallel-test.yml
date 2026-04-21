@@ -36,7 +36,7 @@ services:
       - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
       - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:-}
-      - LOG_LEVEL=debug
+      - LOG_LEVEL=${LOG_LEVEL:-info}
       # Daily scheduler: defaults to true (sync at 00:00 UTC) but can be
       # disabled via .env.parallel-test to run a passive read-only test
       # alongside the TS prod enclave. Set ENABLE_DAILY_SYNC=false in the
