@@ -325,9 +325,67 @@ func (m *MEXC) GetPositions(ctx context.Context) ([]*Position, error) {
 	return positions, nil
 }
 
+// GetTrades fetches spot trades from MEXC. The /api/v3/myTrades endpoint
+// requires the symbol parameter — there is no "all symbols" variant. We
+// enumerate the user's current spot assets and query per ASSET+USDT pair.
+// Assets that are pure stablecoins are skipped (they are the quote side).
+//
+// Trade-off: only symbols where the user currently holds a non-zero balance
+// are queried. A user who fully closed a position within the window and
+// rolled everything back to USDT will lose that symbol — acceptable for the
+// daily snapshot use-case where volume/count is a secondary signal next to
+// the equity line.
 func (m *MEXC) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
-	params := fmt.Sprintf("startTime=%d&endTime=%d&limit=1000",
-		start.UnixMilli(), end.UnixMilli())
+	spotBody, err := m.signedGET(ctx, "/api/v3/account", "")
+	if err != nil {
+		return nil, fmt.Errorf("list assets: %w", err)
+	}
+	var spotResp struct {
+		Balances []struct {
+			Asset  string `json:"asset"`
+			Free   string `json:"free"`
+			Locked string `json:"locked"`
+		} `json:"balances"`
+	}
+	if err := json.Unmarshal(spotBody, &spotResp); err != nil {
+		return nil, fmt.Errorf("parse account: %w", err)
+	}
+
+	stables := map[string]struct{}{
+		"USDT": {}, "USDC": {}, "USD": {}, "BUSD": {}, "DAI": {}, "FDUSD": {},
+	}
+
+	var symbols []string
+	for _, b := range spotResp.Balances {
+		asset := strings.ToUpper(b.Asset)
+		if _, isStable := stables[asset]; isStable {
+			continue
+		}
+		free, _ := strconv.ParseFloat(b.Free, 64)
+		locked, _ := strconv.ParseFloat(b.Locked, 64)
+		if free+locked <= 0 {
+			continue
+		}
+		symbols = append(symbols, asset+"USDT")
+	}
+
+	var trades []*Trade
+	for _, sym := range symbols {
+		symTrades, err := m.fetchTradesForSymbol(ctx, sym, start, end)
+		if err != nil {
+			// Skip symbols that don't exist or error (e.g. delisted pairs) —
+			// one bad symbol shouldn't fail the whole sync.
+			continue
+		}
+		trades = append(trades, symTrades...)
+	}
+
+	return trades, nil
+}
+
+func (m *MEXC) fetchTradesForSymbol(ctx context.Context, symbol string, start, end time.Time) ([]*Trade, error) {
+	params := fmt.Sprintf("symbol=%s&startTime=%d&endTime=%d&limit=1000",
+		symbol, start.UnixMilli(), end.UnixMilli())
 
 	body, err := m.signedGET(ctx, "/api/v3/myTrades", params)
 	if err != nil {
@@ -335,14 +393,14 @@ func (m *MEXC) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, e
 	}
 
 	var rawTrades []struct {
-		ID            int64  `json:"id"`
-		Symbol        string `json:"symbol"`
-		IsBuyer       bool   `json:"isBuyer"`
-		Price         string `json:"price"`
-		Qty           string `json:"qty"`
-		Commission    string `json:"commission"`
+		ID              int64  `json:"id"`
+		Symbol          string `json:"symbol"`
+		IsBuyer         bool   `json:"isBuyer"`
+		Price           string `json:"price"`
+		Qty             string `json:"qty"`
+		Commission      string `json:"commission"`
 		CommissionAsset string `json:"commissionAsset"`
-		Time          int64  `json:"time"`
+		Time            int64  `json:"time"`
 	}
 
 	if err := json.Unmarshal(body, &rawTrades); err != nil {
