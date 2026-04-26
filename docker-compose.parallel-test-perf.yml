@@ -89,7 +89,11 @@ services:
     expose:
       - "9094"
     volumes:
-      - ./certs:/etc/enclave:ro
+      # CERTS_DIR overridable so the perf-test instance can reuse the
+      # same TLS material as the existing enclave_go_test container
+      # (mounted from a different checkout) without copying files
+      # around. Defaults to ./certs for clean fresh setups.
+      - ${CERTS_DIR:-./certs}:/etc/enclave:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
       - vcek_cache_test_perf:/var/cache/enclave/certs
     devices:
