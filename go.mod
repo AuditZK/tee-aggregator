@@ -10,7 +10,7 @@ go 1.26.2
 require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.4.2
-	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jackc/pgx/v5 v5.9.0
 	go.uber.org/zap v1.26.0
 	golang.org/x/crypto v0.46.0
 	golang.org/x/sync v0.19.0
