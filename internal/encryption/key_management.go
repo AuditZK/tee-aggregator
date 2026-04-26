@@ -3,11 +3,14 @@ package encryption
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 )
 
@@ -229,7 +232,17 @@ func (s *KeyManagementService) loadActiveDEK(ctx context.Context) (*DEK, string,
 
 	// pgx reports "no rows" via pgx.ErrNoRows; every other error is
 	// real (missing table, bad schema, etc.) and should surface.
-	if err.Error() == "no rows in result set" {
+	// SEC-010: use errors.Is instead of brittle string matching.
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, "", nil
+	}
+	// AUDIT-DEK-INIT: when the table exists with snake_case schema only
+	// (Go-managed DB), the camelCase fallback throws "undefined_column"
+	// (PG SQLSTATE 42703) or "undefined_table" (42P01). Treat these as
+	// "this schema variant is absent" and signal nil-DEK so AllowAutoInit
+	// can seed a fresh one instead of fataling.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && (pgErr.Code == "42703" || pgErr.Code == "42P01") {
 		return nil, "", nil
 	}
 	return nil, "", err
@@ -239,6 +252,10 @@ func (s *KeyManagementService) loadActiveDEK(ctx context.Context) (*DEK, string,
 // it is safe to write a fresh DEK (either after an explicit Rotate()
 // call or during initial seeding with AllowAutoInit=true). The caller
 // must hold s.mu or be inside the constructor.
+//
+// SEC-010: the two SQL operations (deactivate old, insert new) now run inside
+// a single transaction. A crash or error between them used to leave either
+// zero active DEKs or both rows active; now the rollback is atomic.
 func (s *KeyManagementService) rotateDEKLocked(ctx context.Context) error {
 	newDEK := make([]byte, 32)
 	if _, err := rand.Read(newDEK); err != nil {
@@ -250,8 +267,15 @@ func (s *KeyManagementService) rotateDEKLocked(ctx context.Context) error {
 		return fmt.Errorf("wrap DEK: %w", err)
 	}
 
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin DEK rotation tx: %w", err)
+	}
+	// Ensures we roll back on any unexpected return path. No-op after Commit.
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	if s.dekID != "" {
-		if _, err := s.pool.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			UPDATE data_encryption_keys
 			SET is_active = false, rotated_at = NOW()
 			WHERE id = $1`, s.dekID); err != nil {
@@ -260,7 +284,7 @@ func (s *KeyManagementService) rotateDEKLocked(ctx context.Context) error {
 	}
 
 	var newID string
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO data_encryption_keys
 		(encrypted_dek, iv, auth_tag, master_key_id, is_active, created_at)
 		VALUES ($1, $2, $3, $4, true, NOW())
@@ -270,6 +294,10 @@ func (s *KeyManagementService) rotateDEKLocked(ctx context.Context) error {
 	).Scan(&newID)
 	if err != nil {
 		return fmt.Errorf("store new DEK: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit DEK rotation: %w", err)
 	}
 
 	s.currentDEK = newDEK
