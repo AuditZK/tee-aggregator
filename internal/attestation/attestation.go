@@ -3,11 +3,10 @@ package attestation
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
+	"hash"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +19,27 @@ import (
 	"go.uber.org/zap"
 )
 
+// Platform values embedded in both the REST attestation response and the
+// signed report payload. Explicit constants make it a compile error to
+// mis-spell "dev" vs "unattested-dev" vs "sev-snp" (SEC-115).
+const (
+	// PlatformSevSnp means the enclave is running on attested AMD SEV-SNP
+	// hardware and the SevSnpReport fields are meaningful.
+	PlatformSevSnp = "sev-snp"
+
+	// PlatformUnattestedDev replaces the legacy "dev" value. Renamed so a
+	// client that only inspects the top-level Platform field cannot quietly
+	// treat unattested output as attested output.
+	PlatformUnattestedDev = "unattested-dev"
+)
+
+// VCEK certificate filenames. QUAL-001: extracted to remove the 3- and
+// 4-way duplications across fetchAndCacheVCEK.
+const (
+	vcekPEMFile = "vcek.pem"
+	askPEMFile  = "ask.pem"
+)
+
 // AttestationReport holds the full attestation response.
 type AttestationReport struct {
 	Attestation   *SevSnpReport `json:"attestation"`
@@ -27,17 +47,26 @@ type AttestationReport struct {
 	E2EEncryption *E2EInfo      `json:"e2e_encryption"`
 	ReportSigning *SigningInfo  `json:"report_signing"`
 	Security      *SecurityInfo `json:"security"`
-	Platform      string        `json:"platform"` // "sev-snp" or "dev"
+	Platform      string        `json:"platform"` // "sev-snp" or "unattested-dev" (SEC-115)
 }
 
 // SevSnpReport contains SEV-SNP hardware attestation data.
+//
+// ReportDataBoundToRequest is true when the REPORT_DATA field of the SEV-SNP
+// quote contains the hash we asked snpguest to embed (tls_fp || e2e_pk ||
+// signing_pk [|| nonce]). When false we fell back to snpguest --random — the
+// quote is still signed by AMD hardware but the 64-byte REPORT_DATA is not a
+// cryptographic binding to this enclave's keys. A verifier checking the
+// tls/signing-key binding MUST refuse reports with this flag set to false
+// (SEC-104).
 type SevSnpReport struct {
-	Verified        bool   `json:"verified"`
-	SevSnpEnabled   bool   `json:"sev_snp_enabled"`
-	Measurement     string `json:"measurement,omitempty"`
-	ReportData      string `json:"report_data,omitempty"`
-	PlatformVersion string `json:"platform_version,omitempty"`
-	VcekVerified    bool   `json:"vcek_verified"`
+	Verified                 bool   `json:"verified"`
+	SevSnpEnabled            bool   `json:"sev_snp_enabled"`
+	Measurement              string `json:"measurement,omitempty"`
+	ReportData               string `json:"report_data,omitempty"`
+	ReportDataBoundToRequest bool   `json:"report_data_bound_to_request"`
+	PlatformVersion          string `json:"platform_version,omitempty"`
+	VcekVerified             bool   `json:"vcek_verified"`
 }
 
 // TLSBinding holds TLS certificate fingerprint for attestation binding.
@@ -121,6 +150,9 @@ func NewService(opts Options) *Service {
 }
 
 // GetAttestation returns the current attestation report (cached for 5s).
+// The quote has no client nonce — it is only safe for same-TLS-session
+// verification. For freshness guarantees across sessions / callers, use
+// GetAttestationWithNonce (SEC-101).
 func (s *Service) GetAttestation(ctx context.Context) (*AttestationReport, error) {
 	s.mu.RLock()
 	if s.attestCache != nil && time.Since(s.attestCachedAt) < s.attestTTL {
@@ -130,7 +162,7 @@ func (s *Service) GetAttestation(ctx context.Context) (*AttestationReport, error
 	}
 	s.mu.RUnlock()
 
-	report, err := s.generateAttestation(ctx)
+	report, err := s.generateAttestation(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +175,23 @@ func (s *Service) GetAttestation(ctx context.Context) (*AttestationReport, error
 	return report, nil
 }
 
-func (s *Service) generateAttestation(ctx context.Context) (*AttestationReport, error) {
+// GetAttestationWithNonce returns a fresh attestation report whose report_data
+// binds the supplied client nonce (SEC-101). Never cached: every call invokes
+// snpguest. Callers should pass a 32+ byte random nonce they generated for the
+// current verification session.
+//
+// The resulting report_data = SHA256(tls_fp || e2e_pk || signing_pk || nonce).
+// A verifier checks the same hash locally after fetching the quote and the
+// TLS / signing / E2E public keys, which proves freshness (nonce) AND the
+// keys-to-hardware binding in one step.
+func (s *Service) GetAttestationWithNonce(ctx context.Context, nonce []byte) (*AttestationReport, error) {
+	if len(nonce) == 0 {
+		return nil, fmt.Errorf("nonce is required")
+	}
+	return s.generateAttestation(ctx, nonce)
+}
+
+func (s *Service) generateAttestation(ctx context.Context, nonce []byte) (*AttestationReport, error) {
 	report := &AttestationReport{
 		TLSBinding: &TLSBinding{
 			Fingerprint: s.tlsFingerprint,
@@ -165,7 +213,7 @@ func (s *Service) generateAttestation(ctx context.Context) (*AttestationReport, 
 	}
 
 	if s.devMode {
-		report.Platform = "dev"
+		report.Platform = PlatformUnattestedDev
 		report.Attestation = &SevSnpReport{
 			Verified:      false,
 			SevSnpEnabled: false,
@@ -175,10 +223,10 @@ func (s *Service) generateAttestation(ctx context.Context) (*AttestationReport, 
 	}
 
 	// Try SEV-SNP attestation
-	sevReport, err := s.fetchSevSnpAttestation(ctx)
+	sevReport, err := s.fetchSevSnpAttestation(ctx, nonce)
 	if err != nil {
 		s.logger.Warn("SEV-SNP attestation failed, falling back to dev mode", zap.Error(err))
-		report.Platform = "dev"
+		report.Platform = PlatformUnattestedDev
 		report.Attestation = &SevSnpReport{
 			Verified:      false,
 			SevSnpEnabled: false,
@@ -187,40 +235,47 @@ func (s *Service) generateAttestation(ctx context.Context) (*AttestationReport, 
 		return report, nil
 	}
 
-	report.Platform = "sev-snp"
+	report.Platform = PlatformSevSnp
 	report.Attestation = sevReport
 	report.Security.HardwareAttested = sevReport.Verified
 	return report, nil
 }
 
-func (s *Service) fetchSevSnpAttestation(ctx context.Context) (*SevSnpReport, error) {
-	// Build report data: SHA-256 of TLS fingerprint for binding
-	reportData := s.buildReportData()
+func (s *Service) fetchSevSnpAttestation(ctx context.Context, nonce []byte) (*SevSnpReport, error) {
+	// Build report data: SHA-256 of (tls_fp || e2e_pk || signing_pk || nonce).
+	// nonce is nil for cached GET /api/v1/attestation and non-nil for the
+	// nonce-bound POST flow (SEC-101).
+	reportData := s.buildReportData(nonce)
 
-	// Try snpguest first
-	if snpReport, err := s.fetchWithSnpguest(ctx, reportData); err == nil {
-		return snpReport, nil
-	}
-
-	// Try Azure IMDS
-	if snpReport, err := s.fetchFromAzure(ctx); err == nil {
-		return snpReport, nil
-	}
-
-	// Try GCP metadata
-	if snpReport, err := s.fetchFromGCP(ctx); err == nil {
-		return snpReport, nil
-	}
-
-	return nil, fmt.Errorf("no attestation source available")
+	// Only snpguest is supported. Previous Azure IMDS / GCP metadata fallbacks
+	// returned Verified=true after a plain HTTP 200 without verifying the
+	// Azure attested-document JWS or the GCP Confidential-VM JWT (SEC-003 /
+	// SEC-103). They have been removed pending a proper implementation.
+	//
+	// On a host without snpguest the caller falls back to dev mode (see
+	// generateAttestation) — attested=false is the honest answer.
+	return s.fetchWithSnpguest(ctx, reportData)
 }
 
-func (s *Service) buildReportData() string {
+// buildReportData computes the 64-byte REPORT_DATA payload embedded in the
+// SEV-SNP attestation quote. SEC-102: each input is length-prefixed with its
+// big-endian uint64 byte length so (tls_fp, e2e_pk) pairs whose concatenation
+// happens to collide with a different split can never produce identical
+// report_data. Mirrored in pkg/reportverify.expectedReportData.
+func (s *Service) buildReportData(nonce []byte) string {
 	h := sha256.New()
-	h.Write([]byte(s.tlsFingerprint))
-	h.Write([]byte(s.e2ePublicKey))
-	h.Write([]byte(s.signingPubKey))
+	writeLenPrefixed(h, []byte(s.tlsFingerprint))
+	writeLenPrefixed(h, []byte(s.e2ePublicKey))
+	writeLenPrefixed(h, []byte(s.signingPubKey))
+	writeLenPrefixed(h, nonce) // nil nonce ⇒ writes 8 zero bytes, still domain-separated
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func writeLenPrefixed(h hash.Hash, b []byte) {
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(b)))
+	_, _ = h.Write(lenBuf[:])
+	_, _ = h.Write(b)
 }
 
 // hexLineRegex matches a line that is part of a multi-line hex dump from
@@ -303,9 +358,10 @@ func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*Se
 	}
 
 	report := &SevSnpReport{
-		Verified:      true,
-		SevSnpEnabled: true,
-		VcekVerified:  vcekVerified,
+		Verified:                 true,
+		SevSnpEnabled:            true,
+		VcekVerified:             vcekVerified,
+		ReportDataBoundToRequest: reportBoundToRequest,
 	}
 	parseSnpguestReport(string(displayOutput), report)
 
@@ -411,20 +467,20 @@ func parseSnpguestReport(output string, report *SevSnpReport) {
 
 func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir string) bool {
 	// Check cache first
-	vcekPath := filepath.Join(s.vcekCacheDir, "vcek.pem")
+	vcekPath := filepath.Join(s.vcekCacheDir, vcekPEMFile)
 	if info, err := os.Stat(vcekPath); err == nil {
 		if time.Since(info.ModTime()) < s.vcekTTL {
 			// Copy cached certs to temp certsDir for verification
-			if err := copyFile(vcekPath, filepath.Join(certsDir, "vcek.pem")); err != nil {
+			if err := copyFile(vcekPath, filepath.Join(certsDir, vcekPEMFile)); err != nil {
 				s.logger.Warn("failed to copy cached VCEK cert to temp dir",
 					zap.String("src", vcekPath),
 					zap.Error(err),
 				)
 				return false
 			}
-			caPath := filepath.Join(s.vcekCacheDir, "ask.pem")
+			caPath := filepath.Join(s.vcekCacheDir, askPEMFile)
 			if _, err := os.Stat(caPath); err == nil {
-				if err := copyFile(caPath, filepath.Join(certsDir, "ask.pem")); err != nil {
+				if err := copyFile(caPath, filepath.Join(certsDir, askPEMFile)); err != nil {
 					s.logger.Warn("failed to copy cached CA cert to temp dir",
 						zap.String("src", caPath),
 						zap.Error(err),
@@ -462,15 +518,15 @@ func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir st
 	}
 
 	// Cache for next time (non-fatal: failure just means next boot refetches)
-	if err := copyFile(filepath.Join(certsDir, "vcek.pem"), vcekPath); err != nil {
+	if err := copyFile(filepath.Join(certsDir, vcekPEMFile), vcekPath); err != nil {
 		s.logger.Warn("failed to cache VCEK certificate (next boot will refetch)",
 			zap.String("dst", vcekPath),
 			zap.Error(err),
 		)
 	}
-	askSrc := filepath.Join(certsDir, "ask.pem")
+	askSrc := filepath.Join(certsDir, askPEMFile)
 	if _, err := os.Stat(askSrc); err == nil {
-		if err := copyFile(askSrc, filepath.Join(s.vcekCacheDir, "ask.pem")); err != nil {
+		if err := copyFile(askSrc, filepath.Join(s.vcekCacheDir, askPEMFile)); err != nil {
 			s.logger.Warn("failed to cache ASK certificate (next boot will refetch)",
 				zap.Error(err),
 			)
@@ -492,69 +548,4 @@ func copyFile(src, dst string) error {
 		return fmt.Errorf("write %s: %w", dst, err)
 	}
 	return nil
-}
-
-func (s *Service) fetchFromAzure(ctx context.Context) (*SevSnpReport, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET",
-		"http://169.254.169.254/metadata/attested/document?api-version=2021-01-01", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Metadata", "true")
-
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("azure IMDS request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("azure IMDS returned %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var result struct {
-		Encoding  string `json:"encoding"`
-		Signature string `json:"signature"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
-	}
-
-	return &SevSnpReport{
-		Verified:      true,
-		SevSnpEnabled: true,
-		VcekVerified:  false,
-	}, nil
-}
-
-func (s *Service) fetchFromGCP(ctx context.Context) (*SevSnpReport, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET",
-		"http://metadata.google.internal/computeMetadata/v1/instance/confidential-computing/attestation-report", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Metadata-Flavor", "Google")
-
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("gcp metadata request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("gcp metadata returned %d", resp.StatusCode)
-	}
-
-	return &SevSnpReport{
-		Verified:      true,
-		SevSnpEnabled: true,
-		VcekVerified:  false,
-	}, nil
 }
