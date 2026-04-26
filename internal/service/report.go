@@ -17,7 +17,7 @@ import (
 
 const tradingDaysPerYear = 252
 
-// ReportService generates signed performance reports
+// ReportService generates signed performance reports.
 type ReportService struct {
 	metricsSvc       *MetricsService
 	snapshotRepo     *repository.SnapshotRepo
@@ -792,9 +792,11 @@ func (s *ReportService) buildExchangeDetails(ctx context.Context, userUID string
 	return merged
 }
 
-// VerifySignature checks if a report signature is valid
+// VerifySignature checks if a report signature is valid. Uses the enclave's
+// current SignatureAlgorithm (ECDSA-P256-SHA256) explicitly — no silent
+// algorithm fallback (SEC-108).
 func (s *ReportService) VerifySignature(reportHash, signature, publicKey string) (bool, error) {
-	return signing.Verify(reportHash, signature, publicKey)
+	return signing.Verify(reportHash, signature, publicKey, signing.SignatureAlgorithm)
 }
 
 // PublicKey returns the signer's public key
