@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -83,15 +82,15 @@ func (k *Kraken) doPrivate(ctx context.Context, path string, params url.Values) 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kraken API status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("kraken API status %d: %s", resp.StatusCode, TruncatedBody(body))
 	}
 
 	var envelope struct {

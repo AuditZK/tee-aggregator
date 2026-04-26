@@ -3,6 +3,7 @@ package logstream
 import (
 	"time"
 
+	"github.com/trackrecord/enclave/internal/logredact"
 	"go.uber.org/zap/zapcore"
 )
 
@@ -40,22 +41,30 @@ func (c *BroadcastCore) Check(entry zapcore.Entry, checked *zapcore.CheckedEntry
 }
 
 func (c *BroadcastCore) Write(entry zapcore.Entry, fields []zapcore.Field) error {
-	// Write to inner core first
+	// Write to inner core first.
 	if err := c.inner.Write(entry, fields); err != nil {
 		return err
 	}
 
-	// Broadcast to SSE clients
+	// LOG-AUDIT-001: scrub the entry and fields before broadcasting to SSE
+	// clients. Even when the caller wired BroadcastCore on top of a redacted
+	// inner core, BroadcastCore observes the ORIGINAL entry/fields here
+	// (inner.Write only mutates its own local copy). Without this scrub the
+	// broadcast and the in-memory log buffer would leak credentials in
+	// clear, even though stderr stays redacted.
+	scrubbedMsg := logredact.ScrubMessage(entry.Message)
+	scrubbedFields := logredact.RedactFields(fields)
+
 	logEntry := LogEntry{
 		Timestamp: entry.Time.Format(time.RFC3339),
 		Level:     entry.Level.String(),
-		Message:   entry.Message,
+		Message:   scrubbedMsg,
 	}
 
-	if len(fields) > 0 {
+	if len(scrubbedFields) > 0 {
 		logEntry.Fields = make(map[string]interface{})
 		enc := zapcore.NewMapObjectEncoder()
-		for _, f := range fields {
+		for _, f := range scrubbedFields {
 			f.AddTo(enc)
 		}
 		for k, v := range enc.Fields {

@@ -4,7 +4,10 @@ services:
   enclave:
     build:
       context: .
-      dockerfile: Dockerfile
+      # OPS-AUDIT-001: must be Dockerfile.production — the generic Dockerfile
+      # does NOT bundle snpguest, so attestation would silently fall back to
+      # PlatformUnattestedDev and every signed report would carry attested=false.
+      dockerfile: Dockerfile.production
     container_name: enclave_service
     ports:
       - "8080:8080"
@@ -15,7 +18,10 @@ services:
       - GRPC_PORT=50051
       - DATABASE_URL=${DATABASE_URL}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:-}
+      # CFG-001: required in production. The enclave fatals on startup if
+      # this is empty; use the `:?` form so Docker also refuses to render
+      # the compose file without the env var set.
+      - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:?ENCLAVE_JWT_SECRET is required}
     # SEV-SNP device access (AMD confidential computing)
     devices:
       - /dev/sev-guest:/dev/sev-guest

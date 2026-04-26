@@ -13,12 +13,55 @@
 package logredact
 
 import (
+	"encoding/json"
+	"regexp"
 	"strings"
 
 	"go.uber.org/zap/zapcore"
 )
 
 const redacted = "[REDACTED]"
+
+// valueScrubRegexes catches vendor-specific credential shapes that don't
+// match the tier-1 field-name prefixes. Each pattern is replaced with
+// `[REDACTED]` (preserving the surrounding diagnostic text). LOG-001.
+var valueScrubRegexes = []*regexp.Regexp{
+	// Signed-URL HMAC (e.g. ?timestamp=1&signature=<hex>). The value runs
+	// until the next URL delimiter or quote.
+	regexp.MustCompile(`(?i)signature=[^&\s"'\\]+`),
+	// AWS-style key id — camelCase, so it does not match the underscored
+	// `access_key` prefix in tier1Prefixes.
+	regexp.MustCompile(`(?i)accesskeyid=[^&\s"'\\]+`),
+	// OAuth client_secret form param — `secret_key` prefix in
+	// tier1Prefixes would match `secret_key=` but not `client_secret=`.
+	regexp.MustCompile(`(?i)client_secret=[^&\s"'\\]+`),
+	// HTTP Basic authorization header — the base64 payload holds
+	// key:secret and must be dropped whole.
+	regexp.MustCompile(`(?i)Authorization:\s*Basic\s+[A-Za-z0-9+/=._-]+`),
+}
+
+// scrubSensitiveSubstrings applies every valueScrubRegex to s, replacing
+// each match with `[REDACTED]`. It is safe to call on arbitrary text;
+// when no pattern matches, the input is returned unchanged.
+func scrubSensitiveSubstrings(s string) string {
+	for _, re := range valueScrubRegexes {
+		s = re.ReplaceAllString(s, redacted)
+	}
+	return s
+}
+
+// maskValue returns a redacted version of val. It first applies the
+// surgical regex scrubs (so diagnostic context survives); if the result
+// still contains a tier-1 key=value substring the whole thing is replaced
+// with `[REDACTED]` — when in doubt, drop the value rather than leak a
+// pattern the scrubber missed.
+func maskValue(val string) string {
+	scrubbed := scrubSensitiveSubstrings(val)
+	if containsSensitiveValue(scrubbed) {
+		return redacted
+	}
+	return scrubbed
+}
 
 // TIER 1: Credentials & secrets — always redacted.
 // Uses prefix matching (TS parity: regex with ^ anchor).
@@ -153,25 +196,78 @@ func redactFields(fields []zapcore.Field) []zapcore.Field {
 	out := make([]zapcore.Field, len(fields))
 	for i, f := range fields {
 		if shouldRedact(f.Key) {
-			out[i] = zapcore.Field{
-				Key:    f.Key,
-				Type:   zapcore.StringType,
-				String: redacted,
-			}
-		} else {
-			// Also check if the string VALUE contains sensitive patterns
-			if f.Type == zapcore.StringType && containsSensitiveValue(f.String) {
-				out[i] = zapcore.Field{
-					Key:    f.Key,
-					Type:   zapcore.StringType,
-					String: redacted,
-				}
-			} else {
-				out[i] = f
-			}
+			out[i] = zapcore.Field{Key: f.Key, Type: zapcore.StringType, String: redacted}
+			continue
 		}
+		out[i] = maskFieldValue(f)
 	}
 	return out
+}
+
+// RedactFields applies the same field-level redaction as the internal
+// redactCore.Write path. Exported so downstream cores (notably the SSE
+// BroadcastCore) can scrub the entries they observe BEFORE forwarding
+// them — without this, wrapping a redacted core as the broadcast core's
+// `inner` only protects the stderr path, not the broadcast path
+// (LOG-AUDIT-001).
+//
+// Returns a new slice; the input is never mutated.
+func RedactFields(fields []zapcore.Field) []zapcore.Field {
+	return redactFields(fields)
+}
+
+// ScrubMessage redacts secret substrings (and full connection strings)
+// from a log message text. Exported alongside RedactFields for the same
+// reason — see that doc.
+func ScrubMessage(msg string) string {
+	return scrubMessage(msg)
+}
+
+// maskFieldValue scrubs the value of a single field. LOG-001 (extended):
+//   - StringType / ErrorType: tier-1 prefix + URL-encoded scrub.
+//   - ReflectType: marshal the underlying interface{} to JSON, run the same
+//     scrub over the JSON text, and emit it as a single string field.
+//     This covers `zap.Any`, `zap.Reflect`, `zap.Inline`, and any
+//     constructor that ends up routing through Reflect (the broad bucket
+//     for "I don't have a typed zap field for this").
+//
+// ObjectMarshaler / ArrayMarshaler are NOT scrubbed (zap encodes them
+// piecewise into the encoder's writer, which we don't control here).
+// Callers that need redaction-safe object fields must continue to use
+// pre-scrubbed strings.
+func maskFieldValue(f zapcore.Field) zapcore.Field {
+	switch f.Type {
+	case zapcore.StringType:
+		if masked := maskValue(f.String); masked != f.String {
+			return zapcore.Field{Key: f.Key, Type: zapcore.StringType, String: masked}
+		}
+	case zapcore.ErrorType:
+		err, ok := f.Interface.(error)
+		if !ok || err == nil {
+			return f
+		}
+		raw := err.Error()
+		if masked := maskValue(raw); masked != raw {
+			return zapcore.Field{Key: f.Key, Type: zapcore.StringType, String: masked}
+		}
+	case zapcore.ReflectType:
+		// LOG-001 (extended): zap.Any / zap.Reflect were previously a hole
+		// in the redactor — a benign-named field with a credential-bearing
+		// struct value would render unscrubbed. Marshalling once to JSON
+		// gives us a string we can scrub with the same tier-1 / tier-2
+		// rules as everything else.
+		raw, err := json.Marshal(f.Interface)
+		if err != nil {
+			// Marshalling failed — fall back to the safe default: redact
+			// the whole field rather than risk leaking via the encoder.
+			return zapcore.Field{Key: f.Key, Type: zapcore.StringType, String: redacted}
+		}
+		text := string(raw)
+		if masked := maskValue(text); masked != text {
+			return zapcore.Field{Key: f.Key, Type: zapcore.StringType, String: masked}
+		}
+	}
+	return f
 }
 
 // containsSensitiveValue checks if a string value contains patterns like
@@ -196,12 +292,18 @@ func scrubMessage(msg string) string {
 		return redacted
 	}
 
+	// LOG-001: apply surgical scrubs for vendor-specific patterns before
+	// the tier-1 prefix check, so a message like "refresh failed: Basic …"
+	// keeps its diagnostic prefix while the secret is dropped.
+	scrubbed := scrubSensitiveSubstrings(msg)
+	scrubbedLower := strings.ToLower(scrubbed)
+
 	// Redact anything that looks like a key=value with sensitive key
 	for _, p := range tier1Prefixes {
-		if strings.Contains(lower, p) {
+		if strings.Contains(scrubbedLower, p) {
 			return redacted
 		}
 	}
 
-	return msg
+	return scrubbed
 }

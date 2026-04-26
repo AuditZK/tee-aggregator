@@ -2,6 +2,8 @@ package logstream
 
 import (
 	"context"
+	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +16,10 @@ import (
 
 const maxBufferedLogs = 1000
 
+// msgMethodNotAllowed is the canonical 405 reason string. QUAL-001:
+// extracted to remove a 5-way duplication across handlers.
+const msgMethodNotAllowed = "method not allowed"
+
 // LogEntry represents a single log entry for streaming.
 type LogEntry struct {
 	Timestamp string                 `json:"timestamp"`
@@ -24,14 +30,25 @@ type LogEntry struct {
 
 // Server provides HTTP log streaming via SSE.
 type Server struct {
-	logger  *zap.Logger
-	apiKey  string
-	port    int
-	attest  AttestationProvider
-	clients map[chan LogEntry]struct{}
-	logs    []LogEntry
-	mu      sync.RWMutex
-	server  *http.Server
+	logger    *zap.Logger
+	apiKey    string
+	port      int
+	attest    AttestationProvider
+	clients   map[chan LogEntry]struct{}
+	logs      []LogEntry
+	mu        sync.RWMutex
+	server    *http.Server
+	tlsConfig *tls.Config // SEC-008: when set, Start uses ListenAndServeTLS
+}
+
+// SetTLSConfig wires a TLS config for the log-stream listener (SEC-008).
+// When nil, the server falls back to plaintext HTTP — only acceptable on
+// localhost-only deployments. In production pass the same cert used by the
+// REST server.
+func (s *Server) SetTLSConfig(cfg *tls.Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tlsConfig = cfg
 }
 
 // AttestationProvider describes the subset used by the log server.
@@ -66,14 +83,29 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/logs/stream", s.authMiddleware(s.handleStream))
 	mux.HandleFunc("/logs/clear", s.authMiddleware(s.handleClear))
 
+	s.mu.RLock()
+	tlsCfg := s.tlsConfig
+	s.mu.RUnlock()
+
 	s.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
-		Handler: mux,
+		Addr:      fmt.Sprintf(":%d", s.port),
+		Handler:   mux,
+		TLSConfig: tlsCfg,
 	}
 
-	s.logger.Info("log stream server starting", zap.Int("port", s.port))
+	s.logger.Info("log stream server starting",
+		zap.Int("port", s.port),
+		zap.Bool("tls", tlsCfg != nil),
+	)
 	go func() {
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if tlsCfg != nil {
+			// Certificates are already in tlsCfg, so empty strings here.
+			err = s.server.ListenAndServeTLS("", "")
+		} else {
+			err = s.server.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			s.logger.Error("log stream server error", zap.Error(err))
 		}
 	}()
@@ -89,6 +121,18 @@ func (s *Server) Stop() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return s.server.Shutdown(ctx)
+}
+
+// BufferedLogs returns a defensive copy of the in-memory log buffer.
+// Used by tests (notably the LOG-AUDIT-001 regression guard) and any
+// future admin tooling that needs to inspect what was broadcast without
+// going through the SSE endpoint.
+func (s *Server) BufferedLogs() []LogEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]LogEntry, len(s.logs))
+	copy(out, s.logs)
+	return out
 }
 
 // Broadcast sends a log entry to all connected SSE clients and buffers it.
@@ -117,7 +161,7 @@ func (s *Server) Broadcast(entry LogEntry) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -128,7 +172,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -187,7 +231,7 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAttestationInfo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -230,7 +274,7 @@ func (s *Server) handleAttestationInfo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -285,7 +329,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -308,14 +352,14 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		// SEC-008: header-only. The query-param form used to leak keys into
+		// access logs / browser history. Constant-time compare protects
+		// against byte-by-byte timing attacks on a short key.
 		key := r.Header.Get("X-Api-Key")
-		if key == "" {
-			key = r.URL.Query().Get("apiKey")
-		}
-
-		if key != s.apiKey {
+		if len(key) != len(s.apiKey) ||
+			subtle.ConstantTimeCompare([]byte(key), []byte(s.apiKey)) != 1 {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
-				"error": "Invalid or missing API key. Provide X-Api-Key header or ?apiKey= query param.",
+				"error": "Invalid or missing API key. Provide X-Api-Key header.",
 			})
 			return
 		}

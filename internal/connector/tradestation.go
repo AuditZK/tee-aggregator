@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,6 +13,9 @@ import (
 const (
 	tradeStationAPI     = "https://api.tradestation.com/v3"
 	tradeStationAuthURL = "https://signin.tradestation.com/oauth/token"
+
+	// QUAL-001: extracted to remove a 5-way duplication.
+	tradestationPathAccounts = "/brokerage/accounts"
 )
 
 // TradeStation implements Connector for TradeStation
@@ -42,7 +44,7 @@ func (t *TradeStation) Exchange() string {
 
 // DetectIsPaper mirrors TS behavior: all accounts must be simulation ("Sim*").
 func (t *TradeStation) DetectIsPaper(ctx context.Context) (bool, error) {
-	body, err := t.doRequest(ctx, "/brokerage/accounts")
+	body, err := t.doRequest(ctx, tradestationPathAccounts)
 	if err != nil {
 		return false, err
 	}
@@ -88,11 +90,15 @@ func (t *TradeStation) refreshAccessToken(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+
+	// CONN-AUDIT-001: bounded read for both error and success paths.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
+	if err != nil {
+		return err
+	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("token refresh failed: %s", string(body))
+		return fmt.Errorf("token refresh failed: %s", TruncatedBody(body))
 	}
 
 	var tokenResp struct {
@@ -100,7 +106,7 @@ func (t *TradeStation) refreshAccessToken(ctx context.Context) error {
 		ExpiresIn   int    `json:"expires_in"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return err
 	}
 
@@ -126,28 +132,28 @@ func (t *TradeStation) doRequest(ctx context.Context, path string) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("tradestation API error: %s", string(body))
+		return nil, fmt.Errorf("tradestation API error: %s", TruncatedBody(body))
 	}
 
 	return body, nil
 }
 
 func (t *TradeStation) TestConnection(ctx context.Context) error {
-	_, err := t.doRequest(ctx, "/brokerage/accounts")
+	_, err := t.doRequest(ctx, tradestationPathAccounts)
 	return err
 }
 
 func (t *TradeStation) GetBalance(ctx context.Context) (*Balance, error) {
 	// Get accounts first
-	body, err := t.doRequest(ctx, "/brokerage/accounts")
+	body, err := t.doRequest(ctx, tradestationPathAccounts)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +209,7 @@ func (t *TradeStation) GetBalance(ctx context.Context) (*Balance, error) {
 
 func (t *TradeStation) GetPositions(ctx context.Context) ([]*Position, error) {
 	// Get accounts first
-	body, err := t.doRequest(ctx, "/brokerage/accounts")
+	body, err := t.doRequest(ctx, tradestationPathAccounts)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +287,7 @@ func (t *TradeStation) GetPositions(ctx context.Context) ([]*Position, error) {
 
 func (t *TradeStation) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
 	// Get accounts first
-	body, err := t.doRequest(ctx, "/brokerage/accounts")
+	body, err := t.doRequest(ctx, tradestationPathAccounts)
 	if err != nil {
 		return nil, err
 	}
