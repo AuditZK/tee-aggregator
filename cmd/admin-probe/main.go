@@ -16,6 +16,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -39,6 +41,15 @@ type probeArgs struct {
 	exchange string
 	label    string
 	daysBack int
+	// reveal opts into printing cleartext MT login/server to stderr (SEC-011).
+	// Off by default; only MT-specific debug sessions should flip this.
+	reveal bool
+	// acceptPlaintext is the operator's explicit acknowledgement that this
+	// tool writes live exchange data (balance, positions, trades) to stdout
+	// unredacted — it bypasses the zap log-redaction pipeline that
+	// protects the enclave's production logs (ADMIN-001). Required flag:
+	// without it, main() refuses to run.
+	acceptPlaintext bool
 }
 
 func main() {
@@ -46,6 +57,11 @@ func main() {
 	if args.userUID == "" || args.exchange == "" || args.label == "" {
 		fmt.Fprintln(os.Stderr, "missing required flag(s): -user-uid, -exchange, -label")
 		flag.Usage()
+		os.Exit(2)
+	}
+	if !args.acceptPlaintext {
+		fmt.Fprintln(os.Stderr, "admin-probe writes LIVE exchange data to stdout unredacted.")
+		fmt.Fprintln(os.Stderr, "Re-run with -i-accept-plaintext-output to acknowledge.")
 		os.Exit(2)
 	}
 
@@ -79,6 +95,9 @@ func parseArgs() probeArgs {
 	flag.StringVar(&a.exchange, "exchange", "", "exchange name (required)")
 	flag.StringVar(&a.label, "label", "", "connection label (required)")
 	flag.IntVar(&a.daysBack, "days-back", 7, "how many days of trades to fetch")
+	flag.BoolVar(&a.reveal, "reveal", false, "print cleartext MT login/server to stderr (off by default, SEC-011)")
+	flag.BoolVar(&a.acceptPlaintext, "i-accept-plaintext-output", false,
+		"required ack that balance/positions/trades will be printed to stdout bypassing log redaction (ADMIN-001)")
 	flag.Parse()
 	return a
 }
@@ -126,13 +145,36 @@ func loadCredentials(ctx context.Context, dbURL string, a probeArgs) (*connector
 
 func printHeader(a probeArgs, creds *connector.Credentials) {
 	fmt.Printf("=== %s / %q (user=%s) ===\n", a.exchange, a.label, a.userUID)
-	fmt.Printf("apiKey len=%d · apiSecret len=%d · passphrase len=%d\n",
-		len(creds.APIKey), len(creds.APISecret), len(creds.Passphrase))
+	// SEC-011: print lengths + 8-char SHA-256 fingerprints instead of the raw
+	// credentials. The fingerprint lets an operator correlate two runs without
+	// ever exposing the actual secret to stdout / log aggregators.
+	fmt.Printf("apiKey   len=%d fp=%s\n", len(creds.APIKey), credFingerprint(creds.APIKey))
+	fmt.Printf("apiSecret len=%d fp=%s\n", len(creds.APISecret), credFingerprint(creds.APISecret))
+	fmt.Printf("passphrase len=%d fp=%s\n", len(creds.Passphrase), credFingerprint(creds.Passphrase))
 	if creds.Exchange == "mt5" || creds.Exchange == "mt4" || creds.Exchange == "exness" {
-		fmt.Printf("mt login=%q server=%q MT_BRIDGE_URL=%q\n",
-			creds.APIKey, creds.Passphrase, os.Getenv("MT_BRIDGE_URL"))
+		if a.reveal {
+			// Cleartext only when the operator explicitly asked for it, and
+			// only on stderr so piping stdout to a log file does not capture
+			// the secret.
+			fmt.Fprintf(os.Stderr, "[-reveal] mt login=%q server=%q MT_BRIDGE_URL=%q\n",
+				creds.APIKey, creds.Passphrase, os.Getenv("MT_BRIDGE_URL"))
+		} else {
+			fmt.Printf("mt login=*** server=*** (use -reveal to print on stderr) MT_BRIDGE_URL=%q\n",
+				os.Getenv("MT_BRIDGE_URL"))
+		}
 	}
 	fmt.Println()
+}
+
+// credFingerprint returns the first 8 hex chars of SHA-256(s) or "-" when s is
+// empty. Safe to print: the preimage is not recoverable and two identical
+// secrets produce the same fingerprint (useful for correlation).
+func credFingerprint(s string) string {
+	if s == "" {
+		return "-"
+	}
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:4])
 }
 
 func probeAll(ctx context.Context, conn connector.Connector, daysBack int) {

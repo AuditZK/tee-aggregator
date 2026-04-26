@@ -182,14 +182,14 @@ func (h *Huobi) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, 
 
 	var resp struct {
 		Data []struct {
-			ID            int64  `json:"id"`
-			Symbol        string `json:"symbol"`
-			Type          string `json:"type"` // "buy-market", "sell-limit", etc.
-			FilledAmount  string `json:"filled-amount"`
-			Price         string `json:"price"`
-			FilledFees    string `json:"filled-fees"`
-			FeeCurrency   string `json:"fee-currency"`
-			CreatedAt     int64  `json:"created-at"`
+			ID           int64  `json:"id"`
+			Symbol       string `json:"symbol"`
+			Type         string `json:"type"` // "buy-market", "sell-limit", etc.
+			FilledAmount string `json:"filled-amount"`
+			Price        string `json:"price"`
+			FilledFees   string `json:"filled-fees"`
+			FeeCurrency  string `json:"fee-currency"`
+			CreatedAt    int64  `json:"created-at"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {

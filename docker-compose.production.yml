@@ -22,6 +22,17 @@ services:
       # this is empty; use the `:?` form so Docker also refuses to render
       # the compose file without the env var set.
       - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:?ENCLAVE_JWT_SECRET is required}
+      # PERF-002: tell the Go runtime about the 512 MiB cgroup cap so the GC
+      # can target it instead of computing its heap goal from the host's
+      # (much larger) RAM. 480 MiB leaves a 32 MiB buffer below mem_limit so
+      # the kernel OOM-killer doesn't fire before the runtime can react.
+      - GOMEMLIMIT=480MiB
+      # GOGC=75 trades a modest CPU bump for ~25% lower steady-state heap,
+      # justified under the tight 512 MiB cap.
+      - GOGC=75
+      # GOTRACEBACK=single keeps panic dumps focused on the failing goroutine
+      # so we don't bury operators in 50+ goroutine traces under SSE load.
+      - GOTRACEBACK=single
     # SEV-SNP device access (AMD confidential computing)
     devices:
       - /dev/sev-guest:/dev/sev-guest

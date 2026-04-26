@@ -115,10 +115,10 @@ func (b *Bitget) GetBalance(ctx context.Context) (*Balance, error) {
 	if err == nil {
 		var futResp struct {
 			Data []struct {
-				MarginCoin     string `json:"marginCoin"`
-				AccountEquity  string `json:"accountEquity"`
-				UnrealizedPL   string `json:"unrealizedPL"`
-				Available      string `json:"available"`
+				MarginCoin    string `json:"marginCoin"`
+				AccountEquity string `json:"accountEquity"`
+				UnrealizedPL  string `json:"unrealizedPL"`
+				Available     string `json:"available"`
 			} `json:"data"`
 		}
 		if json.Unmarshal(futBody, &futResp) == nil {
@@ -151,12 +151,12 @@ func (b *Bitget) GetPositions(ctx context.Context) ([]*Position, error) {
 
 	var resp struct {
 		Data []struct {
-			Symbol        string `json:"symbol"`
-			HoldSide      string `json:"holdSide"` // "long" or "short"
-			Total         string `json:"total"`
-			OpenPriceAvg  string `json:"openPriceAvg"`
-			MarkPrice     string `json:"markPrice"`
-			UnrealizedPL  string `json:"unrealizedPL"`
+			Symbol       string `json:"symbol"`
+			HoldSide     string `json:"holdSide"` // "long" or "short"
+			Total        string `json:"total"`
+			OpenPriceAvg string `json:"openPriceAvg"`
+			MarkPrice    string `json:"markPrice"`
+			UnrealizedPL string `json:"unrealizedPL"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {

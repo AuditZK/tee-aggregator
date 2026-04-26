@@ -32,17 +32,19 @@ func newTCPClient(t *testing.T, srv *Server) (pb.EnclaveServiceClient, func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	conn, err := gogrpc.DialContext(
-		ctx,
+	// NewClient replaces the deprecated DialContext + WithBlock combo. NewClient
+	// is always non-blocking, so the 3-second context above now bounds the
+	// first RPC (made by the tests) rather than the dial itself.
+	conn, err := gogrpc.NewClient(
 		lis.Addr().String(),
 		gogrpc.WithTransportCredentials(insecure.NewCredentials()),
-		gogrpc.WithBlock(),
 	)
 	if err != nil {
 		grpcServer.Stop()
 		_ = lis.Close()
 		t.Fatalf("failed to dial tcp grpc server: %v", err)
 	}
+	_ = ctx // used by callers for the first RPC
 
 	cleanup := func() {
 		_ = conn.Close()
@@ -54,7 +56,7 @@ func newTCPClient(t *testing.T, srv *Server) (pb.EnclaveServiceClient, func()) {
 }
 
 func TestHealthCheck_TCPRoundTrip(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil, ServerOptions{})
+	srv := NewServer(zap.NewNop(), Services{}, ServerOptions{})
 	client, cleanup := newTCPClient(t, srv)
 	defer cleanup()
 
@@ -71,7 +73,7 @@ func TestHealthCheck_TCPRoundTrip(t *testing.T) {
 }
 
 func TestCreateUserConnection_TCPDatabaseUnavailable(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil, ServerOptions{})
+	srv := NewServer(zap.NewNop(), Services{}, ServerOptions{})
 	client, cleanup := newTCPClient(t, srv)
 	defer cleanup()
 
@@ -97,7 +99,7 @@ func TestCreateUserConnection_TCPDatabaseUnavailable(t *testing.T) {
 }
 
 func TestCreateUserConnection_TCPValidationRunsBeforeServiceCheck(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil, ServerOptions{})
+	srv := NewServer(zap.NewNop(), Services{}, ServerOptions{})
 	client, cleanup := newTCPClient(t, srv)
 	defer cleanup()
 
@@ -117,7 +119,7 @@ func TestCreateUserConnection_TCPValidationRunsBeforeServiceCheck(t *testing.T) 
 }
 
 func TestProcessSyncJob_TCPServiceUnavailableReturnsPayloadError(t *testing.T) {
-	srv := NewServer(zap.NewNop(), nil, nil, nil, nil, nil, nil, nil, ServerOptions{})
+	srv := NewServer(zap.NewNop(), Services{}, ServerOptions{})
 	client, cleanup := newTCPClient(t, srv)
 	defer cleanup()
 

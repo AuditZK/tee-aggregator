@@ -16,7 +16,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// ErrNotFound is returned when a repository lookup finds no matching row.
 var ErrNotFound = errors.New("not found")
+
+// ErrAlreadyExists is returned when an insert collides with an existing
+// uniqueness constraint (e.g. one active connection per user/exchange).
 var ErrAlreadyExists = errors.New("already exists")
 
 // ExchangeConnection represents an encrypted exchange connection
@@ -837,17 +841,6 @@ func (r *ConnectionRepo) columnExists(ctx context.Context, tableName, columnName
 		return false, fmt.Errorf("check column %s.%s: %w", tableName, columnName, err)
 	}
 	return exists, nil
-}
-
-// col returns the correct column name based on schema type (TS camelCase vs Go snake_case).
-func (r *ConnectionRepo) col(snakeName string) string {
-	if !r.isTSSchema {
-		return snakeName
-	}
-	if mapped, ok := tsColumnMap[snakeName]; ok {
-		return fmt.Sprintf(`"%s"`, mapped) // Quote camelCase for Postgres
-	}
-	return snakeName
 }
 
 // tsColumnMap maps Go snake_case column names to TS Prisma camelCase names.

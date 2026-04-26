@@ -1,7 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-# Go build stage
-FROM golang:1.24-alpine AS builder
+# Go build stage.
+# VULN-001: pinned to 1.26.2-alpine so stdlib CVEs GO-2026-4947/4946/4870/
+# 4866/4865/4603/4602/4601/4600/4599 (all fixed in 1.26.1 / 1.26.2) are
+# picked up deterministically. For fully reproducible builds the next step
+# is a digest pin (`golang:1.26.2-alpine@sha256:<digest>`); do that once CI
+# resolves the upstream digest via `docker pull + inspect` and mirrors the
+# result here. Same applies to the alpine runtime tag below.
+FROM golang:1.26.2-alpine AS builder
 
 WORKDIR /app
 
@@ -29,7 +35,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -o /enclave \
     ./cmd/enclave
 
-# Runtime stage
+# Runtime stage.
+# Same note as the builder: pin by digest in CI. 3.20 receives security updates
+# for the life of the branch; a future audit should also pin the exact patch
+# version (e.g. 3.20.3) for strict reproducibility.
 FROM alpine:3.20
 
 WORKDIR /app

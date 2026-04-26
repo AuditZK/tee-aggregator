@@ -115,6 +115,79 @@ func TestDecryptTSFormat_TooShort(t *testing.T) {
 	}
 }
 
+// SEC-009: EncryptWithAAD / DecryptWithAAD round-trip with matching AAD.
+func TestAAD_RoundTrip(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	svc, _ := New(key)
+
+	plaintext := []byte("my_api_secret_key_123")
+	aad := ConnectionFieldAAD("user_abc1234567890", "conn_42", "api_key")
+
+	encrypted, err := svc.EncryptWithAAD(plaintext, aad)
+	if err != nil {
+		t.Fatalf("EncryptWithAAD: %v", err)
+	}
+
+	got, err := svc.DecryptWithAAD(encrypted, aad)
+	if err != nil {
+		t.Fatalf("DecryptWithAAD: %v", err)
+	}
+	if string(got) != string(plaintext) {
+		t.Fatalf("round-trip mismatch: got=%q want=%q", got, plaintext)
+	}
+}
+
+// SEC-009: ciphertext encrypted for connA must NOT decrypt under connB's AAD.
+// This proves the binding works: a DB-level row swap is refused by GCM.
+func TestAAD_MismatchRefused(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	svc, _ := New(key)
+
+	plaintext := []byte("my_api_secret_key_123")
+	aadA := ConnectionFieldAAD("user_abc1234567890", "connA", "api_key")
+	aadB := ConnectionFieldAAD("user_abc1234567890", "connB", "api_key")
+
+	encrypted, err := svc.EncryptWithAAD(plaintext, aadA)
+	if err != nil {
+		t.Fatalf("EncryptWithAAD: %v", err)
+	}
+
+	if _, err := svc.DecryptWithAAD(encrypted, aadB); err == nil {
+		t.Fatal("decrypt should fail when AAD does not match")
+	}
+	// Field swap within the same connection must also fail.
+	aadField := ConnectionFieldAAD("user_abc1234567890", "connA", "api_secret")
+	if _, err := svc.DecryptWithAAD(encrypted, aadField); err == nil {
+		t.Fatal("decrypt should fail when field AAD does not match")
+	}
+}
+
+// SEC-009: without AAD, legacy ciphertexts still round-trip — backward compat.
+func TestAAD_LegacyNoAAD(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	svc, _ := New(key)
+
+	encrypted, err := svc.Encrypt([]byte("legacy-secret"))
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	got, err := svc.Decrypt(encrypted)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if string(got) != "legacy-secret" {
+		t.Fatalf("legacy round-trip broken: got %q", got)
+	}
+
+	// Mixing legacy-encrypted and AAD-decrypt must fail loudly.
+	if _, err := svc.DecryptWithAAD(encrypted, []byte("some-aad")); err == nil {
+		t.Fatal("legacy ciphertext must not decrypt under non-empty AAD")
+	}
+}
+
 // encryptTSFormat encrypts like the TS enclave: AES-256-GCM with 16-byte IV, hex output.
 func encryptTSFormat(t *testing.T, key []byte, plaintext string) string {
 	t.Helper()

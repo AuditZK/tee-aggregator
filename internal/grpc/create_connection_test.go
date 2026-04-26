@@ -32,7 +32,7 @@ func (f *fakeConnectionService) GetActiveConnections(_ context.Context, _ string
 
 func TestCreateUserConnection_BufconnSuccessPayload(t *testing.T) {
 	fake := &fakeConnectionService{}
-	srv := NewServer(zap.NewNop(), fake, nil, nil, nil, nil, nil, nil, ServerOptions{})
+	srv := NewServer(zap.NewNop(), Services{ConnSvc: fake}, ServerOptions{})
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
 
@@ -70,7 +70,7 @@ func TestCreateUserConnection_BufconnSuccessPayload(t *testing.T) {
 
 func TestCreateUserConnection_BufconnAlreadyExistsNoopPayload(t *testing.T) {
 	fake := &fakeConnectionService{createErr: service.ErrConnectionAlreadyExists}
-	srv := NewServer(zap.NewNop(), fake, nil, nil, nil, nil, nil, nil, ServerOptions{})
+	srv := NewServer(zap.NewNop(), Services{ConnSvc: fake}, ServerOptions{})
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
 
@@ -97,7 +97,7 @@ func TestCreateUserConnection_BufconnAlreadyExistsNoopPayload(t *testing.T) {
 
 func TestCreateUserConnection_BufconnOperationalFailureAsPayload(t *testing.T) {
 	fake := &fakeConnectionService{createErr: errors.New("db write failed")}
-	srv := NewServer(zap.NewNop(), fake, nil, nil, nil, nil, nil, nil, ServerOptions{})
+	srv := NewServer(zap.NewNop(), Services{ConnSvc: fake}, ServerOptions{})
 	client, cleanup := newBufconnClient(t, srv)
 	defer cleanup()
 

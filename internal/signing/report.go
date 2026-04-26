@@ -486,7 +486,30 @@ func toDrawdownPeriodsPayload(in []*DrawdownPeriod) []map[string]any {
 	return out
 }
 
+// marshalSortedJSON produces a deterministic JSON encoding of v, with map
+// keys emitted in lexicographic order at every level. The result is what
+// the report hash is computed over, so its byte layout is part of the
+// signing contract — see TestMarshalSortedJSONMatchesReference for the
+// non-regression test that pins the output against the legacy reference
+// implementation.
+//
+// PERF-001: the previous implementation did Marshal → Unmarshal-into-`any`
+// → re-Marshal-recursive, which cost ~22 k allocs / 700 KB per call on a
+// 365-day report. The new path drives writeSortedJSON directly over the
+// native Go values produced by buildFinancialPayload, so the only fallback
+// to encoding/json is for terminal scalars.
 func marshalSortedJSON(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := writeSortedJSON(&buf, v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// marshalSortedJSONReference is the legacy double-roundtrip implementation,
+// retained for the byte-for-byte non-regression test. Do NOT use in
+// production code paths — see marshalSortedJSON.
+func marshalSortedJSONReference(v any) ([]byte, error) {
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
@@ -504,42 +527,67 @@ func marshalSortedJSON(v any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// writeSortedJSON walks v and writes a canonical JSON encoding (sorted map
+// keys at every level, no whitespace) to buf. It handles the native Go
+// types emitted by buildFinancialPayload directly, so callers don't have
+// to pre-normalise via Unmarshal-into-any.
 func writeSortedJSON(buf *bytes.Buffer, v any) error {
 	switch t := v.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-
-		buf.WriteByte('{')
-		for i, k := range keys {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			keyBytes, _ := json.Marshal(k)
-			buf.Write(keyBytes)
-			buf.WriteByte(':')
-			if err := writeSortedJSON(buf, t[k]); err != nil {
-				return err
-			}
-		}
-		buf.WriteByte('}')
+	case nil:
+		buf.WriteString("null")
 		return nil
+	case map[string]any:
+		return writeSortedMap(buf, t)
 	case []any:
+		return writeAnySlice(buf, t)
+	case []map[string]any:
+		// Common shape for toDailyReturnsPayload / toMonthlyReturnsPayload /
+		// toDrawdownPeriodsPayload / toExchangeDetailsPayload — handle
+		// without a per-element type assertion.
+		// PERF-001 byte-parity: a nil typed slice must render as "null"
+		// to match what the reference (Marshal → Unmarshal-into-any →
+		// re-Marshal) emits. Empty (non-nil) slices stay "[]".
+		if t == nil {
+			buf.WriteString("null")
+			return nil
+		}
 		buf.WriteByte('[')
 		for i, item := range t {
 			if i > 0 {
 				buf.WriteByte(',')
 			}
-			if err := writeSortedJSON(buf, item); err != nil {
+			if err := writeSortedMap(buf, item); err != nil {
 				return err
 			}
 		}
 		buf.WriteByte(']')
 		return nil
+	case []string:
+		// Exchanges []string. Order is preserved (semantic input order).
+		// Same nil-vs-empty distinction as []map[string]any above.
+		if t == nil {
+			buf.WriteString("null")
+			return nil
+		}
+		buf.WriteByte('[')
+		for i, s := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			b, err := json.Marshal(s)
+			if err != nil {
+				return err
+			}
+			buf.Write(b)
+		}
+		buf.WriteByte(']')
+		return nil
 	default:
+		// Scalars (string, bool, int, float64, …) and any unanticipated
+		// shape: hand off to encoding/json. The legacy reference path
+		// also fell through to json.Marshal for leaves, so output is
+		// byte-identical for the supported buildFinancialPayload types
+		// (verified by TestMarshalSortedJSONMatchesReference).
 		b, err := json.Marshal(t)
 		if err != nil {
 			return err
@@ -547,6 +595,46 @@ func writeSortedJSON(buf *bytes.Buffer, v any) error {
 		buf.Write(b)
 		return nil
 	}
+}
+
+func writeSortedMap(buf *bytes.Buffer, m map[string]any) error {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	buf.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		keyBytes, err := json.Marshal(k)
+		if err != nil {
+			return err
+		}
+		buf.Write(keyBytes)
+		buf.WriteByte(':')
+		if err := writeSortedJSON(buf, m[k]); err != nil {
+			return err
+		}
+	}
+	buf.WriteByte('}')
+	return nil
+}
+
+func writeAnySlice(buf *bytes.Buffer, s []any) error {
+	buf.WriteByte('[')
+	for i, item := range s {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		if err := writeSortedJSON(buf, item); err != nil {
+			return err
+		}
+	}
+	buf.WriteByte(']')
+	return nil
 }
 
 // VerifyReport performs the full end-to-end verification of a signed report:

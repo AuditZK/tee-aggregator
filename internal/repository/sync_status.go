@@ -27,10 +27,10 @@ type SyncStatus struct {
 // SyncStatusRepo handles sync status persistence.
 // Supports both TS (Prisma camelCase) and Go (snake_case) column naming.
 type SyncStatusRepo struct {
-	pool       *pgxpool.Pool
-	schemaMu   sync.Mutex
+	pool           *pgxpool.Pool
+	schemaMu       sync.Mutex
 	schemaDetected bool
-	isTSSchema bool
+	isTSSchema     bool
 }
 
 // NewSyncStatusRepo creates a new sync status repository

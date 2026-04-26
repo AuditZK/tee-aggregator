@@ -285,6 +285,19 @@ func containsSensitiveValue(val string) bool {
 // scrubMessage redacts sensitive patterns from the log message text itself.
 // Catches cases like logger.Info("Connecting to postgresql://user:pass@host/db")
 func scrubMessage(msg string) string {
+	// PERF-006: fast path. Every sensitive pattern this function detects
+	// requires at least one of `=`, `:`, or `/` in the message:
+	//   - connection strings → contain "://"
+	//   - signed-URL / OAuth scrubs (regex) → key=value form
+	//   - tier-1 key=value detection → '=' separator
+	//   - "Authorization: Basic …" → ':' separator
+	// Plain INFO/DEBUG messages (the 95% case during sync) carry none of
+	// these and can short-circuit the regex + ToLower + 26-prefix scan,
+	// which together cost ~4.5 µs / 12 allocs per call.
+	if !strings.ContainsAny(msg, "=:/") {
+		return msg
+	}
+
 	lower := strings.ToLower(msg)
 
 	// Redact connection strings

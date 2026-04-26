@@ -107,9 +107,9 @@ func (g *Gate) GetBalance(ctx context.Context) (*Balance, error) {
 	futBody, err := g.doRequest(ctx, "GET", "/api/v4/futures/usdt/accounts", "")
 	if err == nil {
 		var futResp struct {
-			Total        string `json:"total"`
+			Total         string `json:"total"`
 			UnrealisedPnl string `json:"unrealised_pnl"`
-			Available    string `json:"available"`
+			Available     string `json:"available"`
 		}
 		if json.Unmarshal(futBody, &futResp) == nil {
 			futuresEquity, _ = strconv.ParseFloat(futResp.Total, 64)
@@ -180,14 +180,14 @@ func (g *Gate) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, e
 	}
 
 	var resp []struct {
-		ID            string `json:"id"`
-		CurrencyPair  string `json:"currency_pair"`
-		Side          string `json:"side"`
-		Price         string `json:"price"`
-		Amount        string `json:"amount"`
-		Fee           string `json:"fee"`
-		FeeCurrency   string `json:"fee_currency"`
-		CreateTimeMs  string `json:"create_time_ms"`
+		ID           string `json:"id"`
+		CurrencyPair string `json:"currency_pair"`
+		Side         string `json:"side"`
+		Price        string `json:"price"`
+		Amount       string `json:"amount"`
+		Fee          string `json:"fee"`
+		FeeCurrency  string `json:"fee_currency"`
+		CreateTimeMs string `json:"create_time_ms"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err

@@ -760,16 +760,54 @@ grep -r 'Sprintf.*SELECT\|Sprintf.*INSERT\|Sprintf.*UPDATE' internal/repository/
 
 #### 1. Compromised API Gateway
 
-**Threat:** Attacker gains full control of the API Gateway service
+**Threat:** Attacker gains full control of the API Gateway / report-service
+component sitting between the user-facing frontend and the enclave.
 
 **Impact without enclave:**
 - Access to encrypted credentials (could attempt offline brute-force)
 - Access to all snapshot data
+- Ability to forge requests for arbitrary `user_uid` values
 
-**Mitigation:**
-- Gateway has NO access to `exchange_connections` table (PostgreSQL privileges)
-- Gateway receives ONLY aggregated snapshots via gRPC over mTLS
-- Rate limiter audit logs prove systematic snapshots (not cherry-picked)
+**Mitigations:**
+
+1. **Confidentiality of credentials at rest** —
+   Gateway has NO access to `exchange_connections` table (PostgreSQL
+   privileges below). The DEK is unwrapped only inside the enclave, and
+   the master key is derived from the SEV-SNP launch measurement.
+
+2. **Confidentiality of individual trades** —
+   Only aggregated snapshots cross the enclave boundary; per-trade data
+   never leaves the trusted zone.
+
+3. **Per-user authorization (AUTH-001 / AUTH-002 — audit hardening)** —
+   The enclave does **NOT** trust the gateway for `user_uid` authorization.
+   Every RPC and REST handler that accepts a `user_uid` argument runs
+   through `resolveUserUID(ctx, bodyUID)`, which prefers the JWT-verified
+   `claims.Sub` over whatever the caller wrote in the request. A
+   compromised gateway holding a valid HS256 token for user A cannot
+   exfiltrate / mutate data for user B by setting `user_uid=B` in the
+   payload — the JWT subject wins.
+
+   - gRPC: `methodsRequireJWT` covers `GenerateSignedReport`,
+     `CreateUserConnection`, `ProcessSyncJob`, `GetPerformanceMetrics`,
+     `GetSnapshotTimeSeries`, `GetAggregatedMetrics`. See
+     `internal/grpc/server.go`.
+   - REST: same enforcement on `/api/v1/credentials/connect` and the
+     legacy `/api/v1/{connection,sync,metrics,snapshots,report}` set.
+     See `internal/server/handler.go`.
+
+4. **Authentication boundary hardening** —
+   - mTLS is mandatory in production (`buildGRPCTLSConfig` in
+     `cmd/enclave/main.go`).
+   - `GRPC_CLIENT_CERT_CN_ALLOWLIST` must be populated; the enclave
+     refuses to start with an empty allowlist in production.
+   - `ENCLAVE_JWT_EXPECTED_ISSUER`, when set, pins the JWT `iss` claim
+     so a token signed with the enclave secret but minted by a different
+     service is rejected.
+
+5. **Rate-limiter audit log** —
+   `sync_statuses` writes prove daily snapshots run on the cron
+   schedule rather than being cherry-picked.
 
 **Verification:**
 ```sql
@@ -777,6 +815,11 @@ grep -r 'Sprintf.*SELECT\|Sprintf.*INSERT\|Sprintf.*UPDATE' internal/repository/
 SELECT * FROM information_schema.table_privileges
 WHERE grantee = 'gateway_user' AND table_name = 'exchange_connections';
 -- Should return ZERO rows
+```
+
+```bash
+# Per-user authorization regression tests (AUTH-001 / AUTH-002)
+go test ./internal/server/ ./internal/grpc/ -run Audit -v
 ```
 
 #### 2. Compromised Hypervisor

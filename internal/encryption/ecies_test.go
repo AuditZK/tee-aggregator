@@ -7,9 +7,9 @@ import (
 	"encoding/pem"
 	"testing"
 
-	"golang.org/x/crypto/hkdf"
 	"crypto/aes"
 	"crypto/cipher"
+	"golang.org/x/crypto/hkdf"
 )
 
 // eciesEncrypt is a test helper that encrypts with ECIES for round-trip testing.

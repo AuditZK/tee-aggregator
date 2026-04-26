@@ -52,7 +52,8 @@ func TestVerifyHS256_Valid(t *testing.T) {
 }
 
 func TestVerifyHS256_Expired(t *testing.T) {
-	token := makeToken("user_abc123", auth.RequiredAudience, time.Now().Add(-1*time.Second).Unix())
+	// SEC-006: default clock-skew is 30 s; use -60 s to be unambiguously expired.
+	token := makeToken("user_abc123", auth.RequiredAudience, time.Now().Add(-60*time.Second).Unix())
 	_, err := auth.VerifyHS256(token, testSecret)
 	if err != auth.ErrTokenExpired {
 		t.Errorf("expected ErrTokenExpired, got %v", err)
@@ -142,5 +143,84 @@ func TestContextEmpty(t *testing.T) {
 	_, ok := auth.UserUIDFromContext(ctx)
 	if ok {
 		t.Error("expected ok=false for empty context")
+	}
+}
+
+// makeTokenHeader is like makeToken but lets us override the alg/typ header
+// for SEC-006 algorithm-confusion tests.
+func makeTokenHeader(sub, aud string, exp int64, alg, typ string) string {
+	hdr := map[string]string{"alg": alg}
+	if typ != "" {
+		hdr["typ"] = typ
+	}
+	header := base64.RawURLEncoding.EncodeToString(mustJSON(hdr))
+	payload := base64.RawURLEncoding.EncodeToString(mustJSON(map[string]interface{}{
+		"sub": sub,
+		"aud": aud,
+		"iat": time.Now().Unix(),
+		"exp": exp,
+	}))
+	mac := hmac.New(sha256.New, testSecret)
+	mac.Write([]byte(header + "." + payload))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return header + "." + payload + "." + sig
+}
+
+// SEC-006: non-HS256 alg headers must be rejected, even when the body would
+// otherwise verify.
+func TestVerifyHS256_WrongAlgRejected(t *testing.T) {
+	token := makeTokenHeader("user_abc123", auth.RequiredAudience, time.Now().Add(60*time.Second).Unix(), "RS256", "JWT")
+	_, err := auth.VerifyHS256(token, testSecret)
+	if err != auth.ErrInvalidAlgorithm {
+		t.Errorf("expected ErrInvalidAlgorithm, got %v", err)
+	}
+}
+
+// SEC-006: explicitly "none" alg must fail (even though signature is present).
+func TestVerifyHS256_AlgNone(t *testing.T) {
+	token := makeTokenHeader("user_abc123", auth.RequiredAudience, time.Now().Add(60*time.Second).Unix(), "none", "JWT")
+	_, err := auth.VerifyHS256(token, testSecret)
+	if err != auth.ErrInvalidAlgorithm {
+		t.Errorf("expected ErrInvalidAlgorithm, got %v", err)
+	}
+}
+
+// SEC-006: nbf claim in the future must be rejected beyond the skew window.
+func TestVerifyHS256_NotYetValid(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString(mustJSON(map[string]string{"alg": "HS256", "typ": "JWT"}))
+	payload := base64.RawURLEncoding.EncodeToString(mustJSON(map[string]interface{}{
+		"sub": "user_abc123",
+		"aud": auth.RequiredAudience,
+		"exp": time.Now().Add(10 * time.Minute).Unix(),
+		"nbf": time.Now().Add(5 * time.Minute).Unix(), // way beyond skew
+	}))
+	mac := hmac.New(sha256.New, testSecret)
+	mac.Write([]byte(header + "." + payload))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	token := header + "." + payload + "." + sig
+
+	_, err := auth.VerifyHS256(token, testSecret)
+	if err != auth.ErrTokenNotYetValid {
+		t.Errorf("expected ErrTokenNotYetValid, got %v", err)
+	}
+}
+
+// SEC-006: when ExpectedIssuer is set, mismatched iss must fail.
+func TestVerifyHS256_IssuerMismatch(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString(mustJSON(map[string]string{"alg": "HS256", "typ": "JWT"}))
+	payload := base64.RawURLEncoding.EncodeToString(mustJSON(map[string]interface{}{
+		"sub": "user_abc123",
+		"aud": auth.RequiredAudience,
+		"iss": "wrong-issuer",
+		"exp": time.Now().Add(60 * time.Second).Unix(),
+	}))
+	mac := hmac.New(sha256.New, testSecret)
+	mac.Write([]byte(header + "." + payload))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	token := header + "." + payload + "." + sig
+
+	_, err := auth.VerifyHS256WithOptions(token, testSecret, auth.VerifyOptions{ExpectedIssuer: "report-service"})
+	if err != auth.ErrInvalidIssuer {
+		t.Errorf("expected ErrInvalidIssuer, got %v", err)
 	}
 }

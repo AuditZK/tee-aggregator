@@ -17,9 +17,12 @@ import (
 const (
 	binanceSpotAPI    = "https://api.binance.com"
 	binanceFuturesAPI = "https://fapi.binance.com"
+
+	// QUAL-001: extracted to remove duplication across signed-request sites.
+	binancePathAccount = "/api/v3/account"
 )
 
-// Binance implements Connector for Binance exchange
+// Binance implements Connector for Binance exchange.
 type Binance struct {
 	apiKey    string
 	apiSecret string
@@ -88,7 +91,7 @@ func (b *Binance) doRequest(ctx context.Context, method, baseURL, path string, p
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("binance API error: %s", string(body))
+		return nil, fmt.Errorf("binance API error: %s", TruncatedBody(body))
 	}
 
 	return body, nil
@@ -96,7 +99,7 @@ func (b *Binance) doRequest(ctx context.Context, method, baseURL, path string, p
 
 func (b *Binance) TestConnection(ctx context.Context) error {
 	params := url.Values{}
-	_, err := b.doRequest(ctx, "GET", binanceSpotAPI, "/api/v3/account", params, true)
+	_, err := b.doRequest(ctx, "GET", binanceSpotAPI, binancePathAccount, params, true)
 	return err
 }
 
@@ -121,7 +124,7 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 
 func (b *Binance) getSpotBalance(ctx context.Context) (*Balance, error) {
 	params := url.Values{}
-	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, "/api/v3/account", params, true)
+	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, binancePathAccount, params, true)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +264,7 @@ func (b *Binance) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade
 func (b *Binance) getSpotTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
 	// Get active trading pairs first
 	params := url.Values{}
-	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, "/api/v3/account", params, true)
+	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, binancePathAccount, params, true)
 	if err != nil {
 		return nil, err
 	}

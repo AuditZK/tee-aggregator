@@ -118,7 +118,16 @@ func (e *ECIESService) Decrypt(ephemeralPubKeyBytes, iv, ciphertext []byte) ([]b
 	return plaintext, nil
 }
 
-// Cleanup wipes the private key from memory.
+// Cleanup drops the reference to the ECDH private key so the Go runtime can
+// eventually reclaim it. SEC-001: this is NOT a memory wipe — Go's runtime
+// owns the underlying scalar and there is no public API on `ecdh.PrivateKey`
+// to zero it. The bytes persist until garbage collection runs and reuses
+// the page, which is non-deterministic.
+//
+// The enclave's broader threat model relies on AMD SEV-SNP memory
+// encryption for at-rest protection rather than on Go-level wiping; see
+// `internal/security/memory_linux.go` for the process-level controls
+// (RLIMIT_CORE=0, ptrace_scope check) that actually matter for forensics.
 func (e *ECIESService) Cleanup() {
 	e.privateKey = nil
 }
