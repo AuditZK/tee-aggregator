@@ -50,7 +50,14 @@ services:
       # GRPC_INSECURE is allowed in development; lets the perf instance
       # skip mTLS handshake setup so we measure code paths, not crypto.
       - GRPC_INSECURE=${GRPC_INSECURE:-true}
-      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
+      # DATABASE_URL is optional in this perf-test compose. Leave empty
+      # to boot in dev-harness mode (encryption.New(cfg.EncryptionKey)
+      # without DEK unwrap), which is what you want when the live DB
+      # already holds a DEK wrapped with the *other* enclave's
+      # measurement — sharing it across two distinct TEE images would
+      # fail the unwrap by design (each enclave derives its own master
+      # key from its SEV-SNP launch measurement).
+      - DATABASE_URL=${DATABASE_URL:-}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
       # Optional in dev mode (no fatal if empty).
       - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:-}
