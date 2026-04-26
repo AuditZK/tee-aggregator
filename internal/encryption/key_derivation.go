@@ -40,27 +40,8 @@ const (
 // ENCRYPTION_KEY environment variable as the master key directly — this
 // mirrors the TS enclave's dev-mode behaviour and is only safe for test
 // environments where both TS and Go point at the same pre-seeded key.
-//
-// MIGRATION-DEK (zero-downtime binary upgrade): when both paths are
-// available the service keeps both master keys in memory. Callers can
-// then unwrap a DEK with the hardware-derived key (legacy DEKs wrapped
-// by the previous binary) AND re-wrap it with the env-derived key
-// (which survives binary upgrades — same ENCRYPTION_KEY across builds).
-// See cmd/migrate-dek-wrap for the one-shot rewrap procedure.
 type KeyDerivationService struct {
-	// masterKey is the *primary* master key used by WrapKey and
-	// UnwrapKey. It points to masterHW when hardware is available,
-	// otherwise to masterENV. Existing call sites keep their semantics.
-	masterKey []byte
-
-	// masterHW is the SEV-SNP measurement-derived master key. nil when
-	// /dev/sev-guest is missing or snpguest is unreachable.
-	masterHW []byte
-
-	// masterENV is the ENCRYPTION_KEY-derived master key. nil when the
-	// env var is not set / not 32 bytes of hex.
-	masterENV []byte
-
+	masterKey    []byte
 	isHardware   bool
 	snpguestPath string
 	logger       *zap.Logger
@@ -78,123 +59,69 @@ func NewKeyDerivationService(logger *zap.Logger) (*KeyDerivationService, error) 
 	return svc, nil
 }
 
-// deriveMasterKey populates s.masterHW and/or s.masterENV from the
-// available sources, then sets s.masterKey to the preferred one
-// (hardware if present, else env). At least one of the two paths must
-// succeed; otherwise the function returns an error.
-//
-// Why both? cmd/migrate-dek-wrap needs to unwrap a DEK with masterHW
-// (legacy wrap) and re-wrap it with masterENV in the same process so a
-// future binary upgrade — which changes the SEV-SNP measurement and
-// therefore masterHW — can still unwrap the DEK via masterENV.
+// deriveMasterKey populates s.masterKey. Preferred path is SEV-SNP
+// hardware. Falls back to the ENCRYPTION_KEY environment variable when
+// hardware is not available.
 func (s *KeyDerivationService) deriveMasterKey() error {
-	hwErr := s.deriveHardwareMasterKey()
-	envErr := s.deriveEnvMasterKey()
-
-	switch {
-	case s.masterHW != nil:
-		s.masterKey = s.masterHW
-		s.isHardware = true
-		if s.logger != nil && s.masterENV != nil {
-			s.logger.Info("env-derived master key also available (migration helper)",
-				zap.String("env_master_key_id", s.envMasterKeyID()))
+	measurement, platformVersion, err := s.getSEVMeasurement()
+	if err == nil && len(measurement) > 0 {
+		// TS parity: HKDF-SHA256(measurement, salt=platformVersion-utf8,
+		// info="track-record-enclave-dek", length=32). The TS enclave
+		// passes Buffer.from(platformVersion, 'utf8') when present and
+		// Buffer.alloc(0) otherwise. Go's hkdf.New treats an empty
+		// []byte identically to nil per RFC 5869.
+		var salt []byte
+		if platformVersion != "" {
+			salt = []byte(platformVersion)
 		}
-	case s.masterENV != nil:
-		s.masterKey = s.masterENV
-		s.isHardware = false
+		reader := hkdf.New(sha256.New, measurement, salt, []byte(hkdfInfoMasterKey))
+		s.masterKey = make([]byte, masterKeySize)
+		if _, err := io.ReadFull(reader, s.masterKey); err != nil {
+			return fmt.Errorf("derive master key from sev-snp measurement: %w", err)
+		}
+		s.isHardware = true
 		if s.logger != nil {
-			reason := "sev-snp unavailable"
-			if hwErr != nil {
-				reason = hwErr.Error()
-			}
-			s.logger.Warn("falling back to ENCRYPTION_KEY env var as master key (dev/test mode)",
-				zap.String("reason", reason),
+			s.logger.Info("master key derived from SEV-SNP measurement",
+				zap.String("measurement_prefix", hex.EncodeToString(measurement[:min(8, len(measurement))])),
 				zap.String("master_key_id", s.GetMasterKeyID()),
 			)
 		}
-	default:
-		// Both paths failed — surface the most informative error.
-		if hwErr != nil && envErr != nil {
-			return fmt.Errorf("cannot derive master key: sev-snp unavailable (%w) and ENCRYPTION_KEY missing/invalid (%w)", hwErr, envErr)
-		}
-		if hwErr != nil {
-			return fmt.Errorf("cannot derive master key: sev-snp unavailable (%w) and ENCRYPTION_KEY not set", hwErr)
-		}
-		return fmt.Errorf("cannot derive master key: sev-snp unavailable and ENCRYPTION_KEY missing/invalid: %w", envErr)
-	}
-	return nil
-}
-
-// deriveHardwareMasterKey populates s.masterHW from the SEV-SNP
-// measurement when available. Returns the underlying error on failure
-// so the caller can include it in the aggregate error if both paths fail.
-func (s *KeyDerivationService) deriveHardwareMasterKey() error {
-	measurement, platformVersion, err := s.getSEVMeasurement()
-	if err != nil {
-		return err
-	}
-	if len(measurement) == 0 {
-		return fmt.Errorf("empty SEV-SNP measurement")
+		return nil
 	}
 
-	// TS parity: HKDF-SHA256(measurement, salt=platformVersion-utf8,
-	// info="track-record-enclave-dek", length=32).
-	var salt []byte
-	if platformVersion != "" {
-		salt = []byte(platformVersion)
-	}
-	reader := hkdf.New(sha256.New, measurement, salt, []byte(hkdfInfoMasterKey))
-	key := make([]byte, masterKeySize)
-	if _, err := io.ReadFull(reader, key); err != nil {
-		return fmt.Errorf("derive master key from sev-snp measurement: %w", err)
-	}
-	s.masterHW = key
-	if s.logger != nil {
-		s.logger.Info("master key derived from SEV-SNP measurement",
-			zap.String("measurement_prefix", hex.EncodeToString(measurement[:min(8, len(measurement))])),
-			zap.String("master_key_id", s.hwMasterKeyID()),
-		)
-	}
-	return nil
-}
-
-// deriveEnvMasterKey populates s.masterENV from the ENCRYPTION_KEY env
-// var when set and valid. Returns the underlying error on failure so
-// the caller can include it in the aggregate error if both paths fail.
-func (s *KeyDerivationService) deriveEnvMasterKey() error {
+	// Hardware path unavailable or failed. Fall back to the env-var key.
+	// This matches the TS enclave's dev-mode behaviour where
+	// ENCRYPTION_KEY is interpreted as the 32-byte master key directly
+	// (no HKDF, no hardware derivation). Only safe when the TS and Go
+	// enclaves agree on the same pre-seeded master key.
 	envKey := strings.TrimSpace(os.Getenv("ENCRYPTION_KEY"))
 	if envKey == "" {
-		return fmt.Errorf("ENCRYPTION_KEY not set")
+		if err != nil {
+			return fmt.Errorf("cannot derive master key: sev-snp unavailable (%w) and ENCRYPTION_KEY not set", err)
+		}
+		return fmt.Errorf("cannot derive master key: sev-snp unavailable and ENCRYPTION_KEY not set")
 	}
-	keyBytes, err := hex.DecodeString(envKey)
-	if err != nil {
-		return fmt.Errorf("ENCRYPTION_KEY is not valid hex: %w", err)
+
+	keyBytes, decErr := hex.DecodeString(envKey)
+	if decErr != nil {
+		return fmt.Errorf("ENCRYPTION_KEY is not valid hex: %w", decErr)
 	}
 	if len(keyBytes) != masterKeySize {
 		return fmt.Errorf("ENCRYPTION_KEY must decode to %d bytes, got %d", masterKeySize, len(keyBytes))
 	}
-	s.masterENV = keyBytes
+	s.masterKey = keyBytes
+	s.isHardware = false
+	if s.logger != nil {
+		reason := "sev-snp unavailable"
+		if err != nil {
+			reason = err.Error()
+		}
+		s.logger.Warn("falling back to ENCRYPTION_KEY env var as master key (dev/test mode)",
+			zap.String("reason", reason),
+			zap.String("master_key_id", s.GetMasterKeyID()),
+		)
+	}
 	return nil
-}
-
-// hwMasterKeyID returns the master_key_id for the hardware-derived
-// master key (or "" if it isn't available).
-func (s *KeyDerivationService) hwMasterKeyID() string {
-	if s.masterHW == nil {
-		return ""
-	}
-	hash := sha256.Sum256(s.masterHW)
-	return hex.EncodeToString(hash[:8])
-}
-
-// envMasterKeyID returns the master_key_id for the env-derived master
-// key (or "" if it isn't available).
-func (s *KeyDerivationService) envMasterKeyID() string {
-	if s.masterENV == nil {
-		return ""
-	}
-	hash := sha256.Sum256(s.masterENV)
-	return hex.EncodeToString(hash[:8])
 }
 
 // getSEVMeasurement extracts the launch measurement from a fresh
@@ -322,102 +249,6 @@ func (s *KeyDerivationService) UnwrapKey(wrapped *EncryptedData) ([]byte, error)
 	}
 	return svc.Decrypt(wrapped)
 }
-
-// UnwrapSource identifies which master key successfully decrypted a
-// wrapped DEK. Useful for telling the operator whether the active DEK
-// is still bound to the SEV-SNP measurement or has already been
-// migrated to env-only wrap.
-type UnwrapSource string
-
-const (
-	UnwrapSourceHardware UnwrapSource = "hardware"
-	UnwrapSourceEnv      UnwrapSource = "env"
-)
-
-// UnwrapKeyTryAll attempts to decrypt a wrapped DEK with every master
-// key the service has available. It tries hardware first (legacy DEKs
-// produced by older binaries on the same enclave will succeed there),
-// then falls back to env (DEKs that have been re-wrapped via
-// cmd/migrate-dek-wrap, which survives a binary upgrade because the
-// env master key is independent of the SEV-SNP measurement).
-//
-// Returns the unwrapped DEK and the source that produced it. When all
-// available paths fail, returns the error from the last attempt so
-// callers can surface a precise diagnostic.
-func (s *KeyDerivationService) UnwrapKeyTryAll(wrapped *EncryptedData) ([]byte, UnwrapSource, error) {
-	var lastErr error
-
-	if s.masterHW != nil {
-		svc, err := New(s.masterHW)
-		if err == nil {
-			if dek, err := svc.Decrypt(wrapped); err == nil {
-				return dek, UnwrapSourceHardware, nil
-			} else {
-				lastErr = err
-			}
-		} else {
-			lastErr = err
-		}
-	}
-
-	if s.masterENV != nil {
-		svc, err := New(s.masterENV)
-		if err == nil {
-			if dek, err := svc.Decrypt(wrapped); err == nil {
-				return dek, UnwrapSourceEnv, nil
-			} else {
-				lastErr = err
-			}
-		} else {
-			lastErr = err
-		}
-	}
-
-	if lastErr == nil {
-		// Should not happen — either we attempted at least one source
-		// (and lastErr is set) or deriveMasterKey would have returned
-		// an error before this point.
-		lastErr = fmt.Errorf("no master key available")
-	}
-	return nil, "", lastErr
-}
-
-// WrapKeyEnv encrypts a DEK with the env-derived master key
-// specifically. Used by cmd/migrate-dek-wrap to re-wrap an existing
-// DEK so it survives a binary upgrade.
-//
-// Returns ErrEnvMasterKeyUnavailable when ENCRYPTION_KEY isn't set —
-// migrating to env-wrap requires the env key to be present.
-func (s *KeyDerivationService) WrapKeyEnv(dek []byte) (*EncryptedData, error) {
-	if s.masterENV == nil {
-		return nil, ErrEnvMasterKeyUnavailable
-	}
-	svc, err := New(s.masterENV)
-	if err != nil {
-		return nil, err
-	}
-	return svc.Encrypt(dek)
-}
-
-// EnvMasterKeyID returns the master_key_id derived from the env path,
-// or "" when ENCRYPTION_KEY is not set / invalid. Exposed for the
-// migration tool which must record the new master_key_id alongside
-// the re-wrapped DEK.
-func (s *KeyDerivationService) EnvMasterKeyID() string {
-	return s.envMasterKeyID()
-}
-
-// HasEnvMasterKey reports whether the env-derived master key is
-// available. Callers that need to migrate DEK wraps must check this
-// before attempting WrapKeyEnv.
-func (s *KeyDerivationService) HasEnvMasterKey() bool {
-	return s.masterENV != nil
-}
-
-// ErrEnvMasterKeyUnavailable is returned by WrapKeyEnv when
-// ENCRYPTION_KEY is not set — the migration tool surfaces this
-// directly to the operator with a remediation hint.
-var ErrEnvMasterKeyUnavailable = fmt.Errorf("env master key not available (ENCRYPTION_KEY missing or invalid)")
 
 // IsHardwareKey returns true if the master key came from SEV-SNP
 // attestation, false if it came from the ENCRYPTION_KEY env var
