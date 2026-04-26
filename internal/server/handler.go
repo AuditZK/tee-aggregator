@@ -7,17 +7,70 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/trackrecord/enclave/internal/attestation"
+	"github.com/trackrecord/enclave/internal/auth"
 	"github.com/trackrecord/enclave/internal/encryption"
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/service"
 	tlspkg "github.com/trackrecord/enclave/internal/tls"
 	"github.com/trackrecord/enclave/internal/validation"
 	"go.uber.org/zap"
+)
+
+// resolveUserUID returns the authenticated caller UID (AUTH-001). When
+// jwtRequired has verified a bearer token it injects claims.Sub into ctx via
+// auth.WithUserUID; we prefer that value over whatever the client wrote in
+// the request body. The body-supplied value is used only in dev mode (when
+// ENCLAVE_JWT_SECRET is unset and jwtRequired skips auth entirely).
+func resolveUserUID(ctx context.Context, bodyUID string) string {
+	if uid, ok := auth.UserUIDFromContext(ctx); ok {
+		return uid
+	}
+	return bodyUID
+}
+
+// genericInternalError is returned to clients in production paths where
+// the underlying error message could leak SQL, file paths, or stack
+// fragments (SRV-001). Mirrors the gRPC sanitizer behaviour.
+const genericInternalError = "internal server error"
+
+// sanitizeErr returns a client-safe rendering of err. In production
+// (ENV=production) every error collapses to genericInternalError so
+// pgx/SQL/file-path details never leak; in development the original
+// message survives so operators can debug locally. The full error is
+// always logged at the call site via h.logger.Error before this is
+// invoked, so diagnostics are not lost.
+func (h *Handler) sanitizeErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	if isProduction() {
+		return genericInternalError
+	}
+	return err.Error()
+}
+
+// isProduction mirrors the gRPC server check so the REST sanitizer uses
+// the same toggle.
+func isProduction() bool {
+	env := strings.ToLower(os.Getenv("ENV"))
+	nodeEnv := strings.ToLower(os.Getenv("NODE_ENV"))
+	return env == "production" || nodeEnv == "production"
+}
+
+// QUAL-001: error / status messages reused across REST handlers. Extracted
+// as constants so SonarQube's go:S1192 stops complaining and so any wording
+// drift between handlers becomes a structural impossibility.
+const (
+	msgMethodNotAllowed     = "method not allowed"
+	msgInvalidRequestBody   = "invalid request body"
+	msgUserUIDRequired      = "user_uid is required"
+	msgFailedLoadExclusions = "failed to load exclusion rules"
 )
 
 type Handler struct {
@@ -92,7 +145,7 @@ func NewHandlerWithOptions(opts HandlerOptions) *Handler {
 // GetTLSFingerprint - GET /api/v1/tls/fingerprint
 func (h *Handler) GetTLSFingerprint(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -110,10 +163,16 @@ func (h *Handler) GetTLSFingerprint(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetAttestation - GET /api/v1/attestation
+// GetAttestation serves /api/v1/attestation.
+//
+//   - GET returns the cached (5s) attestation quote without freshness guarantees;
+//     safe only for same-TLS-session use.
+//   - POST with body {"nonce":"<hex>"} (1..64 bytes) returns a fresh quote whose
+//     report_data is SHA-256(tls_fp || e2e_pk || signing_pk || nonce). The nonce
+//     proves freshness against replay (SEC-101). Never cached.
 func (h *Handler) GetAttestation(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -124,7 +183,36 @@ func (h *Handler) GetAttestation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	report, err := h.attestSvc.GetAttestation(r.Context())
+	var (
+		report *attestation.AttestationReport
+		err    error
+	)
+	if r.Method == http.MethodPost {
+		var body struct {
+			Nonce string `json:"nonce"`
+		}
+		if err := readJSON(w, r, &body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": msgInvalidRequestBody})
+			return
+		}
+		nonceHex := strings.TrimSpace(body.Nonce)
+		if nonceHex == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "nonce is required (hex string)"})
+			return
+		}
+		nonce, decErr := hex.DecodeString(nonceHex)
+		if decErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "nonce must be a hex string"})
+			return
+		}
+		if len(nonce) == 0 || len(nonce) > 64 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "nonce must be 1..64 bytes after hex decode"})
+			return
+		}
+		report, err = h.attestSvc.GetAttestationWithNonce(r.Context(), nonce)
+	} else {
+		report, err = h.attestSvc.GetAttestation(r.Context())
+	}
 	if err != nil {
 		h.logger.Error("attestation failed", zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
@@ -134,17 +222,19 @@ func (h *Handler) GetAttestation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		verified        bool
-		sevSnpEnabled   bool
-		vcekVerified    bool
-		measurement     string
-		reportData      string
-		platformVersion string
+		verified                 bool
+		sevSnpEnabled            bool
+		vcekVerified             bool
+		reportDataBoundToRequest bool
+		measurement              string
+		reportData               string
+		platformVersion          string
 	)
 	if report.Attestation != nil {
 		verified = report.Attestation.Verified
 		sevSnpEnabled = report.Attestation.SevSnpEnabled
 		vcekVerified = report.Attestation.VcekVerified
+		reportDataBoundToRequest = report.Attestation.ReportDataBoundToRequest
 		measurement = report.Attestation.Measurement
 		reportData = report.Attestation.ReportData
 		platformVersion = report.Attestation.PlatformVersion
@@ -187,12 +277,13 @@ func (h *Handler) GetAttestation(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"attestation": map[string]any{
-			"verified":        verified,
-			"sevSnpEnabled":   sevSnpEnabled,
-			"vcekVerified":    vcekVerified,
-			"measurement":     measurement,
-			"reportData":      reportData,
-			"platformVersion": platformVersion,
+			"verified":                 verified,
+			"sevSnpEnabled":            sevSnpEnabled,
+			"vcekVerified":             vcekVerified,
+			"reportDataBoundToRequest": reportDataBoundToRequest,
+			"measurement":              measurement,
+			"reportData":               reportData,
+			"platformVersion":          platformVersion,
 		},
 		"tlsBinding": map[string]any{
 			"fingerprint":  tlsFingerprint,
@@ -229,7 +320,7 @@ func (h *Handler) GetAttestation(w http.ResponseWriter, r *http.Request) {
 // Accepts E2E encrypted credentials and creates a connection.
 func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -254,10 +345,10 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 		ExcludeFromReport bool `json:"exclude_from_report"`
 	}
 
-	if err := readJSON(r, &req); err != nil {
+	if err := readJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "invalid request body",
+			"error":   msgInvalidRequestBody,
 		})
 		return
 	}
@@ -271,7 +362,10 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.UserUID == "" || req.Exchange == "" {
+	// AUTH-001: prefer the JWT-verified uid over the body-supplied one.
+	userUID := resolveUserUID(r.Context(), req.UserUID)
+
+	if userUID == "" || req.Exchange == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
 			"error":   "user_uid and exchange are required",
@@ -354,14 +448,14 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 
 	// Upsert user
 	if h.userRepo != nil {
-		if _, err := h.userRepo.GetOrCreate(r.Context(), req.UserUID); err != nil {
+		if _, err := h.userRepo.GetOrCreate(r.Context(), userUID); err != nil {
 			h.logger.Error("user upsert failed", zap.Error(err))
 		}
 	}
 
 	// Create connection
 	if err := validation.ValidateCreateConnection(&validation.CreateConnectionRequest{
-		UserUID:    req.UserUID,
+		UserUID:    userUID,
 		Exchange:   req.Exchange,
 		Label:      label,
 		APIKey:     creds.APIKey,
@@ -376,7 +470,7 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = h.connSvc.Create(r.Context(), &service.CreateConnectionRequest{
-		UserUID:           req.UserUID,
+		UserUID:           userUID,
 		Exchange:          req.Exchange,
 		Label:             label,
 		APIKey:            creds.APIKey,
@@ -388,7 +482,7 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, service.ErrConnectionAlreadyExists) {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"success":  true,
-				"user_uid": req.UserUID,
+				"user_uid": userUID,
 				"exchange": req.Exchange,
 				"error":    service.ExistingConnectionNoopMessage,
 			})
@@ -404,7 +498,7 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":  true,
-		"user_uid": req.UserUID,
+		"user_uid": userUID,
 		"exchange": req.Exchange,
 		"message":  "Credentials encrypted and stored in enclave",
 	})
@@ -437,7 +531,7 @@ func isConnectionExcluded(excluded map[string]struct{}, exchange, label string) 
 // HealthCheck - GET /health
 func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -451,7 +545,7 @@ func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 // CreateUserConnection - POST /api/v1/connection
 func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -466,15 +560,18 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 		ExcludeFromReport   bool   `json:"exclude_from_report"`
 	}
 
-	if err := readJSON(r, &req); err != nil {
+	if err := readJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "invalid request body",
+			"error":   msgInvalidRequestBody,
 		})
 		return
 	}
 
-	if req.UserUID == "" || req.Exchange == "" || req.APIKey == "" {
+	// AUTH-001: prefer the JWT-verified uid over the body-supplied one.
+	userUID := resolveUserUID(r.Context(), req.UserUID)
+
+	if userUID == "" || req.Exchange == "" || req.APIKey == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
 			"error":   "user_uid, exchange, and api_key are required",
@@ -483,7 +580,7 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := validation.ValidateCreateConnection(&validation.CreateConnectionRequest{
-		UserUID:             req.UserUID,
+		UserUID:             userUID,
 		Exchange:            req.Exchange,
 		Label:               req.Label,
 		APIKey:              req.APIKey,
@@ -508,7 +605,7 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 
 	// Upsert user first
 	if h.userRepo != nil {
-		if _, err := h.userRepo.GetOrCreate(r.Context(), req.UserUID); err != nil {
+		if _, err := h.userRepo.GetOrCreate(r.Context(), userUID); err != nil {
 			h.logger.Error("user upsert failed", zap.Error(err))
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"success": false,
@@ -519,7 +616,7 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err := h.connSvc.Create(r.Context(), &service.CreateConnectionRequest{
-		UserUID:             req.UserUID,
+		UserUID:             userUID,
 		Exchange:            req.Exchange,
 		Label:               req.Label,
 		APIKey:              req.APIKey,
@@ -533,13 +630,13 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, service.ErrConnectionAlreadyExists) {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"success":  true,
-				"user_uid": req.UserUID,
+				"user_uid": userUID,
 				"error":    service.ExistingConnectionNoopMessage,
 			})
 			return
 		}
 		h.logger.Error("create connection failed",
-			zap.String("user_uid", req.UserUID),
+			zap.String("user_uid", userUID),
 			zap.String("exchange", req.Exchange),
 			zap.Error(err),
 		)
@@ -551,20 +648,20 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.logger.Info("connection created",
-		zap.String("user_uid", req.UserUID),
+		zap.String("user_uid", userUID),
 		zap.String("exchange", req.Exchange),
 	)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":  true,
-		"user_uid": req.UserUID,
+		"user_uid": userUID,
 	})
 }
 
 // ProcessSyncJob - POST /api/v1/sync
 func (h *Handler) ProcessSyncJob(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -573,25 +670,28 @@ func (h *Handler) ProcessSyncJob(w http.ResponseWriter, r *http.Request) {
 		Exchange string `json:"exchange"`
 	}
 
-	if err := readJSON(r, &req); err != nil {
+	if err := readJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "invalid request body",
+			"error":   msgInvalidRequestBody,
 		})
 		return
 	}
 
-	if req.UserUID == "" {
+	// AUTH-001: prefer the JWT-verified uid over the body-supplied one.
+	userUID := resolveUserUID(r.Context(), req.UserUID)
+
+	if userUID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "user_uid is required",
+			"error":   msgUserUIDRequired,
 		})
 		return
 	}
 
 	rawExchange := req.Exchange
 	if err := validation.ValidateSyncRequest(&validation.SyncJobRequest{
-		UserUID:  req.UserUID,
+		UserUID:  userUID,
 		Exchange: rawExchange,
 	}); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -614,14 +714,15 @@ func (h *Handler) ProcessSyncJob(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if req.Exchange != "" {
-		result := h.syncSvc.SyncExchange(r.Context(), req.UserUID, req.Exchange)
+		result := h.syncSvc.SyncExchange(r.Context(), userUID, req.Exchange)
 		results = []*service.SyncResult{result}
 	} else {
-		results, err = h.syncSvc.SyncUser(r.Context(), req.UserUID)
+		results, err = h.syncSvc.SyncUser(r.Context(), userUID)
 		if err != nil {
+			h.logger.Error("sync user failed", zap.String("user_uid", userUID), zap.Error(err))
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"success": false,
-				"error":   err.Error(),
+				"error":   h.sanitizeErr(err),
 			})
 			return
 		}
@@ -637,7 +738,7 @@ func (h *Handler) ProcessSyncJob(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":  anySuccess,
-		"user_uid": req.UserUID,
+		"user_uid": userUID,
 		"results":  results,
 	})
 }
@@ -645,15 +746,16 @@ func (h *Handler) ProcessSyncJob(w http.ResponseWriter, r *http.Request) {
 // GetMetrics - GET /api/v1/metrics?user_uid=xxx&exchange=xxx&start=xxx&end=xxx
 func (h *Handler) GetMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
-	userUID := r.URL.Query().Get("user_uid")
+	// AUTH-001: prefer the JWT-verified uid over the query-supplied one.
+	userUID := resolveUserUID(r.Context(), r.URL.Query().Get("user_uid"))
 	if userUID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "user_uid is required",
+			"error":   msgUserUIDRequired,
 		})
 		return
 	}
@@ -699,7 +801,7 @@ func (h *Handler) GetMetrics(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"success": false,
-				"error":   "failed to load exclusion rules",
+				"error":   msgFailedLoadExclusions,
 			})
 			return
 		}
@@ -708,9 +810,10 @@ func (h *Handler) GetMetrics(w http.ResponseWriter, r *http.Request) {
 
 	metrics, err := h.metricsSvc.CalculateWithFilters(r.Context(), userUID, start, end, exchange, excludedConnectionKeys)
 	if err != nil {
+		h.logger.Error("metrics computation failed", zap.String("user_uid", userUID), zap.Error(err))
 		writeJSON(w, http.StatusOK, map[string]any{
 			"success": false,
-			"error":   err.Error(),
+			"error":   h.sanitizeErr(err),
 		})
 		return
 	}
@@ -740,15 +843,16 @@ func (h *Handler) GetMetrics(w http.ResponseWriter, r *http.Request) {
 // GetSnapshots - GET /api/v1/snapshots?user_uid=xxx&exchange=xxx&start=xxx&end=xxx
 func (h *Handler) GetSnapshots(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
-	userUID := r.URL.Query().Get("user_uid")
+	// AUTH-001: prefer the JWT-verified uid over the query-supplied one.
+	userUID := resolveUserUID(r.Context(), r.URL.Query().Get("user_uid"))
 	if userUID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "user_uid is required",
+			"error":   msgUserUIDRequired,
 		})
 		return
 	}
@@ -778,9 +882,10 @@ func (h *Handler) GetSnapshots(w http.ResponseWriter, r *http.Request) {
 
 	snapshots, err := h.snapshotRepo.GetByUserAndDateRange(r.Context(), userUID, start, end)
 	if err != nil {
+		h.logger.Error("snapshot fetch failed", zap.String("user_uid", userUID), zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"success": false,
-			"error":   err.Error(),
+			"error":   h.sanitizeErr(err),
 		})
 		return
 	}
@@ -791,7 +896,7 @@ func (h *Handler) GetSnapshots(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"success": false,
-				"error":   "failed to load exclusion rules",
+				"error":   msgFailedLoadExclusions,
 			})
 			return
 		}
@@ -845,7 +950,7 @@ func (h *Handler) GetSnapshots(w http.ResponseWriter, r *http.Request) {
 // GenerateReport - POST /api/v1/report
 func (h *Handler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -862,18 +967,21 @@ func (h *Handler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 		Firm               string `json:"firm"`
 	}
 
-	if err := readJSON(r, &req); err != nil {
+	if err := readJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "invalid request body",
+			"error":   msgInvalidRequestBody,
 		})
 		return
 	}
 
-	if req.UserUID == "" {
+	// AUTH-001: prefer the JWT-verified uid over the body-supplied one.
+	userUID := resolveUserUID(r.Context(), req.UserUID)
+
+	if userUID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
-			"error":   "user_uid is required",
+			"error":   msgUserUIDRequired,
 		})
 		return
 	}
@@ -906,18 +1014,18 @@ func (h *Handler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 
 	excludedConnectionKeys := map[string]struct{}{}
 	if h.connSvc != nil {
-		excludedConnectionKeys, err = h.connSvc.GetExcludedConnectionKeys(r.Context(), req.UserUID)
+		excludedConnectionKeys, err = h.connSvc.GetExcludedConnectionKeys(r.Context(), userUID)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"success": false,
-				"error":   "failed to load exclusion rules",
+				"error":   msgFailedLoadExclusions,
 			})
 			return
 		}
 	}
 
 	report, err := h.reportSvc.GenerateReport(r.Context(), &service.GenerateReportRequest{
-		UserUID:            req.UserUID,
+		UserUID:            userUID,
 		StartDate:          startDate,
 		EndDate:            endDate,
 		ReportName:         req.ReportName,
@@ -934,7 +1042,7 @@ func (h *Handler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 		h.logger.Error("generate report failed", zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"success": false,
-			"error":   err.Error(),
+			"error":   h.sanitizeErr(err),
 		})
 		return
 	}
@@ -945,7 +1053,7 @@ func (h *Handler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 // VerifySignature - POST /api/v1/verify
 func (h *Handler) VerifySignature(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, msgMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -955,10 +1063,10 @@ func (h *Handler) VerifySignature(w http.ResponseWriter, r *http.Request) {
 		PublicKey  string `json:"public_key"`
 	}
 
-	if err := readJSON(r, &req); err != nil {
+	if err := readJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"valid": false,
-			"error": "invalid request body",
+			"error": msgInvalidRequestBody,
 		})
 		return
 	}
@@ -981,9 +1089,10 @@ func (h *Handler) VerifySignature(w http.ResponseWriter, r *http.Request) {
 
 	valid, err := h.reportSvc.VerifySignature(req.ReportHash, req.Signature, req.PublicKey)
 	if err != nil {
+		h.logger.Warn("verify signature failed", zap.Error(err))
 		writeJSON(w, http.StatusOK, map[string]any{
 			"valid": false,
-			"error": err.Error(),
+			"error": h.sanitizeErr(err),
 		})
 		return
 	}

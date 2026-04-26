@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -26,6 +27,27 @@ func CORSMiddleware(allowedOrigins string, next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// ValidateCORSConfig fails closed if production is configured with a
+// wildcard or empty CORS_ORIGIN (CORS-001). The historical default
+// reflected `*` against any Origin and combined with a JWT bearer would
+// expose authenticated endpoints to any cross-origin script. Production
+// must explicitly enumerate the trusted origins.
+func ValidateCORSConfig(env, raw string) error {
+	if !strings.EqualFold(env, "production") {
+		return nil
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("CORS_ORIGIN must be an explicit comma-separated allowlist in production (got empty)")
+	}
+	for _, o := range strings.Split(trimmed, ",") {
+		if strings.TrimSpace(o) == "*" {
+			return fmt.Errorf("CORS_ORIGIN must not contain '*' in production")
+		}
+	}
+	return nil
 }
 
 func parseOrigins(raw string) []string {
