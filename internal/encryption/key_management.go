@@ -181,12 +181,27 @@ func (s *KeyManagementService) initializeDEK(ctx context.Context) error {
 		AuthTag:    dek.AuthTag,
 	}
 
-	unwrapped, err := s.derivation.UnwrapKey(wrapped)
+	// MIGRATION-DEK: try both the hardware-derived and env-derived master
+	// keys. This lets a freshly-built binary (different SEV-SNP measurement,
+	// so different masterHW) still boot against a DEK that has been
+	// re-wrapped via cmd/migrate-dek-wrap with the env master key — which
+	// is reproducible across binary upgrades because it derives only from
+	// ENCRYPTION_KEY. Hardware is tried first to preserve the existing
+	// behaviour for un-migrated DEKs.
+	unwrapped, source, err := s.derivation.UnwrapKeyTryAll(wrapped)
 	if err != nil {
 		return fmt.Errorf(
 			"unwrap active DEK (id=%s, stored_master_key_id=%s, derived_master_key_id=%s): %w — "+
-				"refusing to rotate the DEK automatically; investigate the master-key mismatch manually",
+				"refusing to rotate the DEK automatically; investigate the master-key mismatch manually "+
+				"(if you just upgraded the binary, run cmd/migrate-dek-wrap before the new image boots)",
 			dek.ID, dek.MasterKeyID, s.derivation.GetMasterKeyID(), err,
+		)
+	}
+
+	if s.logger != nil {
+		s.logger.Info("DEK unwrapped",
+			zap.String("dek_id", dek.ID),
+			zap.String("source", string(source)),
 		)
 	}
 
