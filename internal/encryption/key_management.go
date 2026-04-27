@@ -69,6 +69,17 @@ type KeyManagementOptions struct {
 	// database when none exists yet. Set false for parallel-test /
 	// shared-DB scenarios to avoid silently reseeding a live schema.
 	AllowAutoInit bool
+
+	// ExternalMasterKey, when non-nil, overrides the master key the
+	// service would otherwise derive from the SEV-SNP measurement (or
+	// the env-var fallback). Used by the B2 handoff client: the new
+	// enclave fetches the master key from its predecessor over an
+	// attested ECIES channel and injects it here so DEK unwrap matches
+	// what the predecessor wrote.
+	//
+	// MUST be exactly 32 bytes (AES-256). The slice is copied into the
+	// service so callers can safely zeroise the original after the call.
+	ExternalMasterKey []byte
 }
 
 // NewKeyManagementService creates a new key management service.
@@ -79,6 +90,25 @@ func NewKeyManagementService(pool *pgxpool.Pool, opts KeyManagementOptions) (*Ke
 		derivation, err = NewKeyDerivationService(opts.Logger)
 		if err != nil {
 			return nil, fmt.Errorf("init key derivation: %w", err)
+		}
+	}
+
+	// B2 handoff: when ExternalMasterKey is provided, override the
+	// derivation's primary master key. The legacy hardware-derived key
+	// is still useful for *signing* future wraps but unwrap will use
+	// the externally-supplied key (matches the previous binary's wrap).
+	if len(opts.ExternalMasterKey) > 0 {
+		if len(opts.ExternalMasterKey) != 32 {
+			return nil, fmt.Errorf("ExternalMasterKey must be 32 bytes, got %d", len(opts.ExternalMasterKey))
+		}
+		copied := make([]byte, 32)
+		copy(copied, opts.ExternalMasterKey)
+		derivation.masterKey = copied
+		derivation.isHardware = false
+		if opts.Logger != nil {
+			opts.Logger.Info("master key supplied externally (handoff path)",
+				zap.String("master_key_id", derivation.GetMasterKeyID()),
+			)
 		}
 	}
 
@@ -94,6 +124,28 @@ func NewKeyManagementService(pool *pgxpool.Pool, opts KeyManagementOptions) (*Ke
 	}
 
 	return svc, nil
+}
+
+// ExportMasterKey returns a copy of the current master key. Used by the
+// B2 handoff server: the predecessor enclave hands its master key to the
+// successor over an attested ECIES channel.
+//
+// CALLER OBLIGATION: zeroise the returned slice as soon as it has been
+// encrypted to the successor's pubkey. Holding it any longer extends the
+// window where a memory dump could expose it.
+//
+// This method is intentionally exposed only on the in-process
+// KeyManagementService. The handoff server gates calls behind attestation
+// verification — see internal/bootstrap.HandoffServer.
+func (s *KeyManagementService) ExportMasterKey() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.derivation == nil || s.derivation.masterKey == nil {
+		return nil, fmt.Errorf("master key not initialised")
+	}
+	out := make([]byte, len(s.derivation.masterKey))
+	copy(out, s.derivation.masterKey)
+	return out, nil
 }
 
 // GetCurrentDEK returns the current DEK for encryption

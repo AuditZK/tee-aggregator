@@ -37,6 +37,15 @@ func NewECIES() (*ECIESService, error) {
 	}, nil
 }
 
+// PrivateKey returns the underlying ECDH private key. Exposed for the
+// B2 handoff client which needs to decrypt the handoff response with
+// the same private key whose public part is published in the
+// attestation report. Caller MUST keep the returned reference inside
+// the TEE process boundary — never log it, never serialise it.
+func (e *ECIESService) PrivateKey() *ecdh.PrivateKey {
+	return e.privateKey
+}
+
 // PublicKeyPEM returns the public key in PEM format.
 func (e *ECIESService) PublicKeyPEM() string {
 	derBytes := e.publicKey.Bytes()
@@ -116,6 +125,66 @@ func (e *ECIESService) Decrypt(ephemeralPubKeyBytes, iv, ciphertext []byte) ([]b
 	}
 
 	return plaintext, nil
+}
+
+// EncryptToPubkey encrypts plaintext to a recipient's ECDH P-256 public
+// key, returning (ephemeral_pubkey_bytes, iv, ciphertext). Mirror of
+// Decrypt — same HKDF / AES-GCM construction — used by the B2 handoff
+// server to wrap the master key for the successor enclave.
+//
+// recipientPubKeyBytes accepts either raw uncompressed P-256 (65 bytes)
+// or a PEM-encoded SubjectPublicKeyInfo (the same shape the enclave
+// publishes in /api/v1/attestation.e2eEncryption.publicKey).
+//
+// This is a free function (not a method) so it does not require an
+// ECIESService instance — the caller doesn't need a long-lived
+// recipient-side state, just the recipient's pubkey.
+func EncryptToPubkey(recipientPubKeyBytes, plaintext []byte) (ephPub, iv, ciphertext []byte, err error) {
+	rawKey, err := ParseEphemeralPublicKey(recipientPubKeyBytes)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("parse recipient pubkey format: %w", err)
+	}
+
+	curve := ecdh.P256()
+	recipientPubKey, err := curve.NewPublicKey(rawKey)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("parse recipient pubkey: %w", err)
+	}
+
+	// Generate the ephemeral keypair on the sender side.
+	ephPriv, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("generate ephemeral keypair: %w", err)
+	}
+
+	sharedSecret, err := ephPriv.ECDH(recipientPubKey)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("ecdh: %w", err)
+	}
+
+	// Same HKDF parameters as Decrypt — both sides must agree exactly.
+	hkdfReader := hkdf.New(sha256.New, sharedSecret, nil, []byte(eciesInfoString))
+	aesKey := make([]byte, 32)
+	if _, err := hkdfReader.Read(aesKey); err != nil {
+		return nil, nil, nil, fmt.Errorf("hkdf derive: %w", err)
+	}
+
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("aes cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("gcm: %w", err)
+	}
+
+	iv = make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(iv); err != nil {
+		return nil, nil, nil, fmt.Errorf("generate iv: %w", err)
+	}
+	ct := gcm.Seal(nil, iv, plaintext, nil)
+
+	return ephPriv.PublicKey().Bytes(), iv, ct, nil
 }
 
 // Cleanup drops the reference to the ECDH private key so the Go runtime can

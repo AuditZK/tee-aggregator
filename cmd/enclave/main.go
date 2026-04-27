@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/trackrecord/enclave/internal/attestation"
+	"github.com/trackrecord/enclave/internal/bootstrap"
 	"github.com/trackrecord/enclave/internal/cache"
 	"github.com/trackrecord/enclave/internal/config"
 	"github.com/trackrecord/enclave/internal/connector"
@@ -151,6 +152,7 @@ func main() {
 	// auto-seeding is explicitly requested — see the pool != nil
 	// branch below.
 	var enc *encryption.Service
+	var keyMgmt *encryption.KeyManagementService
 	if pool != nil {
 		keyDerivation, derivErr := encryption.NewKeyDerivationService(logger)
 		if derivErr != nil {
@@ -161,18 +163,33 @@ func main() {
 			zap.String("master_key_id", keyDerivation.GetMasterKeyID()),
 		)
 
-		keyMgmt, kmErr := encryption.NewKeyManagementService(pool, encryption.KeyManagementOptions{
-			Derivation:    keyDerivation,
-			Logger:        logger,
-			AllowAutoInit: cfg.IsDevelopment(),
+		// B2 handoff: when HANDOFF_PEER_URL is set, this enclave is being
+		// upgraded — fetch the master key from the predecessor over an
+		// attested ECIES channel. This overrides the measurement-derived
+		// key so the existing DEK still unwraps. Failure is fatal: there
+		// is no safe fallback when the operator explicitly asked for handoff.
+		var externalMasterKey []byte
+		if cfg.HandoffPeerURL != "" {
+			externalMasterKey, err = fetchMasterKeyFromPredecessor(ctx, cfg, eciesSvc, tlsKeygen, logger)
+			if err != nil {
+				logger.Fatal("B2 handoff failed", zap.Error(err))
+			}
+			defer wipeBytes(externalMasterKey)
+		}
+
+		keyMgmt, err = encryption.NewKeyManagementService(pool, encryption.KeyManagementOptions{
+			Derivation:        keyDerivation,
+			Logger:            logger,
+			AllowAutoInit:     cfg.IsDevelopment(),
+			ExternalMasterKey: externalMasterKey,
 		})
-		if kmErr != nil {
+		if err != nil {
 			// Hard fail: running against a DB whose DEK we cannot
 			// unwrap means every sync will fail. Bail out early with
 			// a descriptive error instead of silently pretending
 			// ENCRYPTION_KEY works.
 			logger.Fatal("key management init failed (cannot unwrap active DEK)",
-				zap.Error(kmErr),
+				zap.Error(err),
 				zap.String("hint", "check ENCRYPTION_KEY, SEV-SNP attestation, and data_encryption_keys.master_key_id"),
 			)
 		}
@@ -405,6 +422,23 @@ func main() {
 		AttestSvc:    attestSvc,
 		ECIESSvc:     eciesSvc,
 	}))
+
+	// B2 handoff server: expose POST /api/v1/admin/handoff so a
+	// successor enclave can fetch this enclave's master key over an
+	// attested ECIES channel during an upgrade window. Only enabled
+	// when keyMgmt is wired (i.e. we have a real master key to hand off).
+	if keyMgmt != nil {
+		handoffSrv, hsErr := bootstrap.NewHandoffServer(bootstrap.HandoffServerOptions{
+			KeyExporter: keyMgmt,
+			Logger:      logger,
+		})
+		if hsErr != nil {
+			logger.Fatal("init handoff server", zap.Error(hsErr))
+		}
+		restServer.SetHandoffHandler(handoffSrv)
+		logger.Info("B2 handoff server endpoint registered",
+			zap.String("path", "/api/v1/admin/handoff"))
+	}
 	go func() {
 		if err := restServer.Start(ctx); err != nil {
 			logger.Error("REST server stopped", zap.Error(err))

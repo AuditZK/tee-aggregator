@@ -43,6 +43,13 @@ type Server struct {
 	// jwtExpectedIssuer pins the `iss` claim on inbound JWTs when non-empty
 	// (AUTH-002 follow-up). Mirrors the gRPC interceptor.
 	jwtExpectedIssuer string
+
+	// handoffHandler, when non-nil, exposes the B2 handoff endpoint
+	// at POST /api/v1/admin/handoff. Successor enclaves use this to
+	// fetch the master key from this instance during an upgrade window.
+	// Wired by main.go via SetHandoffHandler — the handler itself does
+	// the cryptographic gate (attestation + signed allowlist + ECIES).
+	handoffHandler http.Handler
 }
 
 // SetScheduler attaches the scheduler for admin sync trigger.
@@ -60,6 +67,15 @@ func (s *Server) SetJWTSecret(secret []byte) {
 // Empty disables the check (legacy behaviour). Call before Start().
 func (s *Server) SetJWTExpectedIssuer(iss string) {
 	s.jwtExpectedIssuer = iss
+}
+
+// SetHandoffHandler wires the B2 handoff endpoint. When non-nil, a
+// POST to /api/v1/admin/handoff is delegated to this handler. The
+// handler MUST do its own cryptographic gating — see
+// internal/bootstrap.HandoffServer for the production implementation.
+// Call before Start().
+func (s *Server) SetHandoffHandler(h http.Handler) {
+	s.handoffHandler = h
 }
 
 func New(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool, signer *signing.ReportSigner) *Server {
@@ -129,6 +145,15 @@ func (s *Server) Start(ctx context.Context) error {
 	// and only set by the front proxy anyway). Non-loopback peers get 403.
 	mux.HandleFunc("/api/v1/admin/sync-now", s.localhostOnly(s.handleAdminSyncNow))
 	mux.HandleFunc("/api/v1/admin/cashflows", s.localhostOnly(s.handleAdminDumpCashflows))
+
+	// B2 handoff: deliberately NOT gated by localhostOnly because the
+	// successor enclave runs in a different container with a non-loopback
+	// IP on the Docker bridge. The handler itself does cryptographic
+	// gating (signed allowlist + attestation + ECIES); transport-level
+	// scoping is unnecessary. Wired only when SetHandoffHandler was called.
+	if s.handoffHandler != nil {
+		mux.Handle("/api/v1/admin/handoff", s.handoffHandler)
+	}
 
 	// Legacy REST routes are disabled by default for strict TS parity.
 	if s.cfg.EnableLegacyREST {

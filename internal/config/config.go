@@ -87,6 +87,22 @@ type Config struct {
 	// bound to the same secret is still rejected. Parsed from
 	// ENCLAVE_JWT_EXPECTED_ISSUER.
 	JWTExpectedIssuer string
+
+	// HandoffPeerURL, when non-empty, points at the URL of the previous
+	// running enclave's handoff endpoint (B2). Set ONLY during the
+	// upgrade window when v_N+1 is meant to fetch the master key from
+	// v_N. Once handoff is complete, leave empty so v_N+1 doesn't keep
+	// pinging the (now-shut-down) predecessor at every restart.
+	// Parsed from HANDOFF_PEER_URL.
+	HandoffPeerURL string
+
+	// HandoffSignedAllowlist holds the operator-signed JSON document
+	// listing approved release measurements. Inlined here to allow
+	// override via the GCP `signed-allowlist` metadata key when shipping
+	// a new release before its measurement is hardcoded into the binary.
+	// Parsed from HANDOFF_SIGNED_ALLOWLIST. Empty = use the constant
+	// shipped with the binary (see internal/bootstrap/embedded_allowlist).
+	HandoffSignedAllowlist string
 }
 
 func Load() *Config {
@@ -131,6 +147,9 @@ func Load() *Config {
 		ReattestInterval:        getEnvDuration("ENCLAVE_REATTEST_INTERVAL", 10*time.Minute),
 		ClientCertCNAllowlist:   parseCommaList(getEnv("GRPC_CLIENT_CERT_CN_ALLOWLIST", "")),
 		JWTExpectedIssuer:       strings.TrimSpace(getEnv("ENCLAVE_JWT_EXPECTED_ISSUER", "")),
+
+		HandoffPeerURL:         strings.TrimSpace(getEnv("HANDOFF_PEER_URL", "")),
+		HandoffSignedAllowlist: getEnv("HANDOFF_SIGNED_ALLOWLIST", ""),
 	}
 }
 
