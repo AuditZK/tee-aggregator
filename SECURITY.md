@@ -218,6 +218,58 @@ hkdf.New(sha256.New, measurement, platformVersion, []byte("auditzk-enclave-dek")
 - Key never stored — derived on-demand from hardware
 - NO FALLBACK: AMD SEV-SNP hardware is REQUIRED
 
+#### Trustless Binary Upgrades (B2 Handoff)
+
+The naive consequence of measurement-bound master keys is that every
+binary update would render existing encrypted credentials unreadable —
+forcing every user to re-submit. The B2 design avoids this without
+weakening the trust model:
+
+- The operator publishes a hardcoded **Ed25519 pubkey** in the binary
+  source (`internal/bootstrap/signed_allowlist.go::operatorPubkey`).
+  This pubkey is the long-term root of trust — auditable on GitHub.
+
+- Each release ships with a **SignedAllowlist** (JSON, signed by the
+  operator's matching privkey) listing the SEV-SNP measurements of
+  every approved binary version.
+
+- At upgrade time, the new enclave (v_N+1) attests via SEV-SNP and
+  asks the running enclave (v_N) for the master key. v_N validates:
+
+  1. SignedAllowlist signature matches `operatorPubkey`
+  2. v_N+1's measurement is in the allowlist
+  3. v_N+1's SEV-SNP attestation chain is valid (silicon-signed)
+  4. v_N+1's `report_data` binds the request to its ephemeral ECIES
+     pubkey + a fresh nonce (anti-replay, anti-MITM)
+
+  Then v_N encrypts the master key with v_N+1's ECIES pubkey and
+  returns it. The successor decrypts inside its TEE.
+
+- The operator's privkey lives **only on the operator's laptop**,
+  encrypted with a passphrase by `cmd/release-sign`. It never reaches
+  the enclave or any server. A compromise of GCP metadata, the host
+  filesystem, or the database does NOT yield the ability to sign a
+  malicious release.
+
+- Implementation:
+  - Server: `internal/bootstrap/handoff_server.go` (mounted on
+    `POST /api/v1/admin/handoff`)
+  - Client: `internal/bootstrap/handoff_client.go` (called from
+    `cmd/enclave/main.go` when `HANDOFF_PEER_URL` is set)
+  - Tooling: `cmd/release-sign` (operator) and
+    `cmd/admin-export-master-key` (one-shot for v0→v1 migration)
+
+- See [doc/RELEASE_PROCEDURE.md](doc/RELEASE_PROCEDURE.md) for the
+  steady-state release workflow and
+  [doc/MIGRATION_FROM_LEGACY.md](doc/MIGRATION_FROM_LEGACY.md) for the
+  one-time bridge from a pre-B2 binary.
+
+**Trust model summary:** users trust (a) AMD SEV-SNP silicon and (b)
+the operator's published Ed25519 pubkey + the GitHub source. The
+operator does NOT gain the ability to decrypt user credentials — they
+gain the ability to sign new binaries that, once attested, can in
+turn decrypt them inside the TEE.
+
 #### Encryption Format
 
 ```

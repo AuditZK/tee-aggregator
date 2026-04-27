@@ -36,16 +36,25 @@ import (
 	"time"
 )
 
-// OperatorPubkey is the Ed25519 public key that signs every SignedAllowlist
-// shipped with the enclave. Hardcoded so an attacker who controls the
-// runtime cannot substitute it.
+// operatorPubkey is the Ed25519 public key that signs every SignedAllowlist
+// shipped with the enclave. Stored as a package variable rather than a
+// constant so test code can swap it via the SetOperatorPubkeyForTest
+// helper in a _test.go file. Production code MUST NOT mutate this
+// variable; it is the security root for B2 binary upgrades.
 //
-// Format: ssh-ed25519 wire format, base64-encoded (stdin from
+// Format: ssh-ed25519 wire format, base64-encoded (stdout from
 // `ssh-keygen -t ed25519` minus the `ssh-ed25519 ` prefix and the comment).
 //
 // PLACEHOLDER: replace with the operator's real Ed25519 pubkey before
 // the first production deploy. See cmd/release-sign for how to generate it.
-const OperatorPubkey = "AAAAC3NzaC1lZDI1NTE5AAAAIPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHO"
+var operatorPubkey = "AAAAC3NzaC1lZDI1NTE5AAAAIPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHO"
+
+// OperatorPubkey returns the configured operator Ed25519 pubkey
+// (ssh-ed25519 wire format, base64-encoded). Reading-only — see the
+// operatorPubkey variable doc for why this is not a constant.
+func OperatorPubkey() string {
+	return operatorPubkey
+}
 
 // AllowlistEntry is one approved binary release.
 type AllowlistEntry struct {
@@ -219,7 +228,7 @@ func sortAllowlistEntries(entries []AllowlistEntry) {
 //	uint32  len(pubkey) = 32
 //	string  pubkey (32 bytes)
 func DecodeOperatorPubkey() (ed25519.PublicKey, error) {
-	raw, err := base64.StdEncoding.DecodeString(OperatorPubkey)
+	raw, err := base64.StdEncoding.DecodeString(operatorPubkey)
 	if err != nil {
 		return nil, fmt.Errorf("operator pubkey not base64: %w", err)
 	}
