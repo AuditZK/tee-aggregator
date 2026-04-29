@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"testing"
 )
@@ -185,6 +186,88 @@ func TestAAD_LegacyNoAAD(t *testing.T) {
 	// Mixing legacy-encrypted and AAD-decrypt must fail loudly.
 	if _, err := svc.DecryptWithAAD(encrypted, []byte("some-aad")); err == nil {
 		t.Fatal("legacy ciphertext must not decrypt under non-empty AAD")
+	}
+}
+
+// TestEncryptTSString_RoundTrip pins the format that the TS schema reader
+// expects: EncryptTSString must produce output that DecryptTSString can read
+// back. This is the path the connection service takes when writing into the
+// TS/Prisma exchange_connections table.
+func TestEncryptTSString_RoundTrip(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	svc, err := New(key)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, plaintext := range []string{
+		"12345678",                  // typical MT5 login length
+		"my_super_long_api_key_xyz", // longer payload
+		"x",                         // single byte
+	} {
+		t.Run(fmt.Sprintf("len=%d", len(plaintext)), func(t *testing.T) {
+			ts, err := svc.EncryptTSString(plaintext)
+			if err != nil {
+				t.Fatalf("EncryptTSString: %v", err)
+			}
+			got, err := svc.DecryptTSString(ts)
+			if err != nil {
+				t.Fatalf("DecryptTSString: %v", err)
+			}
+			if got != plaintext {
+				t.Fatalf("round-trip mismatch: got=%q want=%q", got, plaintext)
+			}
+		})
+	}
+}
+
+// TestGoFormatNotInterchangeableWithTSFormat is a regression test for the
+// IV-size bug fixed on this branch: rows created via EncryptString
+// (12-byte nonce GCM) and naively concatenated as iv||tag||ciphertext hex
+// are NOT readable by DecryptTSString, which reads 16 bytes as IV. The two
+// formats are not interchangeable. The connection service must call
+// EncryptTSString when targeting the TS schema; calling EncryptString and
+// shoving the parts into a single hex column produces unreadable rows
+// (auth tag check fails because the IV is misaligned by 4 bytes).
+func TestGoFormatNotInterchangeableWithTSFormat(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	svc, err := New(key)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	plaintext := "12345678"
+
+	enc, err := svc.EncryptString(plaintext)
+	if err != nil {
+		t.Fatalf("EncryptString: %v", err)
+	}
+
+	// Naive repack: hex(iv12) + hex(tag16) + hex(ct). This is what the
+	// removed repackToTSFormat helper used to produce. DecryptTSString
+	// reads the first 32 hex chars as IV, eating 4 bytes of the tag, so
+	// the auth-tag check must fail.
+	ivBytes, err := base64.StdEncoding.DecodeString(enc.IV)
+	if err != nil {
+		t.Fatalf("decode iv: %v", err)
+	}
+	tagBytes, err := base64.StdEncoding.DecodeString(enc.AuthTag)
+	if err != nil {
+		t.Fatalf("decode tag: %v", err)
+	}
+	ctBytes, err := base64.StdEncoding.DecodeString(enc.Ciphertext)
+	if err != nil {
+		t.Fatalf("decode ciphertext: %v", err)
+	}
+	if len(ivBytes) != 12 {
+		t.Fatalf("EncryptString IV must be 12 bytes (stdlib GCM), got %d", len(ivBytes))
+	}
+	misformatted := fmt.Sprintf("%x%x%x", ivBytes, tagBytes, ctBytes)
+
+	if _, err := svc.DecryptTSString(misformatted); err == nil {
+		t.Fatal("DecryptTSString should reject Go-format payload with 12-byte IV — the formats are not interchangeable")
 	}
 }
 
