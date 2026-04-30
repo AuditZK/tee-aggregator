@@ -249,6 +249,14 @@ func (s *ConnectionService) GetActiveConnections(ctx context.Context, userUID st
 	return s.repo.GetActiveByUser(ctx, userUID)
 }
 
+// GetActiveConnectionByLabel returns a single active connection (encrypted)
+// matched by (user, exchange, label) using a TRIM-tolerant exact lookup.
+// Useful for callers that already know the exact connection — avoids the
+// fetch-all-then-filter dance of GetActiveConnections + iterate.
+func (s *ConnectionService) GetActiveConnectionByLabel(ctx context.Context, userUID, exchange, label string) (*repository.ExchangeConnection, error) {
+	return s.repo.GetByUserExchangeLabel(ctx, userUID, normalizeExchange(exchange), strings.TrimSpace(label))
+}
+
 // GetExcludedExchanges returns exchanges marked as excluded from reports/analytics.
 func (s *ConnectionService) GetExcludedExchanges(ctx context.Context, userUID string) (map[string]struct{}, error) {
 	return s.repo.GetExcludedExchangesByUser(ctx, userUID)

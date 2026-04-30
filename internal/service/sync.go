@@ -227,28 +227,21 @@ func (s *SyncService) SyncExchange(ctx context.Context, userUID, exchange string
 // specific connection (e.g. transient DNS/network/broker outage at 00:00
 // UTC). Idempotent — Upsert overwrites today's snapshot if one already
 // exists for the (userUid, timestamp, exchange, label) tuple.
+//
+// Uses connSvc.repo.GetByUserExchangeLabel directly (TRIM-tolerant exact
+// lookup) instead of GetActiveConnections + filter, so a fresh capability
+// detection on the underlying pool can't mask a real row.
 func (s *SyncService) SyncConnectionScheduledByLabel(ctx context.Context, userUID, exchange, label string) *SyncResult {
-	connections, err := s.getConnectionsByExchange(ctx, userUID, exchange)
+	conn, err := s.connSvc.GetActiveConnectionByLabel(ctx, userUID, exchange, label)
 	if err != nil {
 		return &SyncResult{
 			UserUID:  userUID,
 			Exchange: exchange,
 			Label:    label,
-			Error:    err.Error(),
+			Error:    fmt.Sprintf("lookup connection: %v", err),
 		}
 	}
-	target := strings.TrimSpace(label)
-	for _, c := range connections {
-		if c.Label == target {
-			return s.syncConnection(ctx, c)
-		}
-	}
-	return &SyncResult{
-		UserUID:  userUID,
-		Exchange: exchange,
-		Label:    label,
-		Error:    fmt.Sprintf("no active connection for exchange=%s label=%q", exchange, label),
-	}
+	return s.syncConnection(ctx, conn)
 }
 
 // SyncExchangeScheduled is used by the hourly scheduler - bypasses manual sync block
