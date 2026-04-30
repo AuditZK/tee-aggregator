@@ -220,6 +220,37 @@ func (s *SyncService) SyncExchange(ctx context.Context, userUID, exchange string
 	return aggregateSyncResults(userUID, exchange, results)
 }
 
+// SyncConnectionScheduledByLabel re-runs the scheduled sync pipeline for a
+// single (user, exchange, label) connection, bypassing the manual-sync
+// anti-cherry-pick guard (isManualSyncAllowed). Intended for one-off
+// recovery of a missing snapshot when the daily scheduler failed for that
+// specific connection (e.g. transient DNS/network/broker outage at 00:00
+// UTC). Idempotent — Upsert overwrites today's snapshot if one already
+// exists for the (userUid, timestamp, exchange, label) tuple.
+func (s *SyncService) SyncConnectionScheduledByLabel(ctx context.Context, userUID, exchange, label string) *SyncResult {
+	connections, err := s.getConnectionsByExchange(ctx, userUID, exchange)
+	if err != nil {
+		return &SyncResult{
+			UserUID:  userUID,
+			Exchange: exchange,
+			Label:    label,
+			Error:    err.Error(),
+		}
+	}
+	target := strings.TrimSpace(label)
+	for _, c := range connections {
+		if c.Label == target {
+			return s.syncConnection(ctx, c)
+		}
+	}
+	return &SyncResult{
+		UserUID:  userUID,
+		Exchange: exchange,
+		Label:    label,
+		Error:    fmt.Sprintf("no active connection for exchange=%s label=%q", exchange, label),
+	}
+}
+
 // SyncExchangeScheduled is used by the hourly scheduler - bypasses manual sync block
 func (s *SyncService) SyncExchangeScheduled(ctx context.Context, userUID, exchange string) *SyncResult {
 	connections, err := s.getConnectionsByExchange(ctx, userUID, exchange)
