@@ -281,14 +281,55 @@ func (s *Server) sanitizeErrorForClient(err error) string {
 	return s.sanitizeMessageForClient(err.Error())
 }
 
+// userFacingErrorPatterns are substrings that mark an error message as safe
+// to surface to the end-user even in production. These describe a category
+// of failure the user can act on (wrong credentials, typo in server name,
+// IP not whitelisted, etc.) without leaking infrastructure details — they
+// never carry file paths, internal hostnames, IPs, or stack traces.
+//
+// Anything not matching these is replaced by the generic "Internal server
+// error" message in production to avoid leaking implementation specifics.
+var userFacingErrorPatterns = []string{
+	"invalid credentials",
+	"invalid api key",
+	"invalid signature",
+	"auth_failed",
+	"unauthorized",
+	"no such host",
+	"connection refused",
+	"deadline exceeded",
+	"timeout",
+	"ip not whitelist",
+	"ip restricted",
+	"whitelist",
+	"permission denied",
+	"insufficient permission",
+	"validation failed",
+	"protocol_error",
+	"failed to create connection",
+	"failed to create user",
+	"database not configured",
+	"service not available",
+	"sync service not available",
+	"report service not available",
+	"already exists",
+	"not found",
+}
+
 func (s *Server) sanitizeMessageForClient(msg string) string {
 	if msg == "" {
 		return ""
 	}
-	if s.isProduction() {
-		return genericInternalError
+	if !s.isProduction() {
+		return msg
 	}
-	return msg
+	lower := strings.ToLower(msg)
+	for _, p := range userFacingErrorPatterns {
+		if strings.Contains(lower, p) {
+			return msg
+		}
+	}
+	return genericInternalError
 }
 
 func currentEnclaveMode() string {
@@ -380,7 +421,11 @@ func (s *Server) CreateUserConnection(ctx context.Context, req *pb.CreateUserCon
 		return &pb.CreateUserConnectionResponse{
 			Success: false,
 			UserUid: userUID,
-			Error:   s.sanitizeMessageForClient("failed to create connection"),
+			// Pass the real cause: sanitizeErrorForClient routes it through
+			// the whitelist so well-known user-facing patterns (invalid
+			// credentials, no such host, timeout, …) reach the client while
+			// anything else collapses to the generic message.
+			Error: s.sanitizeErrorForClient(err),
 		}, nil
 	}
 
