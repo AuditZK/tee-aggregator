@@ -2,39 +2,49 @@ version: '3.8'
 
 services:
   enclave:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: enclave_service
+    image: enclave-go:prod-20260503
+    container_name: enclave_go_prod
+    user: root
     ports:
-      - "8080:8080"
-      - "50051:50051"
+      - "3060:3060"
+      - "50061:50061"
+      - "50062:50062"
+    env_file:
+      - .env.production
     environment:
-      - ENV=production
-      - PORT=8080
-      - GRPC_PORT=50051
-      - DATABASE_URL=${DATABASE_URL}
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:-}
-    # SEV-SNP device access (AMD confidential computing)
+      - CORS_ORIGIN=https://auditzk.com
+      - GRPC_CLIENT_CERT_CN_ALLOWLIST=gateway-client
     devices:
       - /dev/sev-guest:/dev/sev-guest
-    # Security settings
+    volumes:
+      - /usr/local/bin/snpguest:/usr/local/bin/snpguest:ro
+      - zero-knowledge-aggregator-go-test_vcek_cache_test:/var/cache/enclave/certs:rw
+      - /home/mouchlachjimmy/zero-knowledge-aggregator-go-test/certs:/etc/enclave:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
     security_opt:
-      - no-new-privileges:true
+      - label=disable
+    privileged: true
     read_only: true
     tmpfs:
       - /tmp
-    restart: unless-stopped
-    networks:
-      - enclave-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-check-certificate -qO/dev/null https://localhost:3060/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
     deploy:
       resources:
         limits:
           memory: 512M
         reservations:
-          memory: 256M
+          memory: 128M
 
 networks:
-  enclave-network:
-    driver: bridge
+  default:
+    external: true
+    name: zero-knowledge-aggregator-go-test_default
+
+volumes:
+  zero-knowledge-aggregator-go-test_vcek_cache_test:
+    external: true
