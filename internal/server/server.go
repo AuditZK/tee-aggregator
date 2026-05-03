@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/trackrecord/enclave/internal/auth"
 	"github.com/trackrecord/enclave/internal/config"
 	"github.com/trackrecord/enclave/internal/encryption"
 	"github.com/trackrecord/enclave/internal/repository"
@@ -31,11 +34,48 @@ type Server struct {
 	http      *http.Server
 	pool      *pgxpool.Pool
 	scheduler SyncSchedulerRunner
+
+	// jwtSecret gates the REST surface when non-nil (SEC-002). Same secret as
+	// the gRPC interceptor — typically ENCLAVE_JWT_SECRET. When nil the
+	// middleware logs a dev-mode warning and passes requests through.
+	jwtSecret []byte
+
+	// jwtExpectedIssuer pins the `iss` claim on inbound JWTs when non-empty
+	// (AUTH-002 follow-up). Mirrors the gRPC interceptor.
+	jwtExpectedIssuer string
+
+	// handoffHandler, when non-nil, exposes the B2 handoff endpoint
+	// at POST /api/v1/admin/handoff. Successor enclaves use this to
+	// fetch the master key from this instance during an upgrade window.
+	// Wired by main.go via SetHandoffHandler — the handler itself does
+	// the cryptographic gate (attestation + signed allowlist + ECIES).
+	handoffHandler http.Handler
 }
 
 // SetScheduler attaches the scheduler for admin sync trigger.
 func (s *Server) SetScheduler(sched SyncSchedulerRunner) {
 	s.scheduler = sched
+}
+
+// SetJWTSecret wires the HS256 secret used to verify Authorization: Bearer
+// tokens on sensitive REST endpoints. Call before Start().
+func (s *Server) SetJWTSecret(secret []byte) {
+	s.jwtSecret = secret
+}
+
+// SetJWTExpectedIssuer pins the `iss` claim required on inbound JWTs.
+// Empty disables the check (legacy behaviour). Call before Start().
+func (s *Server) SetJWTExpectedIssuer(iss string) {
+	s.jwtExpectedIssuer = iss
+}
+
+// SetHandoffHandler wires the B2 handoff endpoint. When non-nil, a
+// POST to /api/v1/admin/handoff is delegated to this handler. The
+// handler MUST do its own cryptographic gating — see
+// internal/bootstrap.HandoffServer for the production implementation.
+// Call before Start().
+func (s *Server) SetHandoffHandler(h http.Handler) {
+	s.handoffHandler = h
 }
 
 func New(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool, signer *signing.ReportSigner) *Server {
@@ -82,24 +122,44 @@ func (s *Server) SetHandler(h *Handler) {
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 
-	// Credential rate limiter: 5 requests per 15 minutes per IP
-	credRateLimiter := NewIPRateLimiter(5, 15*time.Minute)
+	// Credential rate limiter: 5 requests per 15 minutes per IP (SEC-004).
+	// X-Forwarded-For is honoured only for peers in RATE_LIMIT_TRUSTED_PROXIES.
+	credRateLimiter := NewIPRateLimiter(5, 15*time.Minute, s.cfg.RateLimitTrustedProxies...)
 
-	// TS parity routes (always enabled)
+	// Public routes (no auth required):
+	//   /health            — liveness probe
+	//   /api/v1/tls/fingerprint — public by design (used by clients before attestation)
+	//   /api/v1/attestation     — public by design (attestation quote)
+	//   /api/v1/verify          — public by design (stateless signature check)
 	mux.HandleFunc("/health", s.handler.HealthCheck)
 	mux.HandleFunc("/api/v1/tls/fingerprint", s.handler.GetTLSFingerprint)
 	mux.HandleFunc("/api/v1/attestation", s.handler.GetAttestation)
-	mux.HandleFunc("/api/v1/credentials/connect", credRateLimiter.Middleware(s.handler.ConnectCredentials))
 
-	// Admin endpoint (always available, localhost only)
-	mux.HandleFunc("/api/v1/admin/sync-now", s.handleAdminSyncNow)
-	mux.HandleFunc("/api/v1/admin/cashflows", s.handleAdminDumpCashflows)
+	// Gated routes: carry user data or mutate state. Must go through jwtRequired
+	// when ENCLAVE_JWT_SECRET is set (SEC-002). In dev mode, jwtRequired logs
+	// a warning and passes the request through.
+	mux.HandleFunc("/api/v1/credentials/connect", credRateLimiter.Middleware(s.jwtRequired(s.handler.ConnectCredentials)))
+
+	// Admin endpoints: enforced localhost-only (SEC-001). The `localhostOnly`
+	// wrapper inspects r.RemoteAddr (not X-Forwarded-For, which is spoofable
+	// and only set by the front proxy anyway). Non-loopback peers get 403.
+	mux.HandleFunc("/api/v1/admin/sync-now", s.localhostOnly(s.handleAdminSyncNow))
+	mux.HandleFunc("/api/v1/admin/cashflows", s.localhostOnly(s.handleAdminDumpCashflows))
+
+	// B2 handoff: deliberately NOT gated by localhostOnly because the
+	// successor enclave runs in a different container with a non-loopback
+	// IP on the Docker bridge. The handler itself does cryptographic
+	// gating (signed allowlist + attestation + ECIES); transport-level
+	// scoping is unnecessary. Wired only when SetHandoffHandler was called.
+	if s.handoffHandler != nil {
+		mux.Handle("/api/v1/admin/handoff", s.handoffHandler)
+	}
 
 	// Legacy REST routes are disabled by default for strict TS parity.
 	if s.cfg.EnableLegacyREST {
 		if s.cfg.IsDevelopment() {
 			// Plaintext credential endpoint — legacy only; use /api/v1/credentials/connect.
-			mux.HandleFunc("/api/v1/connection", s.handler.CreateUserConnection)
+			mux.HandleFunc("/api/v1/connection", s.jwtRequired(s.handler.CreateUserConnection))
 		} else {
 			mux.HandleFunc("/api/v1/connection", func(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusGone, map[string]any{
@@ -108,10 +168,10 @@ func (s *Server) Start(ctx context.Context) error {
 				})
 			})
 		}
-		mux.HandleFunc("/api/v1/sync", s.handler.ProcessSyncJob)
-		mux.HandleFunc("/api/v1/metrics", s.handler.GetMetrics)
-		mux.HandleFunc("/api/v1/snapshots", s.handler.GetSnapshots)
-		mux.HandleFunc("/api/v1/report", s.handler.GenerateReport)
+		mux.HandleFunc("/api/v1/sync", s.jwtRequired(s.handler.ProcessSyncJob))
+		mux.HandleFunc("/api/v1/metrics", s.jwtRequired(s.handler.GetMetrics))
+		mux.HandleFunc("/api/v1/snapshots", s.jwtRequired(s.handler.GetSnapshots))
+		mux.HandleFunc("/api/v1/report", s.jwtRequired(s.handler.GenerateReport))
 		mux.HandleFunc("/api/v1/verify", s.handler.VerifySignature)
 	}
 
@@ -221,7 +281,7 @@ func (s *Server) handleAdminDumpCashflows(w http.ResponseWriter, r *http.Request
 	cashflows, err := s.handler.syncSvc.DumpCashflows(r.Context(), userUID, exchange, label, since)
 	if err != nil {
 		s.logger.Error("dump cashflows failed", zap.Error(err))
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.handler.sanitizeErr(err)})
 		return
 	}
 
@@ -230,6 +290,87 @@ func (s *Server) handleAdminDumpCashflows(w http.ResponseWriter, r *http.Request
 		"count":     len(cashflows),
 		"cashflows": cashflows,
 	})
+}
+
+// jwtRequired verifies an HS256 bearer token on REST handlers (SEC-002).
+//
+// When s.jwtSecret is nil (dev mode) the middleware logs a single-shot warning
+// and passes the request through so local development works without extra
+// setup — same policy as the gRPC authInterceptor.
+//
+// When s.jwtSecret is set, the middleware:
+//   - rejects missing / malformed Authorization headers with 401
+//   - verifies via auth.VerifyHS256 (checks exp + aud == "go-enclave")
+//   - injects the verified `sub` into the request context via auth.WithUserUID
+//     so downstream handlers can prefer the JWT-asserted UID over body fields.
+func (s *Server) jwtRequired(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if len(s.jwtSecret) == 0 {
+			s.logger.Warn("REST JWT auth skipped (ENCLAVE_JWT_SECRET not set)",
+				zap.String("path", r.URL.Path),
+			)
+			next(w, r)
+			return
+		}
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": "missing authorization header",
+			})
+			return
+		}
+
+		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+		if tokenStr == authHeader {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": "authorization header must use Bearer scheme",
+			})
+			return
+		}
+
+		claims, err := auth.VerifyHS256WithOptions(tokenStr, s.jwtSecret, auth.VerifyOptions{
+			ExpectedIssuer: s.jwtExpectedIssuer,
+		})
+		if err != nil {
+			s.logger.Warn("REST JWT verification failed",
+				zap.String("path", r.URL.Path),
+				zap.Error(err),
+			)
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": "invalid or expired token",
+			})
+			return
+		}
+
+		r = r.WithContext(auth.WithUserUID(r.Context(), claims.Sub))
+		next(w, r)
+	}
+}
+
+// localhostOnly rejects non-loopback peers. Deliberately inspects
+// r.RemoteAddr (the actual TCP peer) and ignores X-Forwarded-For / X-Real-IP,
+// which are trivially spoofable over HTTPS. The admin tools run inside the
+// same container (`docker exec`), so loopback is sufficient.
+func (s *Server) localhostOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			s.logger.Warn("admin endpoint blocked: non-loopback peer",
+				zap.String("path", r.URL.Path),
+				zap.String("remote_addr", r.RemoteAddr),
+			)
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": "admin endpoints are restricted to loopback callers",
+			})
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
@@ -261,6 +402,22 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	json.NewEncoder(w).Encode(data)
 }
 
-func readJSON(r *http.Request, v any) error {
-	return json.NewDecoder(r.Body).Decode(v)
+// defaultMaxRequestBodyBytes caps REST request bodies (SEC-007). 64 KiB is
+// far larger than any legitimate credential / sync / report payload and
+// small enough to absorb a burst of hostile requests without growing the
+// enclave heap. Exceeding this returns 413 via http.MaxBytesReader.
+const defaultMaxRequestBodyBytes = int64(64 << 10)
+
+// readJSON decodes the request body into v with a 64 KiB size cap and
+// DisallowUnknownFields enabled (SEC-007). Callers that need a different
+// cap should use readJSONWithLimit.
+func readJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	return readJSONWithLimit(w, r, v, defaultMaxRequestBodyBytes)
+}
+
+func readJSONWithLimit(w http.ResponseWriter, r *http.Request, v any, maxBytes int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
 }

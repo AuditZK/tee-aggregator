@@ -50,9 +50,9 @@ func auditSchemaColumns(ctx context.Context, pool *pgxpool.Pool, logger *zap.Log
 	// Check both Go (snake_case) and TS Prisma (camelCase) column names.
 	// If either exists, the column is present.
 	required := []struct {
-		table     string
-		snakeCol  string
-		camelCol  string
+		table    string
+		snakeCol string
+		camelCol string
 	}{
 		{"users", "platform_hash", "platformHash"},
 		{"exchange_connections", "credentials_hash", "credentialsHash"},

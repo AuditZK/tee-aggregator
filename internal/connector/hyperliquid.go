@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"strconv"
@@ -248,15 +247,15 @@ func (h *Hyperliquid) postInfo(ctx context.Context, body interface{}) (json.RawM
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
+	data, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("hyperliquid API error %d: %s", resp.StatusCode, string(data))
+		return nil, fmt.Errorf("hyperliquid API error %d: %s", resp.StatusCode, TruncatedBody(data))
 	}
 
 	return data, nil

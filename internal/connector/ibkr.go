@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -138,10 +138,19 @@ func (i *IBKR) TestConnection(ctx context.Context) error {
 	return err
 }
 
-func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
-	url := fmt.Sprintf("%s?t=%s&q=%s&v=3", ibkrFlexURL, i.token, i.queryID)
+// flexURL builds the IBKR Flex endpoint URL with properly escaped parameters
+// (CONN-002). Using fmt.Sprintf with raw values risked corrupt requests if a
+// token ever contained URL-reserved characters, and also meant the raw token
+// flowed unescaped into preview/error strings.
+func flexURL(base, token, query string) string {
+	v := url.Values{"t": {token}, "q": {query}, "v": {"3"}}
+	return base + "?" + v.Encode()
+}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
+	u := flexURL(ibkrFlexURL, i.token, i.queryID)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return "", err
 	}
@@ -150,9 +159,10 @@ func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001: bounded read with the higher IBKR Flex cap (statements
+	// for long-history accounts can legitimately be tens of MiB).
+	body, err := ReadCappedBody(resp.Body, IBKRFlexMaxResponseBytes)
 	if err != nil {
 		return "", err
 	}
@@ -172,11 +182,12 @@ func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
 
 	if err := xml.Unmarshal(body, &result); err != nil {
 		// Log the raw body (truncated) so we can diagnose unexpected IBKR responses.
-		preview := string(body)
-		if len(preview) > 300 {
-			preview = preview[:300] + "..."
+		// Scrub the token first in case IBKR echoed the request URL back (CONN-002).
+		snippet := scrubSecret(string(body), i.token)
+		if len(snippet) > 300 {
+			snippet = snippet[:300] + "..."
 		}
-		return "", fmt.Errorf("parse flex response (body=%q): %w", preview, err)
+		return "", fmt.Errorf("parse flex response (body=%q): %w", snippet, err)
 	}
 
 	if result.Status != "Success" {
@@ -187,7 +198,7 @@ func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
 }
 
 func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error) {
-	url := fmt.Sprintf("%s?t=%s&q=%s&v=3", ibkrFlexGetURL, i.token, refCode)
+	u := flexURL(ibkrFlexGetURL, i.token, refCode)
 
 	// Poll with exponential backoff. Small Flex reports (LastBusinessWeek)
 	// are typically ready in 5-10s; 30-day / YTD reports on busy accounts
@@ -198,7 +209,7 @@ func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error
 		30 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second,
 	}
 	for _, sleep := range delays {
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -208,8 +219,8 @@ func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error
 			return nil, err
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		// CONN-AUDIT-001: Flex statement download — use the higher cap.
+		body, err := ReadCappedBody(resp.Body, IBKRFlexMaxResponseBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -226,13 +237,20 @@ func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error
 		if strings.HasPrefix(trimmed, "<FlexStatementResponse") {
 			// Error if Status="Error", otherwise keep polling.
 			if strings.Contains(trimmed, "<Status>Error</Status>") {
-				return nil, fmt.Errorf("flex report error: %s", preview(trimmed, 300))
+				// CONN-002: scrub the token in case IBKR echoed our request URL.
+				return nil, fmt.Errorf("flex report error: %s", preview(scrubSecret(trimmed, i.token), 300))
 			}
-			time.Sleep(sleep)
+			// CONN-005: ctx-aware wait so a cancelled sync propagates
+			// immediately instead of blocking up to 30 s per tick.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(sleep):
+			}
 			continue
 		}
-		// Unknown response shape — surface it.
-		return nil, fmt.Errorf("unexpected flex response: %s", preview(trimmed, 300))
+		// Unknown response shape — surface it (token scrubbed).
+		return nil, fmt.Errorf("unexpected flex response: %s", preview(scrubSecret(trimmed, i.token), 300))
 	}
 
 	return nil, fmt.Errorf("flex report timeout after %d attempts", len(delays))
@@ -245,6 +263,16 @@ func preview(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// scrubSecret replaces every literal occurrence of secret in s with "***"
+// (CONN-002). Used before embedding third-party response text in an error
+// message so an echoed request URL cannot leak the token to logs.
+func scrubSecret(s, secret string) string {
+	if secret == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, secret, "***")
 }
 
 func (i *IBKR) GetBalance(ctx context.Context) (*Balance, error) {
@@ -265,7 +293,7 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 		XMLName        xml.Name `xml:"FlexQueryResponse"`
 		FlexStatements struct {
 			FlexStatement struct {
-				AccountID       string `xml:"accountId,attr"`
+				AccountID           string `xml:"accountId,attr"`
 				EquitySummaryInBase struct {
 					EquitySummaryByReportDateInBase []struct {
 						Currency             string `xml:"currency,attr"`

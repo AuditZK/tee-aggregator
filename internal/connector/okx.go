@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -63,9 +62,9 @@ func (o *OKX) doRequest(ctx context.Context, method, path string) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001: bounded read.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -95,14 +94,14 @@ func (o *OKX) GetBalance(ctx context.Context) (*Balance, error) {
 
 	var resp struct {
 		Data []struct {
-			TotalEq     string `json:"totalEq"`
-			IsoEq       string `json:"isoEq"`
-			AdjEq       string `json:"adjEq"`
-			Details     []struct {
-				Ccy       string `json:"ccy"`
-				Eq        string `json:"eq"`
-				AvailBal  string `json:"availBal"`
-				UPL       string `json:"upl"`
+			TotalEq string `json:"totalEq"`
+			IsoEq   string `json:"isoEq"`
+			AdjEq   string `json:"adjEq"`
+			Details []struct {
+				Ccy      string `json:"ccy"`
+				Eq       string `json:"eq"`
+				AvailBal string `json:"availBal"`
+				UPL      string `json:"upl"`
 			} `json:"details"`
 		} `json:"data"`
 	}
@@ -144,13 +143,13 @@ func (o *OKX) GetPositions(ctx context.Context) ([]*Position, error) {
 
 	var resp struct {
 		Data []struct {
-			InstId    string `json:"instId"`
-			PosSide   string `json:"posSide"`
-			Pos       string `json:"pos"`
-			AvgPx     string `json:"avgPx"`
-			MarkPx    string `json:"markPx"`
-			Upl       string `json:"upl"`
-			InstType  string `json:"instType"`
+			InstId   string `json:"instId"`
+			PosSide  string `json:"posSide"`
+			Pos      string `json:"pos"`
+			AvgPx    string `json:"avgPx"`
+			MarkPx   string `json:"markPx"`
+			Upl      string `json:"upl"`
+			InstType string `json:"instType"`
 		} `json:"data"`
 	}
 

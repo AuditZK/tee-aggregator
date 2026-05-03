@@ -18,7 +18,10 @@
 # to use Dockerfile.production which builds snpguest from source.
 
 # Go build stage
-FROM golang:1.24-alpine AS builder
+# VULN-001: pin to 1.26.2-alpine so the stdlib CVEs fixed in 1.26.1/1.26.2
+# are picked up deterministically (floating `1.26-alpine` resolved to
+# 1.26.0 at audit time).
+FROM golang:1.26.2-alpine AS builder
 
 WORKDIR /app
 
@@ -57,6 +60,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -o /admin-probe \
     ./cmd/admin-probe
 
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -trimpath \
+    -ldflags="-w -s" \
+    -o /admin-recover-snapshot \
+    ./cmd/admin-recover-snapshot
+
 # Runtime stage
 FROM alpine:3.20
 
@@ -73,6 +84,7 @@ RUN chmod +x /usr/local/bin/snpguest
 COPY --from=builder /enclave /app/enclave
 COPY --from=builder /admin-update-creds /app/admin-update-creds
 COPY --from=builder /admin-probe /app/admin-probe
+COPY --from=builder /admin-recover-snapshot /app/admin-recover-snapshot
 
 # Copy migrations
 COPY --from=builder /app/migrations /app/migrations

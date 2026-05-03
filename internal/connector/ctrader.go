@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -44,6 +43,8 @@ const (
 	ctraderPayloadErrorRes       = 2142
 )
 
+// wsResponse is the result delivered to a request waiter when the cTrader
+// server replies (or when the read loop fails before a response arrives).
 type wsResponse struct {
 	payloadType int
 	payload     json.RawMessage
@@ -717,9 +718,9 @@ func (c *CTrader) refreshAccessToken(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001: bounded read.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return err
 	}
@@ -727,7 +728,7 @@ func (c *CTrader) refreshAccessToken(ctx context.Context) error {
 		return fmt.Errorf("cTrader token refresh rate-limited (429), retry later")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Token refresh failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("token refresh failed (HTTP %d): %s", resp.StatusCode, TruncatedBody([]byte(strings.TrimSpace(string(body)))))
 	}
 
 	var tokenResp struct {
@@ -846,17 +847,33 @@ func (c *CTrader) readLoop(ws *websocket.Conn) {
 				errMsg = fmt.Sprintf("cTrader error %s: %s", payload.ErrorCode, payload.Description)
 			}
 
-			select {
-			case respCh <- wsResponse{err: errors.New(errMsg)}:
-			default:
-			}
+			// CONN-007: use a short timeout instead of an unconditional
+			// `default:` drop. The respCh is a 1-buffered channel per
+			// request, so this only backs off when a duplicate response
+			// or a slow consumer already has the slot.
+			deliverCTraderResponse(respCh, wsResponse{err: errors.New(errMsg)})
 			continue
 		}
 
-		select {
-		case respCh <- wsResponse{payloadType: msg.PayloadType, payload: msg.Payload}:
-		default:
-		}
+		deliverCTraderResponse(respCh, wsResponse{payloadType: msg.PayloadType, payload: msg.Payload})
+	}
+}
+
+// deliverCTraderResponse pushes a response to respCh with a short timeout
+// (CONN-007). Previously the dispatcher used a non-blocking `default:` which
+// silently dropped real responses under reconnect churn — the requester
+// would then time out at the outer RTT budget instead of receiving the
+// real reply that just landed. A 200 ms window is plenty for any consumer
+// already waiting on the channel and small enough that a duplicate response
+// for an unknown request doesn't stall the dispatcher.
+func deliverCTraderResponse(respCh chan<- wsResponse, resp wsResponse) {
+	select {
+	case respCh <- resp:
+	case <-time.After(200 * time.Millisecond):
+		// Consumer has gone away or the slot is still held by a prior
+		// duplicate. Drop — no alternative exists at this layer — but
+		// the timeout instead of instant-drop covers the common case of
+		// "consumer was mid-flight switching goroutines".
 	}
 }
 

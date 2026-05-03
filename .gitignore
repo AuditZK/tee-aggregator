@@ -37,3 +37,8 @@ Thumbs.db
 # Build
 /bin/
 /dist/
+
+# Audit (local only, never commit)
+doc/AUDIT_PROMPT.md
+doc/AUDIT_PROMPT.en.md
+doc/audit/

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -64,15 +63,15 @@ func (a *Alpaca) doRequest(ctx context.Context, baseURL, path string) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("alpaca API error: %s", string(body))
+		return nil, fmt.Errorf("alpaca API error: %s", TruncatedBody(body))
 	}
 
 	return body, nil

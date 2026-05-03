@@ -2,7 +2,12 @@ version: '3.8'
 
 services:
   enclave:
-    image: enclave-go:prod-20260503
+    build:
+      context: .
+      # OPS-AUDIT-001: must be Dockerfile.production — the generic Dockerfile
+      # does NOT bundle snpguest, so attestation would silently fall back to
+      # PlatformUnattestedDev and every signed report would carry attested=false.
+      dockerfile: Dockerfile.production
     container_name: enclave_go_prod
     user: root
     ports:
@@ -12,14 +17,35 @@ services:
     env_file:
       - .env.production
     environment:
-      - CORS_ORIGIN=https://auditzk.com
-      - GRPC_CLIENT_CERT_CN_ALLOWLIST=gateway-client
+      - ENV=production
+      - GRPC_PORT=50061
+      - DATABASE_URL=${DATABASE_URL}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      # CFG-001: required in production. The enclave fatals on startup if
+      # this is empty; use the `:?` form so Docker also refuses to render
+      # the compose file without the env var set.
+      - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:?ENCLAVE_JWT_SECRET is required}
+      # CFG-002: required in production — CORS and gRPC mTLS allowlist.
+      - CORS_ORIGIN=${CORS_ORIGIN:?CORS_ORIGIN is required}
+      - GRPC_CLIENT_CERT_CN_ALLOWLIST=${GRPC_CLIENT_CERT_CN_ALLOWLIST:?GRPC_CLIENT_CERT_CN_ALLOWLIST is required}
+      # PERF-002: tell the Go runtime about the 512 MiB cgroup cap so the GC
+      # can target it instead of computing its heap goal from the host's
+      # (much larger) RAM. 480 MiB leaves a 32 MiB buffer below mem_limit so
+      # the kernel OOM-killer doesn't fire before the runtime can react.
+      - GOMEMLIMIT=480MiB
+      # GOGC=75 trades a modest CPU bump for ~25% lower steady-state heap,
+      # justified under the tight 512 MiB cap.
+      - GOGC=75
+      # GOTRACEBACK=single keeps panic dumps focused on the failing goroutine
+      # so we don't bury operators in 50+ goroutine traces under SSE load.
+      - GOTRACEBACK=single
+    # SEV-SNP device access (AMD confidential computing)
     devices:
       - /dev/sev-guest:/dev/sev-guest
     volumes:
       - /usr/local/bin/snpguest:/usr/local/bin/snpguest:ro
-      - zero-knowledge-aggregator-go-test_vcek_cache_test:/var/cache/enclave/certs:rw
-      - /home/mouchlachjimmy/zero-knowledge-aggregator-go-test/certs:/etc/enclave:ro
+      - enclave_vcek_cache:/var/cache/enclave/certs:rw
+      - ./certs:/etc/enclave:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
     security_opt:
       - label=disable
@@ -46,5 +72,4 @@ networks:
     name: zero-knowledge-aggregator-go-test_default
 
 volumes:
-  zero-knowledge-aggregator-go-test_vcek_cache_test:
-    external: true
+  enclave_vcek_cache:

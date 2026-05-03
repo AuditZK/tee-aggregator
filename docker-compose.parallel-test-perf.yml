@@ -1,0 +1,121 @@
+# Docker Compose - Parallel Go enclave PERF test on TEE.
+#
+# Runs ALONGSIDE both the TS production enclave AND the existing
+# `enclave_go_test` container, so the perf branch can be benchmarked in
+# isolation without touching either.
+#
+# Port plan (offset +20 from TS prod, +10 from enclave_go_test):
+#   - 3070  REST     (vs 3050 TS prod, 3060 enclave_go_test)
+#   - 50071 gRPC     (vs 50051 TS prod, 50061 enclave_go_test)
+#   - 50072 SSE log  (vs 50052 TS prod, 50062 enclave_go_test)
+#   - 9094  metrics  (vs 9092 TS prod, 9093 enclave_go_test)
+#
+# Container name and image tag are also disjoint:
+#   - container_name: enclave_go_test_perf
+#   - image:          enclave-go:parallel-test-perf
+#
+# Defaults to ENABLE_DAILY_SYNC=false (passive observer) so this instance
+# never writes snapshots to the shared test DB. Override only when you
+# want a real end-to-end sync run for benchmarking.
+#
+# Start:
+#   docker compose -p ttperf -f docker-compose.parallel-test-perf.yml up -d --build
+#
+# Tail logs:
+#   docker logs -f enclave_go_test_perf
+#
+# Stop & clean:
+#   docker compose -p ttperf -f docker-compose.parallel-test-perf.yml down -v
+
+services:
+  enclave-go-test-perf:
+    build:
+      context: .
+      dockerfile: Dockerfile.parallel-test
+    image: enclave-go:parallel-test-perf
+    container_name: enclave_go_test_perf
+    restart: "no"
+    user: root
+    environment:
+      # Dev mode: skip the production startup guards (mandatory JWT secret,
+      # measurement allowlist, attested-only signing) so this instance can
+      # boot purely as a perf-comparison harness next to the prod stack.
+      - ENV=development
+      # Offset ports (+20 from TS prod, +10 from enclave_go_test).
+      - GRPC_PORT=50071
+      - REST_PORT=3070
+      - LOG_STREAM_PORT=50072
+      - METRICS_ENABLED=true
+      - METRICS_PORT=9094
+      # GRPC_INSECURE is allowed in development; lets the perf instance
+      # skip mTLS handshake setup so we measure code paths, not crypto.
+      - GRPC_INSECURE=${GRPC_INSECURE:-true}
+      # DATABASE_URL is optional in this perf-test compose. Leave empty
+      # to boot in dev-harness mode (encryption.New(cfg.EncryptionKey)
+      # without DEK unwrap), which is what you want when the live DB
+      # already holds a DEK wrapped with the *other* enclave's
+      # measurement — sharing it across two distinct TEE images would
+      # fail the unwrap by design (each enclave derives its own master
+      # key from its SEV-SNP launch measurement).
+      - DATABASE_URL=${DATABASE_URL:-}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      # Optional in dev mode (no fatal if empty).
+      - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:-}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # PERF-test default: passive observer (no scheduler writes). Flip
+      # to true when you explicitly want a live sync for benchmarking.
+      - ENABLE_DAILY_SYNC=${ENABLE_DAILY_SYNC:-false}
+      # AUTO_MIGRATE off by default: the enclave_go_test instance already
+      # owns the schema; running migrations from two containers against
+      # the same DB is an unnecessary risk for a perf-only run.
+      - AUTO_MIGRATE=${AUTO_MIGRATE:-false}
+      - LOG_STREAM_API_KEY=${LOG_STREAM_API_KEY:-}
+      - BENCHMARK_SERVICE_URL=${BENCHMARK_SERVICE_URL:-}
+      - CTRADER_CLIENT_ID=${CTRADER_CLIENT_ID:-}
+      - CTRADER_CLIENT_SECRET=${CTRADER_CLIENT_SECRET:-}
+      - MT_BRIDGE_URL=${MT_BRIDGE_URL:-}
+      - MT_BRIDGE_HMAC_SECRET=${MT_BRIDGE_HMAC_SECRET:-}
+      - EXCHANGE_HTTP_PROXY=${EXCHANGE_HTTP_PROXY:-}
+      - PROXY_EXCHANGES=${PROXY_EXCHANGES:-binance}
+      - CORS_ORIGIN=${CORS_ORIGIN:-}
+      - TLS_CERT_PATH=${TLS_CERT_PATH:-/etc/enclave/server.crt}
+      - TLS_KEY_PATH=${TLS_KEY_PATH:-/etc/enclave/server.key}
+      - TLS_CA_CERT=${TLS_CA_CERT:-/etc/enclave/ca.crt}
+      - TLS_SERVER_CERT=${TLS_SERVER_CERT:-/etc/enclave/server.crt}
+      - TLS_SERVER_KEY=${TLS_SERVER_KEY:-/etc/enclave/server.key}
+      # PERF-002: surface the runtime knobs the production compose now
+      # carries — keeps the perf-test mirror representative of what the
+      # 512 MiB-capped prod container will actually run.
+      - GOMEMLIMIT=480MiB
+      - GOGC=75
+      - GOTRACEBACK=single
+    ports:
+      - "50071:50071"  # gRPC
+      - "50072:50072"  # Log stream SSE
+      - "3070:3070"    # REST API
+    expose:
+      - "9094"
+    volumes:
+      # CERTS_DIR overridable so the perf-test instance can reuse the
+      # same TLS material as the existing enclave_go_test container
+      # (mounted from a different checkout) without copying files
+      # around. Defaults to ./certs for clean fresh setups.
+      - ${CERTS_DIR:-./certs}:/etc/enclave:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - vcek_cache_test_perf:/var/cache/enclave/certs
+    devices:
+      - /dev/sev-guest:/dev/sev-guest
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+volumes:
+  vcek_cache_test_perf:

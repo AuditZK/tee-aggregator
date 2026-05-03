@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"testing"
 )
@@ -112,6 +113,161 @@ func TestDecryptTSFormat_TooShort(t *testing.T) {
 	_, err := svc.DecryptTSString("abcdef")
 	if err == nil {
 		t.Error("expected error for data too short")
+	}
+}
+
+// SEC-009: EncryptWithAAD / DecryptWithAAD round-trip with matching AAD.
+func TestAAD_RoundTrip(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	svc, _ := New(key)
+
+	plaintext := []byte("my_api_secret_key_123")
+	aad := ConnectionFieldAAD("user_abc1234567890", "conn_42", "api_key")
+
+	encrypted, err := svc.EncryptWithAAD(plaintext, aad)
+	if err != nil {
+		t.Fatalf("EncryptWithAAD: %v", err)
+	}
+
+	got, err := svc.DecryptWithAAD(encrypted, aad)
+	if err != nil {
+		t.Fatalf("DecryptWithAAD: %v", err)
+	}
+	if string(got) != string(plaintext) {
+		t.Fatalf("round-trip mismatch: got=%q want=%q", got, plaintext)
+	}
+}
+
+// SEC-009: ciphertext encrypted for connA must NOT decrypt under connB's AAD.
+// This proves the binding works: a DB-level row swap is refused by GCM.
+func TestAAD_MismatchRefused(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	svc, _ := New(key)
+
+	plaintext := []byte("my_api_secret_key_123")
+	aadA := ConnectionFieldAAD("user_abc1234567890", "connA", "api_key")
+	aadB := ConnectionFieldAAD("user_abc1234567890", "connB", "api_key")
+
+	encrypted, err := svc.EncryptWithAAD(plaintext, aadA)
+	if err != nil {
+		t.Fatalf("EncryptWithAAD: %v", err)
+	}
+
+	if _, err := svc.DecryptWithAAD(encrypted, aadB); err == nil {
+		t.Fatal("decrypt should fail when AAD does not match")
+	}
+	// Field swap within the same connection must also fail.
+	aadField := ConnectionFieldAAD("user_abc1234567890", "connA", "api_secret")
+	if _, err := svc.DecryptWithAAD(encrypted, aadField); err == nil {
+		t.Fatal("decrypt should fail when field AAD does not match")
+	}
+}
+
+// SEC-009: without AAD, legacy ciphertexts still round-trip — backward compat.
+func TestAAD_LegacyNoAAD(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	svc, _ := New(key)
+
+	encrypted, err := svc.Encrypt([]byte("legacy-secret"))
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	got, err := svc.Decrypt(encrypted)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if string(got) != "legacy-secret" {
+		t.Fatalf("legacy round-trip broken: got %q", got)
+	}
+
+	// Mixing legacy-encrypted and AAD-decrypt must fail loudly.
+	if _, err := svc.DecryptWithAAD(encrypted, []byte("some-aad")); err == nil {
+		t.Fatal("legacy ciphertext must not decrypt under non-empty AAD")
+	}
+}
+
+// TestEncryptTSString_RoundTrip pins the format that the TS schema reader
+// expects: EncryptTSString must produce output that DecryptTSString can read
+// back. This is the path the connection service takes when writing into the
+// TS/Prisma exchange_connections table.
+func TestEncryptTSString_RoundTrip(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	svc, err := New(key)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, plaintext := range []string{
+		"12345678",                  // typical MT5 login length
+		"my_super_long_api_key_xyz", // longer payload
+		"x",                         // single byte
+	} {
+		t.Run(fmt.Sprintf("len=%d", len(plaintext)), func(t *testing.T) {
+			ts, err := svc.EncryptTSString(plaintext)
+			if err != nil {
+				t.Fatalf("EncryptTSString: %v", err)
+			}
+			got, err := svc.DecryptTSString(ts)
+			if err != nil {
+				t.Fatalf("DecryptTSString: %v", err)
+			}
+			if got != plaintext {
+				t.Fatalf("round-trip mismatch: got=%q want=%q", got, plaintext)
+			}
+		})
+	}
+}
+
+// TestGoFormatNotInterchangeableWithTSFormat is a regression test for the
+// IV-size bug fixed on this branch: rows created via EncryptString
+// (12-byte nonce GCM) and naively concatenated as iv||tag||ciphertext hex
+// are NOT readable by DecryptTSString, which reads 16 bytes as IV. The two
+// formats are not interchangeable. The connection service must call
+// EncryptTSString when targeting the TS schema; calling EncryptString and
+// shoving the parts into a single hex column produces unreadable rows
+// (auth tag check fails because the IV is misaligned by 4 bytes).
+func TestGoFormatNotInterchangeableWithTSFormat(t *testing.T) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	svc, err := New(key)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	plaintext := "12345678"
+
+	enc, err := svc.EncryptString(plaintext)
+	if err != nil {
+		t.Fatalf("EncryptString: %v", err)
+	}
+
+	// Naive repack: hex(iv12) + hex(tag16) + hex(ct). This is what the
+	// removed repackToTSFormat helper used to produce. DecryptTSString
+	// reads the first 32 hex chars as IV, eating 4 bytes of the tag, so
+	// the auth-tag check must fail.
+	ivBytes, err := base64.StdEncoding.DecodeString(enc.IV)
+	if err != nil {
+		t.Fatalf("decode iv: %v", err)
+	}
+	tagBytes, err := base64.StdEncoding.DecodeString(enc.AuthTag)
+	if err != nil {
+		t.Fatalf("decode tag: %v", err)
+	}
+	ctBytes, err := base64.StdEncoding.DecodeString(enc.Ciphertext)
+	if err != nil {
+		t.Fatalf("decode ciphertext: %v", err)
+	}
+	if len(ivBytes) != 12 {
+		t.Fatalf("EncryptString IV must be 12 bytes (stdlib GCM), got %d", len(ivBytes))
+	}
+	misformatted := fmt.Sprintf("%x%x%x", ivBytes, tagBytes, ctBytes)
+
+	if _, err := svc.DecryptTSString(misformatted); err == nil {
+		t.Fatal("DecryptTSString should reject Go-format payload with 12-byte IV — the formats are not interchangeable")
 	}
 }
 

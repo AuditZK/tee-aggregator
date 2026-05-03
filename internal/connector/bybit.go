@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -65,9 +64,9 @@ func (b *Bybit) doRequest(ctx context.Context, method, path, params string) ([]b
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001: bounded read.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -98,10 +97,10 @@ func (b *Bybit) GetBalance(ctx context.Context) (*Balance, error) {
 	var resp struct {
 		Result struct {
 			List []struct {
-				TotalEquity            string `json:"totalEquity"`
-				TotalWalletBalance     string `json:"totalWalletBalance"`
-				TotalPerpUPL           string `json:"totalPerpUPL"`
-				TotalAvailableBalance  string `json:"totalAvailableBalance"`
+				TotalEquity           string `json:"totalEquity"`
+				TotalWalletBalance    string `json:"totalWalletBalance"`
+				TotalPerpUPL          string `json:"totalPerpUPL"`
+				TotalAvailableBalance string `json:"totalAvailableBalance"`
 			} `json:"list"`
 		} `json:"result"`
 	}
@@ -136,12 +135,12 @@ func (b *Bybit) GetPositions(ctx context.Context) ([]*Position, error) {
 	var resp struct {
 		Result struct {
 			List []struct {
-				Symbol         string `json:"symbol"`
-				Side           string `json:"side"`
-				Size           string `json:"size"`
-				AvgPrice       string `json:"avgPrice"`
-				MarkPrice      string `json:"markPrice"`
-				UnrealisedPnl  string `json:"unrealisedPnl"`
+				Symbol        string `json:"symbol"`
+				Side          string `json:"side"`
+				Size          string `json:"size"`
+				AvgPrice      string `json:"avgPrice"`
+				MarkPrice     string `json:"markPrice"`
+				UnrealisedPnl string `json:"unrealisedPnl"`
 			} `json:"list"`
 		} `json:"result"`
 	}
@@ -192,14 +191,14 @@ func (b *Bybit) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, 
 	var resp struct {
 		Result struct {
 			List []struct {
-				ExecId       string `json:"execId"`
-				Symbol       string `json:"symbol"`
-				Side         string `json:"side"`
-				ExecPrice    string `json:"execPrice"`
-				ExecQty      string `json:"execQty"`
-				ExecFee      string `json:"execFee"`
-				ExecTime     string `json:"execTime"`
-				ClosedPnl    string `json:"closedPnl"`
+				ExecId    string `json:"execId"`
+				Symbol    string `json:"symbol"`
+				Side      string `json:"side"`
+				ExecPrice string `json:"execPrice"`
+				ExecQty   string `json:"execQty"`
+				ExecFee   string `json:"execFee"`
+				ExecTime  string `json:"execTime"`
+				ClosedPnl string `json:"closedPnl"`
 			} `json:"list"`
 		} `json:"result"`
 	}

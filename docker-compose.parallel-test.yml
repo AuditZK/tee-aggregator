@@ -35,7 +35,9 @@ services:
       - GRPC_INSECURE=false
       - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
-      - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:-}
+      # CFG-001: parallel-test runs with ENV=production so the enclave
+      # will fatal if this is empty. Fail the compose render early.
+      - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:?ENCLAVE_JWT_SECRET is required}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       # Daily scheduler: defaults to true (sync at 00:00 UTC) but can be
       # disabled via .env.parallel-test to run a passive read-only test
@@ -69,7 +71,12 @@ services:
       - vcek_cache_test:/var/cache/enclave/certs
     devices:
       - /dev/sev-guest:/dev/sev-guest
-    privileged: true
+    # COMPOSE-001: dropped `privileged: true`. The enclave only needs
+    # /dev/sev-guest (declared above) and the VCEK cache volume; no
+    # capabilities beyond the default set are required. If a future
+    # feature genuinely needs a cap, add it explicitly via cap_add.
+    security_opt:
+      - no-new-privileges:true
     read_only: true
     tmpfs:
       - /tmp

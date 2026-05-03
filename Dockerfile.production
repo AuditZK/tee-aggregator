@@ -1,14 +1,26 @@
-# Production Dockerfile with SEV-SNP attestation support
-# Uses Rust nightly for snpguest build
+# Production Dockerfile with SEV-SNP attestation support.
+#
+# Reproducibility notes (SEC audit pass 5):
+#   - Base images are pinned to minor tags; for fully reproducible builds,
+#     switch each FROM to `image@sha256:<digest>` once CI resolves the digest.
+#   - snpguest is pinned to an explicit version + --locked so transitive crates
+#     cannot drift between builds.
+#   - Rust stable is preferred over nightly — nightly's tag mutates daily.
 
-# snpguest build stage (AMD SEV-SNP attestation tool)
-FROM rustlang/rust:nightly-alpine AS snpguest-builder
+# snpguest build stage (AMD SEV-SNP attestation tool).
+FROM rust:1.85-alpine AS snpguest-builder
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static git
-RUN cargo install snpguest --root /usr/local --locked
+# Pin the snpguest version so a transitive crate bump doesn't silently change
+# the binary embedded in every production build.
+RUN cargo install snpguest --version 0.10.0 --root /usr/local --locked
 
-# Go build stage
-FROM golang:1.24-alpine AS builder
+# Go build stage.
+# VULN-001: pinned to 1.26.2-alpine so stdlib CVEs fixed in 1.26.1 / 1.26.2
+# (GO-2026-4947/4946/4870/4866/4865/4603/4602/4601/4600/4599) are picked
+# up deterministically. Next step: digest pin (`@sha256:<digest>`) once CI
+# resolves it.
+FROM golang:1.26.2-alpine AS builder
 
 WORKDIR /app
 
@@ -29,7 +41,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -o /enclave \
     ./cmd/enclave
 
-# Runtime stage
+# Runtime stage.
 FROM alpine:3.20
 
 WORKDIR /app

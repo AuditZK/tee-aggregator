@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +13,14 @@ import (
 	"go.uber.org/zap"
 )
 
-// SyncService orchestrates exchange synchronization
+// QUAL-001: error format strings duplicated across the sync orchestrator.
+const (
+	errFmtGetConnections      = "get connections: %w"
+	errFmtNoActiveConnections = "no active connections for user %s"
+	errMsgSnapshotBuildFailed = "snapshot build failed"
+)
+
+// SyncService orchestrates exchange synchronization.
 type SyncService struct {
 	connSvc      *ConnectionService
 	snapshotRepo *repository.SnapshotRepo
@@ -71,11 +77,11 @@ type SyncResult struct {
 func (s *SyncService) SyncUser(ctx context.Context, userUID string) ([]*SyncResult, error) {
 	connections, err := s.connSvc.GetActiveConnections(ctx, userUID)
 	if err != nil {
-		return nil, fmt.Errorf("get connections: %w", err)
+		return nil, fmt.Errorf(errFmtGetConnections, err)
 	}
 
 	if len(connections) == 0 {
-		return nil, fmt.Errorf("no active connections for user %s", userUID)
+		return nil, fmt.Errorf(errFmtNoActiveConnections, userUID)
 	}
 
 	var (
@@ -90,14 +96,25 @@ func (s *SyncService) SyncUser(ctx context.Context, userUID string) ([]*SyncResu
 			defer wg.Done()
 
 			var result *SyncResult
-			if !s.isManualSyncAllowed(ctx, userUID, c.Exchange, c.Label) {
+			allowed, allowErr := s.isManualSyncAllowed(ctx, userUID, c.Exchange, c.Label)
+			switch {
+			case allowErr != nil:
+				// ENG-001: fail closed — surface the DB error instead of
+				// silently permitting the sync.
+				result = &SyncResult{
+					UserUID:  userUID,
+					Exchange: c.Exchange,
+					Label:    c.Label,
+					Error:    fmt.Sprintf("manual sync blocked: %v", allowErr),
+				}
+			case !allowed:
 				result = &SyncResult{
 					UserUID:  userUID,
 					Exchange: c.Exchange,
 					Label:    c.Label,
 					Error:    "manual sync blocked: snapshot already exists. Only the hourly scheduler can sync after initial snapshot.",
 				}
-			} else {
+			default:
 				result = s.syncConnection(ctx, c)
 			}
 
@@ -121,11 +138,11 @@ func (s *SyncService) SyncUserScheduled(ctx context.Context, userUID string) ([]
 func (s *SyncService) SyncUserScheduledDue(ctx context.Context, userUID string, now time.Time) ([]*SyncResult, error) {
 	connections, err := s.connSvc.GetActiveConnections(ctx, userUID)
 	if err != nil {
-		return nil, fmt.Errorf("get connections: %w", err)
+		return nil, fmt.Errorf(errFmtGetConnections, err)
 	}
 
 	if len(connections) == 0 {
-		return nil, fmt.Errorf("no active connections for user %s", userUID)
+		return nil, fmt.Errorf(errFmtNoActiveConnections, userUID)
 	}
 
 	var (
@@ -176,7 +193,17 @@ func (s *SyncService) SyncExchange(ctx context.Context, userUID, exchange string
 	}
 
 	for _, conn := range connections {
-		if !s.isManualSyncAllowed(ctx, userUID, conn.Exchange, conn.Label) {
+		allowed, allowErr := s.isManualSyncAllowed(ctx, userUID, conn.Exchange, conn.Label)
+		if allowErr != nil {
+			// ENG-001: fail closed on DB error.
+			return &SyncResult{
+				UserUID:  userUID,
+				Exchange: conn.Exchange,
+				Label:    conn.Label,
+				Error:    fmt.Sprintf("manual sync blocked: %v", allowErr),
+			}
+		}
+		if !allowed {
 			return &SyncResult{
 				UserUID:  userUID,
 				Exchange: conn.Exchange,
@@ -191,6 +218,30 @@ func (s *SyncService) SyncExchange(ctx context.Context, userUID, exchange string
 		results = append(results, s.syncConnection(ctx, conn))
 	}
 	return aggregateSyncResults(userUID, exchange, results)
+}
+
+// SyncConnectionScheduledByLabel re-runs the scheduled sync pipeline for a
+// single (user, exchange, label) connection, bypassing the manual-sync
+// anti-cherry-pick guard (isManualSyncAllowed). Intended for one-off
+// recovery of a missing snapshot when the daily scheduler failed for that
+// specific connection (e.g. transient DNS/network/broker outage at 00:00
+// UTC). Idempotent — Upsert overwrites today's snapshot if one already
+// exists for the (userUid, timestamp, exchange, label) tuple.
+//
+// Uses connSvc.repo.GetByUserExchangeLabel directly (TRIM-tolerant exact
+// lookup) instead of GetActiveConnections + filter, so a fresh capability
+// detection on the underlying pool can't mask a real row.
+func (s *SyncService) SyncConnectionScheduledByLabel(ctx context.Context, userUID, exchange, label string) *SyncResult {
+	conn, err := s.connSvc.GetActiveConnectionByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return &SyncResult{
+			UserUID:  userUID,
+			Exchange: exchange,
+			Label:    label,
+			Error:    fmt.Sprintf("lookup connection: %v", err),
+		}
+	}
+	return s.syncConnection(ctx, conn)
 }
 
 // SyncExchangeScheduled is used by the hourly scheduler - bypasses manual sync block
@@ -219,30 +270,30 @@ func (s *SyncService) SyncExchangeScheduled(ctx context.Context, userUID, exchan
 }
 
 // isManualSyncAllowed checks if a manual sync is permitted.
-// Returns false if any snapshot already exists for the user+exchange+label.
-func (s *SyncService) isManualSyncAllowed(ctx context.Context, userUID, exchange, label string) bool {
-	// Check if any snapshot exists for this user+exchange+label.
-	snapshots, err := s.snapshotRepo.GetByUserAndDateRange(ctx, userUID,
-		time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
-		time.Now().UTC(),
-	)
+//
+// Returns (allowed=false, err=nil) when a snapshot already exists for this
+// user+exchange+label — the caller must refuse the sync (anti-cherry-pick).
+// Returns (allowed=false, err=<db error>) when the DB lookup fails —
+// the caller must also refuse and surface the error (ENG-001: fail closed,
+// not open).
+//
+// Replaces a previous full-range scan over every historical snapshot with a
+// targeted `SELECT 1 ... LIMIT 1` via ExistsForUserExchangeLabel.
+func (s *SyncService) isManualSyncAllowed(ctx context.Context, userUID, exchange, label string) (bool, error) {
+	exists, err := s.snapshotRepo.ExistsForUserExchangeLabel(ctx, userUID, exchange, label)
 	if err != nil {
-		// On error, allow sync (fail open for first-time users)
-		return true
+		// Fail closed: the caller surfaces the DB error to the operator
+		// instead of silently letting a manual sync overwrite an
+		// existing committed snapshot.
+		return false, fmt.Errorf("anti-cherry-pick check failed: %w", err)
 	}
-
-	for _, snap := range snapshots {
-		if snap.Exchange == exchange && snap.Label == label {
-			return false
-		}
-	}
-	return true
+	return !exists, nil
 }
 
 func (s *SyncService) getConnectionsByExchange(ctx context.Context, userUID, exchange string) ([]*repository.ExchangeConnection, error) {
 	connections, err := s.connSvc.GetActiveConnections(ctx, userUID)
 	if err != nil {
-		return nil, fmt.Errorf("get connections: %w", err)
+		return nil, fmt.Errorf(errFmtGetConnections, err)
 	}
 	targetExchange := normalizeExchange(exchange)
 	matches := make([]*repository.ExchangeConnection, 0)
@@ -472,11 +523,11 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID string, now time.Time) ([]*SyncResult, error) {
 	connections, err := s.connSvc.GetActiveConnections(ctx, userUID)
 	if err != nil {
-		return nil, fmt.Errorf("get connections: %w", err)
+		return nil, fmt.Errorf(errFmtGetConnections, err)
 	}
 
 	if len(connections) == 0 {
-		return nil, fmt.Errorf("no active connections for user %s", userUID)
+		return nil, fmt.Errorf(errFmtNoActiveConnections, userUID)
 	}
 
 	// Phase 1: Build snapshots with limited concurrency (max 2 per user).
@@ -487,7 +538,13 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		wg      sync.WaitGroup
 	)
 
-	connSem := make(chan struct{}, 1) // Sequential per user (CCXT loads ~150MB per connector)
+	// PERF-005: 4 native Go connectors in parallel ≈ 20 MB peak heap
+	// (struct + http.Client + JSON parsing). The previous "sequential per
+	// user" comment referenced CCXT (Python wrapper, ~150 MB/LoadMarkets)
+	// which the Go enclave doesn't use — every connector under
+	// internal/connector/ is native Go. Going from 1 → 4 turns a 19×Δ
+	// per-connector worst case into roughly ⌈19/4⌉×Δ.
+	connSem := make(chan struct{}, 4)
 	// 5min matches the IBKR Flex poll budget (~4min for 30-day/YTD reports) with
 	// a safety margin; other connectors are sub-second so the ceiling never hits.
 	const connTimeout = 5 * time.Minute
@@ -503,7 +560,6 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 			connSem <- struct{}{}
 			defer func() {
 				<-connSem
-				runtime.GC() // Free CCXT market data after each connection (~150MB)
 			}()
 
 			connCtx, cancel := context.WithTimeout(ctx, connTimeout)
@@ -595,14 +651,14 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
 	if err != nil {
 		result.Error = fmt.Sprintf("get credentials: %v", err)
-		s.logger.Error("snapshot build failed", zap.String("exchange", connMeta.Exchange), zap.String("step", "decrypt"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+		s.logger.Error(errMsgSnapshotBuildFailed, zap.String("exchange", connMeta.Exchange), zap.String("step", "decrypt"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return result
 	}
 
 	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, creds)
 	if err != nil {
 		result.Error = fmt.Sprintf("create connector: %v", err)
-		s.logger.Error("snapshot build failed", zap.String("exchange", connMeta.Exchange), zap.String("step", "connector"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+		s.logger.Error(errMsgSnapshotBuildFailed, zap.String("exchange", connMeta.Exchange), zap.String("step", "connector"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return result
 	}
 
@@ -616,7 +672,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	balance, err := conn.GetBalance(ctx)
 	if err != nil {
 		result.Error = fmt.Sprintf("get balance: %v", err)
-		s.logger.Error("snapshot build failed", zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.String("step", "get_balance"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+		s.logger.Error(errMsgSnapshotBuildFailed, zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.String("step", "get_balance"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return result
 	}
 	s.logger.Info("balance fetched", zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.Duration("elapsed", time.Since(start)))

@@ -100,27 +100,6 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 
 	credentialsHash := hashCredentials(req.APIKey, req.APISecret, req.Passphrase)
 
-	// Encrypt API key
-	apiKeyEnc, err := s.encryption.EncryptString(req.APIKey)
-	if err != nil {
-		return fmt.Errorf("encrypt api key: %w", err)
-	}
-
-	// Encrypt API secret
-	apiSecretEnc, err := s.encryption.EncryptString(req.APISecret)
-	if err != nil {
-		return fmt.Errorf("encrypt api secret: %w", err)
-	}
-
-	// Encrypt passphrase (if present)
-	var passphraseEnc *encryption.EncryptedData
-	if req.Passphrase != "" {
-		passphraseEnc, err = s.encryption.EncryptString(req.Passphrase)
-		if err != nil {
-			return fmt.Errorf("encrypt passphrase: %w", err)
-		}
-	}
-
 	conn := &repository.ExchangeConnection{
 		UserUID:             req.UserUID,
 		Exchange:            normalizedExchange,
@@ -128,18 +107,55 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 		CredentialsHash:     credentialsHash,
 		SyncIntervalMinutes: normalizeSyncIntervalMinutes(req.SyncIntervalMinutes),
 		ExcludeFromReport:   req.ExcludeFromReport,
-		EncryptedAPIKey:     apiKeyEnc.Ciphertext,
-		APIKeyIV:            apiKeyEnc.IV,
-		APIKeyAuthTag:       apiKeyEnc.AuthTag,
-		EncryptedAPISecret:  apiSecretEnc.Ciphertext,
-		APISecretIV:         apiSecretEnc.IV,
-		APISecretAuthTag:    apiSecretEnc.AuthTag,
 	}
 
-	if passphraseEnc != nil {
-		conn.EncryptedPassphrase = passphraseEnc.Ciphertext
-		conn.PassphraseIV = passphraseEnc.IV
-		conn.PassphraseAuthTag = passphraseEnc.AuthTag
+	// Encryption format must match the schema. The TS/Prisma schema stores
+	// each secret in a single column as hex(iv16||tag16||ciphertext) and has
+	// no iv/auth_tag columns; the native Go schema stores ciphertext, iv,
+	// auth_tag separately (12-byte nonce, all base64). Picking the wrong
+	// one produces rows that fail GCM auth-tag verification on read.
+	if s.repo.IsTSSchema(ctx) {
+		apiKeyTS, err := s.encryption.EncryptTSString(req.APIKey)
+		if err != nil {
+			return fmt.Errorf("encrypt api key (ts): %w", err)
+		}
+		apiSecretTS, err := s.encryption.EncryptTSString(req.APISecret)
+		if err != nil {
+			return fmt.Errorf("encrypt api secret (ts): %w", err)
+		}
+		conn.EncryptedAPIKey = apiKeyTS
+		conn.EncryptedAPISecret = apiSecretTS
+		if req.Passphrase != "" {
+			passTS, err := s.encryption.EncryptTSString(req.Passphrase)
+			if err != nil {
+				return fmt.Errorf("encrypt passphrase (ts): %w", err)
+			}
+			conn.EncryptedPassphrase = passTS
+		}
+	} else {
+		apiKeyEnc, err := s.encryption.EncryptString(req.APIKey)
+		if err != nil {
+			return fmt.Errorf("encrypt api key: %w", err)
+		}
+		apiSecretEnc, err := s.encryption.EncryptString(req.APISecret)
+		if err != nil {
+			return fmt.Errorf("encrypt api secret: %w", err)
+		}
+		conn.EncryptedAPIKey = apiKeyEnc.Ciphertext
+		conn.APIKeyIV = apiKeyEnc.IV
+		conn.APIKeyAuthTag = apiKeyEnc.AuthTag
+		conn.EncryptedAPISecret = apiSecretEnc.Ciphertext
+		conn.APISecretIV = apiSecretEnc.IV
+		conn.APISecretAuthTag = apiSecretEnc.AuthTag
+		if req.Passphrase != "" {
+			passphraseEnc, err := s.encryption.EncryptString(req.Passphrase)
+			if err != nil {
+				return fmt.Errorf("encrypt passphrase: %w", err)
+			}
+			conn.EncryptedPassphrase = passphraseEnc.Ciphertext
+			conn.PassphraseIV = passphraseEnc.IV
+			conn.PassphraseAuthTag = passphraseEnc.AuthTag
+		}
 	}
 
 	if err := s.repo.Create(ctx, conn); err != nil {
@@ -231,6 +247,14 @@ func (s *ConnectionService) decryptConnection(conn *repository.ExchangeConnectio
 // GetActiveConnections returns all active connections for a user (encrypted)
 func (s *ConnectionService) GetActiveConnections(ctx context.Context, userUID string) ([]*repository.ExchangeConnection, error) {
 	return s.repo.GetActiveByUser(ctx, userUID)
+}
+
+// GetActiveConnectionByLabel returns a single active connection (encrypted)
+// matched by (user, exchange, label) using a TRIM-tolerant exact lookup.
+// Useful for callers that already know the exact connection — avoids the
+// fetch-all-then-filter dance of GetActiveConnections + iterate.
+func (s *ConnectionService) GetActiveConnectionByLabel(ctx context.Context, userUID, exchange, label string) (*repository.ExchangeConnection, error) {
+	return s.repo.GetByUserExchangeLabel(ctx, userUID, normalizeExchange(exchange), strings.TrimSpace(label))
 }
 
 // GetExcludedExchanges returns exchanges marked as excluded from reports/analytics.

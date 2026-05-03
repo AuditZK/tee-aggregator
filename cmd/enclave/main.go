@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/trackrecord/enclave/internal/attestation"
+	"github.com/trackrecord/enclave/internal/bootstrap"
 	"github.com/trackrecord/enclave/internal/cache"
 	"github.com/trackrecord/enclave/internal/config"
 	"github.com/trackrecord/enclave/internal/connector"
@@ -22,12 +24,12 @@ import (
 	"github.com/trackrecord/enclave/internal/logredact"
 	"github.com/trackrecord/enclave/internal/logstream"
 	"github.com/trackrecord/enclave/internal/metrics"
+	proxyPkg "github.com/trackrecord/enclave/internal/proxy"
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/scheduler"
 	"github.com/trackrecord/enclave/internal/security"
 	"github.com/trackrecord/enclave/internal/server"
 	"github.com/trackrecord/enclave/internal/service"
-	proxyPkg "github.com/trackrecord/enclave/internal/proxy"
 	"github.com/trackrecord/enclave/internal/signing"
 	tlspkg "github.com/trackrecord/enclave/internal/tls"
 	"go.uber.org/zap"
@@ -41,6 +43,14 @@ func main() {
 	// SECURITY: In production, enforce secrets from GCP metadata (no .env files)
 	if cfg.Env == "production" {
 		enforceNoEnvFile()
+	}
+
+	// CORS-001: refuse to start in production with a permissive CORS config.
+	// The historical default reflected `*` against any Origin, which would
+	// expose JWT-authenticated endpoints to any cross-site script.
+	if err := server.ValidateCORSConfig(cfg.Env, cfg.CORSOrigin); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: %v\n", err)
+		os.Exit(1)
 	}
 
 	// 2. Init base logger with configurable log level
@@ -74,7 +84,12 @@ func main() {
 
 	if cfg.LogStreamPort > 0 {
 		logStreamServer = logstream.NewServer(cfg.LogStreamPort, cfg.LogStreamAPIKey, baseLogger)
-		broadcastCore := logstream.NewBroadcastCore(baseLogger.Core(), logStreamServer)
+		// LOG-AUDIT-001: keep stderr scrubbed by wrapping the redacted core as
+		// `inner`; BroadcastCore.Write also re-scrubs entry/fields before the
+		// SSE broadcast (Go passes entry by value, so inner.Write mutations
+		// don't propagate back here).
+		redactedInner := logredact.NewRedactCore(baseLogger.Core())
+		broadcastCore := logstream.NewBroadcastCore(redactedInner, logStreamServer)
 		logger = zap.New(broadcastCore, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
 	}
 	defer logger.Sync()
@@ -137,6 +152,7 @@ func main() {
 	// auto-seeding is explicitly requested — see the pool != nil
 	// branch below.
 	var enc *encryption.Service
+	var keyMgmt *encryption.KeyManagementService
 	if pool != nil {
 		keyDerivation, derivErr := encryption.NewKeyDerivationService(logger)
 		if derivErr != nil {
@@ -147,18 +163,33 @@ func main() {
 			zap.String("master_key_id", keyDerivation.GetMasterKeyID()),
 		)
 
-		keyMgmt, kmErr := encryption.NewKeyManagementService(pool, encryption.KeyManagementOptions{
-			Derivation:    keyDerivation,
-			Logger:        logger,
-			AllowAutoInit: cfg.IsDevelopment(),
+		// B2 handoff: when HANDOFF_PEER_URL is set, this enclave is being
+		// upgraded — fetch the master key from the predecessor over an
+		// attested ECIES channel. This overrides the measurement-derived
+		// key so the existing DEK still unwraps. Failure is fatal: there
+		// is no safe fallback when the operator explicitly asked for handoff.
+		var externalMasterKey []byte
+		if cfg.HandoffPeerURL != "" {
+			externalMasterKey, err = fetchMasterKeyFromPredecessor(ctx, cfg, eciesSvc, tlsKeygen, logger)
+			if err != nil {
+				logger.Fatal("B2 handoff failed", zap.Error(err))
+			}
+			defer wipeBytes(externalMasterKey)
+		}
+
+		keyMgmt, err = encryption.NewKeyManagementService(pool, encryption.KeyManagementOptions{
+			Derivation:        keyDerivation,
+			Logger:            logger,
+			AllowAutoInit:     cfg.IsDevelopment(),
+			ExternalMasterKey: externalMasterKey,
 		})
-		if kmErr != nil {
+		if err != nil {
 			// Hard fail: running against a DB whose DEK we cannot
 			// unwrap means every sync will fail. Bail out early with
 			// a descriptive error instead of silently pretending
 			// ENCRYPTION_KEY works.
 			logger.Fatal("key management init failed (cannot unwrap active DEK)",
-				zap.Error(kmErr),
+				zap.Error(err),
 				zap.String("hint", "check ENCRYPTION_KEY, SEV-SNP attestation, and data_encryption_keys.master_key_id"),
 			)
 		}
@@ -276,6 +307,20 @@ func main() {
 		attestSvc = attestation.NewService(opts)
 		if logStreamServer != nil {
 			logStreamServer.SetAttestationService(attestSvc)
+			// SEC-008: TLS-enable the log-stream listener using the same cert
+			// as the REST server. Falls back to plaintext only when the REST
+			// cert somehow isn't loaded (should never happen in production —
+			// startup would already have failed at step 5).
+			if tlsKeygen != nil {
+				if cert, certErr := tls.X509KeyPair(tlsKeygen.CertPEM(), tlsKeygen.KeyPEM()); certErr == nil {
+					logStreamServer.SetTLSConfig(&tls.Config{
+						MinVersion:   tls.VersionTLS12,
+						Certificates: []tls.Certificate{cert},
+					})
+				} else {
+					logger.Warn("log stream will run plaintext — failed to parse REST TLS cert", zap.Error(certErr))
+				}
+			}
 		}
 	}
 
@@ -290,31 +335,26 @@ func main() {
 	// but without attestation metadata. Operators are alerted via a
 	// warning log so the missing binding is observable. In production on
 	// SEV-SNP hardware this path must succeed.
-	{
-		attestCtx, cancelAttest := context.WithTimeout(context.Background(), 10*time.Second)
-		attestReport, attestErr := attestSvc.GetAttestation(attestCtx)
-		cancelAttest()
-		if attestErr != nil {
-			logger.Warn("failed to fetch attestation for signer binding (reports will omit enclave_attestation)",
-				zap.Error(attestErr),
-			)
-		} else if attestReport.Attestation != nil {
-			signer.SetAttestation(&signing.EnclaveAttestation{
-				Measurement: attestReport.Attestation.Measurement,
-				ReportData:  attestReport.Attestation.ReportData,
-				Platform:    attestReport.Platform,
-				Attested:    attestReport.Attestation.Verified,
-			})
-			measurementPrefix := attestReport.Attestation.Measurement
-			if len(measurementPrefix) > 16 {
-				measurementPrefix = measurementPrefix[:16] + "..."
+	refreshSignerAttestation(context.Background(), attestSvc, signer, cfg, logger, true)
+
+	// SEC-112: re-attest periodically so a late-stage host compromise does
+	// not keep the signer bound to a stale measurement. A transient error
+	// (attestation fetch failure) leaves the existing binding intact; a hard
+	// allowlist mismatch fatals out via enforceMeasurementAllowlist.
+	if cfg.ReattestInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(cfg.ReattestInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					refreshSignerAttestation(ctx, attestSvc, signer, cfg, logger, false)
+				}
 			}
-			logger.Info("report signer bound to SEV-SNP attestation",
-				zap.String("platform", attestReport.Platform),
-				zap.Bool("attested", attestReport.Attestation.Verified),
-				zap.String("measurement_prefix", measurementPrefix),
-			)
-		}
+		}()
+		logger.Info("periodic re-attestation scheduled", zap.Duration("interval", cfg.ReattestInterval))
 	}
 
 	// 14. Start gRPC server
@@ -328,13 +368,34 @@ func main() {
 
 	jwtSecret := []byte(os.Getenv("ENCLAVE_JWT_SECRET"))
 	if len(jwtSecret) == 0 {
+		// CFG-001: a missing secret in production silently downgrades gRPC
+		// JWT auth to a no-op. Refuse to start — the operator almost
+		// certainly forgot to inject the env var, and serving
+		// GenerateSignedReport unauthenticated is strictly worse than
+		// failing loudly on boot.
+		if cfg.Env == "production" {
+			logger.Fatal("ENCLAVE_JWT_SECRET must be set in production — refusing to start with JWT auth disabled")
+		}
 		logger.Warn("ENCLAVE_JWT_SECRET not set — gRPC JWT auth disabled (dev mode)")
 	} else {
 		logger.Info("gRPC JWT auth enabled")
 	}
 
-	grpcServer := enclaveGrpc.NewServer(logger, connSvc, syncSvc, metricsSvc, reportSvc, snapshotRepo, userRepo, attestSvc,
-		enclaveGrpc.ServerOptions{JWTSecret: jwtSecret},
+	grpcServer := enclaveGrpc.NewServer(
+		logger,
+		enclaveGrpc.Services{
+			ConnSvc:      connSvc,
+			SyncSvc:      syncSvc,
+			MetricsSvc:   metricsSvc,
+			ReportSvc:    reportSvc,
+			SnapshotRepo: snapshotRepo,
+			UserRepo:     userRepo,
+			AttestSvc:    attestSvc,
+		},
+		enclaveGrpc.ServerOptions{
+			JWTSecret:         jwtSecret,
+			JWTExpectedIssuer: cfg.JWTExpectedIssuer,
+		},
 	)
 	go func() {
 		if err := grpcServer.Start(cfg.GRPCPort, grpcTLSConfig); err != nil {
@@ -345,6 +406,10 @@ func main() {
 
 	// 15. Start REST server (with TLS, attestation, ECIES, CORS, rate limiting)
 	restServer := server.New(cfg, logger, pool, signer)
+	// SEC-002: share the same HS256 secret with the REST surface so sensitive
+	// endpoints enforce JWT just like the gRPC authInterceptor does.
+	restServer.SetJWTSecret(jwtSecret)
+	restServer.SetJWTExpectedIssuer(cfg.JWTExpectedIssuer)
 	restServer.SetHandler(server.NewHandlerWithOptions(server.HandlerOptions{
 		Logger:       logger,
 		ConnSvc:      connSvc,
@@ -357,6 +422,23 @@ func main() {
 		AttestSvc:    attestSvc,
 		ECIESSvc:     eciesSvc,
 	}))
+
+	// B2 handoff server: expose POST /api/v1/admin/handoff so a
+	// successor enclave can fetch this enclave's master key over an
+	// attested ECIES channel during an upgrade window. Only enabled
+	// when keyMgmt is wired (i.e. we have a real master key to hand off).
+	if keyMgmt != nil {
+		handoffSrv, hsErr := bootstrap.NewHandoffServer(bootstrap.HandoffServerOptions{
+			KeyExporter: keyMgmt,
+			Logger:      logger,
+		})
+		if hsErr != nil {
+			logger.Fatal("init handoff server", zap.Error(hsErr))
+		}
+		restServer.SetHandoffHandler(handoffSrv)
+		logger.Info("B2 handoff server endpoint registered",
+			zap.String("path", "/api/v1/admin/handoff"))
+	}
 	go func() {
 		if err := restServer.Start(ctx); err != nil {
 			logger.Error("REST server stopped", zap.Error(err))
@@ -502,13 +584,228 @@ func buildGRPCTLSConfig(cfg *config.Config) (*tls.Config, error) {
 		clientAuth = tls.RequireAndVerifyClientCert
 	}
 
-	return &tls.Config{
+	// AUTH-002: fail closed in production when the CN allowlist is empty.
+	// An empty allowlist historically meant "accept any cert chained to the
+	// CA", which silently widens the trust boundary beyond the expected
+	// report-service caller. In production we require the allowlist to be
+	// set so misconfigurations are loud rather than silent.
+	if !cfg.IsDevelopment() && len(cfg.ClientCertCNAllowlist) == 0 {
+		return nil, fmt.Errorf("GRPC_CLIENT_CERT_CN_ALLOWLIST must be set in production — refusing to start with an empty client-cert CN allowlist")
+	}
+
+	tlsCfg := &tls.Config{
 		MinVersion:               tls.VersionTLS12,
 		Certificates:             []tls.Certificate{cert},
 		ClientCAs:                clientCAPool,
 		ClientAuth:               clientAuth,
 		PreferServerCipherSuites: true,
-	}, nil
+	}
+
+	if requireClientCert {
+		tlsCfg.VerifyPeerCertificate = buildClientCNVerifier(cfg.ClientCertCNAllowlist)
+	}
+
+	return tlsCfg, nil
+}
+
+// buildClientCNVerifier returns a tls.Config.VerifyPeerCertificate callback
+// that rejects any verified client cert whose Subject.CommonName is not in
+// allowlist. An empty allowlist returns nil — stdlib treats nil as "use only
+// the default chain verification", which is the legacy behaviour. AUTH-001.
+func buildClientCNVerifier(allowlist []string) func([][]byte, [][]*x509.Certificate) error {
+	if len(allowlist) == 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(allowlist))
+	for _, cn := range allowlist {
+		allowed[cn] = struct{}{}
+	}
+	return func(_ [][]byte, verifiedChains [][]*x509.Certificate) error {
+		// After tls.RequireAndVerifyClientCert the stdlib has already
+		// verified the chain; verifiedChains[0][0] is the peer leaf.
+		if len(verifiedChains) == 0 || len(verifiedChains[0]) == 0 {
+			return fmt.Errorf("client cert allowlist enforced but no verified chain present")
+		}
+		leafCN := verifiedChains[0][0].Subject.CommonName
+		if _, ok := allowed[leafCN]; !ok {
+			return fmt.Errorf("client cert CN %q is not on the GRPC_CLIENT_CERT_CN_ALLOWLIST", leafCN)
+		}
+		return nil
+	}
+}
+
+// refreshSignerAttestation fetches a fresh SEV-SNP attestation and rebinds
+// it to the signer (SEC-112). Called once at startup (initial=true) and then
+// periodically by the re-attestation goroutine. A transient fetch failure is
+// logged but leaves the previous binding untouched — we never clear an
+// existing good binding because of a temporary hardware / network blip.
+//
+// When the allowlist check fails, enforceMeasurementAllowlist fatals in
+// production; in development it logs a warning and returns normally.
+func refreshSignerAttestation(
+	parentCtx context.Context,
+	attestSvc *attestation.Service,
+	signer *signing.ReportSigner,
+	cfg *config.Config,
+	logger *zap.Logger,
+	initial bool,
+) {
+	attestCtx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
+	defer cancel()
+	attestReport, attestErr := attestSvc.GetAttestation(attestCtx)
+	if attestErr != nil {
+		// OPS-AUDIT-001 (b): in production, a startup attestation FETCH error
+		// is fatal. We must not boot prod with no attestation backing the
+		// signer. Periodic re-attestation failures keep the previous binding
+		// (transient hardware/network blips happen).
+		if initial && cfg.Env == "production" {
+			logger.Fatal("production refuses to start without a fetched SEV-SNP attestation",
+				zap.Error(attestErr),
+			)
+			return
+		}
+		if initial {
+			logger.Warn("failed to fetch attestation for signer binding (reports will omit enclave_attestation)",
+				zap.Error(attestErr),
+			)
+		} else {
+			logger.Warn("re-attestation failed, keeping previous signer binding",
+				zap.Error(attestErr),
+			)
+		}
+		return
+	}
+
+	// OPS-AUDIT-001 (b): hard production gate — even if the wrong Dockerfile
+	// (or a misconfigured runtime) lets the enclave reach this point with no
+	// hardware attestation, refuse to sign reports as "unattested-dev". On
+	// re-attestation, log Error but preserve the previous binding to avoid
+	// outage on transient downgrades.
+	enforceProductionAttestation(cfg, attestReport, logger, initial)
+
+	if attestReport.Attestation == nil {
+		return
+	}
+
+	enforceMeasurementAllowlist(cfg, attestReport, logger)
+
+	signer.SetAttestation(&signing.EnclaveAttestation{
+		Measurement:              attestReport.Attestation.Measurement,
+		ReportData:               attestReport.Attestation.ReportData,
+		Platform:                 attestReport.Platform,
+		Attested:                 attestReport.Attestation.Verified,
+		ReportDataBoundToRequest: attestReport.Attestation.ReportDataBoundToRequest,
+		VcekVerified:             attestReport.Attestation.VcekVerified,
+	})
+
+	measurementPrefix := attestReport.Attestation.Measurement
+	if len(measurementPrefix) > 16 {
+		measurementPrefix = measurementPrefix[:16] + "..."
+	}
+	msg := "report signer bound to SEV-SNP attestation"
+	if !initial {
+		msg = "report signer re-bound to SEV-SNP attestation (refresh)"
+	}
+	logger.Info(msg,
+		zap.String("platform", attestReport.Platform),
+		zap.Bool("attested", attestReport.Attestation.Verified),
+		zap.String("measurement_prefix", measurementPrefix),
+	)
+}
+
+// enforceProductionAttestation refuses to continue in production when the
+// SEV-SNP attestation is missing, unverified, or unbound to the enclave's
+// keys (OPS-AUDIT-001 (b)). This guard is independent of which Dockerfile
+// produced the running image: even if the runtime ships without snpguest,
+// the resulting "unattested-dev" platform is rejected loudly instead of
+// signing reports that quietly carry attested=false.
+//
+// initial=true (startup) → Fatal so the container restarts under the
+// orchestrator's eye.
+// initial=false (periodic refresh) → Error but preserve the previous
+// binding; outages on transient downgrades would be worse than alerting
+// and continuing on the last-known-good attestation.
+func enforceProductionAttestation(cfg *config.Config, report *attestation.AttestationReport, logger *zap.Logger, initial bool) {
+	if cfg.Env != "production" {
+		return
+	}
+
+	var reason string
+	switch {
+	case report == nil || report.Attestation == nil:
+		reason = "missing SEV-SNP attestation block"
+	case report.Platform != attestation.PlatformSevSnp:
+		reason = "non-sev-snp platform=" + report.Platform
+	case !report.Attestation.Verified:
+		reason = "snpguest report not verified"
+	case !report.Attestation.ReportDataBoundToRequest:
+		reason = "snpguest --random fallback used: REPORT_DATA not bound to enclave keys"
+	default:
+		return
+	}
+
+	if initial {
+		logger.Fatal("production refuses to start without verified SEV-SNP attestation",
+			zap.String("reason", reason),
+		)
+		return
+	}
+	logger.Error("re-attestation downgrade detected in production (keeping previous binding)",
+		zap.String("reason", reason),
+	)
+}
+
+// enforceMeasurementAllowlist verifies that the SEV-SNP launch measurement
+// returned by the attestation service matches one of the values in
+// cfg.MeasurementAllowlist (SEC-106). When the allowlist is empty the check
+// is a no-op — that is an explicit opt-out, documented in SECURITY.md.
+//
+// Behaviour when a mismatch is detected:
+//   - Production (cfg.Env == "production"): logger.Fatal — we must not sign
+//     reports with an enclave build that was not audited.
+//   - Development: logger.Warn so a freshly rebuilt binary can run locally
+//     before its hash is published.
+//
+// A dev-mode attestation (platform != "sev-snp") is skipped: there is no
+// hardware measurement to check, and the allowlist only gates real TEE runs.
+func enforceMeasurementAllowlist(cfg *config.Config, report *attestation.AttestationReport, logger *zap.Logger) {
+	if len(cfg.MeasurementAllowlist) == 0 {
+		return
+	}
+	if report == nil || report.Attestation == nil {
+		return
+	}
+	if report.Platform != "sev-snp" || !report.Attestation.Verified {
+		logger.Info("measurement allowlist not enforced (non-attested run)",
+			zap.String("platform", report.Platform),
+		)
+		return
+	}
+
+	measured := strings.ToLower(strings.TrimSpace(report.Attestation.Measurement))
+	if measured == "" {
+		logger.Fatal("attestation returned attested=true but empty measurement — refusing to start")
+		return
+	}
+
+	for _, allowed := range cfg.MeasurementAllowlist {
+		if measured == allowed {
+			logger.Info("measurement matches allowlist", zap.Int("allowlist_size", len(cfg.MeasurementAllowlist)))
+			return
+		}
+	}
+
+	if cfg.Env == "production" {
+		logger.Fatal("SEV-SNP measurement not in allowlist — refusing to start",
+			zap.String("measured", measured),
+			zap.Int("allowlist_size", len(cfg.MeasurementAllowlist)),
+		)
+		return
+	}
+	logger.Warn("SEV-SNP measurement not in allowlist (dev mode, continuing)",
+		zap.String("measured", measured),
+		zap.Int("allowlist_size", len(cfg.MeasurementAllowlist)),
+	)
 }
 
 // enforceNoEnvFile ensures production enclave does NOT use .env files.

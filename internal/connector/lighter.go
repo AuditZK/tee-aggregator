@@ -235,14 +235,18 @@ func (l *Lighter) fetchAccount(ctx context.Context) (*lighterAccount, error) {
 			"value": l.walletAddress,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("lighter: lookup by l1_address %s: %w", l.walletAddress, err)
+			// CONN-003: the wallet address IS the credential for this connector,
+			// so error strings redact it to a short prefix/suffix — enough to
+			// correlate two runs without exposing the full address to log
+			// aggregators.
+			return nil, fmt.Errorf("lighter: lookup by l1_address %s: %w", walletPrefix(l.walletAddress), err)
 		}
 		var resp lighterAccountResponse
 		if err := json.Unmarshal(data, &resp); err != nil {
 			return nil, fmt.Errorf("lighter: decode account response: %w", err)
 		}
 		if len(resp.Accounts) == 0 {
-			return nil, fmt.Errorf("lighter: no account found for l1_address %s", l.walletAddress)
+			return nil, fmt.Errorf("lighter: no account found for l1_address %s", walletPrefix(l.walletAddress))
 		}
 		idx := resp.Accounts[0].Index
 		l.accountIndex = &idx
@@ -381,15 +385,15 @@ func (l *Lighter) doGet(ctx context.Context, path string, query map[string]strin
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
+	data, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("lighter API error %d: %s", resp.StatusCode, string(data))
+		return nil, fmt.Errorf("lighter API error %d: %s", resp.StatusCode, TruncatedBody(data))
 	}
 
 	return data, nil
@@ -419,15 +423,15 @@ func (l *Lighter) doGetAuth(ctx context.Context, path string, query map[string]s
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
+	data, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("lighter API error %d: %s", resp.StatusCode, string(data))
+		return nil, fmt.Errorf("lighter API error %d: %s", resp.StatusCode, TruncatedBody(data))
 	}
 
 	return data, nil
@@ -452,4 +456,17 @@ func (l *Lighter) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance, err
 		Equity:          bal.Equity,
 		AvailableMargin: bal.Available,
 	}}, nil
+}
+
+// walletPrefix returns a redacted form of an Ethereum-style address for use in
+// error messages and logs (CONN-003). Short addresses are returned as-is
+// because there is nothing meaningful to elide; full 0x... addresses are
+// collapsed to "0xAB...cdef" so operators can still correlate runs without
+// leaking the full wallet.
+func walletPrefix(addr string) string {
+	s := addr
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:6] + "..." + s[len(s)-4:]
 }

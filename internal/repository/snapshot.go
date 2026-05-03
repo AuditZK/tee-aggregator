@@ -4,12 +4,22 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// QUAL-001: snapshot SELECT column lists, extracted to remove the 3-way
+// duplications across GetByUserAndDateRange / GetLatestByUser /
+// GetByUserExchangeAndDate. A typo in either constant now flips every
+// query at once, instead of producing silent column-mismatch bugs.
+const (
+	snapshotColsBase      = "id, user_uid, exchange, timestamp"
+	snapshotColsWithLabel = "id, user_uid, exchange, label, timestamp"
 )
 
 // generateCUID generates a CUID-like identifier compatible with Prisma's @id @default(cuid()).
@@ -19,7 +29,7 @@ func generateCUID() string {
 	return fmt.Sprintf("c%x%010x", time.Now().UnixMilli(), b)
 }
 
-// Snapshot represents a daily equity snapshot
+// Snapshot represents a daily equity snapshot.
 type Snapshot struct {
 	ID              string           `json:"id"`
 	UserUID         string           `json:"user_uid"`
@@ -194,9 +204,9 @@ func (r *SnapshotRepo) GetByUserAndDateRange(ctx context.Context, userUID string
 		return r.getByUserAndDateRangeTS(ctx, userUID, start, end)
 	}
 
-	selectCols := "id, user_uid, exchange, timestamp"
+	selectCols := snapshotColsBase
 	if hasLabel {
-		selectCols = "id, user_uid, exchange, label, timestamp"
+		selectCols = snapshotColsWithLabel
 	}
 	query := fmt.Sprintf(`
 		SELECT %s,
@@ -245,9 +255,9 @@ func (r *SnapshotRepo) GetLatestByUser(ctx context.Context, userUID string) (*Sn
 		return r.getLatestByUserTS(ctx, userUID)
 	}
 
-	selectCols := "id, user_uid, exchange, timestamp"
+	selectCols := snapshotColsBase
 	if hasLabel {
-		selectCols = "id, user_uid, exchange, label, timestamp"
+		selectCols = snapshotColsWithLabel
 	}
 	query := fmt.Sprintf(`
 		SELECT %s,
@@ -316,9 +326,9 @@ func (r *SnapshotRepo) GetByUserExchangeAndDate(ctx context.Context, userUID, ex
 		return r.getByUserExchangeAndDateTS(ctx, userUID, exchange, date)
 	}
 
-	selectCols := "id, user_uid, exchange, timestamp"
+	selectCols := snapshotColsBase
 	if hasLabel {
-		selectCols = "id, user_uid, exchange, label, timestamp"
+		selectCols = snapshotColsWithLabel
 	}
 	whereClause := "WHERE user_uid = $1 AND exchange = $2 AND timestamp = $3"
 	if hasLabel {
@@ -526,6 +536,39 @@ func (r *SnapshotRepo) getLatestByUserExchangeLabelTS(ctx context.Context, userU
 		return nil, ErrNotFound
 	}
 	return snapshots[0], nil
+}
+
+// ExistsForUserExchangeLabel returns true if any snapshot already exists for
+// the given (user_uid, exchange, label) tuple. Used by the anti-cherry-pick
+// guard (ENG-001) — replaces the old full-range scan that was O(all user
+// snapshots) and fail-open on DB errors. Returns an error on DB failure so
+// the caller can fail closed.
+func (r *SnapshotRepo) ExistsForUserExchangeLabel(ctx context.Context, userUID, exchange, label string) (bool, error) {
+	hasLabel := r.hasLabelColumn(ctx)
+
+	var query string
+	var args []any
+	switch {
+	case r.isTSSchema:
+		query = `SELECT 1 FROM snapshot_data WHERE "userUid" = $1 AND exchange = $2 AND label = $3 LIMIT 1`
+		args = []any{userUID, exchange, label}
+	case !hasLabel:
+		query = `SELECT 1 FROM snapshot_data WHERE user_uid = $1 AND exchange = $2 LIMIT 1`
+		args = []any{userUID, exchange}
+	default:
+		query = `SELECT 1 FROM snapshot_data WHERE user_uid = $1 AND exchange = $2 AND label = $3 LIMIT 1`
+		args = []any{userUID, exchange, label}
+	}
+
+	var one int
+	err := r.pool.QueryRow(ctx, query, args...).Scan(&one)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // UpsertBatch atomically upserts multiple snapshots in a single transaction.

@@ -257,6 +257,25 @@ func (s *KeyDerivationService) IsHardwareKey() bool {
 	return s.isHardware
 }
 
+// ExportRawMasterKeyForLegacyMigration returns a copy of the raw
+// master key bytes. Used EXCLUSIVELY by cmd/admin-export-master-key
+// during the v0→v1 migration (before B2 handoff is available on the
+// running predecessor).
+//
+// PRODUCTION CODE MUST NOT CALL THIS. The master key never needs to
+// leave the KeyDerivationService in clear during normal operation —
+// every legitimate consumer (WrapKey, UnwrapKey) calls into it
+// indirectly. If you find yourself adding a second caller, you are
+// almost certainly bypassing the trust model.
+func ExportRawMasterKeyForLegacyMigration(s *KeyDerivationService) ([]byte, error) {
+	if s == nil || len(s.masterKey) == 0 {
+		return nil, fmt.Errorf("master key not initialised")
+	}
+	out := make([]byte, len(s.masterKey))
+	copy(out, s.masterKey)
+	return out, nil
+}
+
 // GetMasterKeyID returns the first 8 bytes of SHA-256(masterKey) as hex,
 // matching the TS enclave's getMasterKeyId() so that the
 // data_encryption_keys.master_key_id column is comparable between Go

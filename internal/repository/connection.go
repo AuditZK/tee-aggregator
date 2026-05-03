@@ -3,7 +3,6 @@ package repository
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,7 +15,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// ErrNotFound is returned when a repository lookup finds no matching row.
 var ErrNotFound = errors.New("not found")
+
+// ErrAlreadyExists is returned when an insert collides with an existing
+// uniqueness constraint (e.g. one active connection per user/exchange).
 var ErrAlreadyExists = errors.New("already exists")
 
 // ExchangeConnection represents an encrypted exchange connection
@@ -62,6 +65,21 @@ type ConnectionRepo struct {
 // NewConnectionRepo creates a new connection repository
 func NewConnectionRepo(pool *pgxpool.Pool) *ConnectionRepo {
 	return &ConnectionRepo{pool: pool}
+}
+
+// IsTSSchema reports whether the underlying exchange_connections table is the
+// TS/Prisma camelCase variant (single hex column per secret, no separate
+// iv/auth_tag columns). Triggers capability detection on first call.
+//
+// The service layer must consult this before encrypting credentials so it
+// picks the matching format: EncryptTSString for TS schema, EncryptString for
+// the native Go schema. Mismatched formats produce ciphertexts that pass
+// shape validation but fail GCM auth-tag verification on read.
+func (r *ConnectionRepo) IsTSSchema(ctx context.Context) bool {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.isTSSchema
 }
 
 // Create inserts a new exchange connection
@@ -146,27 +164,34 @@ func (r *ConnectionRepo) Create(ctx context.Context, conn *ExchangeConnection) e
 // createTS inserts into the TS/Prisma-shaped exchange_connections: camelCase
 // column names, single encrypted* column per secret (hex-packed iv+tag+ciphertext),
 // and a client-generated id because Prisma's @default(cuid()) isn't a DB default.
-// The service layer hands us Go-format fields (ciphertext/iv/authTag in base64) —
-// we repack them into the TS hex layout so existing TS readers can decrypt.
+//
+// The service layer is responsible for handing us TS-format ciphertexts when
+// targeting the TS schema (call IsTSSchema before encrypting and use
+// EncryptTSString). We expect EncryptedAPIKey/Secret/Passphrase to already
+// hold the hex(iv16||tag16||ciphertext) string and IV/AuthTag fields to be
+// empty. A previous version of this function repacked Go-format ciphertexts
+// (12-byte nonce) into the TS layout slot-by-slot, but the read path then
+// misread the leading 16 hex bytes as IV and decryption always failed
+// (tracked: connections created via Go enclave between 2026-04-17 and the
+// fix on this branch). See aes.go DecryptTSFormat for the layout contract.
 func (r *ConnectionRepo) createTS(
 	ctx context.Context,
 	conn *ExchangeConnection,
 	hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper bool,
 ) error {
-	encAPIKey, err := repackToTSFormat(conn.EncryptedAPIKey, conn.APIKeyIV, conn.APIKeyAuthTag)
-	if err != nil {
-		return fmt.Errorf("repack api_key for TS: %w", err)
+	if conn.EncryptedAPIKey == "" || conn.EncryptedAPISecret == "" {
+		return errors.New("createTS: encrypted credentials missing — service must encrypt with EncryptTSString before calling")
 	}
-	encAPISecret, err := repackToTSFormat(conn.EncryptedAPISecret, conn.APISecretIV, conn.APISecretAuthTag)
-	if err != nil {
-		return fmt.Errorf("repack api_secret for TS: %w", err)
+	if conn.APIKeyIV != "" || conn.APIKeyAuthTag != "" ||
+		conn.APISecretIV != "" || conn.APISecretAuthTag != "" ||
+		conn.PassphraseIV != "" || conn.PassphraseAuthTag != "" {
+		return errors.New("createTS: IV/AuthTag fields must be empty for TS schema (use EncryptTSString, not EncryptString)")
 	}
+	encAPIKey := conn.EncryptedAPIKey
+	encAPISecret := conn.EncryptedAPISecret
 	var encPassphrase *string
 	if conn.EncryptedPassphrase != "" {
-		p, err := repackToTSFormat(conn.EncryptedPassphrase, conn.PassphraseIV, conn.PassphraseAuthTag)
-		if err != nil {
-			return fmt.Errorf("repack passphrase for TS: %w", err)
-		}
+		p := conn.EncryptedPassphrase
 		encPassphrase = &p
 	}
 
@@ -213,8 +238,7 @@ func (r *ConnectionRepo) createTS(
 		strings.Join(placeholders, ", "),
 	)
 
-	err = r.pool.QueryRow(ctx, query, args...).Scan(&conn.ID)
-	if err != nil {
+	if err := r.pool.QueryRow(ctx, query, args...).Scan(&conn.ID); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return ErrAlreadyExists
@@ -222,26 +246,6 @@ func (r *ConnectionRepo) createTS(
 		return err
 	}
 	return nil
-}
-
-// repackToTSFormat converts Go-format encrypted data (base64 ciphertext + base64
-// iv + base64 auth tag) into the TS-enclave's single hex string layout
-// (iv|tag|ciphertext, all hex). Required when the Go enclave writes to the
-// TS/Prisma exchange_connections table, which has one column per secret.
-func repackToTSFormat(ciphertextB64, ivB64, authTagB64 string) (string, error) {
-	ivBytes, err := base64.StdEncoding.DecodeString(ivB64)
-	if err != nil {
-		return "", fmt.Errorf("decode iv: %w", err)
-	}
-	tagBytes, err := base64.StdEncoding.DecodeString(authTagB64)
-	if err != nil {
-		return "", fmt.Errorf("decode auth tag: %w", err)
-	}
-	ctBytes, err := base64.StdEncoding.DecodeString(ciphertextB64)
-	if err != nil {
-		return "", fmt.Errorf("decode ciphertext: %w", err)
-	}
-	return hex.EncodeToString(ivBytes) + hex.EncodeToString(tagBytes) + hex.EncodeToString(ctBytes), nil
 }
 
 // randomHex returns 2n hex characters of random data, used as the random
@@ -837,17 +841,6 @@ func (r *ConnectionRepo) columnExists(ctx context.Context, tableName, columnName
 		return false, fmt.Errorf("check column %s.%s: %w", tableName, columnName, err)
 	}
 	return exists, nil
-}
-
-// col returns the correct column name based on schema type (TS camelCase vs Go snake_case).
-func (r *ConnectionRepo) col(snakeName string) string {
-	if !r.isTSSchema {
-		return snakeName
-	}
-	if mapped, ok := tsColumnMap[snakeName]; ok {
-		return fmt.Sprintf(`"%s"`, mapped) // Quote camelCase for Postgres
-	}
-	return snakeName
 }
 
 // tsColumnMap maps Go snake_case column names to TS Prisma camelCase names.

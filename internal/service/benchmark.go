@@ -84,11 +84,11 @@ func (s *BenchmarkService) Calculate(ctx context.Context, portfolioReturns []flo
 	}
 	te := stddev(excessReturns) * math.Sqrt(tradingDaysPerYear)
 
-	// Information Ratio = Mean(excess) * sqrt(252) / StdDev(excess)
+	// Information Ratio = Mean(excess) / StdDev(excess) * sqrt(252).
+	// (Equivalent to Mean(excess)*sqrt(252) / StdDev(excess)*sqrt(252) with
+	// the two sqrt(252) factors cancelled.)
 	ir := 0.0
 	if te > 0 {
-		ir = mean(excessReturns) * math.Sqrt(tradingDaysPerYear) / (stddev(excessReturns) * math.Sqrt(tradingDaysPerYear))
-		// Simplifies to: mean(excess) / stddev(excess)
 		ir = mean(excessReturns) / stddev(excessReturns) * math.Sqrt(tradingDaysPerYear)
 	}
 

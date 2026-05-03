@@ -2,9 +2,9 @@ package connector
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -15,6 +15,9 @@ import (
 )
 
 const deribitAPI = "https://www.deribit.com/api/v2"
+
+// QUAL-001: extracted to remove a 3-way duplication of the account-summary path.
+const deribitPathAccountSummary = "/private/get_account_summary"
 
 // Deribit implements Connector for Deribit exchange.
 // It authenticates using OAuth client_credentials (api_key/api_secret).
@@ -54,7 +57,7 @@ func (d *Deribit) DetectIsPaper(_ context.Context) (bool, error) {
 }
 
 func (d *Deribit) TestConnection(ctx context.Context) error {
-	_, err := d.privateGET(ctx, "/private/get_account_summary", url.Values{
+	_, err := d.privateGET(ctx, deribitPathAccountSummary, url.Values{
 		"currency": {"BTC"},
 	})
 	return err
@@ -71,7 +74,7 @@ func (d *Deribit) GetBalance(ctx context.Context) (*Balance, error) {
 	)
 
 	for _, ccy := range currencies {
-		body, err := d.privateGET(ctx, "/private/get_account_summary", url.Values{
+		body, err := d.privateGET(ctx, deribitPathAccountSummary, url.Values{
 			"currency": {ccy},
 		})
 		if err != nil {
@@ -305,28 +308,32 @@ func (d *Deribit) ensureToken(ctx context.Context) error {
 	}
 	d.mu.Unlock()
 
+	// CONN-001: send client_id / client_secret in an HTTP Basic Authorization
+	// header rather than as URL query parameters. URLs are logged by every
+	// intermediate proxy, CDN, TLS terminator, and crash-dump pipeline; Deribit's
+	// own documentation recommends Basic auth precisely for that reason.
 	values := url.Values{}
 	values.Set("grant_type", "client_credentials")
-	values.Set("client_id", d.apiKey)
-	values.Set("client_secret", d.apiSecret)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, deribitAPI+"/public/auth?"+values.Encode(), nil)
 	if err != nil {
 		return err
 	}
+	basic := base64.StdEncoding.EncodeToString([]byte(d.apiKey + ":" + d.apiSecret))
+	req.Header.Set("Authorization", "Basic "+basic)
 
 	resp, err := d.client.Do(req)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001: bounded read.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("deribit auth status %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("deribit auth status %d: %s", resp.StatusCode, TruncatedBody(body))
 	}
 
 	var authResp struct {
@@ -379,14 +386,14 @@ func (d *Deribit) privateGET(ctx context.Context, path string, params url.Values
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("deribit API status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("deribit API status %d: %s", resp.StatusCode, TruncatedBody(body))
 	}
 
 	var envelope struct {
@@ -415,14 +422,14 @@ func (d *Deribit) publicGET(ctx context.Context, path string, params url.Values)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("deribit public API status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("deribit public API status %d: %s", resp.StatusCode, TruncatedBody(body))
 	}
 	return body, nil
 }
@@ -514,7 +521,7 @@ func (d *Deribit) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance, err
 			continue
 		}
 
-		body, err := d.privateGET(ctx, "/private/get_account_summary", url.Values{
+		body, err := d.privateGET(ctx, deribitPathAccountSummary, url.Values{
 			"currency": {ccy},
 			"extended": {"true"},
 		})

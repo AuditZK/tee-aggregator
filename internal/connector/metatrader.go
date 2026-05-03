@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +16,9 @@ import (
 	"sync"
 	"time"
 )
+
+// QUAL-001: extracted to remove a 3-way duplication of the bridge sessions path.
+const metatraderPathSessions = "/api/v1/sessions/"
 
 // MetaTrader implements Connector for MT4/MT5 through mt-bridge service.
 type MetaTrader struct {
@@ -89,7 +91,7 @@ func (m *MetaTrader) GetBalance(ctx context.Context) (*Balance, error) {
 		Currency      string  `json:"currency"`
 		MarginFree    float64 `json:"margin_free"`
 	}
-	if err := m.callBridge(ctx, http.MethodGet, "/api/v1/sessions/"+sessionID+"/account-info", nil, &info); err != nil {
+	if err := m.callBridge(ctx, http.MethodGet, metatraderPathSessions+sessionID+"/account-info", nil, &info); err != nil {
 		return nil, err
 	}
 
@@ -136,7 +138,7 @@ func (m *MetaTrader) GetPositions(ctx context.Context) ([]*Position, error) {
 		Swap          float64 `json:"swap"`
 		Commission    float64 `json:"commission"`
 	}
-	if err := m.callBridge(ctx, http.MethodGet, "/api/v1/sessions/"+sessionID+"/positions", nil, &rows); err != nil {
+	if err := m.callBridge(ctx, http.MethodGet, metatraderPathSessions+sessionID+"/positions", nil, &rows); err != nil {
 		return nil, err
 	}
 
@@ -168,7 +170,7 @@ func (m *MetaTrader) GetTrades(ctx context.Context, start, end time.Time) ([]*Tr
 
 	from := strconv.FormatInt(start.Unix(), 10)
 	to := strconv.FormatInt(end.Unix(), 10)
-	path := "/api/v1/sessions/" + sessionID + "/history-deals?from=" + url.QueryEscape(from) + "&to=" + url.QueryEscape(to)
+	path := metatraderPathSessions + sessionID + "/history-deals?from=" + url.QueryEscape(from) + "&to=" + url.QueryEscape(to)
 
 	var rows []struct {
 		Ticket      int64   `json:"ticket"`
@@ -281,14 +283,14 @@ func (m *MetaTrader) callBridge(ctx context.Context, method, path string, body a
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
+	raw, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("mt-bridge status %d: %s", resp.StatusCode, string(raw))
+		return fmt.Errorf("mt-bridge status %d: %s", resp.StatusCode, TruncatedBody(raw))
 	}
 
 	var env struct {

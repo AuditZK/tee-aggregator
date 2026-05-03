@@ -8,18 +8,23 @@
 # Prerequisites:
 #   1. GCP VM with metadata configured (see below)
 #   2. Docker installed
-#   3. Pre-built enclave-go:prod image
+#   3. Pre-built enclave-go:prod image (see Dockerfile.production)
 #
-# GCP Metadata keys required:
-#   - database-url        (PostgreSQL connection string)
-#   - encryption-key      (AES-256 key, 64 hex chars)
-#   - dek-override        (DEK from TS enclave migration, 64 hex chars)
-#   - benchmark-service-url (VPS benchmark API URL)
+# GCP Metadata keys required (production):
+#   - database-url           (PostgreSQL connection string)
+#   - encryption-key         (AES-256 key, 64 hex chars)
+#   - enclave-jwt-secret     (HS256 secret, ≥32 bytes — CFG-001 fatal if missing)
 #
-# Optional metadata keys:
+# GCP Metadata keys optional:
+#   - dek-override           (DEK from TS enclave migration, 64 hex chars)
+#   - benchmark-service-url  (VPS benchmark API URL)
+#   - cors-origin            (CORS-001 — required in prod for non-* origins)
+#   - measurement-allowlist  (comma-separated SEV-SNP measurements for SEC-106)
 #   - log-level, ctrader-client-id, ctrader-client-secret
 #   - log-server-api-key, enclave-domain, exchange-http-proxy
-#   - MT_BRIDGE_URL, MT_BRIDGE_HMAC_SECRET
+#   - mt-bridge-url, mt-bridge-hmac-secret
+#   - jwt-expected-issuer    (AUTH-002 — pins JWT iss claim)
+#   - grpc-client-cn-allowlist (AUTH-001 — comma-separated CNs)
 #
 # Usage:
 #   ./scripts/start-enclave.sh [--restart] [--build]
@@ -66,6 +71,9 @@ get_metadata() {
 # Load required secrets
 DATABASE_URL=$(get_metadata "database-url")
 ENCRYPTION_KEY=$(get_metadata "encryption-key")
+ENCLAVE_JWT_SECRET=$(get_metadata "enclave-jwt-secret")
+
+# Load optional secrets
 DEK_OVERRIDE=$(get_metadata "dek-override")
 
 # Load optional config
@@ -76,13 +84,20 @@ CTRADER_CLIENT_SECRET=$(get_metadata "ctrader-client-secret")
 LOG_SERVER_API_KEY=$(get_metadata "log-server-api-key")
 ENCLAVE_DOMAIN=$(get_metadata "enclave-domain")
 EXCHANGE_HTTP_PROXY=$(get_metadata "exchange-http-proxy")
-MT_BRIDGE_URL=$(get_metadata "MT_BRIDGE_URL")
-MT_BRIDGE_HMAC_SECRET=$(get_metadata "MT_BRIDGE_HMAC_SECRET")
+MT_BRIDGE_URL=$(get_metadata "mt-bridge-url")
+MT_BRIDGE_HMAC_SECRET=$(get_metadata "mt-bridge-hmac-secret")
+CORS_ORIGIN=$(get_metadata "cors-origin")
+JWT_EXPECTED_ISSUER=$(get_metadata "jwt-expected-issuer")
+GRPC_CLIENT_CN_ALLOWLIST=$(get_metadata "grpc-client-cn-allowlist")
+MEASUREMENT_ALLOWLIST=$(get_metadata "measurement-allowlist")
+HANDOFF_PEER_URL=$(get_metadata "handoff-peer-url")  # B2: only set during upgrade window
+SIGNED_ALLOWLIST=$(get_metadata "signed-allowlist")  # B2: hardcoded fallback if empty
 
-# Validate required secrets
+# Validate required secrets — CFG-001 / CORS-001 / AUTH-001 enforce in prod.
 MISSING=""
-[[ -z "$DATABASE_URL" ]] && MISSING="$MISSING database-url"
-[[ -z "$ENCRYPTION_KEY" ]] && MISSING="$MISSING encryption-key"
+[[ -z "$DATABASE_URL"        ]] && MISSING="$MISSING database-url"
+[[ -z "$ENCRYPTION_KEY"      ]] && MISSING="$MISSING encryption-key"
+[[ -z "$ENCLAVE_JWT_SECRET"  ]] && MISSING="$MISSING enclave-jwt-secret"
 
 if [[ -n "$MISSING" ]]; then
   echo -e "${RED}ERROR: Missing required GCP metadata keys:${MISSING}${NC}"
@@ -92,7 +107,7 @@ if [[ -n "$MISSING" ]]; then
   echo "    --zone=\$(curl -sH 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/zone | cut -d'/' -f4) \\"
   echo "    --metadata=database-url=postgresql://... \\"
   echo "    --metadata=encryption-key=... \\"
-  echo "    --metadata=dek-override=..."
+  echo "    --metadata=enclave-jwt-secret=..."
   exit 1
 fi
 
@@ -131,7 +146,7 @@ fi
 if [[ "$BUILD_FLAG" == "true" ]]; then
   echo -e "${GREEN}Building enclave image...${NC}"
   cd "$PROJECT_DIR"
-  docker build --no-cache -f Dockerfile.prebuilt -t "$IMAGE_NAME" .
+  docker build --no-cache -f Dockerfile.production -t "$IMAGE_NAME" .
 fi
 
 # Start enclave with all env vars from metadata (NO .env file)
@@ -152,6 +167,7 @@ docker run -d \
   -e DATABASE_URL="$DATABASE_URL" \
   -e ENCRYPTION_KEY="$ENCRYPTION_KEY" \
   -e DEK_OVERRIDE="$DEK_OVERRIDE" \
+  -e ENCLAVE_JWT_SECRET="$ENCLAVE_JWT_SECRET" \
   -e GRPC_PORT=50051 \
   -e GRPC_INSECURE=false \
   -e REST_PORT=3050 \
@@ -170,6 +186,15 @@ docker run -d \
   -e MT_BRIDGE_URL="${MT_BRIDGE_URL:-}" \
   -e MT_BRIDGE_HMAC_SECRET="${MT_BRIDGE_HMAC_SECRET:-}" \
   -e LOG_SERVER_API_KEY="${LOG_SERVER_API_KEY:-}" \
+  -e CORS_ORIGIN="${CORS_ORIGIN:-}" \
+  -e JWT_EXPECTED_ISSUER="${JWT_EXPECTED_ISSUER:-}" \
+  -e GRPC_CLIENT_CERT_CN_ALLOWLIST="${GRPC_CLIENT_CN_ALLOWLIST:-}" \
+  -e ENCLAVE_MEASUREMENT_ALLOWLIST="${MEASUREMENT_ALLOWLIST:-}" \
+  -e HANDOFF_PEER_URL="${HANDOFF_PEER_URL:-}" \
+  -e HANDOFF_SIGNED_ALLOWLIST="${SIGNED_ALLOWLIST:-}" \
+  -e GOMEMLIMIT=480MiB \
+  -e GOGC=75 \
+  -e GOTRACEBACK=single \
   "$IMAGE_NAME"
 
 echo ""

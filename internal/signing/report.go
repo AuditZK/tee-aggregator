@@ -7,12 +7,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"sort"
 	"sync"
 	"time"
@@ -48,8 +48,19 @@ const (
 type EnclaveAttestation struct {
 	Measurement string `json:"measurement,omitempty"`
 	ReportData  string `json:"report_data,omitempty"`
-	Platform    string `json:"platform"` // "sev-snp" or "dev"
+	Platform    string `json:"platform"` // "sev-snp" or "unattested-dev" (SEC-115)
 	Attested    bool   `json:"attested"`
+	// ReportDataBoundToRequest mirrors SevSnpReport.ReportDataBoundToRequest
+	// so verifiers can detect quotes produced via snpguest --random fallback
+	// (REPORT_DATA random instead of keys-hash). A verifier MUST refuse a
+	// signed report whose platform == "sev-snp" but this flag is false
+	// (SEC-104).
+	ReportDataBoundToRequest bool `json:"report_data_bound_to_request"`
+	// VcekVerified is the result of the VCEK certificate-chain check at
+	// signing time. A verifier who skips the live /api/v1/attestation round
+	// trip can fall back to this flag, but SHOULD independently verify the
+	// VCEK chain when possible (SEC-116).
+	VcekVerified bool `json:"vcek_verified"`
 }
 
 // ReportSigner signs performance reports.
@@ -83,35 +94,6 @@ func (s *ReportSigner) Attestation() *EnclaveAttestation {
 	}
 	copy := *s.attestation
 	return &copy
-}
-
-// NewReportSigner creates a signer from a deterministic seed (32 bytes).
-func NewReportSigner(seed []byte) (*ReportSigner, error) {
-	if len(seed) != 32 {
-		return nil, fmt.Errorf("seed must be 32 bytes")
-	}
-
-	curve := elliptic.P256()
-	n := curve.Params().N
-
-	seedHash := sha256.Sum256(seed)
-	d := new(big.Int).SetBytes(seedHash[:])
-	one := big.NewInt(1)
-	max := new(big.Int).Sub(n, one)
-	d.Mod(d, max)
-	d.Add(d, one)
-
-	x, y := curve.ScalarBaseMult(d.Bytes())
-	privateKey := &ecdsa.PrivateKey{
-		PublicKey: ecdsa.PublicKey{
-			Curve: curve,
-			X:     x,
-			Y:     y,
-		},
-		D: d,
-	}
-
-	return newReportSignerFromPrivateKey(privateKey)
 }
 
 // NewReportSignerGenerate creates a signer with a new keypair.
@@ -399,12 +381,18 @@ func buildFinancialPayload(report *SignedReport) map[string]any {
 	// enclaveAttestation binds the signed report to a specific SEV-SNP
 	// measurement. Always include when available, even in dev mode — the
 	// platform field lets the verifier distinguish attested from dev.
+	// reportDataBoundToRequest and vcekVerified are part of the signed payload
+	// (SEC-104 / SEC-116) so a verifier has authenticated signals about
+	// whether the quote actually binds the enclave's keys and whether the
+	// VCEK chain was checked at signing time.
 	if report.EnclaveAttestation != nil {
 		payload["enclaveAttestation"] = map[string]any{
-			"measurement": report.EnclaveAttestation.Measurement,
-			"reportData":  report.EnclaveAttestation.ReportData,
-			"platform":    report.EnclaveAttestation.Platform,
-			"attested":    report.EnclaveAttestation.Attested,
+			"measurement":              report.EnclaveAttestation.Measurement,
+			"reportData":               report.EnclaveAttestation.ReportData,
+			"platform":                 report.EnclaveAttestation.Platform,
+			"attested":                 report.EnclaveAttestation.Attested,
+			"reportDataBoundToRequest": report.EnclaveAttestation.ReportDataBoundToRequest,
+			"vcekVerified":             report.EnclaveAttestation.VcekVerified,
 		}
 	}
 
@@ -498,7 +486,30 @@ func toDrawdownPeriodsPayload(in []*DrawdownPeriod) []map[string]any {
 	return out
 }
 
+// marshalSortedJSON produces a deterministic JSON encoding of v, with map
+// keys emitted in lexicographic order at every level. The result is what
+// the report hash is computed over, so its byte layout is part of the
+// signing contract — see TestMarshalSortedJSONMatchesReference for the
+// non-regression test that pins the output against the legacy reference
+// implementation.
+//
+// PERF-001: the previous implementation did Marshal → Unmarshal-into-`any`
+// → re-Marshal-recursive, which cost ~22 k allocs / 700 KB per call on a
+// 365-day report. The new path drives writeSortedJSON directly over the
+// native Go values produced by buildFinancialPayload, so the only fallback
+// to encoding/json is for terminal scalars.
 func marshalSortedJSON(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := writeSortedJSON(&buf, v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// marshalSortedJSONReference is the legacy double-roundtrip implementation,
+// retained for the byte-for-byte non-regression test. Do NOT use in
+// production code paths — see marshalSortedJSON.
+func marshalSortedJSONReference(v any) ([]byte, error) {
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
@@ -516,42 +527,67 @@ func marshalSortedJSON(v any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// writeSortedJSON walks v and writes a canonical JSON encoding (sorted map
+// keys at every level, no whitespace) to buf. It handles the native Go
+// types emitted by buildFinancialPayload directly, so callers don't have
+// to pre-normalise via Unmarshal-into-any.
 func writeSortedJSON(buf *bytes.Buffer, v any) error {
 	switch t := v.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-
-		buf.WriteByte('{')
-		for i, k := range keys {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			keyBytes, _ := json.Marshal(k)
-			buf.Write(keyBytes)
-			buf.WriteByte(':')
-			if err := writeSortedJSON(buf, t[k]); err != nil {
-				return err
-			}
-		}
-		buf.WriteByte('}')
+	case nil:
+		buf.WriteString("null")
 		return nil
+	case map[string]any:
+		return writeSortedMap(buf, t)
 	case []any:
+		return writeAnySlice(buf, t)
+	case []map[string]any:
+		// Common shape for toDailyReturnsPayload / toMonthlyReturnsPayload /
+		// toDrawdownPeriodsPayload / toExchangeDetailsPayload — handle
+		// without a per-element type assertion.
+		// PERF-001 byte-parity: a nil typed slice must render as "null"
+		// to match what the reference (Marshal → Unmarshal-into-any →
+		// re-Marshal) emits. Empty (non-nil) slices stay "[]".
+		if t == nil {
+			buf.WriteString("null")
+			return nil
+		}
 		buf.WriteByte('[')
 		for i, item := range t {
 			if i > 0 {
 				buf.WriteByte(',')
 			}
-			if err := writeSortedJSON(buf, item); err != nil {
+			if err := writeSortedMap(buf, item); err != nil {
 				return err
 			}
 		}
 		buf.WriteByte(']')
 		return nil
+	case []string:
+		// Exchanges []string. Order is preserved (semantic input order).
+		// Same nil-vs-empty distinction as []map[string]any above.
+		if t == nil {
+			buf.WriteString("null")
+			return nil
+		}
+		buf.WriteByte('[')
+		for i, s := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			b, err := json.Marshal(s)
+			if err != nil {
+				return err
+			}
+			buf.Write(b)
+		}
+		buf.WriteByte(']')
+		return nil
 	default:
+		// Scalars (string, bool, int, float64, …) and any unanticipated
+		// shape: hand off to encoding/json. The legacy reference path
+		// also fell through to json.Marshal for leaves, so output is
+		// byte-identical for the supported buildFinancialPayload types
+		// (verified by TestMarshalSortedJSONMatchesReference).
 		b, err := json.Marshal(t)
 		if err != nil {
 			return err
@@ -559,6 +595,46 @@ func writeSortedJSON(buf *bytes.Buffer, v any) error {
 		buf.Write(b)
 		return nil
 	}
+}
+
+func writeSortedMap(buf *bytes.Buffer, m map[string]any) error {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	buf.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		keyBytes, err := json.Marshal(k)
+		if err != nil {
+			return err
+		}
+		buf.Write(keyBytes)
+		buf.WriteByte(':')
+		if err := writeSortedJSON(buf, m[k]); err != nil {
+			return err
+		}
+	}
+	buf.WriteByte('}')
+	return nil
+}
+
+func writeAnySlice(buf *bytes.Buffer, s []any) error {
+	buf.WriteByte('[')
+	for i, item := range s {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		if err := writeSortedJSON(buf, item); err != nil {
+			return err
+		}
+	}
+	buf.WriteByte(']')
+	return nil
 }
 
 // VerifyReport performs the full end-to-end verification of a signed report:
@@ -592,40 +668,68 @@ func VerifyReport(report *SignedReport) (bool, error) {
 		return false, nil
 	}
 
-	return Verify(report.ReportHash, report.Signature, report.PublicKey)
+	return Verify(report.ReportHash, report.Signature, report.PublicKey, report.SignatureAlgorithm)
 }
 
-// Verify checks a signature against a report hash.
+// Errors surfaced by the strict verifier helpers.
+var (
+	ErrUnknownAlgorithm    = fmt.Errorf("unknown signature algorithm")
+	ErrPublicKeyMismatch   = fmt.Errorf("signing public key does not match expected key")
+	ErrAttestationNotBound = fmt.Errorf("sev-snp report_data is not bound to the enclave keys")
+)
+
+// Verify checks a signature against a report hash, dispatching on algorithm.
+// Unlike the old loose implementation, Verify now REQUIRES the caller to tell
+// it which algorithm to use — there is no silent Ed25519 fallback when the
+// ECDSA decode fails (SEC-108). For caller convenience, an empty algorithm is
+// treated as the current production value (SignatureAlgorithm == ECDSA-P256).
 //
 // Lower-level primitive: callers that already hold a trusted report hash can
 // use this to check the signature only. For end-to-end verification from a
 // SignedReport (including detection of tampering with the payload), use
-// VerifyReport instead.
-func Verify(reportHash, signatureB64, publicKey string) (bool, error) {
-	// Preferred path: TS parity ECDSA (base64 DER public key).
-	signatureDER, sigErr := base64.StdEncoding.DecodeString(signatureB64)
-	publicKeyDER, pubErr := base64.StdEncoding.DecodeString(publicKey)
-	if sigErr == nil && pubErr == nil {
-		parsed, parseErr := x509.ParsePKIXPublicKey(publicKeyDER)
-		if parseErr == nil {
-			if ecdsaKey, ok := parsed.(*ecdsa.PublicKey); ok {
-				reportHashDigest := sha256.Sum256([]byte(reportHash))
-				return ecdsa.VerifyASN1(ecdsaKey, reportHashDigest[:], signatureDER), nil
-			}
-		}
+// VerifyReport. For strict verification that also pins the signing public key,
+// use VerifyReportStrict (SEC-109).
+func Verify(reportHash, signatureB64, publicKey, algorithm string) (bool, error) {
+	switch algorithm {
+	case "", SignatureAlgorithm:
+		return verifyECDSA(reportHash, signatureB64, publicKey)
+	case "Ed25519":
+		return verifyEd25519Legacy(reportHash, signatureB64, publicKey)
+	default:
+		return false, fmt.Errorf("%w: %q", ErrUnknownAlgorithm, algorithm)
 	}
+}
 
-	// Backward compatibility for cached reports signed with legacy Ed25519.
+func verifyECDSA(reportHash, signatureB64, publicKey string) (bool, error) {
+	signatureDER, err := base64.StdEncoding.DecodeString(signatureB64)
+	if err != nil {
+		return false, fmt.Errorf("decode ecdsa signature: %w", err)
+	}
+	publicKeyDER, err := base64.StdEncoding.DecodeString(publicKey)
+	if err != nil {
+		return false, fmt.Errorf("decode ecdsa public key (base64): %w", err)
+	}
+	parsed, err := x509.ParsePKIXPublicKey(publicKeyDER)
+	if err != nil {
+		return false, fmt.Errorf("parse ecdsa public key: %w", err)
+	}
+	ecdsaKey, ok := parsed.(*ecdsa.PublicKey)
+	if !ok {
+		return false, fmt.Errorf("public key is not ECDSA")
+	}
+	reportHashDigest := sha256.Sum256([]byte(reportHash))
+	return ecdsa.VerifyASN1(ecdsaKey, reportHashDigest[:], signatureDER), nil
+}
+
+func verifyEd25519Legacy(reportHash, signatureB64, publicKey string) (bool, error) {
 	hash, err := hex.DecodeString(reportHash)
 	if err != nil {
 		return false, fmt.Errorf("invalid report hash: %w", err)
 	}
-
 	signature, err := base64.StdEncoding.DecodeString(signatureB64)
 	if err != nil {
 		return false, fmt.Errorf("invalid signature: %w", err)
 	}
-
 	publicKeyBytes, err := hex.DecodeString(publicKey)
 	if err != nil {
 		return false, fmt.Errorf("invalid public key: %w", err)
@@ -633,6 +737,70 @@ func Verify(reportHash, signatureB64, publicKey string) (bool, error) {
 	if len(publicKeyBytes) != ed25519.PublicKeySize {
 		return false, fmt.Errorf("invalid public key format")
 	}
-
 	return ed25519.Verify(publicKeyBytes, hash, signature), nil
+}
+
+// VerifyReportStrict is the verifier callers should reach for when they trust
+// an enclave's published signing key (e.g. fetched from /api/v1/attestation
+// and cross-checked against a measurement allowlist).
+//
+// It enforces (SEC-109):
+//  1. report.PublicKey == expectedPubKey (constant-time comparison)
+//  2. Canonical-payload recomputation matches report.ReportHash
+//  3. ECDSA signature over report.ReportHash is valid
+//  4. When expectSevSnp is true, the embedded enclaveAttestation must be
+//     platform == "sev-snp" AND attested == true AND
+//     reportDataBoundToRequest == true (SEC-104 binding check).
+//
+// Returns (true, nil) only if every step passes. Any mismatch returns a
+// specific sentinel error so callers can log it rather than treating it as a
+// generic verification failure.
+func VerifyReportStrict(report *SignedReport, expectedPubKey string, expectSevSnp bool) (bool, error) {
+	if report == nil {
+		return false, fmt.Errorf("nil report")
+	}
+	if expectedPubKey == "" {
+		return false, fmt.Errorf("expectedPubKey is required")
+	}
+	// Step 1: pin the public key before touching any cryptography. This is
+	// what stops an attacker from self-signing a "valid" report with their
+	// own keypair (SEC-109).
+	if subtleConstantTimeStringEqual(report.PublicKey, expectedPubKey) != 1 {
+		return false, ErrPublicKeyMismatch
+	}
+
+	// Step 2 + 3: hash + signature
+	ok, err := VerifyReport(report)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+
+	// Step 4: attestation posture
+	if expectSevSnp {
+		att := report.EnclaveAttestation
+		if att == nil {
+			return false, fmt.Errorf("signed report has no enclaveAttestation block")
+		}
+		if att.Platform != "sev-snp" || !att.Attested {
+			return false, fmt.Errorf("signed report is not attested by sev-snp (platform=%q attested=%v)", att.Platform, att.Attested)
+		}
+		if !att.ReportDataBoundToRequest {
+			return false, ErrAttestationNotBound
+		}
+	}
+
+	return true, nil
+}
+
+// subtleConstantTimeStringEqual returns 1 when a and b are equal, 0 otherwise,
+// in constant time (modulo length). Wraps subtle.ConstantTimeCompare to keep
+// the caller free of crypto/subtle imports.
+func subtleConstantTimeStringEqual(a, b string) int {
+	if len(a) != len(b) {
+		return 0
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b))
 }

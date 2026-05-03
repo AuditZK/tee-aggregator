@@ -13,6 +13,14 @@ import (
 	"go.uber.org/zap"
 )
 
+// QUAL-001: Prometheus exposition format strings, extracted to remove the
+// 3-way duplications across the counter/gauge/histogram render paths.
+const (
+	promFmtHelp          = "# HELP %s %s\n"
+	promFmtMetric        = "%s %g\n"
+	promFmtMetricLabeled = "%s{labels=\"%s\"} %g\n"
+)
+
 // Metrics collects and exposes Prometheus-compatible metrics.
 type Metrics struct {
 	counters   map[string]*counter
@@ -186,16 +194,16 @@ func (m *Metrics) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, name := range names {
 		c := m.counters[name]
 		c.mu.Lock()
-		sb.WriteString(fmt.Sprintf("# HELP %s %s\n", c.name, c.help))
+		sb.WriteString(fmt.Sprintf(promFmtHelp, c.name, c.help))
 		sb.WriteString(fmt.Sprintf("# TYPE %s counter\n", c.name))
 		if len(c.values) == 0 {
 			sb.WriteString(fmt.Sprintf("%s 0\n", c.name))
 		}
 		for labels, val := range c.values {
 			if labels == "" {
-				sb.WriteString(fmt.Sprintf("%s %g\n", c.name, val))
+				sb.WriteString(fmt.Sprintf(promFmtMetric, c.name, val))
 			} else {
-				sb.WriteString(fmt.Sprintf("%s{labels=\"%s\"} %g\n", c.name, labels, val))
+				sb.WriteString(fmt.Sprintf(promFmtMetricLabeled, c.name, labels, val))
 			}
 		}
 		c.mu.Unlock()
@@ -211,16 +219,16 @@ func (m *Metrics) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, name := range names {
 		g := m.gauges[name]
 		g.mu.Lock()
-		sb.WriteString(fmt.Sprintf("# HELP %s %s\n", g.name, g.help))
+		sb.WriteString(fmt.Sprintf(promFmtHelp, g.name, g.help))
 		sb.WriteString(fmt.Sprintf("# TYPE %s gauge\n", g.name))
 		if len(g.values) == 0 {
 			sb.WriteString(fmt.Sprintf("%s 0\n", g.name))
 		}
 		for labels, val := range g.values {
 			if labels == "" {
-				sb.WriteString(fmt.Sprintf("%s %g\n", g.name, val))
+				sb.WriteString(fmt.Sprintf(promFmtMetric, g.name, val))
 			} else {
-				sb.WriteString(fmt.Sprintf("%s{labels=\"%s\"} %g\n", g.name, labels, val))
+				sb.WriteString(fmt.Sprintf(promFmtMetricLabeled, g.name, labels, val))
 			}
 		}
 		g.mu.Unlock()
@@ -236,13 +244,13 @@ func (m *Metrics) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, name := range names {
 		h := m.histograms[name]
 		h.mu.Lock()
-		sb.WriteString(fmt.Sprintf("# HELP %s %s\n", h.name, h.help))
+		sb.WriteString(fmt.Sprintf(promFmtHelp, h.name, h.help))
 		sb.WriteString(fmt.Sprintf("# TYPE %s gauge\n", h.name))
 		for labels, val := range h.values {
 			if labels == "" {
-				sb.WriteString(fmt.Sprintf("%s %g\n", h.name, val))
+				sb.WriteString(fmt.Sprintf(promFmtMetric, h.name, val))
 			} else {
-				sb.WriteString(fmt.Sprintf("%s{labels=\"%s\"} %g\n", h.name, labels, val))
+				sb.WriteString(fmt.Sprintf(promFmtMetricLabeled, h.name, labels, val))
 			}
 		}
 		h.mu.Unlock()

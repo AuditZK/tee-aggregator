@@ -66,7 +66,7 @@ func TestSignAndVerify(t *testing.T) {
 	}
 
 	// Verify the signature
-	valid, err := Verify(report.ReportHash, report.Signature, report.PublicKey)
+	valid, err := Verify(report.ReportHash, report.Signature, report.PublicKey, SignatureAlgorithm)
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
@@ -91,7 +91,7 @@ func TestVerifyTamperedHash(t *testing.T) {
 
 	// Tamper with the hash
 	tampered := "aa" + report.ReportHash[2:]
-	valid, err := Verify(tampered, report.Signature, report.PublicKey)
+	valid, err := Verify(tampered, report.Signature, report.PublicKey, SignatureAlgorithm)
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
@@ -116,33 +116,12 @@ func TestVerifyWrongPublicKey(t *testing.T) {
 	report, _ := signer1.Sign(input)
 
 	// Verify with wrong public key
-	valid, err := Verify(report.ReportHash, report.Signature, signer2.PublicKey())
+	valid, err := Verify(report.ReportHash, report.Signature, signer2.PublicKey(), SignatureAlgorithm)
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
 	if valid {
 		t.Error("Verify() should return false for wrong public key")
-	}
-}
-
-func TestSignFromSeed(t *testing.T) {
-	seed := make([]byte, 32)
-	for i := range seed {
-		seed[i] = byte(i)
-	}
-
-	signer1, err := NewReportSigner(seed)
-	if err != nil {
-		t.Fatalf("NewReportSigner() error = %v", err)
-	}
-
-	signer2, err := NewReportSigner(seed)
-	if err != nil {
-		t.Fatalf("NewReportSigner() error = %v", err)
-	}
-
-	if signer1.PublicKey() != signer2.PublicKey() {
-		t.Error("same seed should produce same public key")
 	}
 }
 
@@ -187,7 +166,7 @@ func TestSignWithAttestation(t *testing.T) {
 		t.Errorf("PayloadVersion = %s, want %s", report.PayloadVersion, PayloadVersion)
 	}
 
-	valid, err := Verify(report.ReportHash, report.Signature, report.PublicKey)
+	valid, err := Verify(report.ReportHash, report.Signature, report.PublicKey, SignatureAlgorithm)
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
@@ -298,7 +277,7 @@ func TestSignWithoutAttestation(t *testing.T) {
 		t.Error("EnclaveAttestation should be nil when not set")
 	}
 
-	valid, err := Verify(report.ReportHash, report.Signature, report.PublicKey)
+	valid, err := Verify(report.ReportHash, report.Signature, report.PublicKey, SignatureAlgorithm)
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
@@ -357,5 +336,69 @@ func TestReportContainsExtendedData(t *testing.T) {
 	}
 	if report.BenchmarkMetrics == nil {
 		t.Error("BenchmarkMetrics should not be nil")
+	}
+}
+
+// TestVerifyReportStrict_KeyPinning checks that VerifyReportStrict refuses a
+// report whose embedded PublicKey does not match the expected enclave key
+// (SEC-109). Without this helper a self-consistent forgery (attacker signs
+// with their own key and embeds it) would pass VerifyReport.
+func TestVerifyReportStrict_KeyPinning(t *testing.T) {
+	enclaveSigner := MustNewReportSignerGenerate()
+	attackerSigner := MustNewReportSignerGenerate()
+
+	input := &ReportInput{
+		UserUID:     "user_abc1234567890",
+		ReportName:  "Test",
+		PeriodStart: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		PeriodEnd:   time.Date(2025, 6, 30, 0, 0, 0, 0, time.UTC),
+		TotalReturn: 0.10,
+		DataPoints:  100,
+	}
+
+	// Attacker produces a self-consistent forgery.
+	forged, _ := attackerSigner.Sign(input)
+
+	// Strict verify with the legitimate enclave key must refuse it.
+	valid, err := VerifyReportStrict(forged, enclaveSigner.PublicKey(), false)
+	if valid {
+		t.Fatal("VerifyReportStrict should refuse a forgery under a different signer key")
+	}
+	if err != ErrPublicKeyMismatch {
+		t.Fatalf("expected ErrPublicKeyMismatch, got %v", err)
+	}
+
+	// A legitimately-signed report should pass.
+	legit, _ := enclaveSigner.Sign(input)
+	valid, err = VerifyReportStrict(legit, enclaveSigner.PublicKey(), false)
+	if err != nil {
+		t.Fatalf("VerifyReportStrict returned error on legit report: %v", err)
+	}
+	if !valid {
+		t.Fatal("VerifyReportStrict should accept a legit report")
+	}
+}
+
+// TestVerify_NoAlgorithmConfusion checks that passing an explicit Ed25519
+// algorithm with ECDSA inputs does NOT accidentally succeed (SEC-108).
+func TestVerify_NoAlgorithmConfusion(t *testing.T) {
+	signer := MustNewReportSignerGenerate()
+	input := &ReportInput{
+		UserUID:     "user_abc1234567890",
+		ReportName:  "Test",
+		PeriodStart: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		PeriodEnd:   time.Date(2025, 6, 30, 0, 0, 0, 0, time.UTC),
+		TotalReturn: 0.10,
+		DataPoints:  100,
+	}
+	report, _ := signer.Sign(input)
+
+	// Claiming Ed25519 over ECDSA inputs must fail, not fall through.
+	valid, err := Verify(report.ReportHash, report.Signature, report.PublicKey, "Ed25519")
+	if valid {
+		t.Fatal("Verify must not accept ECDSA output under Ed25519 algorithm label")
+	}
+	if err == nil {
+		t.Fatal("Verify must return a decode error, not nil")
 	}
 }

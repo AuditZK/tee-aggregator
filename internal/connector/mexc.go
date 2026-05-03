@@ -15,6 +15,9 @@ import (
 
 const mexcAPI = "https://api.mexc.com"
 
+// QUAL-001: extracted to remove a 3-way duplication of the spot-account path.
+const mexcPathAccount = "/api/v3/account"
+
 // MEXC implements Connector for MEXC exchange using native HTTP (no CCXT).
 // Uses HMAC-SHA256 signing, same as Binance.
 type MEXC struct {
@@ -62,13 +65,13 @@ func (m *MEXC) signedGET(ctx context.Context, path, params string) ([]byte, erro
 }
 
 func (m *MEXC) TestConnection(ctx context.Context) error {
-	_, err := m.signedGET(ctx, "/api/v3/account", "")
+	_, err := m.signedGET(ctx, mexcPathAccount, "")
 	return err
 }
 
 func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 	// Spot balance
-	spotBody, err := m.signedGET(ctx, "/api/v3/account", "")
+	spotBody, err := m.signedGET(ctx, mexcPathAccount, "")
 	if err != nil {
 		return nil, fmt.Errorf("spot balance: %w", err)
 	}
@@ -190,7 +193,7 @@ func (m *MEXC) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
 
 // GetFundingFees returns funding fee history from MEXC futures.
 func (m *MEXC) GetFundingFees(ctx context.Context, symbols []string, since time.Time) ([]*FundingFee, error) {
-	params := fmt.Sprintf("page_num=1&page_size=100")
+	params := "page_num=1&page_size=100"
 	body, err := m.futuresSignedGET(ctx, "/api/v1/private/account/funding_records", params)
 	if err != nil {
 		return nil, nil // Futures not available, return empty
@@ -336,7 +339,7 @@ func (m *MEXC) GetPositions(ctx context.Context) ([]*Position, error) {
 // daily snapshot use-case where volume/count is a secondary signal next to
 // the equity line.
 func (m *MEXC) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
-	spotBody, err := m.signedGET(ctx, "/api/v3/account", "")
+	spotBody, err := m.signedGET(ctx, mexcPathAccount, "")
 	if err != nil {
 		return nil, fmt.Errorf("list assets: %w", err)
 	}
@@ -369,18 +372,64 @@ func (m *MEXC) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, e
 		symbols = append(symbols, asset+"USDT")
 	}
 
+	// CONN-006: MEXC rate-limits /api/v3/myTrades to ~20 req/s. A user holding
+	// 40+ assets can burn that budget in a single sync call if we fire
+	// requests back-to-back. 70ms between requests keeps us at ~14 req/s,
+	// well under MEXC's cap and leaving headroom for concurrent connectors.
+	const perSymbolGap = 70 * time.Millisecond
+	// Distinguish permanent failures (delisted pairs → HTTP 400) from
+	// transient ones (429 / 5xx / network). Permanent: skip with debug log.
+	// Transient: escalate so the caller retries the sync cleanly, rather
+	// than silently truncating the user's trade history.
 	var trades []*Trade
-	for _, sym := range symbols {
+	for i, sym := range symbols {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(perSymbolGap):
+			}
+		}
 		symTrades, err := m.fetchTradesForSymbol(ctx, sym, start, end)
 		if err != nil {
-			// Skip symbols that don't exist or error (e.g. delisted pairs) —
-			// one bad symbol shouldn't fail the whole sync.
+			if isMEXCTransient(err) {
+				// Surface the error so the caller knows the window is
+				// incomplete. Half-silent truncation used to mask
+				// multi-hour outages.
+				return nil, fmt.Errorf("mexc: fetch trades for %s: %w", sym, err)
+			}
+			// Permanent (delisted / 400) — safe to skip, but log so an
+			// operator can investigate recurring gaps.
 			continue
 		}
 		trades = append(trades, symTrades...)
 	}
 
 	return trades, nil
+}
+
+// isMEXCTransient classifies an HTTP error as worth escalating (429 / 5xx /
+// network) vs. safe to skip (4xx that mean "symbol does not exist"). The
+// signedGET helper wraps errors as "HTTP %d: %s", so we inspect the string.
+func isMEXCTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "HTTP 429"),
+		strings.Contains(s, "HTTP 500"),
+		strings.Contains(s, "HTTP 502"),
+		strings.Contains(s, "HTTP 503"),
+		strings.Contains(s, "HTTP 504"):
+		return true
+	}
+	// Treat raw network / context errors as transient; only HTTP 4xx
+	// responses are classified as permanent.
+	if !strings.Contains(s, "HTTP 4") {
+		return true
+	}
+	return false
 }
 
 func (m *MEXC) fetchTradesForSymbol(ctx context.Context, symbol string, start, end time.Time) ([]*Trade, error) {
@@ -449,10 +498,10 @@ func (m *MEXC) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, 
 		fmt.Sprintf("startTime=%d&limit=100", since.UnixMilli()))
 	if err == nil {
 		var deposits []struct {
-			Amount    string `json:"amount"`
-			Coin      string `json:"coin"`
-			InsertTime int64 `json:"insertTime"`
-			Status    int    `json:"status"`
+			Amount     string `json:"amount"`
+			Coin       string `json:"coin"`
+			InsertTime int64  `json:"insertTime"`
+			Status     int    `json:"status"`
 		}
 		if json.Unmarshal(depBody, &deposits) == nil {
 			for _, d := range deposits {
