@@ -19,6 +19,11 @@ services:
     environment:
       - ENV=production
       - GRPC_PORT=50061
+      # PORT-001: must match the container-side port in the 3060:3060 mapping
+      # below. Without this the REST listener falls back to config.go default
+      # 8080, which is not exposed on the host — the port forward looks open
+      # at the Docker layer but nothing answers.
+      - REST_PORT=3060
       - DATABASE_URL=${DATABASE_URL}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
       # CFG-001: required in production. The enclave fatals on startup if
