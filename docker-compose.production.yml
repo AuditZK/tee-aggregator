@@ -39,6 +39,12 @@ services:
       # GOTRACEBACK=single keeps panic dumps focused on the failing goroutine
       # so we don't bury operators in 50+ goroutine traces under SSE load.
       - GOTRACEBACK=single
+      # TLS-001: point the REST listener at the Let's Encrypt cert mounted from
+      # the host. Without these, config.go falls back to /app/certs/cert.pem
+      # (the self-signed dev cert baked into the image) and browsers reject
+      # https://enclave.auditzk.com:3060 with ERR_CERT_AUTHORITY_INVALID.
+      - TLS_CERT_PATH=/etc/letsencrypt/live/${ENCLAVE_DOMAIN:-enclave.auditzk.com}/fullchain.pem
+      - TLS_KEY_PATH=/etc/letsencrypt/live/${ENCLAVE_DOMAIN:-enclave.auditzk.com}/privkey.pem
     # SEV-SNP device access (AMD confidential computing)
     devices:
       - /dev/sev-guest:/dev/sev-guest
