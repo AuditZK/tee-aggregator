@@ -50,6 +50,11 @@ services:
       # https://enclave.auditzk.com:3060 with ERR_CERT_AUTHORITY_INVALID.
       - TLS_CERT_PATH=/etc/letsencrypt/live/${ENCLAVE_DOMAIN:-enclave.auditzk.com}/fullchain.pem
       - TLS_KEY_PATH=/etc/letsencrypt/live/${ENCLAVE_DOMAIN:-enclave.auditzk.com}/privkey.pem
+      # MT5-001: required for MetaTrader sync. Without this the connector
+      # falls back to http://mt-bridge:8090 (a Docker-internal service name
+      # that doesn't resolve on this host), and every MT5 sync fails with
+      # "lookup mt-bridge on 127.0.0.11:53: server misbehaving".
+      - MT_BRIDGE_URL=${MT_BRIDGE_URL:?MT_BRIDGE_URL is required (mt-bridge HTTP endpoint, e.g. https://mt-bridge.example.com:8443)}
     # SEV-SNP device access (AMD confidential computing)
     devices:
       - /dev/sev-guest:/dev/sev-guest
