@@ -42,3 +42,13 @@ Thumbs.db
 doc/AUDIT_PROMPT.md
 doc/AUDIT_PROMPT.en.md
 doc/audit/
+
+# Internal docs — only the public-facing markdown files are tracked.
+# Anything else (dev setup, ops runbooks, migration notes) stays local.
+*.md
+!README.md
+!SECURITY.md
+!LICENSE.md
+!CONTRIBUTING.md
+!CHANGELOG.md
+!CODE_OF_CONDUCT.md
