@@ -55,6 +55,30 @@ services:
       # that doesn't resolve on this host), and every MT5 sync fails with
       # "lookup mt-bridge on 127.0.0.11:53: server misbehaving".
       - MT_BRIDGE_URL=${MT_BRIDGE_URL:?MT_BRIDGE_URL is required (mt-bridge HTTP endpoint, e.g. https://mt-bridge.example.com:8443)}
+      # MT5-002: HMAC-SHA256 secret used to sign requests to mt-bridge. Must
+      # match the value configured on the mt-bridge side. Without it, every
+      # request is rejected with `401 AUTH_FAILED Invalid signature`.
+      - MT_BRIDGE_HMAC_SECRET=${MT_BRIDGE_HMAC_SECRET:?MT_BRIDGE_HMAC_SECRET is required (must match mt-bridge config)}
+      # OPS-001: log verbosity. Defaults to info; set to debug to enable
+      # request-level traces (noisy under SSE load).
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # OPS-002: explicit safety flags previously set by start-enclave.sh.
+      # AUTO_MIGRATE=false prevents the enclave from running schema migrations
+      # on its own — those go through a separate migration step.
+      - AUTO_MIGRATE=false
+      # OPS-003: daily snapshot scheduler. The scheduler defaults to enabled
+      # in code, but pin it explicitly so a config drift can't silently
+      # disable the entire sync pipeline.
+      - ENABLE_DAILY_SYNC=true
+      # SEC-003: gRPC must run with TLS (no plaintext) since gateway-service
+      # connects from outside the host.
+      - GRPC_INSECURE=false
+      # mTLS-001: paths to the mTLS material used for gRPC Gateway↔Enclave.
+      # These are mounted from ./certs:/etc/enclave:ro below. Without them
+      # the gRPC server can't validate gateway client certs.
+      - TLS_CA_CERT=/etc/enclave/ca.crt
+      - TLS_SERVER_CERT=/etc/enclave/server.crt
+      - TLS_SERVER_KEY=/etc/enclave/server.key
     # SEV-SNP device access (AMD confidential computing)
     devices:
       - /dev/sev-guest:/dev/sev-guest
