@@ -8,7 +8,8 @@
 #   - Rust stable is preferred over nightly — nightly's tag mutates daily.
 
 # snpguest build stage (AMD SEV-SNP attestation tool).
-FROM rust:1.85-alpine AS snpguest-builder
+# snpguest 0.10.0 requires rustc >= 1.86, so the base image must stay at or above 1.86.
+FROM rust:1.86-alpine AS snpguest-builder
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static git
 # Pin the snpguest version so a transitive crate bump doesn't silently change
