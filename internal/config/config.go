@@ -103,6 +103,24 @@ type Config struct {
 	// Parsed from HANDOFF_SIGNED_ALLOWLIST. Empty = use the constant
 	// shipped with the binary (see internal/bootstrap/embedded_allowlist).
 	HandoffSignedAllowlist string
+
+	// ErrTrack configures the in-process error aggregation layer
+	// (internal/errtrack). It captures Error+ log entries, fingerprints
+	// them by top-N stack frames, and exposes the resulting groups via
+	// the same logstream server (auth + TLS + attestation-bound).
+	//
+	// Disabled by default to keep the change opt-in. When disabled the
+	// /errors/* endpoints respond 503.
+	ErrTrack ErrTrackConfig
+}
+
+// ErrTrackConfig is the tunable surface of the in-process error
+// aggregation store. All values have safe defaults; see DefaultCapacity
+// / DefaultNewGroupRate in internal/errtrack/store.go for the rationale.
+type ErrTrackConfig struct {
+	Enabled      bool
+	Capacity     int // max distinct groups in memory
+	NewGroupRate int // max NEW groups admitted per second (token bucket)
 }
 
 func Load() *Config {
@@ -150,6 +168,12 @@ func Load() *Config {
 
 		HandoffPeerURL:         strings.TrimSpace(getEnv("HANDOFF_PEER_URL", "")),
 		HandoffSignedAllowlist: getEnv("HANDOFF_SIGNED_ALLOWLIST", ""),
+
+		ErrTrack: ErrTrackConfig{
+			Enabled:      getEnvBool("ERRTRACK_ENABLED", false),
+			Capacity:     getEnvInt("ERRTRACK_CAPACITY", 0),       // 0 → DefaultCapacity
+			NewGroupRate: getEnvInt("ERRTRACK_NEW_GROUP_RATE", 0), // 0 → DefaultNewGroupRate
+		},
 	}
 }
 

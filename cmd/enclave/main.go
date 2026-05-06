@@ -20,6 +20,7 @@ import (
 	"github.com/trackrecord/enclave/internal/connector"
 	"github.com/trackrecord/enclave/internal/db"
 	"github.com/trackrecord/enclave/internal/encryption"
+	"github.com/trackrecord/enclave/internal/errtrack"
 	enclaveGrpc "github.com/trackrecord/enclave/internal/grpc"
 	"github.com/trackrecord/enclave/internal/logredact"
 	"github.com/trackrecord/enclave/internal/logstream"
@@ -80,6 +81,7 @@ func main() {
 
 	// 4. Start log stream server (SSE) and wrap logger with broadcast core
 	var logStreamServer *logstream.Server
+	var errStore *errtrack.Store
 	logger := redactedLogger
 
 	if cfg.LogStreamPort > 0 {
@@ -90,7 +92,18 @@ func main() {
 		// don't propagate back here).
 		redactedInner := logredact.NewRedactCore(baseLogger.Core())
 		broadcastCore := logstream.NewBroadcastCore(redactedInner, logStreamServer)
-		logger = zap.New(broadcastCore, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
+
+		// Optional: errtrack capture core sits OUTSIDE the broadcast/redact
+		// chain so the entries it observes have already been redacted at the
+		// field level. errtrack still re-sanitizes everything as defense in
+		// depth. Disabled by default; enable via ERRTRACK_ENABLED=1.
+		var topCore zapcore.Core = broadcastCore
+		if cfg.ErrTrack.Enabled {
+			errStore = errtrack.NewStore(cfg.ErrTrack.Capacity, cfg.ErrTrack.NewGroupRate)
+			logStreamServer.SetErrorStore(errStore)
+			topCore = errtrack.NewCore(broadcastCore, errStore, zapcore.ErrorLevel)
+		}
+		logger = zap.New(topCore, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
 	}
 	defer logger.Sync()
 

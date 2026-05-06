@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/trackrecord/enclave/internal/attestation"
+	"github.com/trackrecord/enclave/internal/errtrack"
 	"go.uber.org/zap"
 )
 
@@ -39,6 +40,11 @@ type Server struct {
 	mu        sync.RWMutex
 	server    *http.Server
 	tlsConfig *tls.Config // SEC-008: when set, Start uses ListenAndServeTLS
+
+	// errStore, when non-nil, backs the /errors/* endpoints. Wired
+	// via SetErrorStore. Reads/writes go through s.mu (RLock for
+	// read-mostly access on the hot path).
+	errStore *errtrack.Store
 }
 
 // SetTLSConfig wires a TLS config for the log-stream listener (SEC-008).
@@ -82,6 +88,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/logs", s.authMiddleware(s.handleLogs))
 	mux.HandleFunc("/logs/stream", s.authMiddleware(s.handleStream))
 	mux.HandleFunc("/logs/clear", s.authMiddleware(s.handleClear))
+	s.registerErrorRoutes(mux)
 
 	s.mu.RLock()
 	tlsCfg := s.tlsConfig
