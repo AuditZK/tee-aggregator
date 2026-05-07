@@ -81,7 +81,11 @@ BENCHMARK_SERVICE_URL=$(get_metadata "benchmark-service-url")
 LOG_LEVEL=$(get_metadata "log-level")
 CTRADER_CLIENT_ID=$(get_metadata "ctrader-client-id")
 CTRADER_CLIENT_SECRET=$(get_metadata "ctrader-client-secret")
-LOG_SERVER_API_KEY=$(get_metadata "log-server-api-key")
+# NAMING-001: the Go config reads LOG_STREAM_API_KEY (see internal/config/config.go);
+# the GCP metadata key stays "log-server-api-key" for historical reasons. Keep
+# the script-side variable aligned with the env var the binary expects, so the
+# value actually flows through.
+LOG_STREAM_API_KEY=$(get_metadata "log-server-api-key")
 ENCLAVE_DOMAIN=$(get_metadata "enclave-domain")
 EXCHANGE_HTTP_PROXY=$(get_metadata "exchange-http-proxy")
 MT_BRIDGE_URL=$(get_metadata "mt-bridge-url")
@@ -185,7 +189,7 @@ docker run -d \
   -e CTRADER_CLIENT_SECRET="${CTRADER_CLIENT_SECRET:-}" \
   -e MT_BRIDGE_URL="${MT_BRIDGE_URL:-}" \
   -e MT_BRIDGE_HMAC_SECRET="${MT_BRIDGE_HMAC_SECRET:-}" \
-  -e LOG_SERVER_API_KEY="${LOG_SERVER_API_KEY:-}" \
+  -e LOG_STREAM_API_KEY="${LOG_STREAM_API_KEY:-}" \
   -e CORS_ORIGIN="${CORS_ORIGIN:-}" \
   -e JWT_EXPECTED_ISSUER="${JWT_EXPECTED_ISSUER:-}" \
   -e GRPC_CLIENT_CERT_CN_ALLOWLIST="${GRPC_CLIENT_CN_ALLOWLIST:-}" \

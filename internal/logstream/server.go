@@ -354,7 +354,7 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.apiKey == "" {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-				"error": "Log server not configured. Set LOG_SERVER_API_KEY environment variable.",
+				"error": "Log server not configured. Set LOG_STREAM_API_KEY environment variable.",
 			})
 			return
 		}
