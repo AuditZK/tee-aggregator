@@ -11,7 +11,12 @@
 # snpguest 0.10.0 requires rustc >= 1.86, so the base image must stay at or above 1.86.
 FROM rust:1.86-alpine AS snpguest-builder
 
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static git
+# perl + make are required because a transitive dep of snpguest 0.10.0
+# (openssl-sys with the `vendored` feature) builds OpenSSL from source
+# regardless of openssl-dev being present. Without perl, ./Configure
+# fails with "Command 'perl' not found" — see commit history for the
+# build trace that surfaced this.
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static git perl make
 # Pin the snpguest version so a transitive crate bump doesn't silently change
 # the binary embedded in every production build.
 RUN cargo install snpguest --version 0.10.0 --root /usr/local --locked
