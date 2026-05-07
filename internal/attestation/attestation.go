@@ -346,7 +346,14 @@ func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*Se
 			s.logger.Warn("snpguest verify failed", zap.String("output", string(verifyOut)))
 			vcekVerified = false
 		} else {
-			s.logger.Info("snpguest VCEK verification successful")
+			// LOG-NOISE-002: success path is debug-level. Periodic
+			// re-attestation (every 10 min) was emitting an INFO line
+			// per cycle, which adds up to a steady drip in the
+			// dashboard. Failures still surface as Warn above. The
+			// initial post-boot verification is still observable via
+			// the "report signer bound to SEV-SNP attestation" INFO
+			// line in main.go.
+			s.logger.Debug("snpguest VCEK verification successful")
 		}
 	}
 

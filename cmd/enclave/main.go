@@ -715,15 +715,27 @@ func refreshSignerAttestation(
 	if len(measurementPrefix) > 16 {
 		measurementPrefix = measurementPrefix[:16] + "..."
 	}
-	msg := "report signer bound to SEV-SNP attestation"
-	if !initial {
-		msg = "report signer re-bound to SEV-SNP attestation (refresh)"
+	// LOG-NOISE-003: only the INITIAL bind is interesting at INFO — it
+	// proves the signer is anchored to a verified measurement. The
+	// periodic refresh (every ReattestInterval, default 10m) is a
+	// no-op as long as the measurement hasn't changed; emitting it at
+	// INFO produces a steady drip of identical lines. Drop refresh
+	// confirmations to DEBUG; if the measurement ever DOES change, that
+	// would be surfaced separately by the attestation pipeline as a
+	// WARN/ERROR.
+	if initial {
+		logger.Info("report signer bound to SEV-SNP attestation",
+			zap.String("platform", attestReport.Platform),
+			zap.Bool("attested", attestReport.Attestation.Verified),
+			zap.String("measurement_prefix", measurementPrefix),
+		)
+	} else {
+		logger.Debug("report signer re-bound to SEV-SNP attestation (refresh)",
+			zap.String("platform", attestReport.Platform),
+			zap.Bool("attested", attestReport.Attestation.Verified),
+			zap.String("measurement_prefix", measurementPrefix),
+		)
 	}
-	logger.Info(msg,
-		zap.String("platform", attestReport.Platform),
-		zap.Bool("attested", attestReport.Attestation.Verified),
-		zap.String("measurement_prefix", measurementPrefix),
-	)
 }
 
 // enforceProductionAttestation refuses to continue in production when the

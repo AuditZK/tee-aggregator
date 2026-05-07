@@ -378,17 +378,15 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		next.ServeHTTP(w, r)
 
-		// Health checks are debug-level to avoid log pollution (every 30s)
-		if r.URL.Path == "/health" {
-			s.logger.Debug("request",
-				zap.String("method", r.Method),
-				zap.String("path", r.URL.Path),
-				zap.Duration("duration", time.Since(start)),
-			)
-			return
-		}
-
-		s.logger.Info("request",
+		// LOG-NOISE-001: per-request access logs are debug-level. They
+		// used to be INFO for non-/health paths, which produced a steady
+		// stream of entries in the dashboard for every dashboard poll
+		// (errtrack /stats and /groups scrapes alone fire several times
+		// per minute). Aggregate request counts and latency live in
+		// Prometheus (`grpc_request_duration_seconds`, etc.); an operator
+		// who needs per-line traces can flip LOG_LEVEL=debug for a
+		// short investigation window.
+		s.logger.Debug("request",
 			zap.String("method", r.Method),
 			zap.String("path", r.URL.Path),
 			zap.Duration("duration", time.Since(start)),
