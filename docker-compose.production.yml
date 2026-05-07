@@ -14,6 +14,31 @@ services:
       - "3060:3060"
       - "50061:50061"
       - "50062:50062"
+    # CFG-MIGRATION (2026-05-08): single source of truth.
+    #
+    # All deployment-specific values (secrets, URLs, allowlists, log level,
+    # cert paths) live in .env.production and are injected via env_file
+    # below. The previous `environment:` block re-declared most of those
+    # with `${VAR}` substitution, which only resolves from `.env` (NOT
+    # env_file) — meaning if `.env` was missing or out of sync, the
+    # explicit `environment:` line silently overrode the env_file value
+    # with empty (CFG-DRIFT footgun).
+    #
+    # We now keep ONLY in `environment:`:
+    #   - immutable runtime tunables (ENV, GOMEMLIMIT, GOGC, GOTRACEBACK)
+    #   - feature toggles that should never differ per host (AUTO_MIGRATE,
+    #     ENABLE_DAILY_SYNC, ERRTRACK_ENABLED, GRPC_INSECURE)
+    #   - in-container filesystem paths (TLS_CA_CERT etc.) — these depend
+    #     on the image's mount layout, so they belong here, not in env.
+    #
+    # Required keys in .env.production (the enclave fatals at boot if any
+    # are missing — see internal/config/config.go and main.go validators):
+    #   DATABASE_URL, ENCRYPTION_KEY, ENCLAVE_JWT_SECRET, CORS_ORIGIN,
+    #   GRPC_CLIENT_CERT_CN_ALLOWLIST, MT_BRIDGE_URL, MT_BRIDGE_HMAC_SECRET,
+    #   LOG_STREAM_API_KEY, TLS_CERT_PATH, TLS_KEY_PATH
+    # Optional:
+    #   LOG_LEVEL (default: info), BENCHMARK_SERVICE_URL,
+    #   ERRTRACK_CAPACITY, ERRTRACK_NEW_GROUP_RATE
     env_file:
       - .env.production
     environment:
@@ -24,15 +49,6 @@ services:
       # 8080, which is not exposed on the host — the port forward looks open
       # at the Docker layer but nothing answers.
       - REST_PORT=3060
-      - DATABASE_URL=${DATABASE_URL}
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      # CFG-001: required in production. The enclave fatals on startup if
-      # this is empty; use the `:?` form so Docker also refuses to render
-      # the compose file without the env var set.
-      - ENCLAVE_JWT_SECRET=${ENCLAVE_JWT_SECRET:?ENCLAVE_JWT_SECRET is required}
-      # CFG-002: required in production — CORS and gRPC mTLS allowlist.
-      - CORS_ORIGIN=${CORS_ORIGIN:?CORS_ORIGIN is required}
-      - GRPC_CLIENT_CERT_CN_ALLOWLIST=${GRPC_CLIENT_CERT_CN_ALLOWLIST:?GRPC_CLIENT_CERT_CN_ALLOWLIST is required}
       # PERF-002: tell the Go runtime about the 512 MiB cgroup cap so the GC
       # can target it instead of computing its heap goal from the host's
       # (much larger) RAM. 480 MiB leaves a 32 MiB buffer below mem_limit so
@@ -44,24 +60,6 @@ services:
       # GOTRACEBACK=single keeps panic dumps focused on the failing goroutine
       # so we don't bury operators in 50+ goroutine traces under SSE load.
       - GOTRACEBACK=single
-      # TLS-001: point the REST listener at the Let's Encrypt cert mounted from
-      # the host. Without these, config.go falls back to /app/certs/cert.pem
-      # (the self-signed dev cert baked into the image) and browsers reject
-      # https://enclave.auditzk.com:3060 with ERR_CERT_AUTHORITY_INVALID.
-      - TLS_CERT_PATH=/etc/letsencrypt/live/${ENCLAVE_DOMAIN:-enclave.auditzk.com}/fullchain.pem
-      - TLS_KEY_PATH=/etc/letsencrypt/live/${ENCLAVE_DOMAIN:-enclave.auditzk.com}/privkey.pem
-      # MT5-001: required for MetaTrader sync. Without this the connector
-      # falls back to http://mt-bridge:8090 (a Docker-internal service name
-      # that doesn't resolve on this host), and every MT5 sync fails with
-      # "lookup mt-bridge on 127.0.0.11:53: server misbehaving".
-      - MT_BRIDGE_URL=${MT_BRIDGE_URL:?MT_BRIDGE_URL is required (mt-bridge HTTP endpoint, e.g. https://mt-bridge.example.com:8443)}
-      # MT5-002: HMAC-SHA256 secret used to sign requests to mt-bridge. Must
-      # match the value configured on the mt-bridge side. Without it, every
-      # request is rejected with `401 AUTH_FAILED Invalid signature`.
-      - MT_BRIDGE_HMAC_SECRET=${MT_BRIDGE_HMAC_SECRET:?MT_BRIDGE_HMAC_SECRET is required (must match mt-bridge config)}
-      # OPS-001: log verbosity. Defaults to info; set to debug to enable
-      # request-level traces (noisy under SSE load).
-      - LOG_LEVEL=${LOG_LEVEL:-info}
       # OPS-002: explicit safety flags previously set by start-enclave.sh.
       # AUTO_MIGRATE=false prevents the enclave from running schema migrations
       # on its own — those go through a separate migration step.
