@@ -70,6 +70,14 @@ services:
       # in code, but pin it explicitly so a config drift can't silently
       # disable the entire sync pipeline.
       - ENABLE_DAILY_SYNC=true
+      # OBS-001: in-process error aggregation (internal/errtrack). Captures
+      # Error+ log entries through a single sanitize funnel reusing
+      # logredact, exposes the resulting groups via /errors/* on the
+      # logstream server. Disabled by default in code; enabled here so
+      # operators can triage live errors via the dashboard. Capacity and
+      # rate-limit defaults (1024 groups / 50 new groups per second) are
+      # applied unless ERRTRACK_CAPACITY / ERRTRACK_NEW_GROUP_RATE override.
+      - ERRTRACK_ENABLED=1
       # SEC-003: gRPC must run with TLS (no plaintext) since gateway-service
       # connects from outside the host.
       - GRPC_INSECURE=false
