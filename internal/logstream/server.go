@@ -40,6 +40,7 @@ type Server struct {
 	mu        sync.RWMutex
 	server    *http.Server
 	tlsConfig *tls.Config // SEC-008: when set, Start uses ListenAndServeTLS
+	corsOrigins string    // CORS-002: allowlist for browser-origin requests
 
 	// errStore, when non-nil, backs the /errors/* endpoints. Wired
 	// via SetErrorStore. Reads/writes go through s.mu (RLock for
@@ -55,6 +56,16 @@ func (s *Server) SetTLSConfig(cfg *tls.Config) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tlsConfig = cfg
+}
+
+// SetCORSOrigins wires a comma-separated CORS allowlist used by
+// corsMiddleware. Must be called before Start to take effect. Empty / "*"
+// is permissive and only acceptable in development; ValidateCORSConfig in
+// internal/server enforces the production constraint.
+func (s *Server) SetCORSOrigins(origins string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.corsOrigins = origins
 }
 
 // AttestationProvider describes the subset used by the log server.
@@ -92,11 +103,12 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.mu.RLock()
 	tlsCfg := s.tlsConfig
+	corsOrigins := s.corsOrigins
 	s.mu.RUnlock()
 
 	s.server = &http.Server{
 		Addr:      fmt.Sprintf(":%d", s.port),
-		Handler:   mux,
+		Handler:   corsMiddleware(corsOrigins, mux),
 		TLSConfig: tlsCfg,
 	}
 

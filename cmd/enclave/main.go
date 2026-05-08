@@ -86,6 +86,9 @@ func main() {
 
 	if cfg.LogStreamPort > 0 {
 		logStreamServer = logstream.NewServer(cfg.LogStreamPort, cfg.LogStreamAPIKey, baseLogger)
+		// CORS-002: log-stream answers the same dashboard origin as REST.
+		// Folding CORS into the enclave removes the Caddy CORS sidecar.
+		logStreamServer.SetCORSOrigins(cfg.CORSOrigin)
 		// LOG-AUDIT-001: keep stderr scrubbed by wrapping the redacted core as
 		// `inner`; BroadcastCore.Write also re-scrubs entry/fields before the
 		// SSE broadcast (Go passes entry by value, so inner.Write mutations
