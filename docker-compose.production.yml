@@ -11,7 +11,12 @@ services:
     container_name: enclave_go_prod
     user: root
     ports:
-      - "3060:3060"
+      # CORS-002: enclave terminates public TLS itself (no Caddy in front),
+      # so the REST listener owns 443. The container still binds 3060
+      # internally — Docker maps host:443 → container:3060. Keeping the
+      # internal port unprivileged means the enclave process doesn't need
+      # CAP_NET_BIND_SERVICE.
+      - "443:3060"
       - "50061:50061"
       - "50062:50062"
     # CFG-MIGRATION (2026-05-08): single source of truth.
@@ -44,8 +49,8 @@ services:
     environment:
       - ENV=production
       - GRPC_PORT=50061
-      # PORT-001: must match the container-side port in the 3060:3060 mapping
-      # below. Without this the REST listener falls back to config.go default
+      # PORT-001: must match the container-side port in the 443:3060 mapping
+      # above. Without this the REST listener falls back to config.go default
       # 8080, which is not exposed on the host — the port forward looks open
       # at the Docker layer but nothing answers.
       - REST_PORT=3060
