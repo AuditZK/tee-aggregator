@@ -55,7 +55,8 @@ func (h *Hyperliquid) GetBalance(ctx context.Context) (*Balance, error) {
 
 	var state struct {
 		MarginSummary struct {
-			AccountValue string `json:"accountValue"`
+			AccountValue    string `json:"accountValue"`
+			TotalMarginUsed string `json:"totalMarginUsed"`
 		} `json:"marginSummary"`
 		AssetPositions []struct {
 			Position struct {
@@ -68,9 +69,15 @@ func (h *Hyperliquid) GetBalance(ctx context.Context) (*Balance, error) {
 	}
 
 	equity, _ := strconv.ParseFloat(state.MarginSummary.AccountValue, 64)
+	// HL exposes the actual margin tied up by open positions directly. Use it
+	// to derive the live free margin (= equity − margin_used) — what the user
+	// can actually deploy into new positions. This is the same number the HL
+	// frontend shows as "Available". Previously this was conflated with
+	// realized cash (equity − unrealizedPnL), which is a different concept.
+	totalMarginUsed, _ := strconv.ParseFloat(state.MarginSummary.TotalMarginUsed, 64)
 
-	// Sum unrealized PnL from open positions to derive realized balance.
-	// accountValue = realized_cash + unrealizedPnL, so realized_cash = accountValue - unrealizedPnL.
+	// Sum unrealized PnL from open positions (used to derive realized cash
+	// in the snapshot pipeline; not the same as free margin).
 	var unrealizedPnL float64
 	for _, ap := range state.AssetPositions {
 		v, _ := strconv.ParseFloat(ap.Position.UnrealizedPnl, 64)
@@ -101,7 +108,7 @@ func (h *Hyperliquid) GetBalance(ctx context.Context) (*Balance, error) {
 
 	return &Balance{
 		Equity:        equity,
-		Available:     equity - unrealizedPnL,
+		Available:     equity - totalMarginUsed,
 		UnrealizedPnL: unrealizedPnL,
 		Currency:      "USD",
 	}, nil
@@ -323,7 +330,8 @@ func (h *Hyperliquid) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance,
 
 	var state struct {
 		MarginSummary struct {
-			AccountValue string `json:"accountValue"`
+			AccountValue    string `json:"accountValue"`
+			TotalMarginUsed string `json:"totalMarginUsed"`
 		} `json:"marginSummary"`
 	}
 	if err := json.Unmarshal(respBody, &state); err != nil {
@@ -332,8 +340,15 @@ func (h *Hyperliquid) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance,
 
 	var balances []*MarketBalance
 	perpEquity, _ := strconv.ParseFloat(state.MarginSummary.AccountValue, 64)
+	perpMarginUsed, _ := strconv.ParseFloat(state.MarginSummary.TotalMarginUsed, 64)
 	if perpEquity > 0 {
-		balances = append(balances, &MarketBalance{MarketType: MarketSwap, Equity: perpEquity})
+		// Free margin on the perp account = accountValue − totalMarginUsed.
+		// Direct from HL's marginSummary; no leverage-table approximation needed.
+		balances = append(balances, &MarketBalance{
+			MarketType:      MarketSwap,
+			Equity:          perpEquity,
+			AvailableMargin: perpEquity - perpMarginUsed,
+		})
 	}
 
 	// Spot balance
