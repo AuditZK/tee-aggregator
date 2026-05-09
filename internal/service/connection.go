@@ -38,6 +38,10 @@ type ConnectionService struct {
 	repo       *repository.ConnectionRepo
 	encryption *encryption.Service
 	factory    *connector.Factory
+	// postCreateHook fires after a successful Create. Used to trigger one-shot
+	// background work tied to the new connection (e.g. historical snapshot
+	// backfill for connectors that support it). Nil = no-op.
+	postCreateHook func(ctx context.Context, userUID, exchange, label string)
 }
 
 // NewConnectionService creates a new connection service
@@ -55,6 +59,14 @@ func (s *ConnectionService) SetFactory(f *connector.Factory) {
 	s.factory = f
 }
 
+// SetPostCreateHook registers a callback invoked asynchronously after a
+// connection is successfully created. The hook receives a fresh background
+// context (the request context is cancelled by the time the goroutine runs).
+// Wired in main.go to SyncService.ReconstructHistoryOnConnect.
+func (s *ConnectionService) SetPostCreateHook(fn func(ctx context.Context, userUID, exchange, label string)) {
+	s.postCreateHook = fn
+}
+
 // CreateConnectionRequest is the input for creating a connection
 type CreateConnectionRequest struct {
 	UserUID             string
@@ -65,6 +77,13 @@ type CreateConnectionRequest struct {
 	Passphrase          string
 	SyncIntervalMinutes int
 	ExcludeFromReport   bool
+	// RebuildHistory gates the post-create historical reconstruction hook.
+	// SEC-ZK-001: for non-IBKR exchanges, "rebuild" sends decrypted credentials
+	// to an out-of-perimeter service. We require explicit caller opt-in (frontend
+	// toggle, or CLI `"rebuild_history": true`) — the zero value (false) means
+	// no rebuild, no plaintext exit. IBKR's in-enclave Flex rebuild is also gated
+	// by this flag for consistency, even though it stays inside the ZK perimeter.
+	RebuildHistory bool
 }
 
 // Create encrypts and stores a new exchange connection
@@ -169,6 +188,17 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 	// after successful connection creation; failures are non-blocking.
 	// Reuse testConn — it already has cached state from TestConnection (e.g. IBKR paper detection).
 	s.captureExchangeMetadata(ctx, conn.ID, testConn)
+
+	// Fire-and-forget post-create hook (historical snapshot backfill).
+	// Detached context — the request context dies when the HTTP response is
+	// sent and historical reconstruction can run for tens of seconds.
+	// SEC-ZK-001: only fire when the caller explicitly opts in. For non-IBKR
+	// the hook ships plaintext credentials to an external service; the
+	// default-false stance ensures terminals/CLIs that don't pass the field
+	// don't trigger that side effect silently.
+	if s.postCreateHook != nil && req.RebuildHistory {
+		go s.postCreateHook(context.Background(), conn.UserUID, conn.Exchange, conn.Label)
+	}
 
 	return nil
 }

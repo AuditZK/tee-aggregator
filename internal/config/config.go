@@ -88,6 +88,20 @@ type Config struct {
 	// ENCLAVE_JWT_EXPECTED_ISSUER.
 	JWTExpectedIssuer string
 
+	// RebuilderServiceURL points at the history-rebuilder-service (lives in
+	// track_record_site/history-rebuilder-service). The enclave POSTs a job
+	// here on connection creation for non-IBKR exchanges (Hyperliquid &
+	// future crypto), passing the decrypted credentials to a NON-ZK service.
+	// Empty = no-op (dev environments without the rebuilder, IBKR-only
+	// deployments). Parsed from REBUILDER_SERVICE_URL.
+	RebuilderServiceURL string
+
+	// RebuilderInternalToken is the shared-secret sent as X-Internal-Token
+	// to authenticate the enclave→rebuilder call. Must match the rebuilder's
+	// REBUILDER_INTERNAL_TOKEN env. Required when RebuilderServiceURL is
+	// set; otherwise the client refuses to start.
+	RebuilderInternalToken string
+
 	// HandoffPeerURL, when non-empty, points at the URL of the previous
 	// running enclave's handoff endpoint (B2). Set ONLY during the
 	// upgrade window when v_N+1 is meant to fetch the master key from
@@ -202,6 +216,9 @@ func Load() *Config {
 		ReattestInterval:        getEnvDuration("ENCLAVE_REATTEST_INTERVAL", 10*time.Minute),
 		ClientCertCNAllowlist:   parseCommaList(getEnv("GRPC_CLIENT_CERT_CN_ALLOWLIST", "")),
 		JWTExpectedIssuer:       strings.TrimSpace(getEnv("ENCLAVE_JWT_EXPECTED_ISSUER", "")),
+
+		RebuilderServiceURL:    strings.TrimSpace(getEnv("REBUILDER_SERVICE_URL", "")),
+		RebuilderInternalToken: strings.TrimSpace(getEnv("REBUILDER_INTERNAL_TOKEN", "")),
 
 		HandoffPeerURL:            strings.TrimSpace(getEnv("HANDOFF_PEER_URL", "")),
 		HandoffPeerTLSFingerprint: strings.TrimSpace(getEnv("HANDOFF_PEER_TLS_FINGERPRINT", "")),

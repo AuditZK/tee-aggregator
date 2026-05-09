@@ -27,6 +27,7 @@ import (
 	"github.com/trackrecord/enclave/internal/logstream"
 	"github.com/trackrecord/enclave/internal/metrics"
 	proxyPkg "github.com/trackrecord/enclave/internal/proxy"
+	"github.com/trackrecord/enclave/internal/rebuilderclient"
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/scheduler"
 	"github.com/trackrecord/enclave/internal/security"
@@ -286,6 +287,27 @@ func main() {
 		if syncStatusRepo != nil {
 			syncSvc.SetSyncStatusRepo(syncStatusRepo)
 		}
+		// SEC-ZK-001: wire the (optional, NON-ZK) external history-rebuilder-service
+		// client. When configured, non-IBKR exchanges (Hyperliquid, …) get
+		// their historical equity rebuilt out-of-perimeter on connect; IBKR
+		// stays in-enclave via Flex (signed by the report chain).
+		// CFG-002: REBUILDER_SERVICE_URL must come paired with a strong
+		// internal token — refusing to boot without auth prevents shipping a
+		// silently-unauthenticated plaintext-creds endpoint to production.
+		if cfg.RebuilderServiceURL != "" {
+			rebuilderClient := rebuilderclient.New(cfg.RebuilderServiceURL, cfg.RebuilderInternalToken, logger)
+			if !rebuilderClient.Configured() {
+				logger.Fatal("rebuilder URL set without internal token",
+					zap.String("hint", "set REBUILDER_INTERNAL_TOKEN (≥24 chars, must match the rebuilder service) or unset REBUILDER_SERVICE_URL to disable the integration"),
+				)
+			}
+			syncSvc.SetRebuilderClient(rebuilderClient)
+			logger.Info("rebuilder client wired", zap.String("url", cfg.RebuilderServiceURL))
+		}
+		// Trigger historical snapshot backfill on connection creation. For IBKR
+		// the rebuild runs in-enclave (ZK-native); for other exchanges the
+		// hook delegates to the external rebuilder when configured.
+		connSvc.SetPostCreateHook(syncSvc.ReconstructHistoryOnConnect)
 		metricsSvc = service.NewMetricsService(snapshotRepo)
 
 		if rateLimitRepo != nil {

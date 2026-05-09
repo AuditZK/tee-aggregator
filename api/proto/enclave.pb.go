@@ -883,8 +883,14 @@ type CreateUserConnectionRequest struct {
 	ApiSecret         string                 `protobuf:"bytes,5,opt,name=api_secret,json=apiSecret,proto3" json:"api_secret,omitempty"`                            // API secret (will be encrypted)
 	Passphrase        string                 `protobuf:"bytes,6,opt,name=passphrase,proto3" json:"passphrase,omitempty"`                                           // Optional passphrase (will be encrypted)
 	ExcludeFromReport bool                   `protobuf:"varint,7,opt,name=exclude_from_report,json=excludeFromReport,proto3" json:"exclude_from_report,omitempty"` // true = analytics only, excluded from certified report
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// SEC-ZK-001: explicit opt-in for historical reconstruction. For non-IBKR
+	// exchanges, "rebuild" sends decrypted credentials to the external
+	// history-rebuilder-service (out-of-perimeter). Default false (zero value)
+	// means the gRPC caller must explicitly request the rebuild — silent
+	// upgrades won't trigger plaintext exit.
+	RebuildHistory bool `protobuf:"varint,8,opt,name=rebuild_history,json=rebuildHistory,proto3" json:"rebuild_history,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreateUserConnectionRequest) Reset() {
@@ -962,6 +968,13 @@ func (x *CreateUserConnectionRequest) GetPassphrase() string {
 func (x *CreateUserConnectionRequest) GetExcludeFromReport() bool {
 	if x != nil {
 		return x.ExcludeFromReport
+	}
+	return false
+}
+
+func (x *CreateUserConnectionRequest) GetRebuildHistory() bool {
+	if x != nil {
+		return x.RebuildHistory
 	}
 	return false
 }
@@ -2431,7 +2444,7 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\vlong_volume\x18\t \x01(\x01R\n" +
 	"longVolume\x12!\n" +
 	"\fshort_volume\x18\n" +
-	" \x01(\x01R\vshortVolume\"\xf2\x01\n" +
+	" \x01(\x01R\vshortVolume\"\x9b\x02\n" +
 	"\x1bCreateUserConnectionRequest\x12\x19\n" +
 	"\buser_uid\x18\x01 \x01(\tR\auserUid\x12\x1a\n" +
 	"\bexchange\x18\x02 \x01(\tR\bexchange\x12\x14\n" +
@@ -2442,7 +2455,8 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\n" +
 	"passphrase\x18\x06 \x01(\tR\n" +
 	"passphrase\x12.\n" +
-	"\x13exclude_from_report\x18\a \x01(\bR\x11excludeFromReport\"i\n" +
+	"\x13exclude_from_report\x18\a \x01(\bR\x11excludeFromReport\x12'\n" +
+	"\x0frebuild_history\x18\b \x01(\bR\x0erebuildHistory\"i\n" +
 	"\x1cCreateUserConnectionResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x19\n" +
 	"\buser_uid\x18\x02 \x01(\tR\auserUid\x12\x14\n" +

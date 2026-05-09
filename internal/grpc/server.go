@@ -408,6 +408,7 @@ func (s *Server) CreateUserConnection(ctx context.Context, req *pb.CreateUserCon
 		APISecret:         req.ApiSecret,
 		Passphrase:        req.Passphrase,
 		ExcludeFromReport: req.ExcludeFromReport,
+		RebuildHistory:    req.RebuildHistory,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrConnectionAlreadyExists) {

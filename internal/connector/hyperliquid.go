@@ -363,6 +363,7 @@ func (h *Hyperliquid) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance,
 	return balances, nil
 }
 
+
 // GetFundingFees returns funding fee history from Hyperliquid.
 // Uses the userFunding endpoint (read-only, no signing needed).
 func (h *Hyperliquid) GetFundingFees(ctx context.Context, symbols []string, since time.Time) ([]*FundingFee, error) {
