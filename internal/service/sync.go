@@ -9,6 +9,7 @@ import (
 
 	"github.com/trackrecord/enclave/internal/cache"
 	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/rebuilderclient"
 	"github.com/trackrecord/enclave/internal/repository"
 	"go.uber.org/zap"
 )
@@ -28,6 +29,10 @@ type SyncService struct {
 	factory      *connector.Factory
 	connCache    *cache.ConnectorCache
 	logger       *zap.Logger
+	// rebuilder is the optional non-ZK history-rebuilder client. When nil OR
+	// not Configured(), connection-time rebuilds for non-IBKR exchanges are
+	// silently skipped — keeps enclave-only dev environments functional.
+	rebuilder *rebuilderclient.Client
 }
 
 // NewSyncService creates a new sync service
@@ -49,6 +54,14 @@ func NewSyncService(
 // SetSyncStatusRepo configures optional sync-status tracking.
 func (s *SyncService) SetSyncStatusRepo(repo *repository.SyncStatusRepo) {
 	s.syncStatus = repo
+}
+
+// SetRebuilderClient wires the (non-ZK) history-rebuilder-service client.
+// Pass nil or an unconfigured client to disable connection-time rebuilds for
+// non-IBKR exchanges (the enclave then writes nothing for HL, Lighter, … on
+// connect; IBKR's in-enclave Flex rebuild is unaffected).
+func (s *SyncService) SetRebuilderClient(c *rebuilderclient.Client) {
+	s.rebuilder = c
 }
 
 // SetFactory replaces the connector factory. Used to inject a proxy-aware
@@ -334,13 +347,19 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		return result
 	}
 
-	// 2b. IBKR: always sync the last 30 days from Flex.
-	// Flex returns a full history on every call, so each sync upserts the
-	// past month. This catches retroactive corrections (backdated deposits,
-	// equity revisions) and overwrites stale snapshots where Flex was
-	// returning a cached/frozen state for several days.
-	if strings.ToLower(connMeta.Exchange) == "ibkr" {
-		s.syncIbkrFromFlex(ctx, connMeta, conn)
+	// 2b. History reconstruction for connectors implementing HistoricalSnapshotProvider.
+	//     IBKR runs on every sync (Flex returns the full window in a single cheap call
+	//     and can carry retroactive corrections). Other connectors only run on first
+	//     sync — once the historical backfill is in DB, subsequent syncs only produce
+	//     the live (today) snapshot.
+	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
+		// IBKR keeps the every-sync Flex refresh because Flex is a single cheap
+		// call and can carry retroactive corrections. Other connectors
+		// (Hyperliquid, …) reconstruct ONCE at connection time via
+		// ReconstructHistoryOnConnect — the sync flow is live-only afterwards.
+		if strings.ToLower(connMeta.Exchange) == "ibkr" {
+			s.syncFromHistoricalProvider(ctx, connMeta, hsp)
+		}
 	}
 
 	// 3. Get balance
@@ -484,6 +503,10 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		TotalVolume:     breakdown.totalVolume(),
 		TotalFees:       breakdown.totalFees(),
 		Breakdown:       breakdown.toRepo(balance.Equity, balance.Available, len(trades)),
+		// Live snapshot: full balance + 24h trades, never reconstructed.
+		// Explicit so an Upsert overwriting a stale historical=true row
+		// from a pre-refactor DB flips the flag back to false.
+		IsHistorical: false,
 	}
 
 	result.snapshot = snapshot
@@ -662,11 +685,17 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		return result
 	}
 
-	// IBKR: patch the last 30 days of snapshots from Flex (see syncConnection).
-	// The scheduler path goes through buildConnectionSnapshot, not syncConnection,
+	// History reconstruction (see syncConnection for the gating rules). The
+	// scheduler path goes through buildConnectionSnapshot, not syncConnection,
 	// so we duplicate the call here to cover both manual and scheduled syncs.
-	if strings.ToLower(connMeta.Exchange) == "ibkr" {
-		s.syncIbkrFromFlex(ctx, connMeta, conn)
+	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
+		// IBKR keeps the every-sync Flex refresh because Flex is a single cheap
+		// call and can carry retroactive corrections. Other connectors
+		// (Hyperliquid, …) reconstruct ONCE at connection time via
+		// ReconstructHistoryOnConnect — the sync flow is live-only afterwards.
+		if strings.ToLower(connMeta.Exchange) == "ibkr" {
+			s.syncFromHistoricalProvider(ctx, connMeta, hsp)
+		}
 	}
 
 	balance, err := conn.GetBalance(ctx)
@@ -784,6 +813,8 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		TotalVolume:     breakdown.totalVolume(),
 		TotalFees:       breakdown.totalFees(),
 		Breakdown:       breakdown.toRepo(balance.Equity, balance.Available, len(trades)),
+		// Live snapshot: see syncConnection above for rationale.
+		IsHistorical: false,
 	}
 	result.TradeCount = len(trades)
 	result.SnapshotEquity = balance.Equity
@@ -898,40 +929,187 @@ func (s *SyncService) enrichBreakdownWithBalances(agg *aggregatedBreakdown, bala
 	}
 }
 
-// syncIbkrFromFlex upserts every daily snapshot returned by the user's Flex
-// Query. The Query period is configured user-side (LastBusinessWeek, YTD,
-// custom range…), so we trust whatever window Flex hands back rather than
-// imposing our own cap — a user with 15 days gets 15 days, a user with 360
-// gets 360. IBKR Flex is the source of truth and we must refresh it every
-// sync to catch retroactive edits (backdated deposits, equity adjustments,
-// reconciliations that take T+1 to settle).
-func (s *SyncService) syncIbkrFromFlex(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector) {
-	provider, ok := conn.(connector.HistoricalSnapshotProvider)
-	if !ok {
+// ReconstructHistoryOnConnect runs the historical snapshot backfill triggered
+// by a freshly created connection (wired via ConnectionService.SetPostCreateHook).
+//
+// Decrypts the credentials, builds the connector, and — if the connector
+// implements HistoricalSnapshotProvider — fetches the daily timeline and
+// upserts it as is_historical=true rows. Best-effort: errors are logged, never
+// returned (the caller is a goroutine with no surface to surface them on).
+//
+// Runs once at connection time. Subsequent syncs only produce live snapshots,
+// except for IBKR which keeps an every-sync Flex refresh handled in
+// syncConnection (Flex returns the full window cheaply and can carry
+// retroactive corrections).
+func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, exchange, label string) {
+	connMeta, err := s.connSvc.GetActiveConnectionByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		s.logger.Error("history backfill: connection lookup failed",
+			zap.String("user_uid", userUID),
+			zap.String("exchange", exchange),
+			zap.String("label", label),
+			zap.Error(err),
+		)
+		return
+	}
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		s.logger.Error("history backfill: credential decrypt failed",
+			zap.String("user_uid", userUID),
+			zap.String("exchange", exchange),
+			zap.String("label", label),
+			zap.Error(err),
+		)
+		return
+	}
+	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, creds)
+	if err != nil {
+		s.logger.Error("history backfill: connector create failed",
+			zap.String("user_uid", userUID),
+			zap.String("exchange", exchange),
+			zap.Error(err),
+		)
+		return
+	}
+	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
+		// IBKR (and any future ZK-native provider) keeps the in-enclave path:
+		// signed by the report chain, stays inside the SEV-SNP perimeter.
+		s.syncFromHistoricalProvider(ctx, connMeta, hsp)
 		return
 	}
 
-	s.logger.Info("IBKR: syncing account history from Flex",
-		zap.String("user_uid", connMeta.UserUID),
-		zap.String("exchange", connMeta.Exchange),
-		zap.String("label", connMeta.Label),
+	// SEC-ZK-001: fallback for non-ZK exchanges (Hyperliquid, Lighter, …) —
+	// hand off to the external history-rebuilder-service. Plaintext creds
+	// leave the enclave here. Explicitly accepted tradeoff: historical data
+	// is NOT sold as verifiable, the live snapshot path stays in-enclave.
+	if s.rebuilder == nil || !s.rebuilder.Configured() {
+		s.logger.Debug("history backfill: rebuilder not configured, skipping",
+			zap.String("user_uid", userUID),
+			zap.String("exchange", exchange),
+		)
+		return
+	}
+	resp, err := s.rebuilder.QueueRebuild(ctx, rebuilderclient.QueueRebuildRequest{
+		UserUID:  userUID,
+		Exchange: exchange,
+		Label:    label,
+		Credentials: rebuilderclient.Credentials{
+			// LOG-CREDS-001: this struct holds plaintext credentials. Once
+			// QueueRebuild returns, the local reference (`creds`) is dropped
+			// below; never log this struct or fmt.Sprintf it.
+			WalletAddress: creds.APIKey, // HL stores wallet in APIKey; harmless for others (rebuilder picks the right field per exchange)
+			APIKey:        creds.APIKey,
+			APISecret:     creds.APISecret,
+			Passphrase:    creds.Passphrase,
+		},
+	})
+	// LOG-CREDS-001: drop the local reference promptly. Best-effort — Go
+	// strings are immutable so the original heap allocation may live until
+	// GC, but this prevents accidental reuse of `creds` later in this scope.
+	creds = nil
+	if err != nil {
+		s.logger.Error("history backfill: rebuilder enqueue failed",
+			zap.String("user_uid", userUID),
+			zap.String("exchange", exchange),
+			zap.Error(err),
+		)
+		return
+	}
+	s.logger.Info("history backfill: queued on external rebuilder",
+		zap.String("user_uid", userUID),
+		zap.String("exchange", exchange),
+		zap.String("job_id", resp.JobID),
 	)
+}
 
-	// Zero time = no client-side filter; upsert whatever Flex returned.
+// syncIbkrFromFlex upserts every daily snapshot returned by the user's Flex
+// Query, EXCEPT today's bucket — that one is built by the live branch
+// (GetBalance + 24h trades) right after this call returns, so writing it
+// from Flex first would be overwritten and would race the live writer.
+//
+// Each Flex-derived snapshot is marked is_historical=true so consumers can
+// distinguish reconstructed days (daily summary, no per-trade detail) from
+// live days (full trade breakdown).
+//
+// The Query period is configured user-side (LastBusinessWeek, YTD, custom
+// range…), so we trust whatever window Flex hands back. A user who widens
+// their Flex query (e.g. 30d → 365d) sees the new earlier days flow into
+// the DB on the next sync — we log "history reconstruction detected" the
+// first time we see Flex go further back than what we already have.
+func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.HistoricalSnapshotProvider) {
+	firstSync := s.isFirstSync(ctx, connMeta)
+	if firstSync {
+		s.logger.Info("history backfill — first sync",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+		)
+	} else {
+		s.logger.Info("history reconstruction sync",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+		)
+	}
+
 	historicalSnapshots, err := provider.GetHistoricalSnapshots(ctx, time.Time{})
 	if err != nil {
-		s.logger.Error("IBKR Flex fetch failed",
+		s.logger.Error("historical snapshots fetch failed",
 			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
 			zap.Error(err),
 		)
 		return
 	}
 
+	// Today is owned by the live branch — never reconstruct it.
+	now := time.Now().UTC()
+	todayKey := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+
+	s.logHistoryExpansion(ctx, connMeta, historicalSnapshots, firstSync)
+
+	snapshots, skippedToday := buildHistoricalSnapshots(connMeta, historicalSnapshots, todayKey)
+
 	processed := 0
-	for _, hs := range historicalSnapshots {
+	for _, snapshot := range snapshots {
+		if err := s.snapshotRepo.Upsert(ctx, snapshot); err != nil {
+			s.logger.Warn("historical snapshot upsert failed",
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("date", snapshot.Timestamp.Format("2006-01-02")),
+				zap.Error(err),
+			)
+			continue
+		}
+		processed++
+	}
+
+	s.logger.Info("history reconstruction completed",
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.Int("snapshots_upserted", processed),
+		zap.Int("skipped_today", skippedToday),
+		zap.Int("total_days", len(historicalSnapshots)),
+	)
+}
+
+// buildHistoricalSnapshots maps connector daily summaries to repo Snapshots
+// marked is_historical=true, skipping the today bucket (owned by the live
+// branch). Pure function — no IO — to keep the upsert loop testable.
+func buildHistoricalSnapshots(
+	connMeta *repository.ExchangeConnection,
+	hs []*connector.HistoricalSnapshot,
+	todayKey time.Time,
+) (snapshots []*repository.Snapshot, skippedToday int) {
+	for _, h := range hs {
+		dayKey := time.Date(h.Date.Year(), h.Date.Month(), h.Date.Day(), 0, 0, 0, 0, time.UTC)
+		if dayKey.Equal(todayKey) {
+			skippedToday++
+			continue
+		}
+
 		breakdown := &repository.MarketBreakdown{}
 		var totalAvailMargin float64
-		for mt, mb := range hs.Breakdown {
+		for mt, mb := range h.Breakdown {
 			metrics := &repository.MarketMetrics{
 				Equity:          mb.Equity,
 				AvailableMargin: mb.AvailableMargin,
@@ -948,43 +1126,84 @@ func (s *SyncService) syncIbkrFromFlex(ctx context.Context, connMeta *repository
 				breakdown.CFD = metrics
 			case connector.MarketForex:
 				breakdown.Forex = metrics
+			case connector.MarketSwap:
+				breakdown.Swap = metrics
+			case connector.MarketSpot:
+				breakdown.Spot = metrics
 			}
 		}
 		// TS-compat global aggregate: dashboard reads breakdown.global.equity,
 		// without it the IBKR equity shows as 0 on the frontend.
 		breakdown.Global = &repository.MarketMetrics{
-			Equity:          hs.TotalEquity,
+			Equity:          h.TotalEquity,
 			AvailableMargin: totalAvailMargin,
 		}
 
-		snapshot := &repository.Snapshot{
+		snapshots = append(snapshots, &repository.Snapshot{
 			UserUID:         connMeta.UserUID,
 			Exchange:        connMeta.Exchange,
 			Label:           connMeta.Label,
-			Timestamp:       hs.Date,
-			TotalEquity:     hs.TotalEquity,
-			RealizedBalance: hs.RealizedBalance,
-			UnrealizedPnL:   hs.TotalEquity - hs.RealizedBalance,
-			Deposits:        hs.Deposits,
-			Withdrawals:     hs.Withdrawals,
+			Timestamp:       dayKey,
+			TotalEquity:     h.TotalEquity,
+			RealizedBalance: h.RealizedBalance,
+			UnrealizedPnL:   h.TotalEquity - h.RealizedBalance,
+			Deposits:        h.Deposits,
+			Withdrawals:     h.Withdrawals,
+			TotalTrades:     h.TotalTrades,
+			TotalVolume:     h.TotalVolume,
+			TotalFees:       h.TotalFees,
 			Breakdown:       breakdown,
-		}
+			IsHistorical:    true,
+		})
+	}
+	return snapshots, skippedToday
+}
 
-		if err := s.snapshotRepo.Upsert(ctx, snapshot); err != nil {
-			s.logger.Warn("IBKR Flex: failed to upsert snapshot",
-				zap.String("date", hs.Date.Format("2006-01-02")),
-				zap.Error(err),
-			)
-			continue
-		}
-		processed++
+// isFirstSync returns true when no sync_status row exists for the connection
+// (i.e. the daily scheduler / manual sync has never previously completed for
+// this exchange+label). Falls back to "not first" if the repo isn't wired or
+// the lookup errors — better to under-log than to spuriously claim "first".
+func (s *SyncService) isFirstSync(ctx context.Context, connMeta *repository.ExchangeConnection) bool {
+	if s.syncStatus == nil {
+		return false
+	}
+	_, err := s.syncStatus.GetByUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
+	return err == repository.ErrNotFound
+}
+
+// logHistoryExpansion compares the earliest day Flex returned to the earliest
+// day already in the DB for this connection. If Flex now reaches further
+// back, log it — that signals the user widened their Flex query window and
+// the aggregator is reconstructing the new days.
+func (s *SyncService) logHistoryExpansion(ctx context.Context, connMeta *repository.ExchangeConnection, hs []*connector.HistoricalSnapshot, firstSync bool) {
+	if firstSync || len(hs) == 0 {
+		return
 	}
 
-	s.logger.Info("IBKR Flex sync completed",
-		zap.String("user_uid", connMeta.UserUID),
-		zap.Int("snapshots_upserted", processed),
-		zap.Int("total_days", len(historicalSnapshots)),
-	)
+	var minFlex time.Time
+	for _, h := range hs {
+		if minFlex.IsZero() || h.Date.Before(minFlex) {
+			minFlex = h.Date
+		}
+	}
+
+	minDB, err := s.snapshotRepo.GetEarliestTimestamp(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
+	if err != nil {
+		// ErrNotFound here means firstSync slipped through (e.g. sync_status
+		// missing for an existing user). Either way nothing to compare.
+		return
+	}
+
+	if minFlex.Before(minDB) {
+		s.logger.Info("IBKR Flex: history reconstruction detected",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.String("db_min", minDB.Format("2006-01-02")),
+			zap.String("flex_min", minFlex.Format("2006-01-02")),
+			zap.Int("days_added", int(minDB.Sub(minFlex).Hours()/24)),
+		)
+	}
 }
 
 // aggregatedBreakdown holds aggregated trade data

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/repository"
 )
 
 func TestAggregateSyncResults_PartialSuccessUsesLatestSnapshot(t *testing.T) {
@@ -462,5 +463,106 @@ func TestEarnBalanceEnrichment(t *testing.T) {
 	}
 	if repo.Earn.Equity != 5000 {
 		t.Fatalf("expected earn equity=5000, got %f", repo.Earn.Equity)
+	}
+}
+
+// IBKR Flex backfill: the today bucket is owned by the live branch (full
+// trade detail) and must never be overwritten from a Flex daily summary.
+func TestBuildHistoricalSnapshots_SkipsToday(t *testing.T) {
+	today := time.Date(2026, 5, 8, 0, 0, 0, 0, time.UTC)
+	connMeta := &repository.ExchangeConnection{
+		UserUID: "user_42", Exchange: "ibkr", Label: "main",
+	}
+	hs := []*connector.HistoricalSnapshot{
+		{Date: today.AddDate(0, 0, -2), TotalEquity: 1000},
+		{Date: today.AddDate(0, 0, -1), TotalEquity: 1100},
+		{Date: today, TotalEquity: 1200}, // must be skipped
+	}
+
+	snapshots, skipped := buildHistoricalSnapshots(connMeta, hs, today)
+
+	if skipped != 1 {
+		t.Fatalf("expected 1 skipped (today), got %d", skipped)
+	}
+	if len(snapshots) != 2 {
+		t.Fatalf("expected 2 snapshots, got %d", len(snapshots))
+	}
+	for _, s := range snapshots {
+		if s.Timestamp.Equal(today) {
+			t.Fatalf("today's bucket leaked into historical output")
+		}
+	}
+}
+
+// All snapshots produced by the Flex backfill carry IsHistorical=true so
+// consumers can tell reconstructed equity-only days from live full-trade
+// days.
+func TestBuildHistoricalSnapshots_MarksHistorical(t *testing.T) {
+	today := time.Date(2026, 5, 8, 0, 0, 0, 0, time.UTC)
+	connMeta := &repository.ExchangeConnection{
+		UserUID: "user_42", Exchange: "ibkr", Label: "",
+	}
+	hs := []*connector.HistoricalSnapshot{
+		{Date: today.AddDate(0, 0, -3), TotalEquity: 900},
+		{Date: today.AddDate(0, 0, -2), TotalEquity: 1000},
+	}
+
+	snapshots, _ := buildHistoricalSnapshots(connMeta, hs, today)
+
+	for _, s := range snapshots {
+		if !s.IsHistorical {
+			t.Fatalf("expected IsHistorical=true on Flex-derived snapshot at %s", s.Timestamp)
+		}
+		if s.UserUID != "user_42" || s.Exchange != "ibkr" {
+			t.Fatalf("connection metadata not propagated: %+v", s)
+		}
+	}
+}
+
+// Per-asset breakdown from Flex must be preserved end-to-end and the global
+// aggregate must be populated (the TS frontend reads breakdown.global.equity
+// for IBKR — without it the dashboard shows 0).
+func TestBuildHistoricalSnapshots_PreservesBreakdown(t *testing.T) {
+	today := time.Date(2026, 5, 8, 0, 0, 0, 0, time.UTC)
+	connMeta := &repository.ExchangeConnection{
+		UserUID: "user_42", Exchange: "ibkr", Label: "main",
+	}
+	day := today.AddDate(0, 0, -1)
+	hs := []*connector.HistoricalSnapshot{
+		{
+			Date:        day,
+			TotalEquity: 5000,
+			Breakdown: map[string]*connector.MarketBalance{
+				connector.MarketStocks:  {Equity: 3000, AvailableMargin: 1500},
+				connector.MarketFutures: {Equity: 2000, AvailableMargin: 500},
+			},
+		},
+	}
+
+	snapshots, _ := buildHistoricalSnapshots(connMeta, hs, today)
+	if len(snapshots) != 1 {
+		t.Fatalf("expected 1 snapshot, got %d", len(snapshots))
+	}
+	got := snapshots[0]
+	if got.Breakdown.Stocks == nil || got.Breakdown.Stocks.Equity != 3000 {
+		t.Fatalf("stocks breakdown lost")
+	}
+	if got.Breakdown.Futures == nil || got.Breakdown.Futures.Equity != 2000 {
+		t.Fatalf("futures breakdown lost")
+	}
+	if got.Breakdown.Global == nil || got.Breakdown.Global.Equity != 5000 {
+		t.Fatalf("global aggregate missing or wrong: %+v", got.Breakdown.Global)
+	}
+	// Sum of per-market AvailableMargin = 2000
+	if got.Breakdown.Global.AvailableMargin != 2000 {
+		t.Fatalf("global available margin: got %f want 2000", got.Breakdown.Global.AvailableMargin)
+	}
+}
+
+func TestBuildHistoricalSnapshots_EmptyInput(t *testing.T) {
+	connMeta := &repository.ExchangeConnection{UserUID: "u", Exchange: "ibkr"}
+	snapshots, skipped := buildHistoricalSnapshots(connMeta, nil, time.Now().UTC())
+	if len(snapshots) != 0 || skipped != 0 {
+		t.Fatalf("expected empty result for empty input, got snapshots=%d skipped=%d", len(snapshots), skipped)
 	}
 }

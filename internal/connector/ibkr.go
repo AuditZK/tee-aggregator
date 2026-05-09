@@ -556,11 +556,14 @@ func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*
 	if err != nil {
 		return nil, err
 	}
+	return i.parseHistoricalSnapshotsFromReport(report, since)
+}
 
-	if err != nil {
-		return nil, err
-	}
-
+// parseHistoricalSnapshotsFromReport extracts daily equity snapshots from a
+// raw Flex XML payload. Split out from GetHistoricalSnapshots so callers can
+// replay a captured XML offline (fixture-based tests, debug tools) without
+// triggering an IBKR Flex generation cooldown.
+func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time) ([]*HistoricalSnapshot, error) {
 	// Parse all daily equity summaries with per-asset breakdown
 	var flex struct {
 		XMLName        xml.Name `xml:"FlexQueryResponse"`
