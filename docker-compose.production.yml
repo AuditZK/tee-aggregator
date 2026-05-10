@@ -96,11 +96,11 @@ services:
       # SEC-ZK-001: external history-rebuilder-go service (NOT in ZK perimeter,
       # NOT signed). The enclave POSTs decrypted credentials there for non-IBKR
       # exchanges when the user has explicitly opted into rebuild_history at
-      # connection time. The URL is the in-network DNS — works because both
-      # stacks share the auditzk docker network. REBUILDER_INTERNAL_TOKEN must
-      # match the rebuilder's value (set in .env.production on both sides);
+      # connection time. URL pulled from .env.production (cross-VPS: typically
+      # https://<auditzk-host>/internal/history-rebuilder fronted by nginx +
+      # iptables-restricted to this enclave's IP). Empty = integration disabled.
+      # REBUILDER_INTERNAL_TOKEN must match the rebuilder's value;
       # CFG-002 fatals at boot if the URL is set but the token is missing.
-      - REBUILDER_SERVICE_URL=http://history-rebuilder:8080
     # SEV-SNP device access (AMD confidential computing)
     devices:
       - /dev/sev-guest:/dev/sev-guest
