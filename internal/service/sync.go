@@ -978,9 +978,14 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 	}
 
 	// SEC-ZK-001: fallback for non-ZK exchanges (Hyperliquid, Lighter, …) —
-	// hand off to the external history-rebuilder-service. Plaintext creds
-	// leave the enclave here. Explicitly accepted tradeoff: historical data
-	// is NOT sold as verifiable, the live snapshot path stays in-enclave.
+	// hand off to the external history-rebuilder-go. Plaintext creds leave
+	// the enclave here. Explicitly accepted tradeoff: historical data is
+	// NOT sold as verifiable, the live snapshot path stays in-enclave.
+	//
+	// The external rebuilder is request/response: it fetches exchange
+	// data, computes the daily timeline, and returns the snapshots in the
+	// HTTP response. The aggregator (this code) is the sole writer of
+	// user_snapshots — the rebuilder never touches the aggregator's DB.
 	if s.rebuilder == nil || !s.rebuilder.Configured() {
 		s.logger.Debug("history backfill: rebuilder not configured, skipping",
 			zap.String("user_uid", userUID),
@@ -988,13 +993,17 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 		)
 		return
 	}
-	resp, err := s.rebuilder.QueueRebuild(ctx, rebuilderclient.QueueRebuildRequest{
+	s.logger.Info("history backfill: dispatching to external rebuilder",
+		zap.String("user_uid", userUID),
+		zap.String("exchange", exchange),
+	)
+	res, err := s.rebuilder.Rebuild(ctx, rebuilderclient.RebuildRequest{
 		UserUID:  userUID,
 		Exchange: exchange,
 		Label:    label,
 		Credentials: rebuilderclient.Credentials{
 			// LOG-CREDS-001: this struct holds plaintext credentials. Once
-			// QueueRebuild returns, the local reference (`creds`) is dropped
+			// Rebuild returns, the local reference (`creds`) is dropped
 			// below; never log this struct or fmt.Sprintf it.
 			WalletAddress: creds.APIKey, // HL stores wallet in APIKey; harmless for others (rebuilder picks the right field per exchange)
 			APIKey:        creds.APIKey,
@@ -1007,18 +1016,22 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 	// GC, but this prevents accidental reuse of `creds` later in this scope.
 	creds = nil
 	if err != nil {
-		s.logger.Error("history backfill: rebuilder enqueue failed",
+		s.logger.Error("history backfill: rebuilder request failed",
 			zap.String("user_uid", userUID),
 			zap.String("exchange", exchange),
 			zap.Error(err),
 		)
 		return
 	}
-	s.logger.Info("history backfill: queued on external rebuilder",
+	s.logger.Info("history backfill: rebuilder returned snapshots",
 		zap.String("user_uid", userUID),
 		zap.String("exchange", exchange),
-		zap.String("job_id", resp.JobID),
+		zap.Int("snapshot_count", len(res.Snapshots)),
+		zap.Int64("rebuild_duration_ms", res.DurationMs),
 	)
+
+	firstSync := s.isFirstSync(ctx, connMeta)
+	s.persistHistoricalSnapshots(ctx, connMeta, res.Snapshots, firstSync, "rebuilder-service")
 }
 
 // syncIbkrFromFlex upserts every daily snapshot returned by the user's Flex
@@ -1061,6 +1074,20 @@ func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *
 		return
 	}
 
+	s.persistHistoricalSnapshots(ctx, connMeta, historicalSnapshots, firstSync, "in-enclave")
+}
+
+// persistHistoricalSnapshots is the upsert loop shared between the
+// in-enclave IBKR path and the external rebuilder path. The aggregator
+// owns the writes to snapshot_data — neither the connector nor the
+// external rebuilder writes user data directly.
+func (s *SyncService) persistHistoricalSnapshots(
+	ctx context.Context,
+	connMeta *repository.ExchangeConnection,
+	historicalSnapshots []*connector.HistoricalSnapshot,
+	firstSync bool,
+	source string,
+) {
 	// Today is owned by the live branch — never reconstruct it.
 	now := time.Now().UTC()
 	todayKey := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
@@ -1085,6 +1112,7 @@ func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *
 	s.logger.Info("history reconstruction completed",
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
+		zap.String("source", source),
 		zap.Int("snapshots_upserted", processed),
 		zap.Int("skipped_today", skippedToday),
 		zap.Int("total_days", len(historicalSnapshots)),
