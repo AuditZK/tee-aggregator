@@ -1,34 +1,29 @@
-# Parallel TEST stack — runs ALONGSIDE enclave_go_prod on the same TEE
-# VPS without touching prod state. Brings up:
+# Parallel TEST enclave — runs ALONGSIDE enclave_go_prod on the same TEE
+# VPS without touching prod state.
 #
-#   - enclave_go_test          — the aggregator (this repo, Dockerfile dev)
-#   - enclave_test_db          — its dedicated postgres (snapshot_data lives here)
-#   - history_rebuilder_test   — the external rebuilder (track_record_site/
-#                                history-rebuilder-go), built from a sibling
-#                                repo. Stateless w.r.t. user data: receives
-#                                creds via /history/rebuild and returns
-#                                snapshots in the response. The aggregator
-#                                writes them to enclave_test_db.
-#   - rebuilder_cache_db_test  — tiny postgres just for the rebuilder's
-#                                cross-user OHLCV cache (non-user data).
-#
-# Zero overlap with prod (docker-compose.production.yml):
-#   - Container names:  *_test  (prod: enclave_go_prod)
-#   - Network:          fresh `tee_test` bridge
-#   - Host ports:       127.0.0.1:8443 / 50063 / 5441 / 8084 / 5442
+# Zero overlap with the prod stack (docker-compose.production.yml):
+#   - Container names:  enclave_go_test, enclave_test_db (prod: enclave_go_prod)
+#   - Network:          fresh `tee_test` bridge (prod: external default net)
+#   - Host ports:       127.0.0.1:8443 / 127.0.0.1:50063 / 127.0.0.1:5441
 #                       (prod: 0.0.0.0:443 / 50061 / 50062, no DB container)
-#   - Image:            built from `Dockerfile` (NOT Dockerfile.production)
-#                       — bypasses snpguest + SEV-SNP attestation, so the
-#                       enclave runs as `unattested-dev`. Acceptable for an
-#                       integration test (we are NOT validating signed
-#                       reports here).
+#   - Database:         containerized postgres in `enclave_test_db`
+#                       (prod: Neon over DATABASE_URL in .env.production)
+#   - Image:            built from `Dockerfile` (NOT Dockerfile.production).
+#                       This bypasses snpguest + SEV-SNP attestation, so
+#                       the enclave runs as `unattested-dev`. Acceptable
+#                       for an isolation/integration test (we are NOT
+#                       validating signed reports here).
 #   - Devices/caps:     none. Prod mounts /dev/sev-guest + privileged.
 #
-# Usage on tee-milan-01:
+# The rebuilder (track_record_site/history-rebuilder-go) is NOT in this
+# compose. It runs on a separate VPS in both prod and test (auditzk
+# side, see track_record_site/docker-compose.test-rebuilder.yml). This
+# mirrors the prod topology where the enclave on the TEE VPS calls
+# across the network to the rebuilder on the auditzk VPS. To wire the
+# cross-VPS path for E2E, see the comment block on REBUILDER_SERVICE_URL
+# below.
 #
-#   # 0. one-time: clone the rebuilder repo as a sibling of this checkout
-#   #    (override path via REBUILDER_REPO_PATH if it lives elsewhere).
-#   git clone https://github.com/AuditZK/track_record_site.git ~/trackrecord
+# Usage on tee-milan-01:
 #
 #   # 1. one-time: generate self-signed TLS material for the REST listener
 #   mkdir -p certs-test
@@ -39,8 +34,7 @@
 #   chmod 644 certs-test/*.pem
 #
 #   # 2. bring up
-#   REBUILDER_REPO_PATH=~/trackrecord/history-rebuilder-go \
-#     docker compose -f docker-compose.test-enclave.yml up -d --build
+#   docker compose -f docker-compose.test-enclave.yml up -d --build
 #
 #   # 3. verify isolation — prod must still be healthy
 #   docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
@@ -48,11 +42,10 @@
 #   # 4. wipe (prod containers untouched)
 #   docker compose -f docker-compose.test-enclave.yml down -v
 #
-# The enclave defaults to talking to the in-network test rebuilder
-# (REBUILDER_SERVICE_URL=http://history_rebuilder_test:8080). Override
-# by exporting REBUILDER_URL=... before `up` to point elsewhere — empty
-# disables the hook entirely (rebuild_history:true becomes a silent
-# no-op, SEC-ZK-001 perimeter intact).
+# By default REBUILDER_SERVICE_URL is empty → the post-create hook is a
+# silent no-op (SEC-ZK-001 perimeter intact, no plaintext credentials
+# leave the test enclave). To wire the cross-VPS path with the parallel
+# test rebuilder on auditzk, see the REBUILDER_SERVICE_URL block below.
 
 services:
   enclave-test-db:
@@ -71,54 +64,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-    networks:
-      - tee_test
-
-  rebuilder-cache-db:
-    image: postgres:16-alpine
-    container_name: rebuilder_cache_db_test
-    environment:
-      POSTGRES_USER: rebuilder
-      POSTGRES_PASSWORD: rebuilder
-      POSTGRES_DB: rebuilder_cache
-    ports:
-      - "127.0.0.1:5442:5432"
-    volumes:
-      - rebuilder-cache-db-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rebuilder -d rebuilder_cache"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    networks:
-      - tee_test
-
-  test-rebuilder:
-    build:
-      # Override via REBUILDER_REPO_PATH=... if the rebuilder repo lives
-      # elsewhere. Default: a sibling clone of trackrecord at
-      # ../trackrecord/history-rebuilder-go.
-      context: ${REBUILDER_REPO_PATH:-../trackrecord/history-rebuilder-go}
-      dockerfile: Dockerfile
-    image: history-rebuilder-go:test
-    container_name: history_rebuilder_test
-    restart: unless-stopped
-    environment:
-      PORT: 8080
-      LOG_LEVEL: debug
-      # Cache-only DB (no user data lives here — see the rebuilder's
-      # 001_init.sql, which now provisions exchange_ohlcv only).
-      NEON_DATABASE_URL: postgres://rebuilder:rebuilder@rebuilder-cache-db:5432/rebuilder_cache?sslmode=disable
-      REBUILDER_AUTH_MODE: shared-secret
-      # Test-only token. Must match REBUILDER_INTERNAL_TOKEN below.
-      REBUILDER_INTERNAL_TOKEN: ${REBUILDER_TOKEN:-test-token-abc123def456ghi789jkl012mno345}
-      CORS_ORIGIN: "*"
-    ports:
-      # Loopback only — host-side port for direct curl smoke tests.
-      - "127.0.0.1:8084:8080"
-    depends_on:
-      rebuilder-cache-db:
-        condition: service_healthy
     networks:
       - tee_test
 
@@ -144,11 +89,39 @@ services:
       CORS_ORIGIN: "*"
       TLS_CERT_PATH: /app/certs/cert.pem
       TLS_KEY_PATH: /app/certs/key.pem
-      # In-network rebuilder. Override REBUILDER_URL=http://... at compose
-      # time to point elsewhere; export REBUILDER_URL="" to disable the
-      # post-create hook entirely (rebuild_history:true becomes a silent
-      # no-op, SEC-ZK-001 perimeter intact).
-      REBUILDER_SERVICE_URL: ${REBUILDER_URL-http://history_rebuilder_test:8080}
+      # E2E with the parallel test rebuilder on the auditzk VPS:
+      #
+      #   On auditzk: pull the rebuilder refactor and rebuild the image
+      #               so the running container speaks the new
+      #               request/response protocol (no Redis, no async).
+      #
+      #   Cross-VPS reach (the rebuilder's host port 3006 is bound on
+      #   127.0.0.1 by default, unreachable from another VPS). Two
+      #   options to bridge — pick whichever fits your environment:
+      #
+      #     A) iptables-restricted public bind on auditzk (rehearsal of
+      #        the prod path, no SSH plumbing). On auditzk:
+      #          docker stop auditzk_test_history_rebuilder
+      #          docker rm   auditzk_test_history_rebuilder
+      #          # Re-up with a public bind, then add an iptables rule
+      #          # allowing only tee-milan-01's source IP to TCP/3006.
+      #          # See the runbook in track_record_site/TEST-DEPLOY.md.
+      #
+      #     B) SSH local-forward from tee-milan-01 to auditzk. Requires
+      #        `GatewayPorts yes` in /etc/ssh/sshd_config on
+      #        tee-milan-01 (so the forwarded port is reachable from a
+      #        Docker container, not just from host loopback):
+      #          ssh -fN -L 172.17.0.1:3006:localhost:3006 \
+      #              auditzk@<auditzk-public-host>
+      #        Then REBUILDER_URL=http://172.17.0.1:3006 below.
+      #
+      #   Then recreate the enclave:
+      #     REBUILDER_URL=http://<reachable-host>:3006 \
+      #       docker compose -f docker-compose.test-enclave.yml \
+      #       up -d --force-recreate enclave-test
+      #
+      # Empty (default) = rebuilder hook off, no plaintext creds exit.
+      REBUILDER_SERVICE_URL: ${REBUILDER_URL:-}
       REBUILDER_INTERNAL_TOKEN: ${REBUILDER_TOKEN:-test-token-abc123def456ghi789jkl012mno345}
     ports:
       - "127.0.0.1:8443:8080"
@@ -158,8 +131,6 @@ services:
     depends_on:
       enclave-test-db:
         condition: service_healthy
-      test-rebuilder:
-        condition: service_started
     networks:
       - tee_test
 
@@ -169,4 +140,3 @@ networks:
 
 volumes:
   enclave-test-db-data:
-  rebuilder-cache-db-data:
