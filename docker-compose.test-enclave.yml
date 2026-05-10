@@ -1,0 +1,122 @@
+# Parallel TEST enclave — runs ALONGSIDE enclave_go_prod on the same TEE
+# VPS without touching prod state.
+#
+# Zero overlap with the prod stack (docker-compose.production.yml):
+#   - Container names:  enclave_go_test, enclave_test_db (prod: enclave_go_prod)
+#   - Network:          fresh `tee_test` bridge (prod: external default net)
+#   - Host ports:       127.0.0.1:8443 / 127.0.0.1:50063 / 127.0.0.1:5441
+#                       (prod: 0.0.0.0:443 / 50061 / 50062, no DB container)
+#   - Database:         containerized postgres in `enclave_test_db`
+#                       (prod: Neon over DATABASE_URL in .env.production)
+#   - Image:            built from `Dockerfile` (NOT Dockerfile.production).
+#                       This bypasses snpguest + SEV-SNP attestation, so
+#                       the enclave runs as `unattested-dev`. Acceptable
+#                       for an isolation/integration test (we are NOT
+#                       validating signed reports here).
+#   - Devices/caps:     none. Prod mounts /dev/sev-guest + privileged.
+#
+# Usage on tee-milan-01:
+#
+#   # 1. one-time: generate self-signed TLS material for the REST listener
+#   mkdir -p certs-test
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+#     -keyout certs-test/key.pem -out certs-test/cert.pem \
+#     -subj "/CN=localhost" \
+#     -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+#
+#   # 2. bring up
+#   docker-compose -f docker-compose.test-enclave.yml up -d --build
+#
+#   # 3. verify isolation — prod must still be healthy
+#   docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+#
+#   # 4. wipe (prod containers untouched)
+#   docker-compose -f docker-compose.test-enclave.yml down -v
+#
+# By default REBUILDER_SERVICE_URL is empty → the post-create hook is a
+# silent no-op (SEC-ZK-001 perimeter intact, no plaintext credentials
+# leave the test enclave). To wire the parallel test rebuilder running
+# on the auditzk VPS for full E2E, see the comment block on the
+# REBUILDER_SERVICE_URL line below.
+
+services:
+  enclave-test-db:
+    image: postgres:16-alpine
+    container_name: enclave_test_db
+    environment:
+      POSTGRES_USER: enclave
+      POSTGRES_PASSWORD: enclave
+      POSTGRES_DB: enclave_test
+    ports:
+      - "127.0.0.1:5441:5432"
+    volumes:
+      - enclave-test-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enclave -d enclave_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tee_test
+
+  enclave-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: enclave-go:test
+    container_name: enclave_go_test
+    restart: unless-stopped
+    environment:
+      ENV: development
+      LOG_LEVEL: debug
+      DATABASE_URL: postgres://enclave:enclave@enclave-test-db:5432/enclave_test?sslmode=disable
+      ENCRYPTION_KEY: test-encryption-key-32-bytes-padded-zzz
+      ENCLAVE_JWT_SECRET: test-jwt-secret-not-for-prod-use-only-pad
+      AUTO_MIGRATE: "true"
+      ENABLE_DAILY_SYNC: "false"
+      ENABLE_LEGACY_REST: "true"
+      GRPC_INSECURE: "true"
+      CORS_ORIGIN: "*"
+      TLS_CERT_PATH: /app/certs/cert.pem
+      TLS_KEY_PATH: /app/certs/key.pem
+      # E2E with the parallel test rebuilder on the auditzk VPS:
+      #
+      #   On auditzk: ensure auditzk_test_history_rebuilder is up
+      #               (docker-compose.test-rebuilder.yml).
+      #   On tee-milan-01: tunnel auditzk's loopback rebuilder port over to
+      #               the docker bridge gateway so this container can reach
+      #               it. Requires `GatewayPorts yes` in /etc/ssh/sshd_config
+      #               on tee-milan-01, OR use socat as below.
+      #
+      #     # bind to docker0 (172.17.0.1 typically — verify with
+      #     # `ip -4 addr show docker0`):
+      #     ssh -fN -L 172.17.0.1:3006:localhost:3006 \
+      #         auditzk@<auditzk-public-host>
+      #
+      #     # or, if GatewayPorts is off, run socat in a sidecar container.
+      #
+      #   Then recreate this enclave with:
+      #     REBUILDER_URL=http://172.17.0.1:3006 \
+      #       docker-compose -f docker-compose.test-enclave.yml \
+      #       up -d --force-recreate enclave-test
+      #
+      # Empty (default) = rebuilder hook off, no plaintext creds exit.
+      REBUILDER_SERVICE_URL: ${REBUILDER_URL:-}
+      REBUILDER_INTERNAL_TOKEN: ${REBUILDER_TOKEN:-test-token-abc123def456ghi789jkl012mno345}
+    ports:
+      - "127.0.0.1:8443:8080"
+      - "127.0.0.1:50063:50051"
+    volumes:
+      - ./certs-test:/app/certs:ro
+    depends_on:
+      enclave-test-db:
+        condition: service_healthy
+    networks:
+      - tee_test
+
+networks:
+  tee_test:
+    driver: bridge
+
+volumes:
+  enclave-test-db-data:
