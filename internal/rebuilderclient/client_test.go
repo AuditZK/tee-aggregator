@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -17,13 +18,13 @@ func TestClient_NotConfigured(t *testing.T) {
 	if c.Configured() {
 		t.Fatal("expected Configured()=false when baseURL+token empty")
 	}
-	_, err := c.QueueRebuild(context.Background(), QueueRebuildRequest{})
+	_, err := c.Rebuild(context.Background(), RebuildRequest{})
 	if err == nil {
 		t.Fatal("expected error when not configured")
 	}
 }
 
-func TestClient_QueueRebuild_SendsAuthHeaderAndPayload(t *testing.T) {
+func TestClient_Rebuild_SendsAuthHeaderAndPayload(t *testing.T) {
 	var gotToken string
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,12 +32,19 @@ func TestClient_QueueRebuild_SendsAuthHeaderAndPayload(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		gotBody = body
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"jobId":"j-123","status":"queued"}`))
+		_, _ = w.Write([]byte(`{
+			"exchange":"hyperliquid","count":2,"durationMs":1234,
+			"snapshots":[
+				{"date":"2026-04-01T00:00:00Z","totalEquity":1000.5,"realizedBalance":900,"deposits":100,"withdrawals":0,"totalTrades":3,"totalVolume":50,"totalFees":0.25,
+				 "breakdown":{"swap":{"marketType":"swap","equity":1000.5,"availableMargin":600}}},
+				{"date":"2026-04-02T00:00:00Z","totalEquity":1010.75,"realizedBalance":900,"deposits":0,"withdrawals":0,"totalTrades":0,"totalVolume":0,"totalFees":0}
+			]
+		}`))
 	}))
 	defer srv.Close()
 
 	c := New(srv.URL, "secret-token", zap.NewNop())
-	resp, err := c.QueueRebuild(context.Background(), QueueRebuildRequest{
+	res, err := c.Rebuild(context.Background(), RebuildRequest{
 		UserUID:     "u1",
 		Exchange:    "hyperliquid",
 		Label:       "main",
@@ -45,26 +53,44 @@ func TestClient_QueueRebuild_SendsAuthHeaderAndPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if resp.JobID != "j-123" || resp.Status != "queued" {
-		t.Fatalf("unexpected resp: %+v", resp)
+	if got := len(res.Snapshots); got != 2 {
+		t.Fatalf("snapshot count: got %d want 2", got)
 	}
+	if res.DurationMs != 1234 {
+		t.Errorf("durationMs: got %d want 1234", res.DurationMs)
+	}
+	first := res.Snapshots[0]
+	if first.TotalEquity != 1000.5 || first.TotalTrades != 3 || first.Deposits != 100 {
+		t.Errorf("first snapshot mapping wrong: %+v", first)
+	}
+	if first.Date.Year() != 2026 || first.Date.Month() != time.April || first.Date.Day() != 1 {
+		t.Errorf("first snapshot date: got %v want 2026-04-01", first.Date)
+	}
+	swap := first.Breakdown["swap"]
+	if swap == nil || swap.MarketType != "swap" || swap.Equity != 1000.5 || swap.AvailableMargin != 600 {
+		t.Errorf("breakdown not mapped: %+v", swap)
+	}
+	// Second snapshot has no breakdown — must round-trip as nil, not empty.
+	if res.Snapshots[1].Breakdown != nil {
+		t.Errorf("second snapshot should have nil breakdown, got %v", res.Snapshots[1].Breakdown)
+	}
+
 	if gotToken != "secret-token" {
 		t.Errorf("X-Internal-Token: got %q want %q", gotToken, "secret-token")
 	}
-	var sent QueueRebuildRequest
+	var sent RebuildRequest
 	if err := json.Unmarshal(gotBody, &sent); err != nil {
 		t.Fatalf("body not valid JSON: %v", err)
 	}
 	if sent.Credentials.WalletAddress != "0xabc" {
 		t.Errorf("wallet not propagated: %+v", sent)
 	}
-	// Request body should NOT contain unrelated empty fields beyond what we set.
 	if !strings.Contains(string(gotBody), `"hyperliquid"`) {
 		t.Errorf("body missing exchange: %s", gotBody)
 	}
 }
 
-func TestClient_QueueRebuild_PropagatesHTTPError(t *testing.T) {
+func TestClient_Rebuild_PropagatesHTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
@@ -72,7 +98,7 @@ func TestClient_QueueRebuild_PropagatesHTTPError(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "wrong-token", zap.NewNop())
-	_, err := c.QueueRebuild(context.Background(), QueueRebuildRequest{UserUID: "u1", Exchange: "hyperliquid"})
+	_, err := c.Rebuild(context.Background(), RebuildRequest{UserUID: "u1", Exchange: "hyperliquid"})
 	if err == nil {
 		t.Fatal("expected error on 401")
 	}
@@ -85,7 +111,7 @@ func TestClient_QueueRebuild_PropagatesHTTPError(t *testing.T) {
 // credentials, even when the upstream rebuilder echoes them in its response
 // body. Regression guard against future "include the body in the error
 // message for debugging" temptations.
-func TestClient_QueueRebuild_ErrorDoesNotLeakCredentials(t *testing.T) {
+func TestClient_Rebuild_ErrorDoesNotLeakCredentials(t *testing.T) {
 	const sentinelKey = "REAL-API-KEY-00000000000000000"
 	const sentinelSecret = "REAL-API-SECRET-1111111111111"
 	const sentinelPass = "REAL-PASSPHRASE-22222222"
@@ -96,14 +122,12 @@ func TestClient_QueueRebuild_ErrorDoesNotLeakCredentials(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusInternalServerError)
-		// Embed the raw body in the response — what the client sees if it
-		// (incorrectly) decides to include the response body in its error.
 		_, _ = w.Write([]byte(`{"error":"internal","echo":` + string(mustJSON(string(body))) + `}`))
 	}))
 	defer srv.Close()
 
 	c := New(srv.URL, "secret-token", zap.NewNop())
-	_, err := c.QueueRebuild(context.Background(), QueueRebuildRequest{
+	_, err := c.Rebuild(context.Background(), RebuildRequest{
 		UserUID:  "u1",
 		Exchange: "hyperliquid",
 		Credentials: Credentials{
@@ -129,9 +153,6 @@ func mustJSON(v string) []byte {
 	return out
 }
 
-// Local alias to keep the test file's import block tidy. encoding/json is
-// already imported above; redirect through this helper so the leak-test
-// assertion logic reads cleanly.
 var jsonMarshal = func(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
