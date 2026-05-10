@@ -74,7 +74,12 @@ services:
       # 32-byte hex (64 chars). Synthetic, throwaway — DEK derivation in
       # this test stack uses no real master key and the DB is ephemeral.
       ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-      ENCLAVE_JWT_SECRET: test-jwt-secret-not-for-prod-use-only-pad
+      # ENCLAVE_JWT_SECRET intentionally unset in this test compose.
+      # The REST jwtRequired middleware passes through when the secret
+      # is empty (dev policy), which lets us hit /api/v1/connection from
+      # curl without standing up a JWT issuer / gateway in front. Set
+      # this in a separate compose override if you specifically want to
+      # test the JWT-gated path.
       AUTO_MIGRATE: "true"
       ENABLE_DAILY_SYNC: "false"
       ENABLE_LEGACY_REST: "true"
