@@ -70,7 +70,9 @@ services:
       ENV: development
       LOG_LEVEL: debug
       DATABASE_URL: postgres://enclave:enclave@enclave-test-db:5432/enclave_test?sslmode=disable
-      ENCRYPTION_KEY: test-encryption-key-32-bytes-padded-zzz
+      # 32-byte hex (64 chars). Synthetic, throwaway — DEK derivation in
+      # this test stack uses no real master key and the DB is ephemeral.
+      ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       ENCLAVE_JWT_SECRET: test-jwt-secret-not-for-prod-use-only-pad
       AUTO_MIGRATE: "true"
       ENABLE_DAILY_SYNC: "false"
