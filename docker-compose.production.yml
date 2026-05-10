@@ -41,6 +41,9 @@ services:
     #   DATABASE_URL, ENCRYPTION_KEY, ENCLAVE_JWT_SECRET, CORS_ORIGIN,
     #   GRPC_CLIENT_CERT_CN_ALLOWLIST, MT_BRIDGE_URL, MT_BRIDGE_HMAC_SECRET,
     #   LOG_STREAM_API_KEY, TLS_CERT_PATH, TLS_KEY_PATH
+    # Required when REBUILDER_SERVICE_URL is set (see environment: below):
+    #   REBUILDER_INTERNAL_TOKEN (≥24 chars; same value as the rebuilder's
+    #     env, otherwise the rebuilder rejects with 401)
     # Optional:
     #   LOG_LEVEL (default: info), BENCHMARK_SERVICE_URL,
     #   ERRTRACK_CAPACITY, ERRTRACK_NEW_GROUP_RATE
@@ -90,6 +93,14 @@ services:
       - TLS_CA_CERT=/etc/enclave/ca.crt
       - TLS_SERVER_CERT=/etc/enclave/server.crt
       - TLS_SERVER_KEY=/etc/enclave/server.key
+      # SEC-ZK-001: external history-rebuilder-go service (NOT in ZK perimeter,
+      # NOT signed). The enclave POSTs decrypted credentials there for non-IBKR
+      # exchanges when the user has explicitly opted into rebuild_history at
+      # connection time. The URL is the in-network DNS — works because both
+      # stacks share the auditzk docker network. REBUILDER_INTERNAL_TOKEN must
+      # match the rebuilder's value (set in .env.production on both sides);
+      # CFG-002 fatals at boot if the URL is set but the token is missing.
+      - REBUILDER_SERVICE_URL=http://history-rebuilder:8080
     # SEV-SNP device access (AMD confidential computing)
     devices:
       - /dev/sev-guest:/dev/sev-guest
