@@ -17,7 +17,6 @@ import (
 const (
 	errFmtGetConnections      = "get connections: %w"
 	errFmtNoActiveConnections = "no active connections for user %s"
-	errMsgSnapshotBuildFailed = "snapshot build failed"
 )
 
 // SyncService orchestrates exchange synchronization.
@@ -578,7 +577,7 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 	var snapshots []*repository.Snapshot
 	for _, r := range results {
 		if r.Error != "" {
-			s.logger.Error("connection sync failed",
+			s.logger.Error(classifySyncError(r.Error),
 				zap.String("user_uid", userUID),
 				zap.String("exchange", r.Exchange),
 				zap.String("label", r.Label),
@@ -651,14 +650,14 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
 	if err != nil {
 		result.Error = fmt.Sprintf("get credentials: %v", err)
-		s.logger.Error(errMsgSnapshotBuildFailed, zap.String("exchange", connMeta.Exchange), zap.String("step", "decrypt"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+		s.logger.Error(classifySyncError(result.Error), zap.String("exchange", connMeta.Exchange), zap.String("step", "decrypt"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return result
 	}
 
 	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, creds)
 	if err != nil {
 		result.Error = fmt.Sprintf("create connector: %v", err)
-		s.logger.Error(errMsgSnapshotBuildFailed, zap.String("exchange", connMeta.Exchange), zap.String("step", "connector"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+		s.logger.Error(classifySyncError(result.Error), zap.String("exchange", connMeta.Exchange), zap.String("step", "connector"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return result
 	}
 
@@ -672,7 +671,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	balance, err := conn.GetBalance(ctx)
 	if err != nil {
 		result.Error = fmt.Sprintf("get balance: %v", err)
-		s.logger.Error(errMsgSnapshotBuildFailed, zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.String("step", "get_balance"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+		s.logger.Error(classifySyncError(result.Error), zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.String("step", "get_balance"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return result
 	}
 	s.logger.Info("balance fetched", zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.Duration("elapsed", time.Since(start)))
