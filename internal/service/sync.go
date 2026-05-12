@@ -327,7 +327,7 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	}
 
 	// 2. Get or create connector (cached, TS parity: UniversalConnectorCache)
-	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, creds)
+	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, connMeta.Label, creds)
 	if err != nil {
 		result.Error = fmt.Sprintf("create connector: %v", err)
 		return result
@@ -654,7 +654,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		return result
 	}
 
-	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, creds)
+	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, connMeta.Label, creds)
 	if err != nil {
 		result.Error = fmt.Sprintf("create connector: %v", err)
 		s.logger.Error(classifySyncError(result.Error), zap.String("exchange", connMeta.Exchange), zap.String("step", "connector"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
@@ -1074,7 +1074,7 @@ func (m *marketAgg) toRepoMetrics() *repository.MarketMetrics {
 
 // getOrCreateConnector returns a cached connector or creates a new one.
 // TS parity: UniversalConnectorCache with SHA-256 credentials hash.
-func (s *SyncService) getOrCreateConnector(exchange, userUID string, creds *Credentials) (connector.Connector, error) {
+func (s *SyncService) getOrCreateConnector(exchange, userUID, label string, creds *Credentials) (connector.Connector, error) {
 	credsHash := cache.HashCredentials(creds.APIKey, creds.APISecret, creds.Passphrase)
 
 	// Check cache first
@@ -1093,6 +1093,15 @@ func (s *SyncService) getOrCreateConnector(exchange, userUID string, creds *Cred
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// Wire token persistence for OAuth connectors so refreshed tokens survive
+	// container restarts. Without this, every boot starts from the original
+	// (possibly expired) access_token stored in DB.
+	if tr, ok := conn.(connector.TokenRefreshable); ok && s.connSvc != nil {
+		tr.SetTokenPersister(func(ctx context.Context, accessToken, refreshToken string) error {
+			return s.connSvc.PersistOAuthTokens(ctx, userUID, exchange, label, accessToken, refreshToken)
+		})
 	}
 
 	// Store in cache
@@ -1120,7 +1129,7 @@ func (s *SyncService) DumpCashflows(
 		return nil, fmt.Errorf("decrypt credentials: %w", err)
 	}
 
-	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, creds)
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
 	if err != nil {
 		return nil, fmt.Errorf("build connector: %w", err)
 	}

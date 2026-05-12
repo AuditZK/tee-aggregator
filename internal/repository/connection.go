@@ -786,6 +786,34 @@ func (r *ConnectionRepo) Deactivate(ctx context.Context, id string) error {
 	return err
 }
 
+// UpdateOAuthTokens replaces the encrypted api_key and api_secret (access_token
+// and refresh_token) for an OAuth connection identified by (userUID, exchange, label).
+// Both values must be TS-format ciphertexts (hex-packed iv16||tag16||ciphertext).
+// IV/AuthTag columns are cleared so the TS-format read path is used on the next
+// decrypt regardless of what format was originally stored.
+func (r *ConnectionRepo) UpdateOAuthTokens(ctx context.Context, userUID, exchange, label, encAccessToken, encRefreshToken string) error {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	isTS := r.isTSSchema
+	r.capMu.Unlock()
+
+	now := time.Now().UTC()
+	var query string
+	if isTS {
+		query = `UPDATE exchange_connections
+			SET "encryptedApiKey" = $1, "encryptedApiSecret" = $2, "updatedAt" = $3
+			WHERE "userUid" = $4 AND exchange = $5 AND label = $6 AND "isActive" = true`
+	} else {
+		query = `UPDATE exchange_connections
+			SET encrypted_api_key = $1, api_key_iv = '', api_key_auth_tag = '',
+			    encrypted_api_secret = $2, api_secret_iv = '', api_secret_auth_tag = '',
+			    updated_at = $3
+			WHERE user_uid = $4 AND exchange = $5 AND label = $6 AND is_active = true`
+	}
+	_, err := r.pool.Exec(ctx, query, encAccessToken, encRefreshToken, now, userUID, exchange, label)
+	return err
+}
+
 func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentialsHash bool, hasSyncIntervalMinutes bool, hasExcludeFromReport bool, hasKYCLevel bool, hasIsPaper bool) {
 	r.capMu.Lock()
 	defer r.capMu.Unlock()

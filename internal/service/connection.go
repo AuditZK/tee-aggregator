@@ -303,6 +303,22 @@ func (s *ConnectionService) decryptField(ciphertext, iv, authTag string) (string
 	return s.encryption.DecryptTSString(ciphertext)
 }
 
+// PersistOAuthTokens re-encrypts refreshed access/refresh tokens and writes
+// them back to the connection row for (userUID, exchange, label). Called by
+// the cTrader connector's token persister after a successful OAuth refresh so
+// the next boot does not start with an already-expired access_token.
+func (s *ConnectionService) PersistOAuthTokens(ctx context.Context, userUID, exchange, label, accessToken, refreshToken string) error {
+	encAccess, err := s.encryption.EncryptTSString(accessToken)
+	if err != nil {
+		return fmt.Errorf("encrypt access token: %w", err)
+	}
+	encRefresh, err := s.encryption.EncryptTSString(refreshToken)
+	if err != nil {
+		return fmt.Errorf("encrypt refresh token: %w", err)
+	}
+	return s.repo.UpdateOAuthTokens(ctx, userUID, exchange, label, encAccess, encRefresh)
+}
+
 func hashCredentials(apiKey, apiSecret, passphrase string) string {
 	input := fmt.Sprintf("%s:%s:%s", apiKey, apiSecret, passphrase)
 	sum := sha256.Sum256([]byte(input))

@@ -732,17 +732,32 @@ func (c *CTrader) refreshAccessToken(ctx context.Context) error {
 	}
 
 	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+		// cTrader error shape (HTTP 200 with error body)
+		ErrorCode   string `json:"errorCode"`
+		Description string `json:"description"`
+		// Standard OAuth2 error shape
+		OAuthError string `json:"error"`
 	}
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return err
+	}
+	if tokenResp.ErrorCode != "" {
+		return fmt.Errorf("token refresh rejected: %s - %s", tokenResp.ErrorCode, tokenResp.Description)
+	}
+	if tokenResp.OAuthError != "" {
+		return fmt.Errorf("token refresh rejected: %s", tokenResp.OAuthError)
 	}
 	if strings.TrimSpace(tokenResp.AccessToken) == "" {
 		return fmt.Errorf("token refresh response missing access_token")
 	}
 
 	c.accessToken = strings.TrimSpace(tokenResp.AccessToken)
+	if strings.TrimSpace(tokenResp.RefreshToken) != "" {
+		c.refreshToken = strings.TrimSpace(tokenResp.RefreshToken)
+	}
 
 	// Persist refreshed tokens to DB if callback is set (TS parity)
 	if c.tokenPersister != nil {
