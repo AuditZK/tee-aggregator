@@ -50,6 +50,7 @@ type KeyManagementService struct {
 
 	currentDEK []byte
 	dekID      string
+	dekSchema  string // "go-snake" or "ts-camel" — set by loadActiveDEK; needed for in-place re-wrap UPDATEs to target the correct column names.
 	mu         sync.RWMutex
 
 	allowAutoInit bool
@@ -267,6 +268,7 @@ func (s *KeyManagementService) initializeDEK(ctx context.Context) error {
 
 	s.currentDEK = unwrapped
 	s.dekID = dek.ID
+	s.dekSchema = schema
 
 	// Legacy-migration auto-rewrap: when the operator booted this
 	// enclave with an LegacyMasterKeyHex (B2 v0→v1 migration), the
@@ -471,10 +473,22 @@ func (s *KeyManagementService) rewrapActiveDEKWithMeasurementKey(ctx context.Con
 	// the wrap is, so any sibling enclave still able to derive the
 	// legacy master key would lose access — but that's the point of
 	// the migration. The old wrap is replaced atomically.
-	if _, err := s.pool.Exec(ctx, `
-		UPDATE data_encryption_keys
-		SET encrypted_dek = $1, iv = $2, auth_tag = $3, master_key_id = $4
-		WHERE id = $5`,
+	//
+	// The DB may use either the Go snake_case schema or the TS Prisma
+	// camelCase schema; loadActiveDEK detected which one and stashed it
+	// in s.dekSchema, so we pick the matching UPDATE here.
+	var updateSQL string
+	switch s.dekSchema {
+	case "ts-camel":
+		updateSQL = `UPDATE data_encryption_keys
+			SET "encryptedDEK" = $1, iv = $2, "authTag" = $3, "masterKeyId" = $4
+			WHERE id = $5`
+	default:
+		updateSQL = `UPDATE data_encryption_keys
+			SET encrypted_dek = $1, iv = $2, auth_tag = $3, master_key_id = $4
+			WHERE id = $5`
+	}
+	if _, err := s.pool.Exec(ctx, updateSQL,
 		wrapped.Ciphertext, wrapped.IV, wrapped.AuthTag,
 		s.measurementMasterKeyID, s.dekID,
 	); err != nil {
