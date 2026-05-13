@@ -32,7 +32,11 @@ func classifySyncError(errStr string) string {
 		return "sync: credential rejected by exchange"
 	case strings.Contains(s, "missing access_token"),
 		strings.Contains(s, "invalid_grant"),
-		strings.Contains(s, "refresh_token expired"):
+		strings.Contains(s, "refresh_token expired"),
+		strings.Contains(s, "token refresh rejected"),
+		strings.Contains(s, "ACCESS_DENIED"),
+		strings.Contains(s, "OAuth token"),
+		strings.Contains(s, "oauth token"):
 		return "sync: OAuth refresh failed"
 	case strings.Contains(s, "User status is abnormal"),
 		strings.Contains(s, "account is suspended"),
