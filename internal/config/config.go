@@ -96,6 +96,17 @@ type Config struct {
 	// Parsed from HANDOFF_PEER_URL.
 	HandoffPeerURL string
 
+	// LegacyMasterKeyHex is the raw 32-byte master key (hex-encoded) that
+	// the previous enclave used to wrap the active DEK. Set this when the
+	// SEV-SNP measurement changed (host migration, firmware update) and the
+	// new enclave cannot unwrap the existing DEK with the measurement-derived
+	// key. The enclave will use this key for the initial unwrap, then
+	// automatically re-wrap the DEK with the new measurement-derived master
+	// key. Remove from env once the enclave boots successfully (the re-wrap
+	// persists to DB, so subsequent boots no longer need it).
+	// Parsed from LEGACY_MASTER_KEY_HEX.
+	LegacyMasterKeyHex string
+
 	// HandoffSignedAllowlist holds the operator-signed JSON document
 	// listing approved release measurements. Inlined here to allow
 	// override via the GCP `signed-allowlist` metadata key when shipping
@@ -168,6 +179,7 @@ func Load() *Config {
 
 		HandoffPeerURL:         strings.TrimSpace(getEnv("HANDOFF_PEER_URL", "")),
 		HandoffSignedAllowlist: getEnv("HANDOFF_SIGNED_ALLOWLIST", ""),
+		LegacyMasterKeyHex:    strings.TrimSpace(getEnv("LEGACY_MASTER_KEY_HEX", "")),
 
 		ErrTrack: ErrTrackConfig{
 			Enabled:      getEnvBool("ERRTRACK_ENABLED", false),

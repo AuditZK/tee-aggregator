@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -191,6 +192,26 @@ func main() {
 				logger.Fatal("B2 handoff failed", zap.Error(err))
 			}
 			defer wipeBytes(externalMasterKey)
+		} else if cfg.LegacyMasterKeyHex != "" {
+			// Measurement-migration path: the SEV-SNP measurement changed
+			// (host migration, firmware update) and the existing DEK was
+			// wrapped with a master key derived from the old measurement.
+			// The operator supplies the old master key as hex; we use it
+			// for the initial unwrap, after which key_management.go
+			// auto-rewraps the DEK with the new measurement-derived key
+			// and persists it. Remove LEGACY_MASTER_KEY_HEX once the
+			// enclave boots cleanly (see LegacyMasterKeyHex in config.go).
+			externalMasterKey, err = hex.DecodeString(cfg.LegacyMasterKeyHex)
+			if err != nil || len(externalMasterKey) != 32 {
+				logger.Fatal("LEGACY_MASTER_KEY_HEX is invalid",
+					zap.String("hint", "must be 64 hex characters (32 bytes)"),
+					zap.Error(err),
+				)
+			}
+			defer wipeBytes(externalMasterKey)
+			logger.Info("using legacy master key for DEK unwrap (measurement migration)",
+				zap.String("hint", "remove LEGACY_MASTER_KEY_HEX after this boot succeeds"),
+			)
 		}
 
 		keyMgmt, err = encryption.NewKeyManagementService(pool, encryption.KeyManagementOptions{
