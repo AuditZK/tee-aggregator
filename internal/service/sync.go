@@ -961,7 +961,7 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 		)
 		return
 	}
-	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, creds)
+	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, label, creds)
 	if err != nil {
 		s.logger.Error("history backfill: connector create failed",
 			zap.String("user_uid", userUID),
