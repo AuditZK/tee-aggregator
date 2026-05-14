@@ -1,0 +1,13 @@
+# Dockerfile.patch — fast Go-only update, no snpguest rebuild.
+#
+# Cross-compile on dev:
+#   GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-w -s" -o enclave_linux ./cmd/enclave/
+#
+# Build + deploy on the VPS:
+#   docker build -f Dockerfile.patch -t tee-aggregator-enclave:latest .
+#   docker compose -f docker-compose.production.yml up -d --force-recreate enclave
+#
+# Requires enclave_linux to be present in the build context (repo root).
+# The snpguest binary and all other layers are inherited from the existing image.
+FROM tee-aggregator-enclave:latest
+COPY enclave_linux /app/enclave
