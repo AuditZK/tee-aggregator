@@ -80,12 +80,13 @@ func fetchMasterKeyFromPredecessor(
 	defer cancel()
 
 	masterKey, err := bootstrap.FetchMasterKey(fetchCtx, bootstrap.HandoffClientOptions{
-		PeerURL:         cfg.HandoffPeerURL,
-		SignedAllowlist: signedAllowlist,
-		AttestationSvc:  attestSvc,
-		ECIESPriv:       eciesSvc.PrivateKey(),
-		ClientVersion:   "go-enclave-1.0.0", // TODO: source from build-time ldflags
-		Logger:          logger,
+		PeerURL:            cfg.HandoffPeerURL,
+		PeerTLSFingerprint: cfg.HandoffPeerTLSFingerprint,
+		SignedAllowlist:    signedAllowlist,
+		AttestationSvc:     attestSvc,
+		ECIESPriv:          eciesSvc.PrivateKey(),
+		ClientVersion:      "go-enclave-1.0.0", // TODO: source from build-time ldflags
+		Logger:             logger,
 	})
 	if err != nil {
 		return nil, err

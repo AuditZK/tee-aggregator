@@ -8,7 +8,6 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -53,9 +52,17 @@ type HandoffClientOptions struct {
 	// (no security significance).
 	ClientVersion string
 
-	// HTTPClient is optional; falls back to a default with reasonable
-	// timeouts. The transport should pin the predecessor's TLS cert
-	// (caller's responsibility) so MITM cannot proxy the handoff.
+	// PeerTLSFingerprint is the SHA-256 fingerprint of the predecessor
+	// enclave's leaf TLS certificate (hex, with or without colons). When
+	// non-empty, FetchMasterKey builds a pinned transport automatically.
+	// Fetch this value from the predecessor's /api/v1/tls/fingerprint
+	// endpoint *before* the upgrade window and store it in
+	// HANDOFF_PEER_TLS_FINGERPRINT. Either this or HTTPClient is required.
+	PeerTLSFingerprint string
+
+	// HTTPClient overrides the default pinned transport. Use only in
+	// tests or when a custom transport policy is required; prefer
+	// PeerTLSFingerprint for production upgrades.
 	HTTPClient *http.Client
 
 	// Logger is optional.
@@ -87,15 +94,13 @@ func FetchMasterKey(ctx context.Context, opts HandoffClientOptions) ([]byte, err
 
 	httpClient := opts.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{
-			Timeout: 30 * time.Second,
-			// We DELIBERATELY accept self-signed certs by default —
-			// the cryptographic check is at the application layer
-			// (attestation + ECIES), not at the TLS layer. Operators
-			// who want stricter pinning supply a custom HTTPClient.
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-			},
+		if opts.PeerTLSFingerprint == "" {
+			return nil, ErrMissingPeerTLSFingerprint
+		}
+		var err error
+		httpClient, err = NewPinnedHTTPClient(opts.PeerTLSFingerprint, 30*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("build pinned handoff transport: %w", err)
 		}
 	}
 
