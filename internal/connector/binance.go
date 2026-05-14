@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -85,9 +84,12 @@ func (b *Binance) doRequest(ctx context.Context, method, baseURL, path string, p
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
+	if err != nil && err != ErrResponseTooLarge {
 		return nil, err
+	}
+	if err == ErrResponseTooLarge {
+		return nil, ErrResponseTooLarge
 	}
 
 	if resp.StatusCode != http.StatusOK {
