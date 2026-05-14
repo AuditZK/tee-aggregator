@@ -33,10 +33,11 @@ const (
 	PlatformUnattestedDev = "unattested-dev"
 )
 
-// VCEK certificate filenames. QUAL-001: extracted to remove the 3- and
+// VCEK/VLEK certificate filenames. QUAL-001: extracted to remove the 3- and
 // 4-way duplications across fetchAndCacheVCEK.
 const (
 	vcekPEMFile = "vcek.pem"
+	vlekPEMFile = "vlek.pem" // cloud-provider VEK (GCP uses VLEK, not chip-specific VCEK)
 	askPEMFile  = "ask.pem"
 )
 
@@ -339,12 +340,28 @@ func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*Se
 	// Step 2: Fetch and verify VCEK certificates
 	vcekVerified := s.fetchAndCacheVCEK(ctx, reportPath, certsDir)
 
-	// Step 3: Verify attestation with VCEK
+	// Step 3: Verify attestation. Try VCEK first; fall back to VLEK for cloud
+	// providers (e.g. GCP) that issue per-VM VLEKs instead of chip-specific VCEKs.
 	if vcekVerified {
 		verifyCmd := exec.CommandContext(ctx, snpguestPath, "verify", "attestation", certsDir, reportPath)
 		if verifyOut, err := verifyCmd.CombinedOutput(); err != nil {
-			s.logger.Warn("snpguest verify failed", zap.String("output", string(verifyOut)))
+			s.logger.Warn("snpguest VCEK verify failed, trying VLEK fallback",
+				zap.String("output", string(verifyOut)))
 			vcekVerified = false
+			// Clear certsDir so the VCEK and VLEK chains don't intermix.
+			os.RemoveAll(certsDir)
+			os.MkdirAll(certsDir, 0700)
+			if s.fetchVLEKCerts(ctx, reportPath, certsDir) {
+				verifyCmd2 := exec.CommandContext(ctx, snpguestPath, "verify", "attestation", certsDir, reportPath)
+				if verifyOut2, err2 := verifyCmd2.CombinedOutput(); err2 != nil {
+					s.logger.Warn("snpguest VLEK verify failed",
+						zap.String("output", string(verifyOut2)))
+				} else {
+					// LOG-NOISE-002: success is debug-level (runs every 10 min).
+					s.logger.Debug("snpguest VLEK verification successful")
+					vcekVerified = true
+				}
+			}
 		} else {
 			// LOG-NOISE-002: success path is debug-level. Periodic
 			// re-attestation (every 10 min) was emitting an INFO line
@@ -473,7 +490,7 @@ func parseSnpguestReport(output string, report *SevSnpReport) {
 }
 
 func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir string) bool {
-	// Check cache first
+	// Check VCEK cache first.
 	vcekPath := filepath.Join(s.vcekCacheDir, vcekPEMFile)
 	if info, err := os.Stat(vcekPath); err == nil {
 		if time.Since(info.ModTime()) < s.vcekTTL {
@@ -494,6 +511,19 @@ func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir st
 					)
 					return false
 				}
+			}
+			return true
+		}
+	}
+
+	// Check VLEK cache — GCP and other cloud providers use per-VM VLEKs.
+	// A successful VLEK verification on a previous boot will have populated this.
+	vlekCachePath := filepath.Join(s.vcekCacheDir, vlekPEMFile)
+	if info, err := os.Stat(vlekCachePath); err == nil && time.Since(info.ModTime()) < s.vcekTTL {
+		if err := copyFile(vlekCachePath, filepath.Join(certsDir, vlekPEMFile)); err == nil {
+			caPath := filepath.Join(s.vcekCacheDir, askPEMFile)
+			if _, err := os.Stat(caPath); err == nil {
+				_ = copyFile(caPath, filepath.Join(certsDir, askPEMFile))
 			}
 			return true
 		}
@@ -540,6 +570,45 @@ func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir st
 		}
 	}
 
+	return true
+}
+
+// fetchVLEKCerts fetches the VLEK (Virtual Machine Launch Endorsement Key) and
+// its CA chain into certsDir, then caches them. Cloud providers such as GCP
+// issue per-VM VLEKs rather than chip-specific VCEKs.
+func (s *Service) fetchVLEKCerts(ctx context.Context, reportPath, certsDir string) bool {
+	if s.snpguestPath == "" {
+		return false
+	}
+	cmd := exec.CommandContext(ctx, s.snpguestPath, "fetch", "vlek", "pem", certsDir, reportPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		s.logger.Warn("failed to fetch VLEK certificate",
+			zap.Error(err),
+			zap.String("output", string(out)),
+		)
+		return false
+	}
+	caCmd := exec.CommandContext(ctx, s.snpguestPath, "fetch", "ca", "pem", certsDir,
+		"--endorser", "vlek", "-r", reportPath)
+	if out, err := caCmd.CombinedOutput(); err != nil {
+		s.logger.Warn("failed to fetch CA for VLEK (verify may still succeed)",
+			zap.Error(err),
+			zap.String("output", string(out)),
+		)
+	}
+	// Cache so the next attestation skips the KDS round-trip.
+	vlekSrc := filepath.Join(certsDir, vlekPEMFile)
+	if _, err := os.Stat(vlekSrc); err == nil {
+		if mkErr := os.MkdirAll(s.vcekCacheDir, 0700); mkErr == nil {
+			if err := copyFile(vlekSrc, filepath.Join(s.vcekCacheDir, vlekPEMFile)); err != nil {
+				s.logger.Warn("failed to cache VLEK certificate", zap.Error(err))
+			}
+			askSrc := filepath.Join(certsDir, askPEMFile)
+			if _, err := os.Stat(askSrc); err == nil {
+				_ = copyFile(askSrc, filepath.Join(s.vcekCacheDir, askPEMFile))
+			}
+		}
+	}
 	return true
 }
 
