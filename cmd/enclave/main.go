@@ -170,6 +170,7 @@ func main() {
 	// branch below.
 	var enc *encryption.Service
 	var keyMgmt *encryption.KeyManagementService
+	var measurementRecovered bool
 	if pool != nil {
 		keyDerivation, derivErr := encryption.NewKeyDerivationService(logger)
 		if derivErr != nil {
@@ -215,10 +216,13 @@ func main() {
 		}
 
 		keyMgmt, err = encryption.NewKeyManagementService(pool, encryption.KeyManagementOptions{
-			Derivation:        keyDerivation,
-			Logger:            logger,
-			AllowAutoInit:     cfg.IsDevelopment(),
-			ExternalMasterKey: externalMasterKey,
+			Derivation:            keyDerivation,
+			Logger:                logger,
+			AllowAutoInit:         cfg.IsDevelopment(),
+			ExternalMasterKey:     externalMasterKey,
+			AutoRecovery:          cfg.MeasurementAutoRecovery,
+			RecoveryLookbackDays:  cfg.MeasurementRecoveryLookbackDays,
+			OnMeasurementRecovery: func() { measurementRecovered = true },
 		})
 		if err != nil {
 			// Hard fail: running against a DB whose DEK we cannot
@@ -500,6 +504,9 @@ func main() {
 			logger.Error("metrics server failed", zap.Error(err))
 		} else {
 			logger.Info("metrics server started", zap.Int("port", cfg.MetricsPort))
+		}
+		if measurementRecovered {
+			metricsServer.IncrCounter("enclave_measurement_recovery_total")
 		}
 	}
 

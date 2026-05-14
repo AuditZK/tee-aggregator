@@ -227,6 +227,31 @@ func parseMeasurementFromDisplay(output string) ([]byte, string) {
 	return bytes, ""
 }
 
+// newKeyDerivationServiceFromMeasurementBytes constructs a KeyDerivationService
+// whose master key is derived from a specific SEV-SNP measurement (raw bytes).
+// Used exclusively by the measurement auto-recovery path: we derive a candidate
+// master key from a historical measurement and test whether it can unwrap the
+// active DEK, without touching hardware or env-var paths.
+//
+// platformVersion is always empty for snpguest-sourced reports (getSEVMeasurement
+// returns "" for it), so the HKDF salt is nil — matching the hardware path when
+// no platform version is present.
+func newKeyDerivationServiceFromMeasurementBytes(measurement []byte, logger *zap.Logger) (*KeyDerivationService, error) {
+	if len(measurement) == 0 {
+		return nil, fmt.Errorf("measurement is empty")
+	}
+	reader := hkdf.New(sha256.New, measurement, nil, []byte(hkdfInfoMasterKey))
+	masterKey := make([]byte, masterKeySize)
+	if _, err := io.ReadFull(reader, masterKey); err != nil {
+		return nil, fmt.Errorf("derive candidate master key from measurement: %w", err)
+	}
+	return &KeyDerivationService{
+		masterKey:  masterKey,
+		isHardware: false,
+		logger:     logger,
+	}, nil
+}
+
 // WrapKey encrypts a DEK with the master key using AES-256-GCM.
 // Matches TS key-derivation.service.ts wrapKey() which uses a 12-byte
 // IV and base64 encoding for the three fields.

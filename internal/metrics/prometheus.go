@@ -69,6 +69,7 @@ func New(logger *zap.Logger) *Metrics {
 	m.registerCounter("exchange_connections_total", "Total exchange connections created")
 	m.registerCounter("enclave_attestation_success_total", "Successful attestations")
 	m.registerCounter("enclave_attestation_failure_total", "Failed attestations")
+	m.registerCounter("enclave_measurement_recovery_total", "Successful DEK unwrap recoveries after SEV-SNP measurement change")
 
 	// Gauges
 	m.registerGauge("grpc_active_connections", "Active gRPC connections")

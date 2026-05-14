@@ -96,6 +96,15 @@ type Config struct {
 	// Parsed from HANDOFF_PEER_URL.
 	HandoffPeerURL string
 
+	// HandoffPeerTLSFingerprint is the SHA-256 fingerprint of the predecessor
+	// enclave's leaf TLS certificate (hex, with or without colons). Required
+	// alongside HANDOFF_PEER_URL to prevent MITM on the master-key transfer.
+	// Fetch from <predecessor>/api/v1/tls/fingerprint before the upgrade window
+	// and populate via scripts/pre-upgrade.sh. Failure mode when absent with
+	// HANDOFF_PEER_URL set: boot fails with ErrMissingPeerTLSFingerprint.
+	// Parsed from HANDOFF_PEER_TLS_FINGERPRINT.
+	HandoffPeerTLSFingerprint string
+
 	// LegacyMasterKeyHex is the raw 32-byte master key (hex-encoded) that
 	// the previous enclave used to wrap the active DEK. Set this when the
 	// SEV-SNP measurement changed (host migration, firmware update) and the
@@ -114,6 +123,23 @@ type Config struct {
 	// Parsed from HANDOFF_SIGNED_ALLOWLIST. Empty = use the constant
 	// shipped with the binary (see internal/bootstrap/embedded_allowlist).
 	HandoffSignedAllowlist string
+
+	// MeasurementAutoRecovery enables automatic DEK unwrap recovery when the
+	// SEV-SNP measurement changes (firmware update, host migration). The enclave
+	// queries signed_reports for historical measurements, derives candidate master
+	// keys, and retries the unwrap. On success it immediately re-wraps the DEK
+	// under the current measurement-derived key so subsequent boots need no
+	// operator intervention. Disable only during audits or manual recovery
+	// procedures. Failure mode when false: boot fails if measurement changed;
+	// operator must set LEGACY_MASTER_KEY_HEX. Parsed from MEASUREMENT_AUTO_RECOVERY.
+	MeasurementAutoRecovery bool
+
+	// MeasurementRecoveryLookbackDays controls how far back the auto-recovery
+	// scan searches signed_reports for historical measurements. Firmware installs
+	// older than this window require LEGACY_MASTER_KEY_HEX. Parsed from
+	// MEASUREMENT_RECOVERY_LOOKBACK_DAYS. Failure mode when absent: defaults to
+	// 180 days.
+	MeasurementRecoveryLookbackDays int
 
 	// ErrTrack configures the in-process error aggregation layer
 	// (internal/errtrack). It captures Error+ log entries, fingerprints
@@ -177,9 +203,13 @@ func Load() *Config {
 		ClientCertCNAllowlist:   parseCommaList(getEnv("GRPC_CLIENT_CERT_CN_ALLOWLIST", "")),
 		JWTExpectedIssuer:       strings.TrimSpace(getEnv("ENCLAVE_JWT_EXPECTED_ISSUER", "")),
 
-		HandoffPeerURL:         strings.TrimSpace(getEnv("HANDOFF_PEER_URL", "")),
+		HandoffPeerURL:            strings.TrimSpace(getEnv("HANDOFF_PEER_URL", "")),
+		HandoffPeerTLSFingerprint: strings.TrimSpace(getEnv("HANDOFF_PEER_TLS_FINGERPRINT", "")),
 		HandoffSignedAllowlist: getEnv("HANDOFF_SIGNED_ALLOWLIST", ""),
 		LegacyMasterKeyHex:    strings.TrimSpace(getEnv("LEGACY_MASTER_KEY_HEX", "")),
+
+		MeasurementAutoRecovery:         getEnvBool("MEASUREMENT_AUTO_RECOVERY", true),
+		MeasurementRecoveryLookbackDays: getEnvInt("MEASUREMENT_RECOVERY_LOOKBACK_DAYS", 180),
 
 		ErrTrack: ErrTrackConfig{
 			Enabled:      getEnvBool("ERRTRACK_ENABLED", false),

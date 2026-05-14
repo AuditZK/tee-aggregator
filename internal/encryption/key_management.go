@@ -67,6 +67,16 @@ type KeyManagementService struct {
 	// override. Used as the "destination" master_key_id when the
 	// migration re-wrap kicks in.
 	measurementMasterKeyID string
+
+	// autoRecovery enables tryMeasurementRecovery on unwrap failure.
+	autoRecovery bool
+	// recoveryLookbackDays is the signed_reports lookback window for
+	// historical measurement candidates.
+	recoveryLookbackDays int
+	// onMeasurementRecovery, when non-nil, is called after a successful
+	// auto-recovery so the caller can increment a Prometheus counter without
+	// creating a package dependency between encryption and metrics.
+	onMeasurementRecovery func()
 }
 
 // KeyManagementOptions configures NewKeyManagementService.
@@ -94,6 +104,22 @@ type KeyManagementOptions struct {
 	// MUST be exactly 32 bytes (AES-256). The slice is copied into the
 	// service so callers can safely zeroise the original after the call.
 	ExternalMasterKey []byte
+
+	// AutoRecovery enables automatic DEK unwrap recovery when the SEV-SNP
+	// measurement has changed. On unwrap failure the service queries
+	// signed_reports for historical measurements, derives candidate master
+	// keys, and retries. On success it re-wraps the DEK under the current
+	// measurement-derived key so subsequent boots need no operator action.
+	AutoRecovery bool
+
+	// RecoveryLookbackDays is how far back (in days) to search signed_reports
+	// for historical measurement candidates. Zero defaults to 180.
+	RecoveryLookbackDays int
+
+	// OnMeasurementRecovery, when non-nil, is called after a successful
+	// auto-recovery. Use this to increment a Prometheus counter without
+	// creating a dependency between the encryption and metrics packages.
+	OnMeasurementRecovery func()
 }
 
 // NewKeyManagementService creates a new key management service.
@@ -134,6 +160,11 @@ func NewKeyManagementService(pool *pgxpool.Pool, opts KeyManagementOptions) (*Ke
 		}
 	}
 
+	lookback := opts.RecoveryLookbackDays
+	if lookback <= 0 {
+		lookback = 180
+	}
+
 	svc := &KeyManagementService{
 		pool:                   pool,
 		derivation:             derivation,
@@ -141,6 +172,9 @@ func NewKeyManagementService(pool *pgxpool.Pool, opts KeyManagementOptions) (*Ke
 		allowAutoInit:          opts.AllowAutoInit,
 		legacyMasterKeyApplied: legacyApplied,
 		measurementMasterKeyID: measurementMasterKeyID,
+		autoRecovery:           opts.AutoRecovery,
+		recoveryLookbackDays:   lookback,
+		onMeasurementRecovery:  opts.OnMeasurementRecovery,
 	}
 
 	if err := svc.initializeDEK(context.Background()); err != nil {
@@ -257,18 +291,16 @@ func (s *KeyManagementService) initializeDEK(ctx context.Context) error {
 		AuthTag:    dek.AuthTag,
 	}
 
-	unwrapped, err := s.derivation.UnwrapKey(wrapped)
-	if err != nil {
-		return fmt.Errorf(
-			"unwrap active DEK (id=%s, stored_master_key_id=%s, derived_master_key_id=%s): %w — "+
-				"refusing to rotate the DEK automatically; investigate the master-key mismatch manually",
-			dek.ID, dek.MasterKeyID, s.derivation.GetMasterKeyID(), err,
-		)
+	unwrapped, unwrapErr := s.derivation.UnwrapKey(wrapped)
+	if unwrapErr != nil {
+		if err := s.handleUnwrapFailure(ctx, wrapped, dek, schema, unwrapErr); err != nil {
+			return err
+		}
+	} else {
+		s.currentDEK = unwrapped
+		s.dekID = dek.ID
+		s.dekSchema = schema
 	}
-
-	s.currentDEK = unwrapped
-	s.dekID = dek.ID
-	s.dekSchema = schema
 
 	// Legacy-migration auto-rewrap: when the operator booted this
 	// enclave with an LegacyMasterKeyHex (B2 v0→v1 migration), the
