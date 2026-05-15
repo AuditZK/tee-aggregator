@@ -131,8 +131,10 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 		return cached, nil
 	}
 
-	// 1. Fetch snapshots
-	snapshots, err := s.snapshotRepo.GetByUserAndDateRange(ctx, req.UserUID, req.StartDate, req.EndDate)
+	// 1. Fetch snapshots. SEC-001: a signed report must cover only data
+	// produced inside the SEV-SNP perimeter, so history reconstructed by the
+	// external rebuilder is excluded here (GetVerifiableByUserAndDateRange).
+	snapshots, err := s.snapshotRepo.GetVerifiableByUserAndDateRange(ctx, req.UserUID, req.StartDate, req.EndDate)
 	if err != nil {
 		return nil, fmt.Errorf("fetch snapshots: %w", err)
 	}
@@ -151,8 +153,10 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 	// 2. Convert to daily returns (TWR with multi-exchange support)
 	dailyReturns := convertSnapshotsToDailyReturns(snapshots)
 
-	// 3. Calculate core metrics
-	metrics, err := s.metricsSvc.CalculateWithExcludedExchanges(ctx, req.UserUID, req.StartDate, req.EndDate, req.ExcludedExchanges)
+	// 3. Calculate core metrics over the SAME verifiable, exchange-filtered
+	// snapshot set. Re-fetching via the MetricsService would silently
+	// re-include the external-rebuilder history excluded in step 1 (SEC-001).
+	metrics, err := s.metricsSvc.CalculateFromSnapshots(snapshots)
 	if err != nil {
 		return nil, fmt.Errorf("calculate metrics: %w", err)
 	}

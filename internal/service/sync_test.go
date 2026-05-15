@@ -486,7 +486,7 @@ func TestBuildHistoricalSnapshots_SkipsToday(t *testing.T) {
 		{Date: today, TotalEquity: 1200}, // must be skipped
 	}
 
-	snapshots, skipped := buildHistoricalSnapshots(connMeta, hs, today)
+	snapshots, skipped := buildHistoricalSnapshots(connMeta, hs, today, false)
 
 	if skipped != 1 {
 		t.Fatalf("expected 1 skipped (today), got %d", skipped)
@@ -514,7 +514,7 @@ func TestBuildHistoricalSnapshots_MarksHistorical(t *testing.T) {
 		{Date: today.AddDate(0, 0, -2), TotalEquity: 1000},
 	}
 
-	snapshots, _ := buildHistoricalSnapshots(connMeta, hs, today)
+	snapshots, _ := buildHistoricalSnapshots(connMeta, hs, today, false)
 
 	for _, s := range snapshots {
 		if !s.IsHistorical {
@@ -546,7 +546,7 @@ func TestBuildHistoricalSnapshots_PreservesBreakdown(t *testing.T) {
 		},
 	}
 
-	snapshots, _ := buildHistoricalSnapshots(connMeta, hs, today)
+	snapshots, _ := buildHistoricalSnapshots(connMeta, hs, today, false)
 	if len(snapshots) != 1 {
 		t.Fatalf("expected 1 snapshot, got %d", len(snapshots))
 	}
@@ -568,9 +568,38 @@ func TestBuildHistoricalSnapshots_PreservesBreakdown(t *testing.T) {
 
 func TestBuildHistoricalSnapshots_EmptyInput(t *testing.T) {
 	connMeta := &repository.ExchangeConnection{UserUID: "u", Exchange: "ibkr"}
-	snapshots, skipped := buildHistoricalSnapshots(connMeta, nil, time.Now().UTC())
+	snapshots, skipped := buildHistoricalSnapshots(connMeta, nil, time.Now().UTC(), false)
 	if len(snapshots) != 0 || skipped != 0 {
 		t.Fatalf("expected empty result for empty input, got snapshots=%d skipped=%d", len(snapshots), skipped)
+	}
+}
+
+// SEC-001: snapshots reconstructed by the external rebuilder must be stamped
+// FromExternalRebuilder=true so GetVerifiableByUserAndDateRange keeps them out
+// of signed reports. In-enclave (IBKR Flex) history stays false.
+func TestBuildHistoricalSnapshots_StampsExternalRebuilderOrigin(t *testing.T) {
+	today := time.Date(2026, 5, 8, 0, 0, 0, 0, time.UTC)
+	connMeta := &repository.ExchangeConnection{UserUID: "user_42", Exchange: "hyperliquid", Label: "main"}
+	hs := []*connector.HistoricalSnapshot{
+		{Date: today.AddDate(0, 0, -2), TotalEquity: 1000},
+		{Date: today.AddDate(0, 0, -1), TotalEquity: 1100},
+	}
+
+	external, _ := buildHistoricalSnapshots(connMeta, hs, today, true)
+	if len(external) != 2 {
+		t.Fatalf("expected 2 snapshots, got %d", len(external))
+	}
+	for _, s := range external {
+		if !s.FromExternalRebuilder {
+			t.Fatalf("rebuilder-sourced snapshot at %s must have FromExternalRebuilder=true", s.Timestamp)
+		}
+	}
+
+	inEnclave, _ := buildHistoricalSnapshots(connMeta, hs, today, false)
+	for _, s := range inEnclave {
+		if s.FromExternalRebuilder {
+			t.Fatalf("in-enclave snapshot at %s must have FromExternalRebuilder=false", s.Timestamp)
+		}
 	}
 }
 
@@ -719,7 +748,7 @@ func TestBuildHistoricalSnapshots_AllMarketTypes(t *testing.T) {
 		},
 	}}
 
-	snapshots, _ := buildHistoricalSnapshots(connMeta, hs, today)
+	snapshots, _ := buildHistoricalSnapshots(connMeta, hs, today, false)
 	if len(snapshots) != 1 {
 		t.Fatalf("expected 1 snapshot, got %d", len(snapshots))
 	}

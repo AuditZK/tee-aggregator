@@ -20,6 +20,14 @@ import (
 const (
 	errFmtGetConnections      = "get connections: %w"
 	errFmtNoActiveConnections = "no active connections for user %s"
+
+	// History-reconstruction source labels passed to persistHistoricalSnapshots.
+	// sourceExternalRebuilder marks snapshots rebuilt OUTSIDE the SEV-SNP
+	// perimeter by the history-rebuilder service — they must never enter a
+	// signed report (SEC-001). sourceInEnclave covers IBKR Flex history, which
+	// is reconstructed inside the enclave and is legitimately verifiable.
+	sourceExternalRebuilder = "rebuilder-service"
+	sourceInEnclave         = "in-enclave"
 )
 
 // SyncService orchestrates exchange synchronization.
@@ -1094,7 +1102,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 	)
 
 	firstSync := s.isFirstSync(ctx, connMeta)
-	s.persistHistoricalSnapshots(ctx, connMeta, res.Snapshots, firstSync, "rebuilder-service")
+	s.persistHistoricalSnapshots(ctx, connMeta, res.Snapshots, firstSync, sourceExternalRebuilder)
 	s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
 }
 
@@ -1138,7 +1146,7 @@ func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *
 		return
 	}
 
-	s.persistHistoricalSnapshots(ctx, connMeta, historicalSnapshots, firstSync, "in-enclave")
+	s.persistHistoricalSnapshots(ctx, connMeta, historicalSnapshots, firstSync, sourceInEnclave)
 }
 
 // persistHistoricalSnapshots is the upsert loop shared between the
@@ -1158,7 +1166,7 @@ func (s *SyncService) persistHistoricalSnapshots(
 
 	s.logHistoryExpansion(ctx, connMeta, historicalSnapshots, firstSync)
 
-	snapshots, skippedToday := buildHistoricalSnapshots(connMeta, historicalSnapshots, todayKey)
+	snapshots, skippedToday := buildHistoricalSnapshots(connMeta, historicalSnapshots, todayKey, source == sourceExternalRebuilder)
 
 	processed := 0
 	for _, snapshot := range snapshots {
@@ -1190,6 +1198,7 @@ func buildHistoricalSnapshots(
 	connMeta *repository.ExchangeConnection,
 	hs []*connector.HistoricalSnapshot,
 	todayKey time.Time,
+	fromExternalRebuilder bool,
 ) (snapshots []*repository.Snapshot, skippedToday int) {
 	for _, h := range hs {
 		dayKey := time.Date(h.Date.Year(), h.Date.Month(), h.Date.Day(), 0, 0, 0, 0, time.UTC)
@@ -1245,6 +1254,9 @@ func buildHistoricalSnapshots(
 			TotalFees:       h.TotalFees,
 			Breakdown:       breakdown,
 			IsHistorical:    true,
+			// SEC-001: snapshots from the external rebuilder are out of the
+			// SEV-SNP perimeter and must be excluded from signed reports.
+			FromExternalRebuilder: fromExternalRebuilder,
 		})
 	}
 	return snapshots, skippedToday

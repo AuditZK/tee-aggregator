@@ -25,7 +25,37 @@ const (
 	// (is_historical) has been applied. Centralized to avoid drift across
 	// the dozen query builders in this file.
 	snapshotIsHistoricalCol = ", is_historical"
+
+	// Suffix appended to INSERT column lists when migration 015
+	// (from_external_rebuilder) has been applied.
+	snapshotFromExternalRebuilderCol = ", from_external_rebuilder"
 )
+
+// snapshotOptionalCols builds the trailing column / placeholder / ON CONFLICT
+// fragments for the Go-only optional snapshot columns — is_historical
+// (migration 013) and from_external_rebuilder (migration 015) — together with
+// the matching args. baseArgCount is the number of positional args already
+// bound; the optional columns take $(baseArgCount+1) onward. Keeping the
+// placeholder numbers dynamic avoids the per-call-site hardcoding that made
+// adding a second optional column error-prone.
+func snapshotOptionalCols(s *Snapshot, hasHist, hasOrigin bool, baseArgCount int) (cols, placeholders, excluded string, extra []any) {
+	n := baseArgCount
+	if hasHist {
+		n++
+		cols += snapshotIsHistoricalCol
+		placeholders += fmt.Sprintf(", $%d", n)
+		excluded += ", is_historical = EXCLUDED.is_historical"
+		extra = append(extra, s.IsHistorical)
+	}
+	if hasOrigin {
+		n++
+		cols += snapshotFromExternalRebuilderCol
+		placeholders += fmt.Sprintf(", $%d", n)
+		excluded += ", from_external_rebuilder = EXCLUDED.from_external_rebuilder"
+		extra = append(extra, s.FromExternalRebuilder)
+	}
+	return
+}
 
 // generateCUID generates a CUID-like identifier compatible with Prisma's @id @default(cuid()).
 func generateCUID() string {
@@ -57,6 +87,13 @@ type Snapshot struct {
 	// snapshots from the realtime sync window are false. Persisted only on
 	// the Go schema (TS Prisma schema does not have this column).
 	IsHistorical bool `json:"is_historical,omitempty"`
+
+	// FromExternalRebuilder marks a snapshot reconstructed by the out-of-enclave
+	// history-rebuilder service (SEC-001). Such data is NOT covered by the
+	// signed report — GetVerifiableByUserAndDateRange filters it out. False for
+	// live snapshots and for IBKR Flex history rebuilt inside the enclave.
+	// Persisted only on the Go schema (migration 015).
+	FromExternalRebuilder bool `json:"from_external_rebuilder,omitempty"`
 }
 
 // MarketBreakdown holds metrics per market type.
@@ -99,11 +136,12 @@ type MarketMetrics struct {
 type SnapshotRepo struct {
 	pool *pgxpool.Pool
 
-	capMu              sync.Mutex
-	capabilitiesLoaded bool
-	hasLabelCol        bool
-	hasIsHistoricalCol bool // Go schema only; TS Prisma never has it
-	isTSSchema         bool // true = TS Prisma camelCase columns
+	capMu                       sync.Mutex
+	capabilitiesLoaded          bool
+	hasLabelCol                 bool
+	hasIsHistoricalCol          bool // Go schema only; TS Prisma never has it
+	hasFromExternalRebuilderCol bool // Go schema only (migration 015)
+	isTSSchema                  bool // true = TS Prisma camelCase columns
 }
 
 // NewSnapshotRepo creates a new snapshot repository
@@ -116,27 +154,23 @@ func (r *SnapshotRepo) Upsert(ctx context.Context, s *Snapshot) error {
 	breakdownJSON, _ := json.Marshal(s.Breakdown)
 	hasLabel := r.hasLabelColumn(ctx)
 	hasHist := r.hasIsHistoricalColumn(ctx)
+	hasOrigin := r.hasFromExternalRebuilderColumn(ctx)
 
 	if r.isTSSchema {
 		return r.upsertTS(ctx, s, breakdownJSON)
 	}
 
 	if hasLabel {
-		// Conditional column inclusion keeps the path compatible with a DB
-		// where migration 013 has not yet run.
-		histCol, histPlaceholder, histExcluded := "", "", ""
 		args := []any{
 			s.UserUID, s.Exchange, s.Label, s.Timestamp,
 			s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
 			s.Deposits, s.Withdrawals, s.TotalTrades, s.TotalVolume, s.TotalFees,
 			breakdownJSON, time.Now().UTC(),
 		}
-		if hasHist {
-			histCol = snapshotIsHistoricalCol
-			histPlaceholder = ", $15"
-			histExcluded = ",\n\t\t\t\tis_historical = EXCLUDED.is_historical"
-			args = append(args, s.IsHistorical)
-		}
+		// Optional columns keep the path compatible with a DB where
+		// migration 013 / 015 has not yet run.
+		optCols, optPlaceholders, optExcluded, optArgs := snapshotOptionalCols(s, hasHist, hasOrigin, len(args))
+		args = append(args, optArgs...)
 		query := fmt.Sprintf(`
 			INSERT INTO snapshot_data (
 				user_uid, exchange, label, timestamp,
@@ -155,24 +189,19 @@ func (r *SnapshotRepo) Upsert(ctx context.Context, s *Snapshot) error {
 				total_volume = EXCLUDED.total_volume,
 				total_fees = EXCLUDED.total_fees,
 				breakdown_by_market = EXCLUDED.breakdown_by_market%s
-			RETURNING id`, histCol, histPlaceholder, histExcluded)
+			RETURNING id`, optCols, optPlaceholders, optExcluded)
 
 		return r.pool.QueryRow(ctx, query, args...).Scan(&s.ID)
 	}
 
-	histCol, histPlaceholder, histExcluded := "", "", ""
 	args := []any{
 		s.UserUID, s.Exchange, s.Timestamp,
 		s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
 		s.Deposits, s.Withdrawals, s.TotalTrades, s.TotalVolume, s.TotalFees,
 		breakdownJSON, time.Now().UTC(),
 	}
-	if hasHist {
-		histCol = snapshotIsHistoricalCol
-		histPlaceholder = ", $14"
-		histExcluded = ",\n\t\t\tis_historical = EXCLUDED.is_historical"
-		args = append(args, s.IsHistorical)
-	}
+	optCols, optPlaceholders, optExcluded, optArgs := snapshotOptionalCols(s, hasHist, hasOrigin, len(args))
+	args = append(args, optArgs...)
 	query := fmt.Sprintf(`
 		INSERT INTO snapshot_data (
 			user_uid, exchange, timestamp,
@@ -191,7 +220,7 @@ func (r *SnapshotRepo) Upsert(ctx context.Context, s *Snapshot) error {
 			total_volume = EXCLUDED.total_volume,
 			total_fees = EXCLUDED.total_fees,
 			breakdown_by_market = EXCLUDED.breakdown_by_market%s
-		RETURNING id`, histCol, histPlaceholder, histExcluded)
+		RETURNING id`, optCols, optPlaceholders, optExcluded)
 
 	return r.pool.QueryRow(ctx, query, args...).Scan(&s.ID)
 }
@@ -227,8 +256,22 @@ func (r *SnapshotRepo) upsertTS(ctx context.Context, s *Snapshot, breakdownJSON 
 	).Scan(&s.ID)
 }
 
-// GetByUserAndDateRange returns snapshots for a user within a date range
+// GetByUserAndDateRange returns snapshots for a user within a date range.
 func (r *SnapshotRepo) GetByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
+	return r.getByUserAndDateRange(ctx, userUID, start, end, false)
+}
+
+// GetVerifiableByUserAndDateRange is GetByUserAndDateRange restricted to
+// snapshots produced inside the SEV-SNP perimeter — it excludes history
+// reconstructed by the external rebuilder (SEC-001). The signed report is
+// built from this set so its signature only covers enclave-verified data. On a
+// TS/Prisma schema (no from_external_rebuilder column) it behaves exactly like
+// GetByUserAndDateRange; the rebuilt-history feature targets the Go schema.
+func (r *SnapshotRepo) GetVerifiableByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
+	return r.getByUserAndDateRange(ctx, userUID, start, end, true)
+}
+
+func (r *SnapshotRepo) getByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time, verifiableOnly bool) ([]*Snapshot, error) {
 	hasLabel := r.hasLabelColumn(ctx)
 	hasHist := r.hasIsHistoricalColumn(ctx)
 
@@ -244,15 +287,19 @@ func (r *SnapshotRepo) GetByUserAndDateRange(ctx context.Context, userUID string
 	if hasHist {
 		histCol = snapshotIsHistoricalCol
 	}
+	whereExtra := ""
+	if verifiableOnly && r.hasFromExternalRebuilderColumn(ctx) {
+		whereExtra = " AND from_external_rebuilder = FALSE"
+	}
 	query := fmt.Sprintf(`
 		SELECT %s,
 			total_equity, realized_balance, unrealized_pnl,
 			deposits, withdrawals, total_trades, total_volume, total_fees,
 			breakdown_by_market, created_at%s
 		FROM snapshot_data
-		WHERE user_uid = $1 AND timestamp >= $2 AND timestamp <= $3
+		WHERE user_uid = $1 AND timestamp >= $2 AND timestamp <= $3%s
 		ORDER BY timestamp`,
-		selectCols, histCol,
+		selectCols, histCol, whereExtra,
 	)
 
 	rows, err := r.pool.Query(ctx, query, userUID, start, end)
@@ -676,6 +723,7 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 
 	hasLabel := r.hasLabelColumn(ctx)
 	hasHist := r.hasIsHistoricalColumn(ctx)
+	hasOrigin := r.hasFromExternalRebuilderColumn(ctx)
 
 	for _, s := range snapshots {
 		breakdownJSON, _ := json.Marshal(s.Breakdown)
@@ -705,19 +753,14 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 				breakdownJSON, now, now,
 			)
 		} else if hasLabel {
-			histCol, histPlaceholder, histExcluded := "", "", ""
 			args := []any{
 				s.UserUID, s.Exchange, s.Label, s.Timestamp,
 				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
 				s.Deposits, s.Withdrawals, s.TotalTrades, s.TotalVolume, s.TotalFees,
 				breakdownJSON, time.Now().UTC(),
 			}
-			if hasHist {
-				histCol = snapshotIsHistoricalCol
-				histPlaceholder = ", $15"
-				histExcluded = ",\n\t\t\t\t\tis_historical = EXCLUDED.is_historical"
-				args = append(args, s.IsHistorical)
-			}
+			optCols, optPlaceholders, optExcluded, optArgs := snapshotOptionalCols(s, hasHist, hasOrigin, len(args))
+			args = append(args, optArgs...)
 			_, err = tx.Exec(ctx, fmt.Sprintf(`
 				INSERT INTO snapshot_data (
 					user_uid, exchange, label, timestamp,
@@ -736,22 +779,17 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 					total_volume = EXCLUDED.total_volume,
 					total_fees = EXCLUDED.total_fees,
 					breakdown_by_market = EXCLUDED.breakdown_by_market%s`,
-				histCol, histPlaceholder, histExcluded), args...,
+				optCols, optPlaceholders, optExcluded), args...,
 			)
 		} else {
-			histCol, histPlaceholder, histExcluded := "", "", ""
 			args := []any{
 				s.UserUID, s.Exchange, s.Timestamp,
 				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
 				s.Deposits, s.Withdrawals, s.TotalTrades, s.TotalVolume, s.TotalFees,
 				breakdownJSON, time.Now().UTC(),
 			}
-			if hasHist {
-				histCol = snapshotIsHistoricalCol
-				histPlaceholder = ", $14"
-				histExcluded = ",\n\t\t\t\t\tis_historical = EXCLUDED.is_historical"
-				args = append(args, s.IsHistorical)
-			}
+			optCols, optPlaceholders, optExcluded, optArgs := snapshotOptionalCols(s, hasHist, hasOrigin, len(args))
+			args = append(args, optArgs...)
 			_, err = tx.Exec(ctx, fmt.Sprintf(`
 				INSERT INTO snapshot_data (
 					user_uid, exchange, timestamp,
@@ -770,7 +808,7 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 					total_volume = EXCLUDED.total_volume,
 					total_fees = EXCLUDED.total_fees,
 					breakdown_by_market = EXCLUDED.breakdown_by_market%s`,
-				histCol, histPlaceholder, histExcluded), args...,
+				optCols, optPlaceholders, optExcluded), args...,
 			)
 		}
 
@@ -883,8 +921,10 @@ func (r *SnapshotRepo) hasLabelColumn(ctx context.Context) bool {
 	if tsSchema {
 		// TS Prisma always has the label column
 		r.hasLabelCol = true
-		// TS Prisma never has is_historical (Go-only column from migration 013)
+		// TS Prisma never has is_historical / from_external_rebuilder
+		// (Go-only columns from migrations 013 / 015).
 		r.hasIsHistoricalCol = false
+		r.hasFromExternalRebuilderCol = false
 	} else {
 		exists, err := r.columnExists(ctx, "snapshot_data", "label")
 		if err != nil {
@@ -897,6 +937,12 @@ func (r *SnapshotRepo) hasLabelColumn(ctx context.Context) bool {
 			r.hasIsHistoricalCol = false
 		} else {
 			r.hasIsHistoricalCol = histExists
+		}
+		originExists, err := r.columnExists(ctx, "snapshot_data", "from_external_rebuilder")
+		if err != nil {
+			r.hasFromExternalRebuilderCol = false
+		} else {
+			r.hasFromExternalRebuilderCol = originExists
 		}
 	}
 
@@ -911,6 +957,15 @@ func (r *SnapshotRepo) hasIsHistoricalColumn(ctx context.Context) bool {
 	r.capMu.Lock()
 	defer r.capMu.Unlock()
 	return r.hasIsHistoricalCol
+}
+
+// hasFromExternalRebuilderColumn reports whether migration 015 has been
+// applied. Detection is gated through hasLabelColumn() to share the cache.
+func (r *SnapshotRepo) hasFromExternalRebuilderColumn(ctx context.Context) bool {
+	r.hasLabelColumn(ctx) // primes capabilitiesLoaded
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.hasFromExternalRebuilderCol
 }
 
 func (r *SnapshotRepo) columnExists(ctx context.Context, tableName, columnName string) (bool, error) {

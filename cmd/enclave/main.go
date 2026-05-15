@@ -812,11 +812,11 @@ func refreshSignerAttestation(
 }
 
 // enforceProductionAttestation refuses to continue in production when the
-// SEV-SNP attestation is missing, unverified, or unbound to the enclave's
-// keys (OPS-AUDIT-001 (b)). This guard is independent of which Dockerfile
-// produced the running image: even if the runtime ships without snpguest,
-// the resulting "unattested-dev" platform is rejected loudly instead of
-// signing reports that quietly carry attested=false.
+// SEV-SNP attestation is missing, unverified, not chained to the AMD root, or
+// unbound to the enclave's keys (OPS-AUDIT-001 (b)). This guard is independent
+// of which Dockerfile produced the running image: even if the runtime ships
+// without snpguest, the resulting "unattested-dev" platform is rejected loudly
+// instead of signing reports that quietly carry attested=false.
 //
 // initial=true (startup) → Fatal so the container restarts under the
 // orchestrator's eye.
@@ -836,6 +836,14 @@ func enforceProductionAttestation(cfg *config.Config, report *attestation.Attest
 		reason = "non-sev-snp platform=" + report.Platform
 	case !report.Attestation.Verified:
 		reason = "snpguest report not verified"
+	case !report.Attestation.VcekVerified:
+		// SEC-002: Verified only means snpguest produced a parseable report.
+		// VcekVerified is the real trust anchor — the quote's signature chains
+		// to the AMD root. Without it a host-fabricated blob would pass. The
+		// VCEK is cached 7d (attestation.vcekTTL), so a transient AMD KDS
+		// outage does not block routine reboots; only a cold-cache boot while
+		// KDS is unreachable trips this — which is correct fail-closed.
+		reason = "VCEK/VLEK certificate chain not verified against AMD root (KDS unreachable with a cold cert cache?)"
 	case !report.Attestation.ReportDataBoundToRequest:
 		reason = "snpguest --random fallback used: REPORT_DATA not bound to enclave keys"
 	default:
