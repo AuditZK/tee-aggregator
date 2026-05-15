@@ -2,8 +2,15 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrTransient marks errors that are temporary upstream conditions (rate limit,
+// generation backlog, service unavailable) and NOT credential failures. The
+// connection service treats these as non-fatal during initial credential
+// validation: the connection is saved and the daily scheduler retries.
+var ErrTransient = errors.New("transient connector error")
 
 // Market type constants
 const (

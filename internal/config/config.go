@@ -102,6 +102,15 @@ type Config struct {
 	// set; otherwise the client refuses to start.
 	RebuilderInternalToken string
 
+	// HistorySyncNotifyURL, when set, is the base URL the enclave POSTs a
+	// best-effort "history rebuilt" ping to after a connection's historical
+	// backfill completes. The enclave appends the userUID to the path
+	// (<url>/<userUID>). It carries NO credentials and triggers nothing
+	// inside the enclave — it only lets a downstream service (analytics)
+	// run a per-user sync without waiting for its daily cron. Empty = no-op.
+	// Parsed from HISTORY_SYNC_NOTIFY_URL.
+	HistorySyncNotifyURL string
+
 	// HandoffPeerURL, when non-empty, points at the URL of the previous
 	// running enclave's handoff endpoint (B2). Set ONLY during the
 	// upgrade window when v_N+1 is meant to fetch the master key from
@@ -219,6 +228,7 @@ func Load() *Config {
 
 		RebuilderServiceURL:    strings.TrimSpace(getEnv("REBUILDER_SERVICE_URL", "")),
 		RebuilderInternalToken: strings.TrimSpace(getEnv("REBUILDER_INTERNAL_TOKEN", "")),
+		HistorySyncNotifyURL:   strings.TrimSpace(getEnv("HISTORY_SYNC_NOTIFY_URL", "")),
 
 		HandoffPeerURL:            strings.TrimSpace(getEnv("HANDOFF_PEER_URL", "")),
 		HandoffPeerTLSFingerprint: strings.TrimSpace(getEnv("HANDOFF_PEER_TLS_FINGERPRINT", "")),

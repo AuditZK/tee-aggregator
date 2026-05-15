@@ -11,6 +11,7 @@ import (
 	"github.com/trackrecord/enclave/internal/connector"
 	"github.com/trackrecord/enclave/internal/encryption"
 	"github.com/trackrecord/enclave/internal/repository"
+	"go.uber.org/zap"
 )
 
 var ErrConnectionAlreadyExists = errors.New("connection already exists")
@@ -42,6 +43,8 @@ type ConnectionService struct {
 	// background work tied to the new connection (e.g. historical snapshot
 	// backfill for connectors that support it). Nil = no-op.
 	postCreateHook func(ctx context.Context, userUID, exchange, label string)
+	// logger is optional; when nil, transient-validation warnings are silent.
+	logger *zap.Logger
 }
 
 // NewConnectionService creates a new connection service
@@ -65,6 +68,12 @@ func (s *ConnectionService) SetFactory(f *connector.Factory) {
 // Wired in main.go to SyncService.ReconstructHistoryOnConnect.
 func (s *ConnectionService) SetPostCreateHook(fn func(ctx context.Context, userUID, exchange, label string)) {
 	s.postCreateHook = fn
+}
+
+// SetLogger attaches a zap logger for non-fatal diagnostic events (e.g. saving
+// a connection despite a transient upstream validation failure).
+func (s *ConnectionService) SetLogger(logger *zap.Logger) {
+	s.logger = logger
 }
 
 // CreateConnectionRequest is the input for creating a connection
@@ -114,7 +123,21 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 		return fmt.Errorf("invalid credentials: unsupported exchange %s", normalizedExchange)
 	}
 	if err := testConn.TestConnection(ctx); err != nil {
-		return fmt.Errorf("invalid credentials: %w", err)
+		// Transient upstream failures (busy report generator, rate limit, service
+		// hiccup) are NOT credential errors. Save the connection so the daily
+		// scheduler retries, and surface the deferred validation in logs.
+		if errors.Is(err, connector.ErrTransient) {
+			if s.logger != nil {
+				s.logger.Warn("upstream validation deferred; saving connection",
+					zap.String("user_uid", req.UserUID),
+					zap.String("exchange", normalizedExchange),
+					zap.String("label", normalizedLabel),
+					zap.Error(err),
+				)
+			}
+		} else {
+			return fmt.Errorf("invalid credentials: %w", err)
+		}
 	}
 
 	credentialsHash := hashCredentials(req.APIKey, req.APISecret, req.Passphrase)

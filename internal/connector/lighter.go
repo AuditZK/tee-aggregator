@@ -309,7 +309,9 @@ func (l *Lighter) downloadCSV(ctx context.Context, csvURL string) ([]lighterExpo
 		return nil, fmt.Errorf("lighter CSV download: HTTP %d", resp.StatusCode)
 	}
 
-	reader := csv.NewReader(resp.Body)
+	// CONN-AUDIT-001: data_url is returned by the upstream API — cap the S3
+	// CSV stream so a hostile/compromised export URL can't bloat the heap.
+	reader := csv.NewReader(io.LimitReader(resp.Body, DefaultMaxResponseBytes))
 	// Header: Market,Side,Date,Trade Value,Size,Price,Closed PnL,Fee,Role,Type
 	header, err := reader.Read()
 	if err != nil {

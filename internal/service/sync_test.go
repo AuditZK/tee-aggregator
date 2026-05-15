@@ -1,11 +1,18 @@
 package service
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/rebuilderclient"
 	"github.com/trackrecord/enclave/internal/repository"
+	"go.uber.org/zap"
 )
 
 func TestAggregateSyncResults_PartialSuccessUsesLatestSnapshot(t *testing.T) {
@@ -564,5 +571,171 @@ func TestBuildHistoricalSnapshots_EmptyInput(t *testing.T) {
 	snapshots, skipped := buildHistoricalSnapshots(connMeta, nil, time.Now().UTC())
 	if len(snapshots) != 0 || skipped != 0 {
 		t.Fatalf("expected empty result for empty input, got snapshots=%d skipped=%d", len(snapshots), skipped)
+	}
+}
+
+// History-reconstruction orchestration tests.
+//
+// reconstructHistory is the routing decision that governs whether plaintext
+// credentials leave the SEV-SNP enclave: a connector implementing
+// HistoricalSnapshotProvider reconstructs in-enclave, every other connector
+// hands off to the external rebuilder. These tests exercise that routing
+// with connector + rebuilder doubles (no DB). Snapshot-shaping correctness
+// is covered by the TestBuildHistoricalSnapshots_* tests above.
+
+// fakeHistConnector implements connector.Connector but NOT
+// HistoricalSnapshotProvider — a non-IBKR exchange that must route to the
+// external rebuilder.
+type fakeHistConnector struct{ exchange string }
+
+func (f *fakeHistConnector) GetBalance(context.Context) (*connector.Balance, error) {
+	return &connector.Balance{}, nil
+}
+func (f *fakeHistConnector) GetPositions(context.Context) ([]*connector.Position, error) {
+	return nil, nil
+}
+func (f *fakeHistConnector) GetTrades(context.Context, time.Time, time.Time) ([]*connector.Trade, error) {
+	return nil, nil
+}
+func (f *fakeHistConnector) TestConnection(context.Context) error { return nil }
+func (f *fakeHistConnector) Exchange() string                     { return f.exchange }
+
+// fakeHistProvider also implements HistoricalSnapshotProvider — a ZK-native
+// connector (IBKR) that must reconstruct in-enclave.
+type fakeHistProvider struct {
+	fakeHistConnector
+	called bool
+}
+
+func (f *fakeHistProvider) GetHistoricalSnapshots(context.Context, time.Time) ([]*connector.HistoricalSnapshot, error) {
+	f.called = true
+	return nil, nil
+}
+
+var (
+	_ connector.Connector                  = (*fakeHistConnector)(nil)
+	_ connector.Connector                  = (*fakeHistProvider)(nil)
+	_ connector.HistoricalSnapshotProvider = (*fakeHistProvider)(nil)
+)
+
+// A ZK-native provider must reconstruct in-enclave and must NEVER reach the
+// external rebuilder — that would push IBKR-class credentials out of the
+// SEV-SNP perimeter (SEC-ZK-001).
+func TestReconstructHistory_ZKNativeProviderStaysInEnclave(t *testing.T) {
+	var rebuilderHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		rebuilderHits++
+		_, _ = w.Write([]byte(`{"snapshots":[]}`))
+	}))
+	defer srv.Close()
+
+	svc := &SyncService{
+		logger:    zap.NewNop(),
+		rebuilder: rebuilderclient.New(srv.URL, "internal-token-0123456789", zap.NewNop()),
+	}
+	provider := &fakeHistProvider{fakeHistConnector: fakeHistConnector{exchange: "ibkr"}}
+	connMeta := &repository.ExchangeConnection{UserUID: "u1", Exchange: "ibkr", Label: "main"}
+
+	svc.reconstructHistory(context.Background(), connMeta, provider, &Credentials{APIKey: "k", APISecret: "s"})
+
+	if !provider.called {
+		t.Error("ZK-native provider: in-enclave GetHistoricalSnapshots was never called")
+	}
+	if rebuilderHits != 0 {
+		t.Errorf("SEC-ZK-001 violation: a HistoricalSnapshotProvider connection hit the external "+
+			"rebuilder %d time(s) — IBKR-class credentials must never leave the enclave", rebuilderHits)
+	}
+}
+
+// A non-provider connector with no usable rebuilder must be a silent no-op:
+// enclave-only dev environments stay functional, no panic, no dispatch.
+func TestReconstructHistory_NonProviderWithoutRebuilderIsNoop(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		rebuilder *rebuilderclient.Client
+	}{
+		{"rebuilder nil", nil},
+		{"rebuilder unconfigured", rebuilderclient.New("", "", zap.NewNop())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &SyncService{logger: zap.NewNop(), rebuilder: tc.rebuilder}
+			conn := &fakeHistConnector{exchange: "hyperliquid"}
+			connMeta := &repository.ExchangeConnection{UserUID: "u1", Exchange: "hyperliquid", Label: "main"}
+			// Must return cleanly — no panic, no dispatch.
+			svc.reconstructHistory(context.Background(), connMeta, conn, &Credentials{APIKey: "wallet"})
+		})
+	}
+}
+
+// A non-provider connector with a configured rebuilder must POST to it,
+// carrying the X-Internal-Token and the plaintext credentials.
+func TestReconstructHistory_NonProviderDispatchesToRebuilder(t *testing.T) {
+	var gotToken string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotToken = r.Header.Get("X-Internal-Token")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"exchange":"hyperliquid","count":0,"durationMs":5,"snapshots":[]}`))
+	}))
+	defer srv.Close()
+
+	svc := &SyncService{
+		logger:    zap.NewNop(),
+		rebuilder: rebuilderclient.New(srv.URL, "internal-token-0123456789", zap.NewNop()),
+	}
+	conn := &fakeHistConnector{exchange: "hyperliquid"}
+	connMeta := &repository.ExchangeConnection{UserUID: "u1", Exchange: "hyperliquid", Label: "main"}
+
+	svc.reconstructHistory(context.Background(), connMeta, conn,
+		&Credentials{APIKey: "0xWALLET", APISecret: "secret-xyz", Passphrase: "pp"})
+
+	if gotToken != "internal-token-0123456789" {
+		t.Errorf("X-Internal-Token not propagated to rebuilder: got %q", gotToken)
+	}
+	body := string(gotBody)
+	if !strings.Contains(body, "0xWALLET") || !strings.Contains(body, "secret-xyz") {
+		t.Errorf("rebuild request did not carry the credentials to the rebuilder")
+	}
+}
+
+// buildHistoricalSnapshots must map every market type Flex / the rebuilder
+// can return; the tests above only exercise stocks + futures.
+func TestBuildHistoricalSnapshots_AllMarketTypes(t *testing.T) {
+	today := time.Date(2026, 5, 8, 0, 0, 0, 0, time.UTC)
+	connMeta := &repository.ExchangeConnection{UserUID: "u", Exchange: "ibkr", Label: "main"}
+	hs := []*connector.HistoricalSnapshot{{
+		Date:        today.AddDate(0, 0, -1),
+		TotalEquity: 100, RealizedBalance: 70,
+		TotalTrades: 9, TotalVolume: 1234, TotalFees: 5.5,
+		Breakdown: map[string]*connector.MarketBalance{
+			connector.MarketStocks:  {Equity: 1, AvailableMargin: 1},
+			connector.MarketOptions: {Equity: 2, AvailableMargin: 2},
+			connector.MarketFutures: {Equity: 3, AvailableMargin: 3},
+			connector.MarketCFD:     {Equity: 4, AvailableMargin: 4},
+			connector.MarketForex:   {Equity: 5, AvailableMargin: 5},
+			connector.MarketSwap:    {Equity: 6, AvailableMargin: 6},
+			connector.MarketSpot:    {Equity: 7, AvailableMargin: 7},
+		},
+	}}
+
+	snapshots, _ := buildHistoricalSnapshots(connMeta, hs, today)
+	if len(snapshots) != 1 {
+		t.Fatalf("expected 1 snapshot, got %d", len(snapshots))
+	}
+	b := snapshots[0].Breakdown
+	if b.Stocks == nil || b.Options == nil || b.Futures == nil ||
+		b.CFD == nil || b.Forex == nil || b.Swap == nil || b.Spot == nil {
+		t.Fatalf("not all market types mapped: %+v", b)
+	}
+	if b.Global.AvailableMargin != 28 { // 1+2+3+4+5+6+7
+		t.Errorf("global available margin: got %f want 28", b.Global.AvailableMargin)
+	}
+	if got := snapshots[0]; got.UnrealizedPnL != 30 { // TotalEquity - RealizedBalance
+		t.Errorf("unrealized pnl: got %f want 30", got.UnrealizedPnL)
+	}
+	if got := snapshots[0]; got.TotalTrades != 9 || got.TotalVolume != 1234 || got.TotalFees != 5.5 {
+		t.Errorf("trade aggregates not propagated: trades=%d volume=%f fees=%f",
+			got.TotalTrades, got.TotalVolume, got.TotalFees)
 	}
 }

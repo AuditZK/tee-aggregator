@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +34,11 @@ type SyncService struct {
 	// not Configured(), connection-time rebuilds for non-IBKR exchanges are
 	// silently skipped — keeps enclave-only dev environments functional.
 	rebuilder *rebuilderclient.Client
+	// historyNotifyURL, when set, is the base URL pinged after a connection's
+	// history backfill completes (<url>/<userUID>). Best-effort, carries no
+	// credentials, ignores the response — lets analytics run a per-user sync
+	// without waiting for its daily cron. Empty = no ping.
+	historyNotifyURL string
 }
 
 // NewSyncService creates a new sync service
@@ -61,6 +68,49 @@ func (s *SyncService) SetSyncStatusRepo(repo *repository.SyncStatusRepo) {
 // connect; IBKR's in-enclave Flex rebuild is unaffected).
 func (s *SyncService) SetRebuilderClient(c *rebuilderclient.Client) {
 	s.rebuilder = c
+}
+
+// SetHistoryNotifyURL configures the best-effort "history rebuilt" ping URL.
+// Empty disables it (the enclave then stays fully blind — downstream services
+// pick up new history on their own schedule).
+func (s *SyncService) SetHistoryNotifyURL(rawURL string) {
+	s.historyNotifyURL = strings.TrimSpace(rawURL)
+}
+
+// notifyHistoryRebuilt sends a best-effort POST to <historyNotifyURL>/<userUID>
+// after a connection's historical backfill completes. It carries no payload
+// and no credentials, and the response is ignored — the enclave only emits a
+// ping, it never reaches into another service's data. On any failure the
+// downstream service still catches up via its own cron. No-op when unset.
+func (s *SyncService) notifyHistoryRebuilt(ctx context.Context, userUID string) {
+	if s.historyNotifyURL == "" {
+		return
+	}
+
+	endpoint := strings.TrimRight(s.historyNotifyURL, "/") + "/" + url.PathEscape(userUID)
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		s.logger.Warn("history-rebuilt notify: build request failed", zap.Error(err))
+		return
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		s.logger.Warn("history-rebuilt notify failed",
+			zap.String("user_uid", userUID), zap.Error(err))
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 300 {
+		s.logger.Warn("history-rebuilt notify rejected",
+			zap.String("user_uid", userUID), zap.Int("status", resp.StatusCode))
+		return
+	}
+	s.logger.Info("history-rebuilt notify sent", zap.String("user_uid", userUID))
 }
 
 // SetFactory replaces the connector factory. Used to inject a proxy-aware
@@ -970,10 +1020,23 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 		)
 		return
 	}
+	s.reconstructHistory(ctx, connMeta, conn, creds)
+}
+
+// reconstructHistory routes a freshly built connection to its history
+// backfill path. Connectors implementing HistoricalSnapshotProvider (IBKR)
+// reconstruct in-enclave — signed by the report chain, never leaving the
+// SEV-SNP perimeter. Every other connector hands off to the external
+// rebuilder, which is where plaintext credentials cross the perimeter
+// (SEC-ZK-001). Split from ReconstructHistoryOnConnect so this routing —
+// the decision that governs whether credentials leave the enclave — is
+// unit-testable without a DB-backed ConnectionService.
+func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, creds *Credentials) {
 	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
 		// IBKR (and any future ZK-native provider) keeps the in-enclave path:
 		// signed by the report chain, stays inside the SEV-SNP perimeter.
 		s.syncFromHistoricalProvider(ctx, connMeta, hsp)
+		s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
 		return
 	}
 
@@ -988,19 +1051,19 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 	// user_snapshots — the rebuilder never touches the aggregator's DB.
 	if s.rebuilder == nil || !s.rebuilder.Configured() {
 		s.logger.Debug("history backfill: rebuilder not configured, skipping",
-			zap.String("user_uid", userUID),
-			zap.String("exchange", exchange),
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
 		)
 		return
 	}
 	s.logger.Info("history backfill: dispatching to external rebuilder",
-		zap.String("user_uid", userUID),
-		zap.String("exchange", exchange),
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
 	)
 	res, err := s.rebuilder.Rebuild(ctx, rebuilderclient.RebuildRequest{
-		UserUID:  userUID,
-		Exchange: exchange,
-		Label:    label,
+		UserUID:  connMeta.UserUID,
+		Exchange: connMeta.Exchange,
+		Label:    connMeta.Label,
 		Credentials: rebuilderclient.Credentials{
 			// LOG-CREDS-001: this struct holds plaintext credentials. Once
 			// Rebuild returns, the local reference (`creds`) is dropped
@@ -1017,21 +1080,22 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 	creds = nil
 	if err != nil {
 		s.logger.Error("history backfill: rebuilder request failed",
-			zap.String("user_uid", userUID),
-			zap.String("exchange", exchange),
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
 			zap.Error(err),
 		)
 		return
 	}
 	s.logger.Info("history backfill: rebuilder returned snapshots",
-		zap.String("user_uid", userUID),
-		zap.String("exchange", exchange),
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
 		zap.Int("snapshot_count", len(res.Snapshots)),
 		zap.Int64("rebuild_duration_ms", res.DurationMs),
 	)
 
 	firstSync := s.isFirstSync(ctx, connMeta)
 	s.persistHistoricalSnapshots(ctx, connMeta, res.Snapshots, firstSync, "rebuilder-service")
+	s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
 }
 
 // syncIbkrFromFlex upserts every daily snapshot returned by the user's Flex

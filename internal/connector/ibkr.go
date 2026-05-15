@@ -191,10 +191,42 @@ func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
 	}
 
 	if result.Status != "Success" {
-		return "", fmt.Errorf("flex request failed: %s - %s", result.ErrorCode, result.ErrorMessage)
+		base := fmt.Errorf("flex request failed: %s - %s", result.ErrorCode, result.ErrorMessage)
+		if isTransientFlexErrorCode(result.ErrorCode) {
+			return "", fmt.Errorf("%w: %w", ErrTransient, base)
+		}
+		return "", base
 	}
 
 	return result.ReferenceCode, nil
+}
+
+// transientFlexErrorCodes lists IBKR Flex error codes that indicate temporary
+// upstream conditions (busy report generator, rate limit, service hiccup) and
+// NOT credential failures. See IBKR Flex Web Service docs.
+//
+//   1001 - Statement could not be generated at this time. Please try again shortly.
+//   1005 - Currently not available.
+//   1011 - Service unavailable.
+//   1014 - Statement generation failed.
+//   1018 - Too many requests (rate limit).
+//   1019 - Statement is busy generating.
+//
+// Codes like 1008 (bad token), 1012 (token expired), 1013 (invalid query ID),
+// 1015 (bad request) and 1020 (invalid request) are NOT transient — they mean
+// the credentials/parameters are wrong and must be fixed by the user.
+var transientFlexErrorCodes = map[string]struct{}{
+	"1001": {},
+	"1005": {},
+	"1011": {},
+	"1014": {},
+	"1018": {},
+	"1019": {},
+}
+
+func isTransientFlexErrorCode(code string) bool {
+	_, ok := transientFlexErrorCodes[code]
+	return ok
 }
 
 func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error) {

@@ -283,7 +283,12 @@ func main() {
 
 	if pool != nil {
 		connSvc = service.NewConnectionService(connRepo, enc)
+		connSvc.SetLogger(logger)
 		syncSvc = service.NewSyncService(connSvc, snapshotRepo, connectorCache, logger)
+		if cfg.HistorySyncNotifyURL != "" {
+			syncSvc.SetHistoryNotifyURL(cfg.HistorySyncNotifyURL)
+			logger.Info("history-rebuilt notify wired", zap.String("url", cfg.HistorySyncNotifyURL))
+		}
 		if syncStatusRepo != nil {
 			syncSvc.SetSyncStatusRepo(syncStatusRepo)
 		}
@@ -300,6 +305,21 @@ func main() {
 				logger.Fatal("rebuilder URL set without internal token",
 					zap.String("hint", "set REBUILDER_INTERNAL_TOKEN (≥24 chars, must match the rebuilder service) or unset REBUILDER_SERVICE_URL to disable the integration"),
 				)
+			}
+			// CFG-003: the rebuilder POST carries decrypted exchange credentials.
+			// An http:// endpoint exposes them in cleartext, so production refuses
+			// to boot on a non-https URL — the same fail-closed stance as CFG-002
+			// for the missing token. Dev is allowed http:// (loopback rebuilder).
+			if !strings.HasPrefix(strings.ToLower(cfg.RebuilderServiceURL), "https://") {
+				if cfg.IsDevelopment() {
+					logger.Warn("rebuilder URL is not https; plaintext credentials would transit in cleartext",
+						zap.String("hint", "acceptable for local dev only — production REBUILDER_SERVICE_URL must be https://"),
+					)
+				} else {
+					logger.Fatal("rebuilder URL must be https in production",
+						zap.String("hint", "REBUILDER_SERVICE_URL ships decrypted exchange credentials; set an https:// URL or unset it to disable the integration"),
+					)
+				}
 			}
 			syncSvc.SetRebuilderClient(rebuilderClient)
 			logger.Info("rebuilder client wired", zap.String("url", cfg.RebuilderServiceURL))
