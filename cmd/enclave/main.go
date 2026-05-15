@@ -488,7 +488,7 @@ func main() {
 	logger.Info("gRPC server started", zap.Int("port", cfg.GRPCPort))
 
 	// 15. Start REST server (with TLS, attestation, ECIES, CORS, rate limiting)
-	restServer := server.New(cfg, logger, pool, signer)
+	restServer := server.New(cfg, logger, pool)
 	// SEC-002: share the same HS256 secret with the REST surface so sensitive
 	// endpoints enforce JWT just like the gRPC authInterceptor does.
 	restServer.SetJWTSecret(jwtSecret)

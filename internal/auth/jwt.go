@@ -21,6 +21,7 @@ var (
 	ErrMalformedToken   = errors.New("malformed JWT")
 	ErrInvalidSignature = errors.New("invalid JWT signature")
 	ErrTokenExpired     = errors.New("JWT expired")
+	ErrMissingExp       = errors.New("JWT missing exp claim")
 	ErrTokenNotYetValid = errors.New("JWT not yet valid (nbf)")
 	ErrInvalidAudience  = errors.New("JWT audience mismatch")
 	ErrInvalidIssuer    = errors.New("JWT issuer mismatch")
@@ -67,7 +68,7 @@ type contextKey string
 const ctxKeyUserUID contextKey = "auth_user_uid"
 
 // VerifyHS256 parses and validates a compact JWS token signed with HS256.
-// It verifies the alg/typ header, signature, exp (with 30 s skew), aud,
+// It verifies the alg/typ header, signature, exp (required, 30 s skew), aud,
 // and sub. For iss enforcement, use VerifyHS256WithOptions.
 func VerifyHS256(tokenStr string, secret []byte) (*Claims, error) {
 	return VerifyHS256WithOptions(tokenStr, secret, VerifyOptions{})
@@ -126,7 +127,13 @@ func VerifyHS256WithOptions(tokenStr string, secret []byte, opts VerifyOptions) 
 		skew = 0
 	}
 	now := time.Now()
-	if claims.Exp > 0 && now.Add(-skew).Unix() > claims.Exp {
+	// SEC-006: exp is mandatory. A token without an expiry never ages out, so
+	// a single leaked or mis-issued token would stay valid forever — reject it
+	// rather than trust the issuer to always set the claim.
+	if claims.Exp <= 0 {
+		return nil, ErrMissingExp
+	}
+	if now.Add(-skew).Unix() > claims.Exp {
 		return nil, ErrTokenExpired
 	}
 	if claims.Nbf > 0 && now.Add(skew).Unix() < claims.Nbf {

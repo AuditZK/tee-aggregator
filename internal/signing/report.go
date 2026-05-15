@@ -26,8 +26,19 @@ const (
 	// PayloadVersion bumps whenever the signed payload shape changes.
 	// 1.0 = original (metrics + returns only)
 	// 1.1 = adds enclaveAttestation {measurement, reportData, platform, attested}
-	PayloadVersion = "1.1"
+	// 1.2 = adds metrics.winRate and metrics.profitFactor to the signed payload
+	PayloadVersion = "1.2"
 )
+
+// payloadVersionsWithoutWinRate are the pre-1.2 signed-payload shapes whose
+// metrics block omits winRate/profitFactor. buildFinancialPayload must
+// reproduce that older shape for such reports, or VerifyReport would
+// recompute a different hash and reject an already-issued report.
+var payloadVersionsWithoutWinRate = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+}
 
 // EnclaveAttestation binds the signed report to a specific SEV-SNP measurement
 // and the report_data field of the attestation quote. A verifier MUST:
@@ -376,6 +387,17 @@ func buildFinancialPayload(report *SignedReport) map[string]any {
 		},
 		"dailyReturns":   toDailyReturnsPayload(report.DailyReturns),
 		"monthlyReturns": toMonthlyReturnsPayload(report.MonthlyReturns),
+	}
+
+	// SEC-003: winRate / profitFactor are presented to consumers as report
+	// metrics, so they must be covered by the signature. They entered the
+	// signed payload at PayloadVersion 1.2; reports issued under an earlier
+	// version keep their original metrics shape so VerifyReport still
+	// reproduces their hash.
+	if _, legacy := payloadVersionsWithoutWinRate[report.PayloadVersion]; !legacy {
+		metrics := payload["metrics"].(map[string]any)
+		metrics["winRate"] = report.WinRate
+		metrics["profitFactor"] = report.ProfitFactor
 	}
 
 	// enclaveAttestation binds the signed report to a specific SEV-SNP
