@@ -257,7 +257,6 @@ func main() {
 	var snapshotRepo *repository.SnapshotRepo
 	var userRepo *repository.UserRepo
 	var signedReportRepo *repository.SignedReportRepo
-	var rateLimitRepo *repository.RateLimitRepo
 	var syncStatusRepo *repository.SyncStatusRepo
 
 	if pool != nil {
@@ -265,7 +264,6 @@ func main() {
 		snapshotRepo = repository.NewSnapshotRepo(pool)
 		userRepo = repository.NewUserRepo(pool)
 		signedReportRepo = repository.NewSignedReportRepo(pool)
-		rateLimitRepo = repository.NewRateLimitRepo(pool)
 		syncStatusRepo = repository.NewSyncStatusRepo(pool)
 	}
 
@@ -274,7 +272,6 @@ func main() {
 	var syncSvc *service.SyncService
 	var metricsSvc *service.MetricsService
 	var reportSvc *service.ReportService
-	var rateLimiterSvc *service.RateLimiterService
 	benchmarkSvc := service.NewBenchmarkService()
 
 	// 11b. Init connector cache (TS parity: UniversalConnectorCache)
@@ -329,10 +326,6 @@ func main() {
 		// hook delegates to the external rebuilder when configured.
 		connSvc.SetPostCreateHook(syncSvc.ReconstructHistoryOnConnect)
 		metricsSvc = service.NewMetricsService(snapshotRepo)
-
-		if rateLimitRepo != nil {
-			rateLimiterSvc = service.NewRateLimiterService(rateLimitRepo, logger)
-		}
 	}
 
 	// 11c. Wire HTTP proxy for geo-restricted exchanges (e.g. Binance from EU).
@@ -574,9 +567,6 @@ func main() {
 		zap.Bool("log_stream", logStreamServer != nil),
 		zap.Bool("metrics", metricsServer != nil),
 	)
-
-	// Suppress unused variable warnings for services used only indirectly
-	_ = rateLimiterSvc
 
 	// 19. Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
