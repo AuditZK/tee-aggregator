@@ -1167,28 +1167,62 @@ func (s *SyncService) persistHistoricalSnapshots(
 	s.logHistoryExpansion(ctx, connMeta, historicalSnapshots, firstSync)
 
 	snapshots, skippedToday := buildHistoricalSnapshots(connMeta, historicalSnapshots, todayKey, source == sourceExternalRebuilder)
+	if len(snapshots) == 0 {
+		return
+	}
 
-	processed := 0
-	for _, snapshot := range snapshots {
-		if err := s.snapshotRepo.Upsert(ctx, snapshot); err != nil {
-			s.logger.Warn("historical snapshot upsert failed",
-				zap.String("exchange", connMeta.Exchange),
-				zap.String("date", snapshot.Timestamp.Format("2006-01-02")),
-				zap.Error(err),
-			)
-			continue
-		}
-		processed++
+	// ENG-002: write the whole reconstructed series in ONE transaction. The
+	// previous per-row Upsert loop left a silent hole in the timeline when a
+	// single day failed, and a holed series quietly skews the report's TWR.
+	// UpsertBatch is all-or-nothing — and the non-IBKR backfill fires only once
+	// at connection time and is never re-attempted — so absorb a transient DB
+	// blip with a bounded retry rather than permanently leaving the connection
+	// without history. IBKR re-runs every sync and self-heals regardless.
+	err := retryWithBackoff(ctx, 3, time.Second, func() error {
+		return s.snapshotRepo.UpsertBatch(ctx, snapshots)
+	})
+	if err != nil {
+		s.logger.Error("history reconstruction failed — transaction rolled back, no snapshots written",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.String("source", source),
+			zap.Int("total_days", len(snapshots)),
+			zap.String("hint", "transient retries exhausted; re-create the connection to re-run the backfill"),
+			zap.Error(err),
+		)
+		return
 	}
 
 	s.logger.Info("history reconstruction completed",
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
 		zap.String("source", source),
-		zap.Int("snapshots_upserted", processed),
+		zap.Int("snapshots_upserted", len(snapshots)),
 		zap.Int("skipped_today", skippedToday),
 		zap.Int("total_days", len(historicalSnapshots)),
 	)
+}
+
+// retryWithBackoff calls fn up to maxAttempts times, sleeping attempt*base
+// between tries and aborting early if ctx is cancelled. Returns nil on the
+// first success, otherwise the error from the final attempt.
+func retryWithBackoff(ctx context.Context, maxAttempts int, base time.Duration, fn func() error) error {
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * base):
+		}
+	}
+	return err
 }
 
 // buildHistoricalSnapshots maps connector daily summaries to repo Snapshots
