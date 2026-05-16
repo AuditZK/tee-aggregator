@@ -274,8 +274,10 @@ func TestCryptoBase_DoJSON_HappyPath(t *testing.T) {
 	}
 }
 
-// CONN-004 retry: 429 followed by 200 must succeed within maxRetryAttempts.
-func TestCryptoBase_DoRequestWithRetry_RecoversAfter429(t *testing.T) {
+// CONN-004 retry: 429 followed by 200 must succeed within maxRetryAttempts,
+// and buildReq must be invoked once per attempt — that is what re-signs the
+// request and is the whole reason retryHTTP takes a builder.
+func TestRetryHTTP_RecoversAfter429(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := atomic.AddInt32(&hits, 1)
@@ -289,9 +291,11 @@ func TestCryptoBase_DoRequestWithRetry_RecoversAfter429(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	b := NewCryptoBase("k", "s", srv.URL)
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
-	body, err := b.DoRequestWithRetry(req)
+	var builds int32
+	body, err := retryHTTP(srv.Client(), func() (*http.Request, error) {
+		atomic.AddInt32(&builds, 1)
+		return http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+	})
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -301,9 +305,12 @@ func TestCryptoBase_DoRequestWithRetry_RecoversAfter429(t *testing.T) {
 	if atomic.LoadInt32(&hits) != 2 {
 		t.Fatalf("hits=%d, want 2", hits)
 	}
+	if atomic.LoadInt32(&builds) != 2 {
+		t.Fatalf("builds=%d, want 2 — request must be rebuilt (re-signed) per attempt", builds)
+	}
 }
 
-func TestCryptoBase_DoRequestWithRetry_PermanentFailureNoRetry(t *testing.T) {
+func TestRetryHTTP_PermanentFailureNoRetry(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
@@ -312,9 +319,9 @@ func TestCryptoBase_DoRequestWithRetry_PermanentFailureNoRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	b := NewCryptoBase("k", "s", srv.URL)
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
-	_, err := b.DoRequestWithRetry(req)
+	_, err := retryHTTP(srv.Client(), func() (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+	})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -323,7 +330,7 @@ func TestCryptoBase_DoRequestWithRetry_PermanentFailureNoRetry(t *testing.T) {
 	}
 }
 
-func TestCryptoBase_DoRequestWithRetry_ContextCancelledStopsRetry(t *testing.T) {
+func TestRetryHTTP_ContextCancelledStopsRetry(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
@@ -332,11 +339,49 @@ func TestCryptoBase_DoRequestWithRetry_ContextCancelledStopsRetry(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // pre-cancelled
 
-	b := NewCryptoBase("k", "s", srv.URL)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/", nil)
-	_, err := b.DoRequestWithRetry(req)
+	_, err := retryHTTP(srv.Client(), func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/", nil)
+	})
 	if err == nil {
 		t.Fatal("expected ctx error")
+	}
+}
+
+// End-to-end: signedQueryGET (the BingX / MEXC-spot request path) must route
+// through retryHTTP and re-sign on retry — the retried request must carry a
+// fresh `timestamp`, otherwise the exchange would reject the replayed HMAC.
+func TestSignedQueryGET_RetriesWithFreshSignature(t *testing.T) {
+	var attempts int32
+	tsCh := make(chan string, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tsCh <- r.URL.Query().Get("timestamp")
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	b := NewCryptoBase("key", "secret", srv.URL)
+	body, err := b.signedQueryGET(context.Background(), "X-API-KEY", "/account", "")
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("body=%s", body)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Fatalf("attempts=%d, want 2", got)
+	}
+	close(tsCh)
+	var seen []string
+	for ts := range tsCh {
+		seen = append(seen, ts)
+	}
+	if len(seen) != 2 || seen[0] == seen[1] {
+		t.Fatalf("timestamps=%v — retry must rebuild with a fresh signed timestamp", seen)
 	}
 }
 

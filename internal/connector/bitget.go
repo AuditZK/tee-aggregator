@@ -2,9 +2,6 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -33,28 +30,26 @@ func NewBitget(creds *Credentials) *Bitget {
 func (b *Bitget) Exchange() string { return "bitget" }
 
 func (b *Bitget) sign(timestamp, method, path, body string) string {
-	message := timestamp + method + path + body
-	mac := hmac.New(sha256.New, []byte(b.base.APISecret))
-	mac.Write([]byte(message))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	return signHMACBase64(b.base.APISecret, timestamp+method+path+body)
 }
 
 func (b *Bitget) doRequest(ctx context.Context, method, path string) ([]byte, error) {
-	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	signature := b.sign(timestamp, method, path, "")
+	body, err := retryHTTP(b.base.Client, func() (*http.Request, error) {
+		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+		signature := b.sign(timestamp, method, path, "")
 
-	req, err := http.NewRequestWithContext(ctx, method, b.base.BaseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
+		req, err := http.NewRequestWithContext(ctx, method, b.base.BaseURL+path, nil)
+		if err != nil {
+			return nil, err
+		}
 
-	req.Header.Set("ACCESS-KEY", b.base.APIKey)
-	req.Header.Set("ACCESS-SIGN", signature)
-	req.Header.Set("ACCESS-TIMESTAMP", timestamp)
-	req.Header.Set("ACCESS-PASSPHRASE", b.passphrase)
-	req.Header.Set("Content-Type", "application/json")
-
-	body, err := b.base.DoRequest(req)
+		req.Header.Set("ACCESS-KEY", b.base.APIKey)
+		req.Header.Set("ACCESS-SIGN", signature)
+		req.Header.Set("ACCESS-TIMESTAMP", timestamp)
+		req.Header.Set("ACCESS-PASSPHRASE", b.passphrase)
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
 	}

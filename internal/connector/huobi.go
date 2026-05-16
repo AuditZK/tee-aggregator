@@ -2,9 +2,6 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -32,36 +29,34 @@ func NewHuobi(creds *Credentials) *Huobi {
 func (h *Huobi) Exchange() string { return "huobi" }
 
 func (h *Huobi) sign(method, host, path string, params url.Values) string {
-	payload := method + "\n" + host + "\n" + path + "\n" + params.Encode()
-	mac := hmac.New(sha256.New, []byte(h.base.APISecret))
-	mac.Write([]byte(payload))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	return signHMACBase64(h.base.APISecret, method+"\n"+host+"\n"+path+"\n"+params.Encode())
 }
 
 func (h *Huobi) signedGET(ctx context.Context, path string, extra url.Values) ([]byte, error) {
-	params := url.Values{}
-	params.Set("AccessKeyId", h.base.APIKey)
-	params.Set("SignatureMethod", "HmacSHA256")
-	params.Set("SignatureVersion", "2")
-	params.Set("Timestamp", time.Now().UTC().Format("2006-01-02T15:04:05"))
+	body, err := retryHTTP(h.base.Client, func() (*http.Request, error) {
+		params := url.Values{}
+		params.Set("AccessKeyId", h.base.APIKey)
+		params.Set("SignatureMethod", "HmacSHA256")
+		params.Set("SignatureVersion", "2")
+		params.Set("Timestamp", time.Now().UTC().Format("2006-01-02T15:04:05"))
 
-	for k, vs := range extra {
-		for _, v := range vs {
-			params.Set(k, v)
+		for k, vs := range extra {
+			for _, v := range vs {
+				params.Set(k, v)
+			}
 		}
-	}
 
-	signature := h.sign("GET", "api.huobi.pro", path, params)
-	params.Set("Signature", signature)
+		signature := h.sign("GET", "api.huobi.pro", path, params)
+		params.Set("Signature", signature)
 
-	reqURL := h.base.BaseURL + path + "?" + params.Encode()
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	body, err := h.base.DoRequest(req)
+		reqURL := h.base.BaseURL + path + "?" + params.Encode()
+		req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
 	}

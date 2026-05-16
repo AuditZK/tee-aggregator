@@ -2,9 +2,6 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -35,38 +32,30 @@ func (b *Bybit) Exchange() string {
 }
 
 func (b *Bybit) sign(timestamp, params string) string {
-	payload := timestamp + b.apiKey + "5000" + params
-	h := hmac.New(sha256.New, []byte(b.apiSecret))
-	h.Write([]byte(payload))
-	return hex.EncodeToString(h.Sum(nil))
+	return signHMACHex(b.apiSecret, timestamp+b.apiKey+"5000"+params)
 }
 
 func (b *Bybit) doRequest(ctx context.Context, method, path, params string) ([]byte, error) {
-	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	signature := b.sign(timestamp, params)
+	body, err := retryHTTP(b.client, func() (*http.Request, error) {
+		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+		signature := b.sign(timestamp, params)
 
-	url := bybitAPI + path
-	if params != "" {
-		url += "?" + params
-	}
+		url := bybitAPI + path
+		if params != "" {
+			url += "?" + params
+		}
 
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
-	if err != nil {
-		return nil, err
-	}
+		req, err := http.NewRequestWithContext(ctx, method, url, nil)
+		if err != nil {
+			return nil, err
+		}
 
-	req.Header.Set("X-BAPI-API-KEY", b.apiKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", timestamp)
-	req.Header.Set("X-BAPI-SIGN", signature)
-	req.Header.Set("X-BAPI-RECV-WINDOW", "5000")
-
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// CONN-AUDIT-001: bounded read.
-	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
+		req.Header.Set("X-BAPI-API-KEY", b.apiKey)
+		req.Header.Set("X-BAPI-TIMESTAMP", timestamp)
+		req.Header.Set("X-BAPI-SIGN", signature)
+		req.Header.Set("X-BAPI-RECV-WINDOW", "5000")
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
 	}

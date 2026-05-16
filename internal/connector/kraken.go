@@ -57,40 +57,33 @@ func (k *Kraken) sign(path, nonce, postData string) (string, error) {
 }
 
 func (k *Kraken) doPrivate(ctx context.Context, path string, params url.Values) ([]byte, error) {
-	if params == nil {
-		params = url.Values{}
-	}
+	body, err := retryHTTP(k.client, func() (*http.Request, error) {
+		if params == nil {
+			params = url.Values{}
+		}
 
-	nonce := strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
-	params.Set("nonce", nonce)
-	postData := params.Encode()
+		// Fresh nonce per attempt — Kraken rejects a replayed nonce, so a
+		// retry MUST rebuild and re-sign rather than resend the same request.
+		nonce := strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
+		params.Set("nonce", nonce)
+		postData := params.Encode()
 
-	signature, err := k.sign(path, nonce, postData)
+		signature, err := k.sign(path, nonce, postData)
+		if err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, krakenAPI+path, strings.NewReader(postData))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("API-Key", k.apiKey)
+		req.Header.Set("API-Sign", signature)
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, krakenAPI+path, strings.NewReader(postData))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("API-Key", k.apiKey)
-	req.Header.Set("API-Sign", signature)
-
-	resp, err := k.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
-	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kraken API status %d: %s", resp.StatusCode, TruncatedBody(body))
 	}
 
 	var envelope struct {
