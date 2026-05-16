@@ -31,6 +31,34 @@ const (
 	snapshotFromExternalRebuilderCol = ", from_external_rebuilder"
 )
 
+// snapshotUpdateSetGo / snapshotUpdateSetTS are the ON CONFLICT ... DO UPDATE
+// SET bodies for the Go (snake_case) and TS (Prisma camelCase) schemas.
+// QUAL-001: the Go body was hand-copied across Upsert and UpsertBatch (4
+// sites), the TS body across upsertTS and UpsertBatch (2 sites) — a silent
+// column-drift hazard now reduced to one definition each. Callers append
+// snapshotOptionalCols' `excluded` fragment to the Go body.
+const (
+	snapshotUpdateSetGo = `DO UPDATE SET
+				total_equity = EXCLUDED.total_equity,
+				realized_balance = EXCLUDED.realized_balance,
+				unrealized_pnl = EXCLUDED.unrealized_pnl,
+				deposits = EXCLUDED.deposits,
+				withdrawals = EXCLUDED.withdrawals,
+				total_trades = EXCLUDED.total_trades,
+				total_volume = EXCLUDED.total_volume,
+				total_fees = EXCLUDED.total_fees,
+				breakdown_by_market = EXCLUDED.breakdown_by_market`
+
+	snapshotUpdateSetTS = `DO UPDATE SET
+				"totalEquity" = EXCLUDED."totalEquity",
+				"realizedBalance" = EXCLUDED."realizedBalance",
+				"unrealizedPnL" = EXCLUDED."unrealizedPnL",
+				deposits = EXCLUDED.deposits,
+				withdrawals = EXCLUDED.withdrawals,
+				breakdown_by_market = EXCLUDED.breakdown_by_market,
+				"updatedAt" = EXCLUDED."updatedAt"`
+)
+
 // snapshotOptionalCols builds the trailing column / placeholder / ON CONFLICT
 // fragments for the Go-only optional snapshot columns — is_historical
 // (migration 013) and from_external_rebuilder (migration 015) — together with
@@ -179,17 +207,8 @@ func (r *SnapshotRepo) Upsert(ctx context.Context, s *Snapshot) error {
 				breakdown_by_market, created_at%s
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14%s)
 			ON CONFLICT (user_uid, exchange, label, timestamp)
-			DO UPDATE SET
-				total_equity = EXCLUDED.total_equity,
-				realized_balance = EXCLUDED.realized_balance,
-				unrealized_pnl = EXCLUDED.unrealized_pnl,
-				deposits = EXCLUDED.deposits,
-				withdrawals = EXCLUDED.withdrawals,
-				total_trades = EXCLUDED.total_trades,
-				total_volume = EXCLUDED.total_volume,
-				total_fees = EXCLUDED.total_fees,
-				breakdown_by_market = EXCLUDED.breakdown_by_market%s
-			RETURNING id`, optCols, optPlaceholders, optExcluded)
+			%s%s
+			RETURNING id`, optCols, optPlaceholders, snapshotUpdateSetGo, optExcluded)
 
 		return r.pool.QueryRow(ctx, query, args...).Scan(&s.ID)
 	}
@@ -210,17 +229,8 @@ func (r *SnapshotRepo) Upsert(ctx context.Context, s *Snapshot) error {
 			breakdown_by_market, created_at%s
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13%s)
 		ON CONFLICT (user_uid, exchange, timestamp)
-		DO UPDATE SET
-			total_equity = EXCLUDED.total_equity,
-			realized_balance = EXCLUDED.realized_balance,
-			unrealized_pnl = EXCLUDED.unrealized_pnl,
-			deposits = EXCLUDED.deposits,
-			withdrawals = EXCLUDED.withdrawals,
-			total_trades = EXCLUDED.total_trades,
-			total_volume = EXCLUDED.total_volume,
-			total_fees = EXCLUDED.total_fees,
-			breakdown_by_market = EXCLUDED.breakdown_by_market%s
-		RETURNING id`, optCols, optPlaceholders, optExcluded)
+		%s%s
+		RETURNING id`, optCols, optPlaceholders, snapshotUpdateSetGo, optExcluded)
 
 	return r.pool.QueryRow(ctx, query, args...).Scan(&s.ID)
 }
@@ -238,14 +248,7 @@ func (r *SnapshotRepo) upsertTS(ctx context.Context, s *Snapshot, breakdownJSON 
 			breakdown_by_market, "createdAt", "updatedAt"
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT ("userUid", exchange, label, timestamp)
-		DO UPDATE SET
-			"totalEquity" = EXCLUDED."totalEquity",
-			"realizedBalance" = EXCLUDED."realizedBalance",
-			"unrealizedPnL" = EXCLUDED."unrealizedPnL",
-			deposits = EXCLUDED.deposits,
-			withdrawals = EXCLUDED.withdrawals,
-			breakdown_by_market = EXCLUDED.breakdown_by_market,
-			"updatedAt" = EXCLUDED."updatedAt"
+		` + snapshotUpdateSetTS + `
 		RETURNING id`
 
 	return r.pool.QueryRow(ctx, query, generatedID,
@@ -738,14 +741,7 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 					breakdown_by_market, "createdAt", "updatedAt"
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 				ON CONFLICT ("userUid", exchange, label, timestamp)
-				DO UPDATE SET
-					"totalEquity" = EXCLUDED."totalEquity",
-					"realizedBalance" = EXCLUDED."realizedBalance",
-					"unrealizedPnL" = EXCLUDED."unrealizedPnL",
-					deposits = EXCLUDED.deposits,
-					withdrawals = EXCLUDED.withdrawals,
-					breakdown_by_market = EXCLUDED.breakdown_by_market,
-					"updatedAt" = EXCLUDED."updatedAt"`,
+				` + snapshotUpdateSetTS,
 				generateCUID(),
 				s.UserUID, s.Exchange, s.Label, s.Timestamp,
 				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
@@ -769,17 +765,8 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 					breakdown_by_market, created_at%s
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14%s)
 				ON CONFLICT (user_uid, exchange, label, timestamp)
-				DO UPDATE SET
-					total_equity = EXCLUDED.total_equity,
-					realized_balance = EXCLUDED.realized_balance,
-					unrealized_pnl = EXCLUDED.unrealized_pnl,
-					deposits = EXCLUDED.deposits,
-					withdrawals = EXCLUDED.withdrawals,
-					total_trades = EXCLUDED.total_trades,
-					total_volume = EXCLUDED.total_volume,
-					total_fees = EXCLUDED.total_fees,
-					breakdown_by_market = EXCLUDED.breakdown_by_market%s`,
-				optCols, optPlaceholders, optExcluded), args...,
+				%s%s`,
+				optCols, optPlaceholders, snapshotUpdateSetGo, optExcluded), args...,
 			)
 		} else {
 			args := []any{
@@ -798,17 +785,8 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 					breakdown_by_market, created_at%s
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13%s)
 				ON CONFLICT (user_uid, exchange, timestamp)
-				DO UPDATE SET
-					total_equity = EXCLUDED.total_equity,
-					realized_balance = EXCLUDED.realized_balance,
-					unrealized_pnl = EXCLUDED.unrealized_pnl,
-					deposits = EXCLUDED.deposits,
-					withdrawals = EXCLUDED.withdrawals,
-					total_trades = EXCLUDED.total_trades,
-					total_volume = EXCLUDED.total_volume,
-					total_fees = EXCLUDED.total_fees,
-					breakdown_by_market = EXCLUDED.breakdown_by_market%s`,
-				optCols, optPlaceholders, optExcluded), args...,
+				%s%s`,
+				optCols, optPlaceholders, snapshotUpdateSetGo, optExcluded), args...,
 			)
 		}
 
