@@ -151,11 +151,6 @@ func (s *ReportSigner) PublicKey() string {
 	return s.publicKeyBase64
 }
 
-// PublicKeyHex is kept for compatibility; it now returns base64 DER public key.
-func (s *ReportSigner) PublicKeyHex() string {
-	return s.PublicKey()
-}
-
 // DailyReturn represents a single day's return data.
 type DailyReturn struct {
 	Date             string  `json:"date"`
@@ -523,27 +518,6 @@ func toDrawdownPeriodsPayload(in []*DrawdownPeriod) []map[string]any {
 func marshalSortedJSON(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := writeSortedJSON(&buf, v); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-// marshalSortedJSONReference is the legacy double-roundtrip implementation,
-// retained for the byte-for-byte non-regression test. Do NOT use in
-// production code paths — see marshalSortedJSON.
-func marshalSortedJSONReference(v any) ([]byte, error) {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-
-	var normalized any
-	if err := json.Unmarshal(raw, &normalized); err != nil {
-		return nil, err
-	}
-
-	var buf bytes.Buffer
-	if err := writeSortedJSON(&buf, normalized); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

@@ -106,26 +106,6 @@ type connectionService interface {
 	GetExcludedConnectionKeys(ctx context.Context, userUID string) (map[string]struct{}, error)
 }
 
-func NewHandler(
-	logger *zap.Logger,
-	connSvc connectionService,
-	syncSvc *service.SyncService,
-	metricsSvc *service.MetricsService,
-	reportSvc *service.ReportService,
-	snapshotRepo *repository.SnapshotRepo,
-	userRepo *repository.UserRepo,
-) *Handler {
-	return &Handler{
-		logger:       logger,
-		connSvc:      connSvc,
-		syncSvc:      syncSvc,
-		metricsSvc:   metricsSvc,
-		reportSvc:    reportSvc,
-		snapshotRepo: snapshotRepo,
-		userRepo:     userRepo,
-	}
-}
-
 // NewHandlerWithOptions creates a handler with all optional services.
 func NewHandlerWithOptions(opts HandlerOptions) *Handler {
 	return &Handler{

@@ -2,6 +2,7 @@ package signing
 
 import (
 	"bytes"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -179,4 +180,26 @@ func TestMarshalSortedJSONMatchesReference(t *testing.T) {
 			}
 		})
 	}
+}
+
+// marshalSortedJSONReference is the legacy double-roundtrip implementation
+// (Marshal → Unmarshal-into-any → writeSortedJSON). It exists only as the
+// byte-for-byte oracle for TestMarshalSortedJSONMatchesReference — the
+// production path is marshalSortedJSON.
+func marshalSortedJSONReference(v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	var normalized any
+	if err := json.Unmarshal(raw, &normalized); err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	if err := writeSortedJSON(&buf, normalized); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

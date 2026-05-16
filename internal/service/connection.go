@@ -120,7 +120,7 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 		Passphrase: req.Passphrase,
 	})
 	if err != nil {
-		return fmt.Errorf("invalid credentials: unsupported exchange %s", normalizedExchange)
+		return fmt.Errorf("invalid credentials: %w", err)
 	}
 	if err := testConn.TestConnection(ctx); err != nil {
 		// Transient upstream failures (busy report generator, rate limit, service

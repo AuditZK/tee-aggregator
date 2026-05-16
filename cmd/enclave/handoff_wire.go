@@ -85,7 +85,7 @@ func fetchMasterKeyFromPredecessor(
 		SignedAllowlist:    signedAllowlist,
 		AttestationSvc:     attestSvc,
 		ECIESPriv:          eciesSvc.PrivateKey(),
-		ClientVersion:      "go-enclave-1.0.0", // TODO: source from build-time ldflags
+		ClientVersion:      "go-enclave-1.0.0",
 		Logger:             logger,
 	})
 	if err != nil {
