@@ -9,6 +9,11 @@ services:
       # PlatformUnattestedDev and every signed report would carry attested=false.
       dockerfile: Dockerfile.production
     container_name: enclave_go_prod
+    # OPS-01: still root because /dev/sev-guest is mode 0600 root:root on the
+    # host — a non-root container user cannot open it without a host-side udev
+    # rule giving the device a readable group. To go non-root: add such a rule
+    # (e.g. KERNEL=="sev-guest", GROUP="sev", MODE="0640"), drop this line so
+    # the image's `USER enclave` applies, and add `group_add: ["<gid of sev>"]`.
     user: root
     ports:
       # CORS-002: enclave terminates public TLS itself (no Caddy in front),
@@ -101,7 +106,11 @@ services:
       # iptables-restricted to this enclave's IP). Empty = integration disabled.
       # REBUILDER_INTERNAL_TOKEN must match the rebuilder's value;
       # CFG-002 fatals at boot if the URL is set but the token is missing.
-    # SEV-SNP device access (AMD confidential computing)
+    # SEV-SNP device access (AMD confidential computing). The explicit device
+    # mapping below is what grants /dev/sev-guest — `privileged: true` was
+    # removed (OPS-01): it handed the container ALL capabilities and every host
+    # device with no isolation, none of which the enclave needs beyond this one
+    # device.
     devices:
       - /dev/sev-guest:/dev/sev-guest
     volumes:
@@ -109,9 +118,11 @@ services:
       - enclave_vcek_cache:/var/cache/enclave/certs:rw
       - ./certs:/etc/enclave:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
+    # OPS-01: label=disable keeps SELinux from relabel-blocking the bind mounts
+    # above on enforcing hosts. Deliberate, documented exception — revisit once
+    # a dedicated SELinux policy module ships for the enclave.
     security_opt:
       - label=disable
-    privileged: true
     read_only: true
     tmpfs:
       - /tmp

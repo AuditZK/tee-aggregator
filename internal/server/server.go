@@ -101,10 +101,10 @@ func (s *Server) Start(ctx context.Context) error {
 	credRateLimiter := NewIPRateLimiter(5, 15*time.Minute, s.cfg.RateLimitTrustedProxies...)
 
 	// Public routes (no auth required):
-	//   /health            — liveness probe
-	//   /api/v1/tls/fingerprint — public by design (used by clients before attestation)
-	//   /api/v1/attestation     — public by design (attestation quote)
-	//   /api/v1/verify          — public by design (stateless signature check)
+	//   /health                 — liveness probe
+	//   /api/v1/tls/fingerprint  — public by design (used by clients before attestation)
+	//   /api/v1/attestation      — public by design (attestation quote)
+	// (/api/v1/verify is public too, but only registered under EnableLegacyREST.)
 	mux.HandleFunc("/health", s.handler.HealthCheck)
 	mux.HandleFunc("/api/v1/tls/fingerprint", s.handler.GetTLSFingerprint)
 	mux.HandleFunc("/api/v1/attestation", s.handler.GetAttestation)

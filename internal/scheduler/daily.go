@@ -110,7 +110,7 @@ func (s *SyncScheduler) executeDailySync() {
 		wg              sync.WaitGroup
 	)
 
-	sem := make(chan struct{}, 3) // Max 3 concurrent user syncs (CCXT loads ~40MB per connector)
+	sem := make(chan struct{}, 3) // Max 3 concurrent user syncs to bound memory + exchange-API pressure
 
 	for _, user := range users {
 		wg.Add(1)

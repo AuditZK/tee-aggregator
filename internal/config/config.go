@@ -140,11 +140,11 @@ type Config struct {
 	LegacyMasterKeyHex string
 
 	// HandoffSignedAllowlist holds the operator-signed JSON document
-	// listing approved release measurements. Inlined here to allow
-	// override via the GCP `signed-allowlist` metadata key when shipping
-	// a new release before its measurement is hardcoded into the binary.
-	// Parsed from HANDOFF_SIGNED_ALLOWLIST. Empty = use the constant
-	// shipped with the binary (see internal/bootstrap/embedded_allowlist).
+	// listing approved release measurements, supplied via the GCP
+	// `signed-allowlist` metadata key. Parsed from HANDOFF_SIGNED_ALLOWLIST.
+	// Required alongside HANDOFF_PEER_URL — when empty, the B2 handoff client
+	// fails with errMissingSignedAllowlist (cmd/enclave/handoff_wire.go). There
+	// is no allowlist embedded in the binary.
 	HandoffSignedAllowlist string
 
 	// MeasurementAutoRecovery enables automatic DEK unwrap recovery when the

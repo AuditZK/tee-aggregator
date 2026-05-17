@@ -136,14 +136,16 @@ func TestNewClient(t *testing.T) {
 		}
 	})
 
-	t.Run("NewClient leaves Timeout unset (audit C-03)", func(t *testing.T) {
-		// proxy.NewClient returns an http.Client with no Timeout. Today that is
-		// masked only because NewBinanceWithClient patches Timeout==0 -> 30s.
-		// Pinned here as a tripwire: any future connector that consumes a
-		// proxied client WITHOUT patching the timeout would hang indefinitely.
+	t.Run("NewClient sets a request timeout (CONN-03)", func(t *testing.T) {
+		// CONN-03 remediation: proxy.NewClient must carry a non-zero Timeout on
+		// BOTH branches so a connector that swaps in a proxied client cannot
+		// hang a sync goroutine indefinitely on a slow or silent proxy.
 		cfg := ParseConfig("http://proxy.example:8080", "binance")
-		if to := cfg.NewClient("binance").Timeout; to != 0 {
-			t.Errorf("Timeout = %v; finding C-03 said NewClient sets none — update the audit if this was fixed", to)
+		if to := cfg.NewClient("binance").Timeout; to <= 0 {
+			t.Errorf("proxied client Timeout = %v, want > 0", to)
+		}
+		if to := cfg.NewClient("kraken").Timeout; to <= 0 {
+			t.Errorf("unproxied client Timeout = %v, want > 0", to)
 		}
 	})
 }

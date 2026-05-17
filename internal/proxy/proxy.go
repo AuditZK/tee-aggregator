@@ -5,7 +5,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
+
+// clientTimeout bounds a proxied exchange request end-to-end so a slow or
+// silent proxy cannot hang a sync goroutine indefinitely. Matches the 30 s
+// timeout the non-proxied connector HTTP clients use.
+const clientTimeout = 30 * time.Second
 
 // Config holds HTTP proxy configuration for exchange connectors.
 type Config struct {
@@ -68,10 +74,12 @@ func (c *Config) ConfigureTransport(exchange string) *http.Transport {
 }
 
 // NewClient creates an http.Client with optional proxy for the given exchange.
+// The client always carries a request timeout (clientTimeout) — a connector
+// that swaps in this client must not lose the deadline the default clients have.
 func (c *Config) NewClient(exchange string) *http.Client {
 	transport := c.ConfigureTransport(exchange)
 	if transport == nil {
-		return &http.Client{}
+		return &http.Client{Timeout: clientTimeout}
 	}
-	return &http.Client{Transport: transport}
+	return &http.Client{Transport: transport, Timeout: clientTimeout}
 }
