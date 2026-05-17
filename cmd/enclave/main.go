@@ -377,7 +377,14 @@ func main() {
 			opts.TLSFingerprint = tlsKeygen.Fingerprint()
 		}
 		if eciesSvc != nil {
-			opts.E2EPublicKey = eciesSvc.PublicKeyPEM()
+			e2ePub, err := eciesSvc.PublicKeyPEM()
+			if err != nil {
+				logger.Fatal("encode E2E public key",
+					zap.Error(err),
+					zap.String("hint", "x509.MarshalPKIXPublicKey failed for the ECDH P-256 key — this should never happen for a well-formed key; rebuild the enclave"),
+				)
+			}
+			opts.E2EPublicKey = e2ePub
 		}
 		opts.SigningPubKey = signingPubKey
 		attestSvc = attestation.NewService(opts)
