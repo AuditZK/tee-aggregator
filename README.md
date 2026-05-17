@@ -3,8 +3,8 @@
 **Trusted Computing Base for Confidential Trading Data Aggregation**
 
 [![License: ASAL](https://img.shields.io/badge/License-ASAL%20v1.0-blue.svg)](LICENSE)
-[![TCB](https://img.shields.io/badge/TCB-~8,500%20LOC-green.svg)]()
-[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8.svg)]()
+[![TCB](https://img.shields.io/badge/TCB-~27k%20LOC-green.svg)]()
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8.svg)]()
 [![AMD SEV-SNP](https://img.shields.io/badge/AMD-SEV--SNP-red.svg)]()
 
 ## Overview
@@ -77,7 +77,7 @@ This is a full rewrite of the [TypeScript enclave](https://github.com/AuditZK/ze
 ║  │  Autonomous Daily Sync Scheduler (00:00 UTC)         │ ║
 ║  │  - SyncScheduler (internal/scheduler)                │ ║
 ║  │  - Triggers daily snapshots for ALL active users     │ ║
-║  │  - Rate-limited (23h cooldown per user/exchange)     │ ║
+║  │  - One snapshot per day per user/exchange/label      │ ║
 ║  │  - Audit trail: sync_statuses table                  │ ║
 ║  └───────────────────────────────────────────────────────┘ ║
 ║                                                             ║
@@ -102,9 +102,9 @@ This is a full rewrite of the [TypeScript enclave](https://github.com/AuditZK/ze
 ║  │  │  - Atomic snapshot batch save (all-or-nothing)  │ │ ║
 ║  │  └─────────────────────────────────────────────────┘ │ ║
 ║  │  ┌─────────────────────────────────────────────────┐ │ ║
-║  │  │  RateLimiterService                             │ │ ║
-║  │  │  - 23-hour cooldown enforcement                 │ │ ║
-║  │  │  - Prevents cherry-picking via manual API calls │ │ ║
+║  │  │  Anti-Cherry-Pick Guard                         │ │ ║
+║  │  │  - One snapshot per day per user/exchange/label │ │ ║
+║  │  │  - Manual re-sync refused once today's exists   │ │ ║
 ║  │  └─────────────────────────────────────────────────┘ │ ║
 ║  └───────────────────────────────────────────────────────┘ ║
 ║                                                             ║
@@ -168,8 +168,8 @@ External Exchange APIs (Binance, IBKR, Alpaca, …)
          │
          ▼
   ┌──────────────┐
-  │ Rate Limiter │ ◄── sync_statuses table
-  │ / Audit Log  │     Prevents manual cherry-picking (23h cooldown)
+  │ Anti-Cherry- │ ◄── sync_statuses table (audit trail)
+  │ Pick + Audit │     One snapshot/day; manual re-sync refused if it exists
   └──────────────┘
          │
          ▼
@@ -182,19 +182,18 @@ External Exchange APIs (Binance, IBKR, Alpaca, …)
 
 | Component | Package | LOC | Purpose |
 |-----------|---------|-----|---------|
-| **EncryptionService** | `internal/encryption` | ~600 | AES-256-GCM, DEK management, SEV-SNP key derivation |
-| **Exchange Connectors** | `internal/connector` | ~4,200 | 20+ native connectors (no CCXT) |
-| **SyncService** | `internal/service` | ~1,150 | Orchestration, snapshot creation, rate limiting |
-| **gRPC Server** | `internal/grpc` | ~800 | Server, request handling, mTLS |
-| **REST Server** | `internal/server` | ~200 | Admin endpoints, health check |
-| **Repositories** | `internal/repository` | ~900 | Database access (pgx, dual-schema) |
-| **Scheduler** | `internal/scheduler` | ~200 | Autonomous daily sync (00:00 UTC) |
-| **Attestation** | `internal/attestation` | ~200 | SEV-SNP VCEK verification |
-| **Proxy / Cache / Security** | `internal/{proxy,cache,security}` | ~250 | HTTP proxy, connector cache, mlock |
-| **Entry Point** | `cmd/enclave` | ~300 | main.go, DI wiring |
-| **Total** | | **~8,800** | Minimized attack surface |
+| **Exchange Connectors** | `internal/connector` | ~8,000 | 19 native connectors + mock (no CCXT) |
+| **Core Services** | `internal/service` | ~3,550 | Sync orchestration, snapshot creation, reporting |
+| **Repositories** | `internal/repository` | ~2,500 | Database access (pgx, dual-schema) |
+| **REST Server** | `internal/server` | ~1,750 | REST handlers, CORS, rate limiting |
+| **Encryption** | `internal/encryption` | ~1,550 | AES-256-GCM, DEK management, SEV-SNP key derivation |
+| **gRPC Server** | `internal/grpc` | ~1,150 | Server, request handling, mTLS |
+| **Entry Point** | `cmd/enclave` | ~1,050 | `main.go`, boot orchestration |
+| **Attestation** | `internal/attestation` | ~630 | SEV-SNP attestation + VCEK verification |
+| **Other packages** | `internal/{bootstrap,errtrack,signing,logstream,logredact,validation,…}`, `pkg/reportverify` | ~6,500 | Key handoff, error tracking, report signing, logging |
+| **Total** | | **~26,700** | Hand-written Go (excludes tests and generated `api/proto`) |
 
-**Rationale**: Native Go connectors replace CCXT (150MB per LoadMarkets call → ~5MB per connector), enabling a larger connector matrix with a smaller memory footprint. The TCB is larger than the TS implementation in LOC but eliminates an entire npm dependency tree from the audit scope.
+**Rationale**: Native Go connectors replace CCXT, enabling a larger connector matrix with a smaller memory footprint. The TCB is larger than the TypeScript implementation in LOC, but eliminates an entire npm dependency tree from the audit scope.
 
 ### Dependencies
 
@@ -202,12 +201,13 @@ Critical dependencies (included in TCB audit scope):
 
 | Module | Version | Purpose |
 |--------|---------|---------|
-| `github.com/jackc/pgx/v5` | 5.x | PostgreSQL driver (parameterized queries) |
-| `google.golang.org/grpc` | 1.x | gRPC implementation |
-| `go.uber.org/zap` | 2.x | Structured logging (PII redaction) |
-| `github.com/golang-jwt/jwt/v5` | 5.x | JWT validation (cTrader OAuth) |
+| `github.com/jackc/pgx/v5` | 5.9.x | PostgreSQL driver (parameterized queries) |
+| `google.golang.org/grpc` | 1.79.x | gRPC implementation |
+| `google.golang.org/protobuf` | 1.36.x | Protobuf runtime |
+| `go.uber.org/zap` | 1.26.x | Structured logging (redaction core) |
+| `golang.org/x/crypto` | 0.50.x | HKDF / ECIES primitives |
 
-Total direct dependencies: ~15 modules (`go.sum` pins exact hashes for all transitive deps)
+JWT (HS256) and ECDSA-P256 report signing use the Go standard library only — no third-party JWT or crypto dependency. Total direct dependencies: 9 modules (`go.sum` pins exact hashes for all transitive deps).
 
 ## Threat Model
 
@@ -233,7 +233,7 @@ Total direct dependencies: ~15 modules (`go.sum` pins exact hashes for all trans
 
 **Mitigation**:
 - `go.sum` pins cryptographic hashes for all modules
-- Minimal dependency surface (~15 direct deps vs ~49 for TS)
+- Minimal dependency surface (9 direct deps vs ~49 for TS)
 - Reproducible builds allow hash verification
 
 #### 4. Malicious Insider
@@ -279,14 +279,14 @@ Auditors should focus on:
 - [ ] Review `internal/encryption/` — key derivation, AES-GCM usage, DEK management
 - [ ] Verify no credentials logged in `internal/logredact/` redaction rules
 - [ ] Confirm decrypted credentials not written to disk or global variables
-- [ ] Check `internal/security/mlock.go` — memory locking for key material
+- [ ] Check `internal/security/` (`memory_linux.go`) — core-dump / ptrace hardening, memory locking
 
 **Snapshot Privacy:**
 - [ ] Review `internal/service/sync.go` — snapshot creation, field selection
 - [ ] Verify gRPC responses in `internal/grpc/server.go` contain only aggregated data
 - [ ] Confirm no individual trades in `snapshot_data` writes
 - [ ] Review `internal/scheduler/daily.go` — 00:00 UTC systematic execution
-- [ ] Verify sync_statuses rate-limit enforcement in `internal/service/sync.go`
+- [ ] Verify the anti-cherry-pick guard in `internal/service/sync.go` (`isManualSyncAllowed`)
 
 **Input Validation:**
 - [ ] Review gRPC message validation in `internal/grpc/server.go`
@@ -312,7 +312,7 @@ Auditors should focus on:
 ### Responsible Disclosure
 
 Security vulnerabilities should be reported privately to:
-- **Email**: security@auditzk.com
+- **Email**: contact@auditzk.com
 - **Response SLA**: 48 hours for acknowledgment, 7 days for initial assessment
 
 Please **do not** open public GitHub issues for security vulnerabilities.
@@ -352,7 +352,7 @@ sha256sum enclave
 ### Build Environment
 
 For bit-for-bit reproducibility:
-- **Go**: 1.22.x (exact version pinned in `go.mod`)
+- **Go**: 1.26.3 (exact version pinned in `go.mod`)
 - **OS**: Ubuntu 22.04 LTS
 - **Architecture**: x86_64 (linux/amd64)
 - **CGO**: disabled (`CGO_ENABLED=0`)
@@ -374,7 +374,9 @@ In production on AMD SEV-SNP:
 service EnclaveService {
   rpc ProcessSyncJob(SyncJobRequest) returns (SyncJobResponse);
   rpc GetAggregatedMetrics(AggregatedMetricsRequest) returns (AggregatedMetricsResponse);
+  rpc GenerateSignedReport(ReportRequest) returns (SignedReportResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  // … see the full service (8 RPCs) in api/proto/enclave.proto
 }
 ```
 
