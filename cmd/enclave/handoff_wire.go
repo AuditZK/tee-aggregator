@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/trackrecord/enclave/internal/attestation"
@@ -58,7 +59,11 @@ func fetchMasterKeyFromPredecessor(
 		attestOpts.TLSFingerprint = tlsKeygen.Fingerprint()
 	}
 	if eciesSvc != nil {
-		attestOpts.E2EPublicKey = eciesSvc.PublicKeyPEM()
+		e2ePub, err := eciesSvc.PublicKeyPEM()
+		if err != nil {
+			return nil, fmt.Errorf("encode E2E public key: %w", err)
+		}
+		attestOpts.E2EPublicKey = e2ePub
 	}
 	attestOpts.SigningPubKey = tempSigner.PublicKey()
 	attestSvc := attestation.NewService(attestOpts)

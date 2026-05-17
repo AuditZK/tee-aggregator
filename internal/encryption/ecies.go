@@ -4,8 +4,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
@@ -46,14 +48,17 @@ func (e *ECIESService) PrivateKey() *ecdh.PrivateKey {
 	return e.privateKey
 }
 
-// PublicKeyPEM returns the public key in PEM format.
-func (e *ECIESService) PublicKeyPEM() string {
-	derBytes := e.publicKey.Bytes()
-	block := &pem.Block{
-		Type:  "PUBLIC KEY",
-		Bytes: derBytes,
+// PublicKeyPEM returns the public key as a PEM-wrapped SubjectPublicKeyInfo.
+// SEC-ECIES-001: the DER MUST be SPKI (RFC 7468), not the raw EC point — a
+// "PUBLIC KEY" block carrying a bare point is rejected by every standard
+// parser (WebCrypto importKey('spki'), Python cryptography, .NET
+// ImportSubjectPublicKeyInfo), which is what the /setup credential flow uses.
+func (e *ECIESService) PublicKeyPEM() (string, error) {
+	der, err := x509.MarshalPKIXPublicKey(e.publicKey)
+	if err != nil {
+		return "", fmt.Errorf("marshal spki: %w", err)
 	}
-	return string(pem.EncodeToMemory(block))
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})), nil
 }
 
 // PublicKeyHex returns the public key as a hex string.
@@ -66,15 +71,29 @@ func (e *ECIESService) PublicKeyBase64() string {
 	return base64.StdEncoding.EncodeToString(e.publicKey.Bytes())
 }
 
-// ParseEphemeralPublicKey parses an ephemeral public key from either raw bytes
-// (uncompressed P-256 point, 65 bytes) or PEM-encoded format (as sent by TS clients).
+// ParseEphemeralPublicKey normalises a client ephemeral public key to the raw
+// uncompressed P-256 point (65 bytes) that ecdh.Curve.NewPublicKey expects.
+//
+// SEC-ECIES-001: WebCrypto, Python cryptography and .NET all export SPKI, so
+// the inner DER of a PEM block is a SubjectPublicKeyInfo, not a bare point —
+// returning block.Bytes verbatim feeds SPKI into NewPublicKey and fails.
+// Accepted inputs: PEM-of-SPKI, raw SPKI DER, raw uncompressed point (and a
+// legacy PEM-of-raw-point, handled by the fallthrough).
 func ParseEphemeralPublicKey(data []byte) ([]byte, error) {
-	// Try PEM decode first (TS clients send PEM strings)
-	block, _ := pem.Decode(data)
-	if block != nil {
-		return block.Bytes, nil
+	if block, _ := pem.Decode(data); block != nil {
+		data = block.Bytes
 	}
-	// Already raw bytes
+	// x509.ParsePKIXPublicKey returns *ecdsa.PublicKey for NIST-curve SPKI;
+	// a raw point is not valid SPKI and falls through unchanged.
+	if pub, err := x509.ParsePKIXPublicKey(data); err == nil {
+		if ec, ok := pub.(*ecdsa.PublicKey); ok {
+			ecdhKey, err := ec.ECDH()
+			if err != nil {
+				return nil, fmt.Errorf("ec public key to ecdh: %w", err)
+			}
+			return ecdhKey.Bytes(), nil
+		}
+	}
 	return data, nil
 }
 
