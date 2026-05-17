@@ -232,7 +232,7 @@ func Load() *Config {
 
 		HandoffPeerURL:            strings.TrimSpace(getEnv("HANDOFF_PEER_URL", "")),
 		HandoffPeerTLSFingerprint: strings.TrimSpace(getEnv("HANDOFF_PEER_TLS_FINGERPRINT", "")),
-		HandoffSignedAllowlist: getEnv("HANDOFF_SIGNED_ALLOWLIST", ""),
+		HandoffSignedAllowlist:    getEnv("HANDOFF_SIGNED_ALLOWLIST", ""),
 		LegacyMasterKeyHex:    strings.TrimSpace(getEnv("LEGACY_MASTER_KEY_HEX", "")),
 
 		MeasurementAutoRecovery:         getEnvBool("MEASUREMENT_AUTO_RECOVERY", true),
