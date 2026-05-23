@@ -541,7 +541,19 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		m.availableMargin = balance.Available
 	}
 
-	// 8. Create snapshot
+	// 8. Inception-deposit convention (UX-001). When this is the very first
+	// snapshot we write for the connection AND the connector didn't already
+	// surface a cashflow for the period, treat the existing balance as a
+	// deposit. Without this, the dashboard's cumulative-return calc has no
+	// base reference for users who connect a broker that already holds
+	// funds (Lighter / HL / MEXC / MT5 demos…), and the "Inception deposit"
+	// marker on the equity curve is missing. See Notion ticket
+	// "Code fix : inception deposit auto sur premier snapshot d'une connexion".
+	if deposits == 0 && balance.Equity > 0 && s.isFirstSync(ctx, connMeta) {
+		deposits = balance.Equity
+	}
+
+	// 9. Create snapshot
 	// TS parity: realizedBalance = equity - unrealizedPnL (preserves the
 	// invariant equity == realized + unrealized). Using balance.Available
 	// (cash) diverges on margin accounts — cash can be deeply negative when
@@ -852,6 +864,14 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		m := breakdown.getOrCreateMarket(primaryMarketType(connMeta.Exchange))
 		m.equity = balance.Equity
 		m.availableMargin = balance.Available
+	}
+
+	// Inception-deposit convention (UX-001): see the non-atomic path above
+	// for the full rationale. Both call sites need the same fallback,
+	// otherwise the atomic-sync flow leaves new connections with deposits=0
+	// when the connector lacks CashflowFetcher.
+	if deposits == 0 && balance.Equity > 0 && s.isFirstSync(ctx, connMeta) {
+		deposits = balance.Equity
 	}
 
 	// TS parity: realizedBalance = equity - unrealizedPnL. See the non-atomic
@@ -1288,11 +1308,35 @@ func buildHistoricalSnapshots(
 			TotalFees:       h.TotalFees,
 			Breakdown:       breakdown,
 			IsHistorical:    true,
-			// SEC-001: snapshots from the external rebuilder are out of the
-			// SEV-SNP perimeter and must be excluded from signed reports.
+			// PayloadVersion 1.3 surfaces this flag per-day in signed reports;
+			// the report builder labels each daily return as
+			// "rebuilder-service" or "in-enclave" accordingly so verifiers
+			// can apply their own trust policy.
 			FromExternalRebuilder: fromExternalRebuilder,
 		})
 	}
+
+	// Inception-deposit convention (UX-001) for historical reconstructions:
+	// the earliest reconstructed day inherits its TotalEquity as an inception
+	// deposit unless the connector already reported a non-zero cashflow.
+	// Without this the dashboard's cumulative-return curve has no base
+	// reference, just like the live-sync first-snapshot case. The connector
+	// list is small enough (IBKR Flex, history-rebuilder for HL/Lighter/MEXC)
+	// that a single "patch the earliest entry" pass is enough — no need to
+	// sort by date since both sources emit a chronologically sorted slice
+	// today, but use min() in case that drifts.
+	if len(snapshots) > 0 {
+		earliest := snapshots[0]
+		for _, s := range snapshots[1:] {
+			if s.Timestamp.Before(earliest.Timestamp) {
+				earliest = s
+			}
+		}
+		if earliest.Deposits == 0 && earliest.TotalEquity > 0 {
+			earliest.Deposits = earliest.TotalEquity
+		}
+	}
+
 	return snapshots, skippedToday
 }
 
