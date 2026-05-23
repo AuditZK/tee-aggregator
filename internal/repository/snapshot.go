@@ -264,14 +264,64 @@ func (r *SnapshotRepo) GetByUserAndDateRange(ctx context.Context, userUID string
 	return r.getByUserAndDateRange(ctx, userUID, start, end, false)
 }
 
-// GetVerifiableByUserAndDateRange is GetByUserAndDateRange restricted to
-// snapshots produced inside the SEV-SNP perimeter — it excludes history
-// reconstructed by the external rebuilder (SEC-001). The signed report is
-// built from this set so its signature only covers enclave-verified data. On a
-// TS/Prisma schema (no from_external_rebuilder column) it behaves exactly like
-// GetByUserAndDateRange; the rebuilt-history feature targets the Go schema.
+// GetVerifiableByUserAndDateRange returns snapshots eligible for inclusion in
+// a signed report. As of PayloadVersion 1.3 (see internal/signing) this is the
+// FULL set — live + in-enclave-reconstructed + external-rebuilder-reconstructed
+// — and the per-day verifiability is encoded in the signed payload itself via
+// the daily_returns[*].verifiability_class field. Verifiers who require strict
+// in-enclave-only data filter the daily returns at consumption time.
+//
+// Earlier payload versions (≤ 1.2) excluded external-rebuilder snapshots at
+// this layer (SEC-001). That coarse-grained gate is now replaced by per-day
+// labelling so the same signed report can convey both live and rebuilt
+// history with cryptographically attested provenance.
+//
+// Callers that genuinely need the strict in-enclave-only set should use
+// GetStrictlyInEnclaveByUserAndDateRange.
 func (r *SnapshotRepo) GetVerifiableByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
+	return r.getByUserAndDateRange(ctx, userUID, start, end, false)
+}
+
+// GetStrictlyInEnclaveByUserAndDateRange returns only snapshots that never
+// left the SEV-SNP perimeter: live daily syncs plus IBKR Flex history
+// reconstructed in-enclave. External-rebuilder snapshots are excluded. Use
+// this when the caller wants the pre-1.3 "verifiable only" behaviour.
+func (r *SnapshotRepo) GetStrictlyInEnclaveByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
 	return r.getByUserAndDateRange(ctx, userUID, start, end, true)
+}
+
+// GetExternalRebuilderDays returns the set of UTC day-keys (00:00:00 of the
+// day) for which the user has at least one snapshot produced by the external
+// history-rebuilder service in [start, end]. The signed-report builder uses
+// this to label each daily return with its verifiability_class without
+// scanning every individual snapshot. On a schema that doesn't have the
+// from_external_rebuilder column (legacy TS/Prisma), the returned map is
+// empty — every day is treated as in-enclave/live, which matches the pre-
+// migration-015 reality.
+func (r *SnapshotRepo) GetExternalRebuilderDays(ctx context.Context, userUID string, start, end time.Time) (map[time.Time]struct{}, error) {
+	out := make(map[time.Time]struct{})
+	if !r.hasFromExternalRebuilderColumn(ctx) {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT date_trunc('day', timestamp) AS day
+		FROM snapshot_data
+		WHERE user_uid = $1 AND timestamp >= $2 AND timestamp <= $3
+		  AND from_external_rebuilder = TRUE`,
+		userUID, start, end,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var day time.Time
+		if err := rows.Scan(&day); err != nil {
+			return nil, err
+		}
+		out[day.UTC()] = struct{}{}
+	}
+	return out, rows.Err()
 }
 
 func (r *SnapshotRepo) getByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time, verifiableOnly bool) ([]*Snapshot, error) {

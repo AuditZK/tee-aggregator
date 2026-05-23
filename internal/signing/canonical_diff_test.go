@@ -182,6 +182,112 @@ func TestMarshalSortedJSONMatchesReference(t *testing.T) {
 	}
 }
 
+// TestVerifiabilityClassInPayload pins the PayloadVersion-gated behaviour of
+// the verifiabilityClass field on daily_returns. The contract is:
+//
+//   - Pre-1.3 reports (1.0/1.1/1.2) carry no verifiabilityClass in the
+//     signed payload, so VerifyReport on legacy reports still reproduces
+//     their hash byte-for-byte.
+//   - 1.3+ reports always emit the key (even when empty), so a verifier
+//     can rely on its presence to decide trust policy.
+func TestVerifiabilityClassInPayload(t *testing.T) {
+	dailyReturns := []DailyReturn{
+		{
+			Date:               "2026-01-01",
+			NetReturn:          0.01,
+			NAV:                100,
+			VerifiabilityClass: VerifiabilityClassLive,
+		},
+		{
+			Date:               "2026-01-02",
+			NetReturn:          0.02,
+			NAV:                101,
+			VerifiabilityClass: VerifiabilityClassRebuilderService,
+		},
+	}
+
+	cases := []struct {
+		name           string
+		payloadVersion string
+		wantKey        bool
+	}{
+		{name: "legacy_1.2", payloadVersion: "1.2", wantKey: false},
+		{name: "current_1.3", payloadVersion: "1.3", wantKey: true},
+		{name: "empty_version_treated_as_legacy", payloadVersion: "", wantKey: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := toDailyReturnsPayload(dailyReturns, tc.payloadVersion)
+			if len(payload) != len(dailyReturns) {
+				t.Fatalf("got %d entries, want %d", len(payload), len(dailyReturns))
+			}
+			_, hasKey := payload[0]["verifiabilityClass"]
+			if hasKey != tc.wantKey {
+				t.Errorf("payloadVersion=%q: verifiabilityClass present=%v, want=%v", tc.payloadVersion, hasKey, tc.wantKey)
+			}
+			if tc.wantKey {
+				if payload[0]["verifiabilityClass"] != VerifiabilityClassLive {
+					t.Errorf("entry 0: got class=%v, want %q", payload[0]["verifiabilityClass"], VerifiabilityClassLive)
+				}
+				if payload[1]["verifiabilityClass"] != VerifiabilityClassRebuilderService {
+					t.Errorf("entry 1: got class=%v, want %q", payload[1]["verifiabilityClass"], VerifiabilityClassRebuilderService)
+				}
+			}
+		})
+	}
+}
+
+// TestVerifiabilityClassSignAndVerifyRoundtrip pins the end-to-end signature
+// invariant for 1.3 reports: a verifier MUST reject any tampering with the
+// verifiabilityClass field (since it's part of the canonical payload).
+func TestVerifiabilityClassSignAndVerifyRoundtrip(t *testing.T) {
+	signer := MustNewReportSignerGenerate()
+	signer.SetAttestation(&EnclaveAttestation{
+		Platform:                 "sev-snp",
+		Attested:                 true,
+		ReportDataBoundToRequest: true,
+		VcekVerified:             true,
+	})
+
+	report, err := signer.Sign(&ReportInput{
+		UserUID:      "u1",
+		ReportName:   "r",
+		PeriodStart:  time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		PeriodEnd:    time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC),
+		DataPoints:   2,
+		BaseCurrency: "USD",
+		DailyReturns: []DailyReturn{
+			{Date: "2026-01-01", NetReturn: 0.01, NAV: 100, VerifiabilityClass: VerifiabilityClassRebuilderService},
+			{Date: "2026-01-02", NetReturn: 0.02, NAV: 101, VerifiabilityClass: VerifiabilityClassLive},
+		},
+	})
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if report.PayloadVersion != "1.3" {
+		t.Fatalf("expected new reports to carry PayloadVersion 1.3, got %q", report.PayloadVersion)
+	}
+
+	ok, err := VerifyReport(report)
+	if err != nil || !ok {
+		t.Fatalf("verify untampered report: ok=%v err=%v", ok, err)
+	}
+
+	// Tamper: swap the rebuilder-service class to live and re-verify. The
+	// signature was computed over the canonical payload that includes the
+	// class, so the hash recomputation must mismatch and VerifyReport must
+	// return (false, nil).
+	report.DailyReturns[0].VerifiabilityClass = VerifiabilityClassLive
+	ok, err = VerifyReport(report)
+	if err != nil {
+		t.Fatalf("verify tampered report errored unexpectedly: %v", err)
+	}
+	if ok {
+		t.Fatalf("tampered verifiabilityClass slipped past VerifyReport")
+	}
+}
+
 // marshalSortedJSONReference is the legacy double-roundtrip implementation
 // (Marshal → Unmarshal-into-any → writeSortedJSON). It exists only as the
 // byte-for-byte oracle for TestMarshalSortedJSONMatchesReference — the

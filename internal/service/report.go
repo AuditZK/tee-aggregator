@@ -131,12 +131,34 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 		return cached, nil
 	}
 
-	// 1. Fetch snapshots. SEC-001: a signed report must cover only data
-	// produced inside the SEV-SNP perimeter, so history reconstructed by the
-	// external rebuilder is excluded here (GetVerifiableByUserAndDateRange).
+	// 1. Fetch snapshots. As of PayloadVersion 1.3 the signed report covers
+	// the full history (live + in-enclave reconstructed + external-rebuilder
+	// reconstructed) and each daily return carries a verifiabilityClass label
+	// derived from the underlying snapshots' provenance. Verifiers who need
+	// strict in-enclave-only data filter the daily returns at consumption
+	// time. The previous SEC-001 coarse gate was replaced by per-day
+	// labelling so that user-facing PDFs and signed reports stay byte-for-
+	// byte consistent on the equity curve.
 	snapshots, err := s.snapshotRepo.GetVerifiableByUserAndDateRange(ctx, req.UserUID, req.StartDate, req.EndDate)
 	if err != nil {
 		return nil, fmt.Errorf("fetch snapshots: %w", err)
+	}
+
+	// Days that include at least one external-rebuilder snapshot — used to
+	// label the verifiabilityClass of each daily return (1.3+ payload).
+	externalRebuilderDays, err := s.snapshotRepo.GetExternalRebuilderDays(ctx, req.UserUID, req.StartDate, req.EndDate)
+	if err != nil {
+		// Non-fatal: degrade gracefully by treating the set as empty (no
+		// per-day rebuilder taint). The signed report is still produced;
+		// the worst case is a strict verifier accepting a day they would
+		// otherwise filter — which the same verifier can detect by cross-
+		// referencing the user's exchange list. Logged so an operator can
+		// chase the underlying query failure.
+		s.logger.Warn("fetch external-rebuilder day set failed; verifiabilityClass labels may underreport rebuilder taint",
+			zap.String("user_uid", req.UserUID),
+			zap.Error(err),
+		)
+		externalRebuilderDays = map[time.Time]struct{}{}
 	}
 
 	snapshots = filterSnapshotsByExcludedExchanges(snapshots, req.ExcludedExchanges)
@@ -195,7 +217,7 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 		BenchmarkUsed:    req.Benchmark,
 		Exchanges:        exchanges,
 		ExchangeDetails:  s.buildExchangeDetails(ctx, req.UserUID, exchanges),
-		DailyReturns:     toSigningDailyReturns(dailyReturns),
+		DailyReturns:     toSigningDailyReturns(dailyReturns, snapshots, externalRebuilderDays),
 		MonthlyReturns:   toSigningMonthlyReturns(monthlyReturns),
 	}
 
@@ -679,16 +701,61 @@ func calculateDrawdownData(daily []dailyReturn) *drawdownData {
 
 // Conversion helpers: internal types -> signing types
 
-func toSigningDailyReturns(daily []dailyReturn) []signing.DailyReturn {
+// toSigningDailyReturns converts internal daily returns to the signing-layer
+// shape, attaching a verifiabilityClass label per day (PayloadVersion 1.3+).
+//
+// Per-day labelling rule (most-restrictive wins; surfaced for verifier
+// policy):
+//
+//	- "rebuilder-service" if any snapshot for the day came from the external
+//	  history-rebuilder (the day's data path briefly left the SEV-SNP
+//	  perimeter).
+//	- "in-enclave" if no rebuilder taint but at least one snapshot was
+//	  reconstructed inside the enclave (IBKR Flex etc.).
+//	- "live" if every snapshot for the day is a live daily-sync write.
+//
+// This decision is made off the snapshot set, NOT the daily-return slice, so
+// the label reflects the underlying data even when the daily aggregation has
+// already collapsed multiple exchanges into one row.
+func toSigningDailyReturns(daily []dailyReturn, snapshots []*repository.Snapshot, externalRebuilderDays map[time.Time]struct{}) []signing.DailyReturn {
+	// Index snapshots by day-key to derive in-enclave vs live without
+	// hitting the rebuilder map twice.
+	inEnclaveDays := make(map[time.Time]bool, len(snapshots))
+	for _, s := range snapshots {
+		if s.IsHistorical && !s.FromExternalRebuilder {
+			day := time.Date(s.Timestamp.Year(), s.Timestamp.Month(), s.Timestamp.Day(), 0, 0, 0, 0, time.UTC)
+			inEnclaveDays[day] = true
+		}
+	}
+
 	result := make([]signing.DailyReturn, len(daily))
 	for i, dr := range daily {
+		dayKey, parseErr := time.Parse("2006-01-02", dr.date)
+		var class string
+		switch {
+		case parseErr != nil:
+			// Defensive: if the date format ever drifts, fall back to "live"
+			// (the most permissive label). The signature still binds the
+			// returned class, so any tamper detection downstream is preserved.
+			class = signing.VerifiabilityClassLive
+		default:
+			dayKey = dayKey.UTC()
+			if _, taint := externalRebuilderDays[dayKey]; taint {
+				class = signing.VerifiabilityClassRebuilderService
+			} else if inEnclaveDays[dayKey] {
+				class = signing.VerifiabilityClassInEnclave
+			} else {
+				class = signing.VerifiabilityClassLive
+			}
+		}
 		result[i] = signing.DailyReturn{
-			Date:             dr.date,
-			NetReturn:        dr.netReturn,
-			BenchmarkReturn:  dr.benchmarkReturn,
-			Outperformance:   dr.outperformance,
-			CumulativeReturn: dr.cumulativeReturn,
-			NAV:              dr.nav,
+			Date:               dr.date,
+			NetReturn:          dr.netReturn,
+			BenchmarkReturn:    dr.benchmarkReturn,
+			Outperformance:     dr.outperformance,
+			CumulativeReturn:   dr.cumulativeReturn,
+			NAV:                dr.nav,
+			VerifiabilityClass: class,
 		}
 	}
 	return result
