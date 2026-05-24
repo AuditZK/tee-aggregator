@@ -84,7 +84,19 @@ func (h *Hyperliquid) GetBalance(ctx context.Context) (*Balance, error) {
 		unrealizedPnL += v
 	}
 
-	// Also check spot balances
+	// Also check spot balances.
+	//
+	// Post the 2026-05-23 HL network upgrade, USDC that collateralizes perp
+	// positions is exposed on BOTH endpoints: it sits in
+	// spotClearinghouseState.balances[].total AND is already counted inside
+	// clearinghouseState.marginSummary.accountValue. Adding spot.total raw
+	// double-counts the collateral, inflating reported equity by exactly
+	// totalMarginUsed (incident 2026-05-24: a HL user showed a phantom
+	// +15% / +$900 overnight while doing nothing).
+	//
+	// Fix: add only the spot portion NOT reserved as perp margin
+	// (= total − hold). For pure-spot users (no perp positions, hold=0)
+	// this is identical to the prior behavior.
 	spotResp, err := h.postInfo(ctx, map[string]interface{}{
 		"type": "spotClearinghouseState",
 		"user": h.walletAddress,
@@ -94,13 +106,19 @@ func (h *Hyperliquid) GetBalance(ctx context.Context) (*Balance, error) {
 			Balances []struct {
 				Coin  string `json:"coin"`
 				Total string `json:"total"`
+				Hold  string `json:"hold"`
 			} `json:"balances"`
 		}
 		if json.Unmarshal(spotResp, &spotState) == nil {
 			for _, b := range spotState.Balances {
-				val, _ := strconv.ParseFloat(b.Total, 64)
-				if b.Coin == "USDC" || b.Coin == "USDT" {
-					equity += val
+				if b.Coin != "USDC" && b.Coin != "USDT" {
+					continue
+				}
+				total, _ := strconv.ParseFloat(b.Total, 64)
+				hold, _ := strconv.ParseFloat(b.Hold, 64)
+				free := total - hold
+				if free > 0 {
+					equity += free
 				}
 			}
 		}
