@@ -88,6 +88,29 @@ type Config struct {
 	// ENCLAVE_JWT_EXPECTED_ISSUER.
 	JWTExpectedIssuer string
 
+	// RebuilderServiceURL points at the history-rebuilder-service (lives in
+	// track_record_site/history-rebuilder-service). The enclave POSTs a job
+	// here on connection creation for non-IBKR exchanges (Hyperliquid &
+	// future crypto), passing the decrypted credentials to a NON-ZK service.
+	// Empty = no-op (dev environments without the rebuilder, IBKR-only
+	// deployments). Parsed from REBUILDER_SERVICE_URL.
+	RebuilderServiceURL string
+
+	// RebuilderInternalToken is the shared-secret sent as X-Internal-Token
+	// to authenticate the enclave→rebuilder call. Must match the rebuilder's
+	// REBUILDER_INTERNAL_TOKEN env. Required when RebuilderServiceURL is
+	// set; otherwise the client refuses to start.
+	RebuilderInternalToken string
+
+	// HistorySyncNotifyURL, when set, is the base URL the enclave POSTs a
+	// best-effort "history rebuilt" ping to after a connection's historical
+	// backfill completes. The enclave appends the userUID to the path
+	// (<url>/<userUID>). It carries NO credentials and triggers nothing
+	// inside the enclave — it only lets a downstream service (analytics)
+	// run a per-user sync without waiting for its daily cron. Empty = no-op.
+	// Parsed from HISTORY_SYNC_NOTIFY_URL.
+	HistorySyncNotifyURL string
+
 	// HandoffPeerURL, when non-empty, points at the URL of the previous
 	// running enclave's handoff endpoint (B2). Set ONLY during the
 	// upgrade window when v_N+1 is meant to fetch the master key from
@@ -117,11 +140,11 @@ type Config struct {
 	LegacyMasterKeyHex string
 
 	// HandoffSignedAllowlist holds the operator-signed JSON document
-	// listing approved release measurements. Inlined here to allow
-	// override via the GCP `signed-allowlist` metadata key when shipping
-	// a new release before its measurement is hardcoded into the binary.
-	// Parsed from HANDOFF_SIGNED_ALLOWLIST. Empty = use the constant
-	// shipped with the binary (see internal/bootstrap/embedded_allowlist).
+	// listing approved release measurements, supplied via the GCP
+	// `signed-allowlist` metadata key. Parsed from HANDOFF_SIGNED_ALLOWLIST.
+	// Required alongside HANDOFF_PEER_URL — when empty, the B2 handoff client
+	// fails with errMissingSignedAllowlist (cmd/enclave/handoff_wire.go). There
+	// is no allowlist embedded in the binary.
 	HandoffSignedAllowlist string
 
 	// MeasurementAutoRecovery enables automatic DEK unwrap recovery when the
@@ -203,9 +226,13 @@ func Load() *Config {
 		ClientCertCNAllowlist:   parseCommaList(getEnv("GRPC_CLIENT_CERT_CN_ALLOWLIST", "")),
 		JWTExpectedIssuer:       strings.TrimSpace(getEnv("ENCLAVE_JWT_EXPECTED_ISSUER", "")),
 
+		RebuilderServiceURL:    strings.TrimSpace(getEnv("REBUILDER_SERVICE_URL", "")),
+		RebuilderInternalToken: strings.TrimSpace(getEnv("REBUILDER_INTERNAL_TOKEN", "")),
+		HistorySyncNotifyURL:   strings.TrimSpace(getEnv("HISTORY_SYNC_NOTIFY_URL", "")),
+
 		HandoffPeerURL:            strings.TrimSpace(getEnv("HANDOFF_PEER_URL", "")),
 		HandoffPeerTLSFingerprint: strings.TrimSpace(getEnv("HANDOFF_PEER_TLS_FINGERPRINT", "")),
-		HandoffSignedAllowlist: getEnv("HANDOFF_SIGNED_ALLOWLIST", ""),
+		HandoffSignedAllowlist:    getEnv("HANDOFF_SIGNED_ALLOWLIST", ""),
 		LegacyMasterKeyHex:    strings.TrimSpace(getEnv("LEGACY_MASTER_KEY_HEX", "")),
 
 		MeasurementAutoRecovery:         getEnvBool("MEASUREMENT_AUTO_RECOVERY", true),

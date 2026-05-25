@@ -2,9 +2,6 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -55,48 +52,32 @@ func (b *Binance) Exchange() string {
 }
 
 func (b *Binance) sign(params url.Values) string {
-	h := hmac.New(sha256.New, []byte(b.apiSecret))
-	h.Write([]byte(params.Encode()))
-	return hex.EncodeToString(h.Sum(nil))
+	return signHMACHex(b.apiSecret, params.Encode())
 }
 
 func (b *Binance) doRequest(ctx context.Context, method, baseURL, path string, params url.Values, signed bool) ([]byte, error) {
-	if signed {
-		params.Set("timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
-		params.Set("signature", b.sign(params))
-	}
+	return retryHTTP(b.client, func() (*http.Request, error) {
+		if signed {
+			// Del before re-signing: on a retry attempt params still carries
+			// the previous attempt's signature, which must not be part of the
+			// next signed payload.
+			params.Del("signature")
+			params.Set("timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+			params.Set("signature", b.sign(params))
+		}
 
-	reqURL := baseURL + path
-	if len(params) > 0 {
-		reqURL += "?" + params.Encode()
-	}
+		reqURL := baseURL + path
+		if len(params) > 0 {
+			reqURL += "?" + params.Encode()
+		}
 
-	req, err := http.NewRequestWithContext(ctx, method, reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("X-MBX-APIKEY", b.apiKey)
-
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
-	if err != nil && err != ErrResponseTooLarge {
-		return nil, err
-	}
-	if err == ErrResponseTooLarge {
-		return nil, ErrResponseTooLarge
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("binance API error: %s", TruncatedBody(body))
-	}
-
-	return body, nil
+		req, err := http.NewRequestWithContext(ctx, method, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("X-MBX-APIKEY", b.apiKey)
+		return req, nil
+	})
 }
 
 func (b *Binance) TestConnection(ctx context.Context) error {

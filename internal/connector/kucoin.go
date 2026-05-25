@@ -2,9 +2,6 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -33,9 +30,7 @@ func NewKuCoin(creds *Credentials) *KuCoin {
 func (k *KuCoin) Exchange() string { return "kucoin" }
 
 func (k *KuCoin) hmacSign(message string) string {
-	mac := hmac.New(sha256.New, []byte(k.base.APISecret))
-	mac.Write([]byte(message))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	return signHMACBase64(k.base.APISecret, message)
 }
 
 func (k *KuCoin) signedPassphrase() string {
@@ -43,22 +38,23 @@ func (k *KuCoin) signedPassphrase() string {
 }
 
 func (k *KuCoin) doRequest(ctx context.Context, method, path string) ([]byte, error) {
-	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	signature := k.hmacSign(timestamp + method + path)
+	body, err := retryHTTP(k.base.Client, func() (*http.Request, error) {
+		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+		signature := k.hmacSign(timestamp + method + path)
 
-	req, err := http.NewRequestWithContext(ctx, method, k.base.BaseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
+		req, err := http.NewRequestWithContext(ctx, method, k.base.BaseURL+path, nil)
+		if err != nil {
+			return nil, err
+		}
 
-	req.Header.Set("KC-API-KEY", k.base.APIKey)
-	req.Header.Set("KC-API-SIGN", signature)
-	req.Header.Set("KC-API-TIMESTAMP", timestamp)
-	req.Header.Set("KC-API-PASSPHRASE", k.signedPassphrase())
-	req.Header.Set("KC-API-KEY-VERSION", "2")
-	req.Header.Set("Content-Type", "application/json")
-
-	body, err := k.base.DoRequest(req)
+		req.Header.Set("KC-API-KEY", k.base.APIKey)
+		req.Header.Set("KC-API-SIGN", signature)
+		req.Header.Set("KC-API-TIMESTAMP", timestamp)
+		req.Header.Set("KC-API-PASSPHRASE", k.signedPassphrase())
+		req.Header.Set("KC-API-KEY-VERSION", "2")
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -2,9 +2,6 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -31,28 +28,26 @@ func NewCoinbase(creds *Credentials) *Coinbase {
 func (c *Coinbase) Exchange() string { return "coinbase" }
 
 func (c *Coinbase) sign(timestamp, method, path, body string) string {
-	message := timestamp + method + path + body
-	mac := hmac.New(sha256.New, []byte(c.base.APISecret))
-	mac.Write([]byte(message))
-	return hex.EncodeToString(mac.Sum(nil))
+	return signHMACHex(c.base.APISecret, timestamp+method+path+body)
 }
 
 func (c *Coinbase) doRequest(ctx context.Context, method, path string) ([]byte, error) {
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	signature := c.sign(timestamp, method, path, "")
+	return retryHTTP(c.base.Client, func() (*http.Request, error) {
+		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+		signature := c.sign(timestamp, method, path, "")
 
-	req, err := http.NewRequestWithContext(ctx, method, c.base.BaseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
+		req, err := http.NewRequestWithContext(ctx, method, c.base.BaseURL+path, nil)
+		if err != nil {
+			return nil, err
+		}
 
-	req.Header.Set("CB-ACCESS-KEY", c.base.APIKey)
-	req.Header.Set("CB-ACCESS-SIGN", signature)
-	req.Header.Set("CB-ACCESS-TIMESTAMP", timestamp)
-	req.Header.Set("CB-VERSION", "2023-01-01")
-	req.Header.Set("Content-Type", "application/json")
-
-	return c.base.DoRequest(req)
+		req.Header.Set("CB-ACCESS-KEY", c.base.APIKey)
+		req.Header.Set("CB-ACCESS-SIGN", signature)
+		req.Header.Set("CB-ACCESS-TIMESTAMP", timestamp)
+		req.Header.Set("CB-VERSION", "2023-01-01")
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 }
 
 func (c *Coinbase) TestConnection(ctx context.Context) error {

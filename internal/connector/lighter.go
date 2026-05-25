@@ -28,6 +28,7 @@ type Lighter struct {
 	walletAddress string
 	accountIndex  *int
 	client        *http.Client
+	baseURL       string
 }
 
 // NewLighter creates a new Lighter connector.
@@ -37,7 +38,8 @@ func NewLighter(creds *Credentials) *Lighter {
 	token := strings.TrimSpace(creds.APIKey)
 
 	l := &Lighter{
-		client: &http.Client{Timeout: 30 * time.Second},
+		baseURL: lighterAPI,
+		client:  &http.Client{Timeout: 30 * time.Second},
 	}
 
 	switch {
@@ -215,25 +217,22 @@ func (l *Lighter) getAccountIndex(ctx context.Context) (int, error) {
 }
 
 func (l *Lighter) fetchAccount(ctx context.Context) (*lighterAccount, error) {
-	if l.accountIndex != nil && *l.accountIndex > 0 {
-		data, err := l.doGet(ctx, "/api/v1/account", map[string]string{
+	switch {
+	case l.accountIndex != nil && *l.accountIndex > 0:
+		data, err := l.request(ctx, "/api/v1/account", map[string]string{
 			"by":    "index",
 			"value": strconv.Itoa(*l.accountIndex),
-		})
-		if err == nil {
-			var resp lighterAccountResponse
-			if json.Unmarshal(data, &resp) == nil && len(resp.Accounts) > 0 {
-				return &resp.Accounts[0], nil
-			}
+		}, "")
+		if err != nil {
+			return nil, fmt.Errorf("lighter: fetch account index %d: %w", *l.accountIndex, err)
 		}
-		return nil, fmt.Errorf("lighter: could not fetch account (index=%d)", *l.accountIndex)
-	}
+		return decodeFirstAccount(data, fmt.Sprintf("index %d", *l.accountIndex))
 
-	if l.walletAddress != "" {
-		data, err := l.doGet(ctx, "/api/v1/account", map[string]string{
+	case l.walletAddress != "":
+		data, err := l.request(ctx, "/api/v1/account", map[string]string{
 			"by":    "l1_address",
 			"value": l.walletAddress,
-		})
+		}, "")
 		if err != nil {
 			// CONN-003: the wallet address IS the credential for this connector,
 			// so error strings redact it to a short prefix/suffix — enough to
@@ -241,19 +240,30 @@ func (l *Lighter) fetchAccount(ctx context.Context) (*lighterAccount, error) {
 			// aggregators.
 			return nil, fmt.Errorf("lighter: lookup by l1_address %s: %w", walletPrefix(l.walletAddress), err)
 		}
-		var resp lighterAccountResponse
-		if err := json.Unmarshal(data, &resp); err != nil {
-			return nil, fmt.Errorf("lighter: decode account response: %w", err)
+		account, err := decodeFirstAccount(data, "l1_address "+walletPrefix(l.walletAddress))
+		if err != nil {
+			return nil, err
 		}
-		if len(resp.Accounts) == 0 {
-			return nil, fmt.Errorf("lighter: no account found for l1_address %s", walletPrefix(l.walletAddress))
-		}
-		idx := resp.Accounts[0].Index
+		idx := account.Index
 		l.accountIndex = &idx
-		return &resp.Accounts[0], nil
-	}
+		return account, nil
 
-	return nil, fmt.Errorf("lighter: credentials must be a ro:<index>:... token or an 0x... wallet address")
+	default:
+		return nil, fmt.Errorf("lighter: credentials must be a ro:<index>:... token or an 0x... wallet address")
+	}
+}
+
+// decodeFirstAccount unmarshals a Lighter account response and returns the
+// first account. who names the lookup (index / l1_address) for error context.
+func decodeFirstAccount(data json.RawMessage, who string) (*lighterAccount, error) {
+	var resp lighterAccountResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("lighter: decode account response: %w", err)
+	}
+	if len(resp.Accounts) == 0 {
+		return nil, fmt.Errorf("lighter: no account found for %s", who)
+	}
+	return &resp.Accounts[0], nil
 }
 
 // fetchExportTrades uses /api/v1/export to get trade history as CSV.
@@ -268,7 +278,7 @@ func (l *Lighter) fetchExportTrades(ctx context.Context, accountIndex int, start
 		"end_timestamp":   strconv.FormatInt(endMs, 10),
 	}
 
-	data, err := l.doGetAuth(ctx, "/api/v1/export", query)
+	data, err := l.request(ctx, "/api/v1/export", query, l.authToken)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +319,9 @@ func (l *Lighter) downloadCSV(ctx context.Context, csvURL string) ([]lighterExpo
 		return nil, fmt.Errorf("lighter CSV download: HTTP %d", resp.StatusCode)
 	}
 
-	reader := csv.NewReader(resp.Body)
+	// CONN-AUDIT-001: data_url is returned by the upstream API — cap the S3
+	// CSV stream so a hostile/compromised export URL can't bloat the heap.
+	reader := csv.NewReader(io.LimitReader(resp.Body, DefaultMaxResponseBytes))
 	// Header: Market,Side,Date,Trade Value,Size,Price,Closed PnL,Fee,Role,Type
 	header, err := reader.Read()
 	if err != nil {
@@ -363,8 +375,13 @@ func csvColFloat(record []string, idx map[string]int, col string) float64 {
 	return math.Abs(v)
 }
 
-func (l *Lighter) doGet(ctx context.Context, path string, query map[string]string) (json.RawMessage, error) {
-	endpoint, err := url.Parse(lighterAPI + path)
+// request issues a bounded GET to the Lighter API. A non-empty token is sent
+// as the authorization header (required by /api/v1/export). Retryable upstream
+// failures — network errors, 429, 5xx — are wrapped in ErrTransient so the
+// connection service defers credential validation to the scheduler instead of
+// rejecting a connection on a transient blip (CONN-02).
+func (l *Lighter) request(ctx context.Context, path string, query map[string]string, token string) (json.RawMessage, error) {
+	endpoint, err := url.Parse(l.baseURL + path)
 	if err != nil {
 		return nil, err
 	}
@@ -376,14 +393,18 @@ func (l *Lighter) doGet(ctx context.Context, path string, query map[string]strin
 		endpoint.RawQuery = q.Encode()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
 		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("authorization", token)
 	}
 
 	resp, err := l.client.Do(req)
 	if err != nil {
-		return nil, err
+		// A transport failure is not a credential failure — tag it transient.
+		return nil, fmt.Errorf("%w: lighter request: %w", ErrTransient, err)
 	}
 
 	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
@@ -393,44 +414,9 @@ func (l *Lighter) doGet(ctx context.Context, path string, query map[string]strin
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("lighter API error %d: %s", resp.StatusCode, TruncatedBody(data))
-	}
-
-	return data, nil
-}
-
-// doGetAuth sends a GET with the authorization header.
-func (l *Lighter) doGetAuth(ctx context.Context, path string, query map[string]string) (json.RawMessage, error) {
-	endpoint, err := url.Parse(lighterAPI + path)
-	if err != nil {
-		return nil, err
-	}
-	if len(query) > 0 {
-		q := endpoint.Query()
-		for k, v := range query {
-			q.Set(k, v)
+		if isRetryableStatus(resp.StatusCode) {
+			return nil, fmt.Errorf("%w: lighter API error %d: %s", ErrTransient, resp.StatusCode, TruncatedBody(data))
 		}
-		endpoint.RawQuery = q.Encode()
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", endpoint.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("authorization", l.authToken)
-
-	resp, err := l.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
-	data, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("lighter API error %d: %s", resp.StatusCode, TruncatedBody(data))
 	}
 

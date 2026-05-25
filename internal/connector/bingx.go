@@ -2,12 +2,8 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -30,30 +26,8 @@ func NewBingX(creds *Credentials) *BingX {
 
 func (b *BingX) Exchange() string { return "bingx" }
 
-func (b *BingX) sign(params string) string {
-	mac := hmac.New(sha256.New, []byte(b.base.APISecret))
-	mac.Write([]byte(params))
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
 func (b *BingX) signedGET(ctx context.Context, path, params string) ([]byte, error) {
-	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	queryString := params
-	if queryString != "" {
-		queryString += "&"
-	}
-	queryString += "timestamp=" + ts
-
-	signature := b.sign(queryString)
-	reqURL := b.base.BaseURL + path + "?" + queryString + "&signature=" + signature
-
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("X-BX-APIKEY", b.base.APIKey)
-
-	return b.base.DoRequest(req)
+	return b.base.signedQueryGET(ctx, "X-BX-APIKEY", path, params)
 }
 
 func (b *BingX) TestConnection(ctx context.Context) error {

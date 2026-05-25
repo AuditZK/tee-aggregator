@@ -135,6 +135,14 @@ func buildSignedAllowlist(t *testing.T, priv ed25519.PrivateKey, measurements []
 }
 
 func TestHandoffServer_HappyPath(t *testing.T) {
+	// Skipped: the production server verifies the signed allowlist against the
+	// package-level OperatorPubkey constant, which a unit test cannot override
+	// (Go has no constant patching). The allowlist signature path is covered by
+	// signed_allowlist_test.go; the full handoff path is covered by the Phase 7
+	// E2E test, which supplies a real OperatorPubkey via a test build. The body
+	// below is kept as the reference sketch of that full path.
+	t.Skip("full happy path requires test-only OperatorPubkey override; covered by E2E test (Phase 7)")
+
 	// Setup: an operator signing key + a fresh master key + a successor's
 	// ECIES keypair.
 	_, opPriv, _ := makeTestKeypair(t)
@@ -142,30 +150,6 @@ func TestHandoffServer_HappyPath(t *testing.T) {
 	exporter := &fakeExporter{key: masterKey}
 	successorE2EPEM, successorPriv := makeECIESKeypair(t)
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
-
-	// Override the package-level OperatorPubkey check by stubbing
-	// VerifyAllowlist via a server using injected verification. Since
-	// we can't change the const, use a real keypair AND patch the
-	// canonical payload check inline. Trick: we override the verifier
-	// by making the test server call VerifyAllowlist directly with the
-	// test key — done by using verifyWithKey defined in the other
-	// test file. To do that we need to bypass the production server's
-	// VerifyAllowlist call. Easiest: pin the OperatorPubkey constant
-	// IN-PROCESS via a temporary patch — but Go doesn't allow that, so
-	// we instead use the production flow with an allowlist whose
-	// signature happens to match our test pubkey, and patch the
-	// constant lookup at runtime via a build-tag indirection. To keep
-	// this simple, we test the path that doesn't depend on
-	// OperatorPubkey: a test-only HandoffServer field that overrides
-	// VerifyAllowlist. We expose this via the Production constructor
-	// taking a hook. Since we don't have that hook, this test exercises
-	// the parts of the server we CAN test in isolation, leaving the
-	// VerifyAllowlist + signature check to the dedicated tests in
-	// signed_allowlist_test.go.
-	//
-	// In practice, the integration test (Phase 7) will exercise the
-	// full path with a real OperatorPubkey override via a test build.
-	t.Skip("full happy path requires test-only OperatorPubkey override; covered by E2E test (Phase 7)")
 
 	measurement := "1206abcdef1234567890"
 

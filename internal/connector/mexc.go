@@ -2,9 +2,6 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -38,30 +35,8 @@ func NewMEXC(creds *Credentials) *MEXC {
 
 func (m *MEXC) Exchange() string { return "mexc" }
 
-func (m *MEXC) sign(params string) string {
-	mac := hmac.New(sha256.New, []byte(m.base.APISecret))
-	mac.Write([]byte(params))
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
 func (m *MEXC) signedGET(ctx context.Context, path, params string) ([]byte, error) {
-	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	queryString := params
-	if queryString != "" {
-		queryString += "&"
-	}
-	queryString += "timestamp=" + ts
-
-	signature := m.sign(queryString)
-	url := m.base.BaseURL + path + "?" + queryString + "&signature=" + signature
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("X-MEXC-APIKEY", m.base.APIKey)
-
-	return m.base.DoRequest(req)
+	return m.base.signedQueryGET(ctx, "X-MEXC-APIKEY", path, params)
 }
 
 func (m *MEXC) TestConnection(ctx context.Context) error {
@@ -262,29 +237,27 @@ func (m *MEXC) fetchTickerPrice(ctx context.Context, asset string) float64 {
 }
 
 func (m *MEXC) futuresSignedGET(ctx context.Context, path, params string) ([]byte, error) {
-	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	return retryHTTP(m.base.Client, func() (*http.Request, error) {
+		ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
 
-	// MEXC futures signature: HMAC-SHA256(apiKey + timestamp + params)
-	signPayload := m.base.APIKey + ts + params
-	mac := hmac.New(sha256.New, []byte(m.base.APISecret))
-	mac.Write([]byte(signPayload))
-	signature := hex.EncodeToString(mac.Sum(nil))
+		// MEXC futures signature: HMAC-SHA256(apiKey + timestamp + params)
+		signature := signHMACHex(m.base.APISecret, m.base.APIKey+ts+params)
 
-	url := "https://contract.mexc.com" + path
-	if params != "" {
-		url += "?" + params
-	}
+		url := "https://contract.mexc.com" + path
+		if params != "" {
+			url += "?" + params
+		}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("ApiKey", m.base.APIKey)
-	req.Header.Set("Request-Time", ts)
-	req.Header.Set("Signature", signature)
-	req.Header.Set("Content-Type", "application/json")
-
-	return m.base.DoRequest(req)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("ApiKey", m.base.APIKey)
+		req.Header.Set("Request-Time", ts)
+		req.Header.Set("Signature", signature)
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 }
 
 func (m *MEXC) GetPositions(ctx context.Context) ([]*Position, error) {

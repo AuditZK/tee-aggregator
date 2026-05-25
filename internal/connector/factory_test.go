@@ -56,7 +56,7 @@ func TestFactorySupportedExchangesIncludesDeribitAndMetaTrader(t *testing.T) {
 		got[ex] = struct{}{}
 	}
 
-	for _, ex := range []string{"deribit", "mt4", "mt5", "binance_futures", "binanceusdm", "mock"} {
+	for _, ex := range []string{"deribit", "mt4", "mt5", "binance_futures", "binanceusdm"} {
 		if _, ok := got[ex]; !ok {
 			t.Fatalf("supported exchanges missing %q", ex)
 		}
@@ -66,6 +66,52 @@ func TestFactorySupportedExchangesIncludesDeribitAndMetaTrader(t *testing.T) {
 		if _, ok := got[ex]; !ok {
 			t.Fatalf("supported exchanges missing %q", ex)
 		}
+	}
+}
+
+// CONN-01: the mock connector fabricates balances/trades and must never be
+// reachable through the production factory.
+func TestFactoryMockRejectedInProduction(t *testing.T) {
+	t.Setenv("ENV", "production")
+	t.Setenv("NODE_ENV", "")
+	f := NewFactory()
+
+	if _, err := f.Create(&Credentials{Exchange: "mock"}); err == nil {
+		t.Fatal("Create(mock) must fail when ENV=production")
+	} else if !errors.Is(err, ErrUnsupportedExchange) {
+		t.Fatalf("expected ErrUnsupportedExchange, got %v", err)
+	}
+
+	for _, ex := range f.SupportedExchanges() {
+		if ex == "mock" {
+			t.Fatal("SupportedExchanges() must not list mock when ENV=production")
+		}
+	}
+}
+
+// CONN-01: the mock connector stays available outside production for the dev
+// harness and integration tests.
+func TestFactoryMockAvailableOutsideProduction(t *testing.T) {
+	t.Setenv("ENV", "development")
+	t.Setenv("NODE_ENV", "")
+	f := NewFactory()
+
+	conn, err := f.Create(&Credentials{Exchange: "mock"})
+	if err != nil {
+		t.Fatalf("Create(mock) should succeed outside production: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("Create(mock) returned nil connector")
+	}
+
+	var listed bool
+	for _, ex := range f.SupportedExchanges() {
+		if ex == "mock" {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Fatal("SupportedExchanges() should list mock outside production")
 	}
 }
 

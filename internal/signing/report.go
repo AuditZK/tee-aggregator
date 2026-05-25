@@ -26,8 +26,34 @@ const (
 	// PayloadVersion bumps whenever the signed payload shape changes.
 	// 1.0 = original (metrics + returns only)
 	// 1.1 = adds enclaveAttestation {measurement, reportData, platform, attested}
-	PayloadVersion = "1.1"
+	// 1.2 = adds metrics.winRate and metrics.profitFactor to the signed payload
+	// 1.3 = adds daily_returns[*].verifiabilityClass — per-day provenance
+	//       label ("live" / "in-enclave" / "rebuilder-service") replacing the
+	//       coarse SEC-001 gate that excluded external-rebuilder snapshots.
+	//       The signature now covers the full history (live + reconstructed)
+	//       and a verifier filters by class at consumption time.
+	PayloadVersion = "1.3"
 )
+
+// payloadVersionsWithoutWinRate are the pre-1.2 signed-payload shapes whose
+// metrics block omits winRate/profitFactor. buildFinancialPayload must
+// reproduce that older shape for such reports, or VerifyReport would
+// recompute a different hash and reject an already-issued report.
+var payloadVersionsWithoutWinRate = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+}
+
+// payloadVersionsWithoutVerifiabilityClass are the pre-1.3 signed-payload
+// shapes whose daily_returns entries do not carry verifiabilityClass. Older
+// reports keep their original shape so VerifyReport reproduces their hash.
+var payloadVersionsWithoutVerifiabilityClass = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+	"1.2": {},
+}
 
 // EnclaveAttestation binds the signed report to a specific SEV-SNP measurement
 // and the report_data field of the attestation quote. A verifier MUST:
@@ -140,10 +166,28 @@ func (s *ReportSigner) PublicKey() string {
 	return s.publicKeyBase64
 }
 
-// PublicKeyHex is kept for compatibility; it now returns base64 DER public key.
-func (s *ReportSigner) PublicKeyHex() string {
-	return s.PublicKey()
-}
+// VerifiabilityClass categorises the provenance of the snapshots that fed a
+// daily return, surfaced in the signed payload at PayloadVersion ≥ 1.3 so
+// consumers can apply their own trust policy.
+//
+//	"live"              — all snapshots are live daily-sync writes from the
+//	                      enclave; never historically reconstructed.
+//	"in-enclave"        — at least one snapshot is reconstructed, but all
+//	                      reconstruction happened inside the SEV-SNP
+//	                      perimeter (e.g. IBKR Flex CSV import). The full
+//	                      chain remains ZK-verifiable.
+//	"rebuilder-service" — at least one snapshot was reconstructed by the
+//	                      external history-rebuilder service, which means
+//	                      plaintext credentials briefly left the enclave to
+//	                      fetch exchange history. The DATA is attested by the
+//	                      enclave (we observed it and signed it), but the
+//	                      FETCH path is not ZK. Strict verifiers should
+//	                      filter these out.
+const (
+	VerifiabilityClassLive             = "live"
+	VerifiabilityClassInEnclave        = "in-enclave"
+	VerifiabilityClassRebuilderService = "rebuilder-service"
+)
 
 // DailyReturn represents a single day's return data.
 type DailyReturn struct {
@@ -153,6 +197,12 @@ type DailyReturn struct {
 	Outperformance   float64 `json:"outperformance"`
 	CumulativeReturn float64 `json:"cumulative_return"`
 	NAV              float64 `json:"nav"`
+
+	// VerifiabilityClass is the provenance label for the snapshots that
+	// produced this daily return. Empty for pre-1.3 reports (omitted from
+	// the canonical payload via the payloadVersionsWithoutVerifiabilityClass
+	// gate). See the package-level constants for the allowed values.
+	VerifiabilityClass string `json:"verifiability_class,omitempty"`
 }
 
 // MonthlyReturn represents a single month's return data.
@@ -374,8 +424,19 @@ func buildFinancialPayload(report *SignedReport) map[string]any {
 			"maxDrawdown":      report.MaxDrawdown,
 			"calmarRatio":      report.CalmarRatio,
 		},
-		"dailyReturns":   toDailyReturnsPayload(report.DailyReturns),
+		"dailyReturns":   toDailyReturnsPayload(report.DailyReturns, report.PayloadVersion),
 		"monthlyReturns": toMonthlyReturnsPayload(report.MonthlyReturns),
+	}
+
+	// SEC-003: winRate / profitFactor are presented to consumers as report
+	// metrics, so they must be covered by the signature. They entered the
+	// signed payload at PayloadVersion 1.2; reports issued under an earlier
+	// version keep their original metrics shape so VerifyReport still
+	// reproduces their hash.
+	if _, legacy := payloadVersionsWithoutWinRate[report.PayloadVersion]; !legacy {
+		metrics := payload["metrics"].(map[string]any)
+		metrics["winRate"] = report.WinRate
+		metrics["profitFactor"] = report.ProfitFactor
 	}
 
 	// enclaveAttestation binds the signed report to a specific SEV-SNP
@@ -443,17 +504,26 @@ func toExchangeDetailsPayload(in []ExchangeInfo) []map[string]any {
 	return out
 }
 
-func toDailyReturnsPayload(in []DailyReturn) []map[string]any {
+func toDailyReturnsPayload(in []DailyReturn, payloadVersion string) []map[string]any {
+	_, omitVerifiability := payloadVersionsWithoutVerifiabilityClass[payloadVersion]
 	out := make([]map[string]any, 0, len(in))
 	for _, dr := range in {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"date":             dr.Date,
 			"netReturn":        dr.NetReturn,
 			"benchmarkReturn":  dr.BenchmarkReturn,
 			"outperformance":   dr.Outperformance,
 			"cumulativeReturn": dr.CumulativeReturn,
 			"nav":              dr.NAV,
-		})
+		}
+		// SEC-001-v2: PayloadVersion 1.3+ carries per-day provenance so a
+		// verifier can apply strict ("in-enclave only") or loose ("anything
+		// attested by the enclave") policies. Older versions stay byte-
+		// identical so VerifyReport still reproduces their hash.
+		if !omitVerifiability {
+			entry["verifiabilityClass"] = dr.VerifiabilityClass
+		}
+		out = append(out, entry)
 	}
 	return out
 }
@@ -501,27 +571,6 @@ func toDrawdownPeriodsPayload(in []*DrawdownPeriod) []map[string]any {
 func marshalSortedJSON(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := writeSortedJSON(&buf, v); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-// marshalSortedJSONReference is the legacy double-roundtrip implementation,
-// retained for the byte-for-byte non-regression test. Do NOT use in
-// production code paths — see marshalSortedJSON.
-func marshalSortedJSONReference(v any) ([]byte, error) {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-
-	var normalized any
-	if err := json.Unmarshal(raw, &normalized); err != nil {
-		return nil, err
-	}
-
-	var buf bytes.Buffer
-	if err := writeSortedJSON(&buf, normalized); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

@@ -5,6 +5,7 @@
 *.so
 *.dylib
 /enclave
+/enclave_linux
 
 # Test binary
 *.test
@@ -37,6 +38,12 @@ Thumbs.db
 # Build
 /bin/
 /dist/
+
+# TLS material & logs — never commit private keys
+/certs/
+*.pem
+*.key
+*.log
 
 # Audit (local only, never commit)
 doc/AUDIT_PROMPT.md

@@ -148,6 +148,12 @@ message CreateUserConnectionRequest {
   string api_secret = 5;         // API secret (will be encrypted)
   string passphrase = 6;         // Optional passphrase (will be encrypted)
   bool exclude_from_report = 7;  // true = analytics only, excluded from certified report
+  // SEC-ZK-001: explicit opt-in for historical reconstruction. For non-IBKR
+  // exchanges, "rebuild" sends decrypted credentials to the external
+  // history-rebuilder-service (out-of-perimeter). Default false (zero value)
+  // means the gRPC caller must explicitly request the rebuild — silent
+  // upgrades won't trigger plaintext exit.
+  bool rebuild_history = 8;
 }
 
 // Response from creating a user with exchange connection

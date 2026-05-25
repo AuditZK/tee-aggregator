@@ -1,13 +1,15 @@
 # syntax=docker/dockerfile:1.7
 
 # Go build stage.
-# VULN-001: pinned to 1.26.2-alpine so stdlib CVEs GO-2026-4947/4946/4870/
-# 4866/4865/4603/4602/4601/4600/4599 (all fixed in 1.26.1 / 1.26.2) are
-# picked up deterministically. For fully reproducible builds the next step
-# is a digest pin (`golang:1.26.2-alpine@sha256:<digest>`); do that once CI
-# resolves the upstream digest via `docker pull + inspect` and mirrors the
-# result here. Same applies to the alpine runtime tag below.
-FROM golang:1.26.2-alpine AS builder
+# VULN-001: pinned to 1.26.3-alpine so stdlib CVEs GO-2026-4947/4946/4870/
+# 4866/4865/4603/4602/4601/4600/4599 (1.26.1 / 1.26.2) plus GO-2026-4982/
+# 4980/4971/4918 (html/template XSS, net NUL-byte panic, net/http HTTP/2
+# SETTINGS infinite loop — fixed in 1.26.3) are picked up deterministically.
+# For fully reproducible builds the next step is a digest pin
+# (`golang:1.26.3-alpine@sha256:<digest>`); do that once CI resolves the
+# upstream digest via `docker pull + inspect` and mirrors the result here.
+# Same applies to the alpine runtime tag below.
+FROM golang:1.26.3-alpine AS builder
 
 WORKDIR /app
 

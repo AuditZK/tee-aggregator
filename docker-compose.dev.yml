@@ -54,6 +54,18 @@ services:
       - METRICS_ENABLED=true
       - ENABLE_DAILY_SYNC=true
       - DATA_RETENTION_DAYS=30
+      - ENABLE_LEGACY_REST=true
+      # Wire to the external (NON-ZK) history-rebuilder-service running in
+      # track_record_site's compose. The container reaches the host-mapped
+      # port 8082 via the special host.docker.internal DNS (Docker Desktop).
+      # Empty REBUILDER_SERVICE_URL = enclave runs without rebuilder
+      # integration (IBKR-only history reconstruction).
+      # Switched from :8082 (TS port) to :8083 (Go port). Same wire contract,
+      # same JSON, same DB schema — drop-in. Revert if regression.
+      - REBUILDER_SERVICE_URL=http://host.docker.internal:8083
+      - REBUILDER_INTERNAL_TOKEN=dev-token-ad7fcb12c8f54aab8b5e9f0c41728beb
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./certs:/app/certs:ro
     depends_on:

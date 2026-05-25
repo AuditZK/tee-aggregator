@@ -25,6 +25,16 @@ func Connect(ctx context.Context, databaseURL string, logger *zap.Logger) (*pgxp
 	config.MaxConnLifetime = time.Hour
 	config.MaxConnIdleTime = 30 * time.Minute
 
+	// Repository queries do not set per-query deadlines, and the post-create /
+	// scheduler hooks run on context.Background(). A query that hangs would
+	// otherwise hold one of the 10 pool connections forever; ten such queries
+	// exhaust the pool and stall every later caller, health check included.
+	// Enforce a server-side ceiling instead. An operator can override it by
+	// putting statement_timeout in DATABASE_URL.
+	if _, ok := config.ConnConfig.RuntimeParams["statement_timeout"]; !ok {
+		config.ConnConfig.RuntimeParams["statement_timeout"] = "30000"
+	}
+
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)

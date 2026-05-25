@@ -2,9 +2,6 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -37,34 +34,26 @@ func (o *OKX) Exchange() string {
 }
 
 func (o *OKX) sign(timestamp, method, path, body string) string {
-	message := timestamp + method + path + body
-	h := hmac.New(sha256.New, []byte(o.apiSecret))
-	h.Write([]byte(message))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+	return signHMACBase64(o.apiSecret, timestamp+method+path+body)
 }
 
 func (o *OKX) doRequest(ctx context.Context, method, path string) ([]byte, error) {
-	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	signature := o.sign(timestamp, method, path, "")
+	body, err := retryHTTP(o.client, func() (*http.Request, error) {
+		timestamp := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+		signature := o.sign(timestamp, method, path, "")
 
-	req, err := http.NewRequestWithContext(ctx, method, okxAPI+path, nil)
-	if err != nil {
-		return nil, err
-	}
+		req, err := http.NewRequestWithContext(ctx, method, okxAPI+path, nil)
+		if err != nil {
+			return nil, err
+		}
 
-	req.Header.Set("OK-ACCESS-KEY", o.apiKey)
-	req.Header.Set("OK-ACCESS-SIGN", signature)
-	req.Header.Set("OK-ACCESS-TIMESTAMP", timestamp)
-	req.Header.Set("OK-ACCESS-PASSPHRASE", o.passphrase)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := o.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// CONN-AUDIT-001: bounded read.
-	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
+		req.Header.Set("OK-ACCESS-KEY", o.apiKey)
+		req.Header.Set("OK-ACCESS-SIGN", signature)
+		req.Header.Set("OK-ACCESS-TIMESTAMP", timestamp)
+		req.Header.Set("OK-ACCESS-PASSPHRASE", o.passphrase)
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -94,6 +94,13 @@ func (s *KeyDerivationService) deriveMasterKey() error {
 	// ENCRYPTION_KEY is interpreted as the 32-byte master key directly
 	// (no HKDF, no hardware derivation). Only safe when the TS and Go
 	// enclaves agree on the same pre-seeded master key.
+	//
+	// SEC-009: this fallback is NOT gated on ENV — a production enclave whose
+	// snpguest call fails reaches it. That is contained downstream, not here:
+	// enforceProductionAttestation (cmd/enclave/main.go) fatals before the
+	// enclave serves traffic when the platform is not attested sev-snp, so
+	// production cannot stay up on an env-derived master key. Preserve that
+	// invariant if this fallback is ever moved or reordered.
 	envKey := strings.TrimSpace(os.Getenv("ENCRYPTION_KEY"))
 	if envKey == "" {
 		if err != nil {

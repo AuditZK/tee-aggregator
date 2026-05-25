@@ -1,0 +1,106 @@
+# Parallel TEST enclave — runs ALONGSIDE enclave_go_prod on the same TEE
+# VPS without touching prod state.
+#
+# Topology mirrors prod:
+#
+#   ┌─ tee-milan-01 (this compose) ───┐  cross-VPS  ┌─ auditzk ──────────┐
+#   │  enclave_go_test                 ├────────────┤ test-enclave-db    │
+#   │   DATABASE_URL=auditzk:5443      │  iptables  │ test-history-rebuil│
+#   │   REBUILDER_SERVICE_URL=         │  filtered  │ der                │
+#   │     auditzk:3006                 │            │                    │
+#   └──────────────────────────────────┘            └────────────────────┘
+#
+# The auditzk side runs from track_record_site/docker-compose.test-rebuilder.yml.
+# This compose is intentionally enclave-only — the data layer lives on
+# auditzk in both prod and test (no DB on the TEE VPS).
+#
+# Zero overlap with the prod stack (docker-compose.production.yml):
+#   - Container name:   enclave_go_test (prod: enclave_go_prod)
+#   - Network:          fresh `tee_test` bridge
+#   - Host ports:       127.0.0.1:8443 / 127.0.0.1:50063 (loopback only)
+#                       (prod: 0.0.0.0:443 / 50061 / 50062)
+#   - Image:            built from `Dockerfile` (NOT Dockerfile.production)
+#                       — bypasses snpguest + SEV-SNP attestation, so the
+#                       enclave runs as `unattested-dev`. Acceptable for
+#                       an integration test (we are NOT validating signed
+#                       reports here).
+#   - Devices/caps:     none. Prod mounts /dev/sev-guest + privileged.
+#
+# Required env on tee-milan-01 (failing fast on missing values is on
+# purpose — pointing at the wrong host silently is the worst outcome):
+#   AUDITZK_HOST                hostname/IP of the auditzk VPS
+#                               (where postgres + rebuilder live)
+#   REBUILDER_TOKEN             same value as REBUILDER_INTERNAL_TOKEN on
+#                               the rebuilder side (default below works
+#                               for the test stack)
+#
+# Usage on tee-milan-01:
+#
+#   # 1. one-time: TLS cert for the REST listener
+#   mkdir -p certs-test
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+#     -keyout certs-test/key.pem -out certs-test/cert.pem \
+#     -subj "/CN=localhost" \
+#     -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+#   chmod 644 certs-test/*.pem
+#
+#   # 2. bring up — substitute your auditzk hostname/IP
+#   AUDITZK_HOST=<auditzk-public-host-or-ip> \
+#     docker compose -f docker-compose.test-enclave.yml up -d --build
+#
+#   # 3. verify isolation — prod must still be healthy
+#   docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+#
+#   # 4. wipe (prod containers untouched)
+#   docker compose -f docker-compose.test-enclave.yml down
+
+services:
+  enclave-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: enclave-go:test
+    container_name: enclave_go_test
+    restart: unless-stopped
+    environment:
+      ENV: development
+      LOG_LEVEL: debug
+      # The DB lives on auditzk (mirroring prod, where the enclave
+      # connects cross-VPS to auditzk's postgres). Override AUDITZK_HOST
+      # at compose time. Substitution leaves DATABASE_URL malformed if
+      # AUDITZK_HOST is unset, which surfaces as a fast boot failure
+      # instead of a silent "DB not reached" hang.
+      DATABASE_URL: postgres://enclave:enclave@${AUDITZK_HOST:?AUDITZK_HOST must be set — points at auditzk's test-enclave-db}:${AUDITZK_DB_PORT:-5443}/enclave_test?sslmode=disable
+      # 32-byte hex (64 chars). Synthetic, throwaway — DEK derivation in
+      # this test stack uses no real master key and the DB is ephemeral.
+      ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      # ENCLAVE_JWT_SECRET intentionally unset in this test compose.
+      # The REST jwtRequired middleware passes through when the secret
+      # is empty (dev policy), which lets us hit /api/v1/connection from
+      # curl without standing up a JWT issuer / gateway in front. Set
+      # this in a separate compose override if you specifically want to
+      # test the JWT-gated path.
+      AUTO_MIGRATE: "true"
+      ENABLE_DAILY_SYNC: "false"
+      ENABLE_LEGACY_REST: "true"
+      GRPC_INSECURE: "true"
+      CORS_ORIGIN: "*"
+      TLS_CERT_PATH: /app/certs/cert.pem
+      TLS_KEY_PATH: /app/certs/key.pem
+      # Cross-VPS rebuilder — same auditzk host as the DB. Empty disables
+      # the post-create hook (no plaintext creds exit, SEC-ZK-001
+      # perimeter intact). Override to an empty string explicitly to opt
+      # out: REBUILDER_URL="" docker compose ... up -d.
+      REBUILDER_SERVICE_URL: ${REBUILDER_URL-http://${AUDITZK_HOST}:${AUDITZK_REBUILDER_PORT:-3006}}
+      REBUILDER_INTERNAL_TOKEN: ${REBUILDER_TOKEN:-test-token-abc123def456ghi789jkl012mno345}
+    ports:
+      - "127.0.0.1:8443:8080"
+      - "127.0.0.1:50063:50051"
+    volumes:
+      - ./certs-test:/app/certs:ro
+    networks:
+      - tee_test
+
+networks:
+  tee_test:
+    driver: bridge

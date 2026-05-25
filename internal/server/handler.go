@@ -106,26 +106,6 @@ type connectionService interface {
 	GetExcludedConnectionKeys(ctx context.Context, userUID string) (map[string]struct{}, error)
 }
 
-func NewHandler(
-	logger *zap.Logger,
-	connSvc connectionService,
-	syncSvc *service.SyncService,
-	metricsSvc *service.MetricsService,
-	reportSvc *service.ReportService,
-	snapshotRepo *repository.SnapshotRepo,
-	userRepo *repository.UserRepo,
-) *Handler {
-	return &Handler{
-		logger:       logger,
-		connSvc:      connSvc,
-		syncSvc:      syncSvc,
-		metricsSvc:   metricsSvc,
-		reportSvc:    reportSvc,
-		snapshotRepo: snapshotRepo,
-		userRepo:     userRepo,
-	}
-}
-
 // NewHandlerWithOptions creates a handler with all optional services.
 func NewHandlerWithOptions(opts HandlerOptions) *Handler {
 	return &Handler{
@@ -343,6 +323,9 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 			Tag                string `json:"tag"`
 		} `json:"encrypted"`
 		ExcludeFromReport bool `json:"exclude_from_report"`
+		// SEC-ZK-001: explicit opt-in for historical reconstruction. See the
+		// twin field on the legacy /api/v1/connection handler for rationale.
+		RebuildHistory bool `json:"rebuild_history"`
 	}
 
 	if err := readJSON(w, r, &req); err != nil {
@@ -477,6 +460,7 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 		APISecret:         apiSecret,
 		Passphrase:        passphrase,
 		ExcludeFromReport: req.ExcludeFromReport,
+		RebuildHistory:    req.RebuildHistory,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrConnectionAlreadyExists) {
@@ -558,6 +542,11 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 		Passphrase          string `json:"passphrase"`
 		SyncIntervalMinutes int    `json:"sync_interval_minutes"`
 		ExcludeFromReport   bool   `json:"exclude_from_report"`
+		// SEC-ZK-001: explicit opt-in for historical reconstruction. Default
+		// false (zero value) means CLI/curl callers that omit the field don't
+		// silently trigger a plaintext-credential POST to the rebuilder. The
+		// frontend toggle sends true when the user pre-checks "rebuild history".
+		RebuildHistory bool `json:"rebuild_history"`
 	}
 
 	if err := readJSON(w, r, &req); err != nil {
@@ -624,6 +613,7 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 		Passphrase:          req.Passphrase,
 		SyncIntervalMinutes: req.SyncIntervalMinutes,
 		ExcludeFromReport:   req.ExcludeFromReport,
+		RebuildHistory:      req.RebuildHistory,
 	})
 
 	if err != nil {

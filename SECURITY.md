@@ -28,7 +28,7 @@ This document describes the security architecture, mechanisms, and guarantees of
 The AuditZK Enclave implements a **zero-knowledge architecture** for processing sensitive trading data. The system is designed with the following core security principles:
 
 1. **Hardware Root of Trust**: AMD SEV-SNP provides memory encryption and attestation
-2. **Minimal Trust Boundary**: Only ~8,800 LOC in the Trusted Computing Base (TCB)
+2. **Minimal Trust Boundary**: ~27,000 LOC of hand-written Go in the Trusted Computing Base (TCB)
 3. **Data Minimization**: Individual trades never leave the enclave
 4. **Defense in Depth**: Multiple layers of security controls
 5. **Auditability**: All security mechanisms are auditable and reproducible
@@ -124,36 +124,30 @@ The enclave generates cryptographically signed attestation reports that prove:
 
 #### 3. Attestation Implementation
 
-Location: [internal/service/attestation.go](internal/service/attestation.go)
+Location: [internal/attestation/](internal/attestation/)
 
 **Supported Platforms:**
 - **Bare Metal / KVM**: `/dev/sev-guest` device
 - **Azure Confidential VMs**: IMDS attestation endpoint
 - **GCP Confidential VMs**: Metadata server attestation
 
-**Attestation Process:**
+**Attestation API** ([internal/attestation/attestation.go](internal/attestation/attestation.go)):
 
 ```go
-// 1. Check if SEV-SNP is available
-func IsSevSnpAvailable() bool {
-    // Check AMD_SEV_SNP environment variable
-    // Check for /dev/sev-guest device
-    // Verify CPU capabilities in /proc/cpuinfo
-}
+// GetAttestation returns the current attestation report (cached ~5s).
+func (s *Service) GetAttestation(ctx context.Context) (*AttestationReport, error)
 
-// 2. Fetch attestation report
-func GetAttestationReport() (*AttestationReport, error) {
-    // Platform-specific attestation retrieval
-    // Contains: measurement, signature, platform version, chip ID
-}
-
-// 3. Verify cryptographic signature
-func VerifySignature(report *AttestationReport) error {
-    // Fetch VCEK public key from AMD Key Distribution Service
-    // Verify ECDSA signature using SHA-384
-    // Validate report data integrity
-}
+// GetAttestationWithNonce returns a fresh report whose report_data binds the
+// enclave's TLS / E2E / signing public keys — and the caller's nonce — into
+// the SEV-SNP quote (anti-replay).
+func (s *Service) GetAttestationWithNonce(ctx context.Context, nonce []byte) (*AttestationReport, error)
 ```
+
+Internally, `fetchWithSnpguest` invokes the `snpguest` tool to produce and
+parse the SEV-SNP quote, and `fetchAndCacheVCEK` validates the VCEK / VLEK
+certificate chain against the AMD root. The resulting flags — `Verified`,
+`VcekVerified`, `ReportDataBoundToRequest` — gate production startup via
+`enforceProductionAttestation`.
 
 **Verification Output:**
 
@@ -183,7 +177,7 @@ func VerifySignature(report *AttestationReport) error {
 
 ### Encryption Service
 
-Location: [internal/service/encryption.go](internal/service/encryption.go)
+Location: [internal/encryption/](internal/encryption/)
 
 #### Algorithm: AES-256-GCM
 
@@ -202,15 +196,19 @@ Location: [internal/service/encryption.go](internal/service/encryption.go)
 #### Key Derivation (AMD SEV-SNP Hardware)
 
 ```go
-// Master key derived from AMD SEV-SNP hardware measurement
-// NO secrets in environment variables
-attestation, err := GetAttestationReport()
-measurement := attestation.Measurement // SHA-384 hash of enclave binary
-
-// Derive master key using HKDF-SHA256
-masterKey := make([]byte, 32)
-hkdf.New(sha256.New, measurement, platformVersion, []byte("auditzk-enclave-dek"))
+// internal/encryption/key_derivation.go — deriveMasterKey()
+// HKDF-SHA256(measurement, salt=platformVersion, info="track-record-enclave-dek")
+reader := hkdf.New(sha256.New, measurement, salt, []byte(hkdfInfoMasterKey))
+s.masterKey = make([]byte, masterKeySize) // 32 bytes
+if _, err := io.ReadFull(reader, s.masterKey); err != nil {
+    return fmt.Errorf("derive master key from sev-snp measurement: %w", err)
+}
+s.isHardware = true
 ```
+
+The HKDF `info` string (`hkdfInfoMasterKey`) and 32-byte length match the TS
+enclave exactly — a divergence would derive a different master key and fail to
+unwrap existing DEKs.
 
 **Security:**
 - Master key derived from AMD SEV-SNP hardware measurement (NOT environment variables)
@@ -323,7 +321,7 @@ hash := hex.EncodeToString(h.Sum(nil))
 
 The logging system implements **deterministic multi-tier redaction** to ensure NO sensitive data ever leaves the enclave, even in logs.
 
-Location: [internal/logger/logger.go](internal/logger/logger.go)
+Location: [internal/logredact/redact.go](internal/logredact/redact.go)
 
 ### Two-Tier Redaction (ALWAYS Active)
 
@@ -402,101 +400,41 @@ logger.Info("Sync completed",
 
 ## Memory Protection
 
-Location: [internal/service/memory.go](internal/service/memory.go)
+Location: [internal/security/](internal/security/)
 
 ### Protection Mechanisms
 
-#### 1. Core Dump Prevention
+`MemoryProtection.Apply()` runs three hardening steps at boot; `WipeBuffer`
+overwrites a buffer on demand:
 
-**Threat:** Core dumps can leak decrypted credentials to disk
-
-**Mitigation:**
 ```go
-// Disable core dumps via setrlimit syscall
-syscall.Setrlimit(syscall.RLIMIT_CORE, &syscall.Rlimit{Cur: 0, Max: 0})
-```
-
-**Verification:**
-```bash
-ulimit -c  # Should output: 0
-```
-
-#### 2. Ptrace Protection
-
-**Threat:** Debuggers (gdb, strace) can attach and read process memory
-
-**Mitigation:**
-```
-/proc/sys/kernel/yama/ptrace_scope = 2
-```
-
-**Levels:**
-- `0`: No restrictions (INSECURE)
-- `1`: Restricted to parent processes
-- `2`: Admin-only ptrace (RECOMMENDED for production)
-- `3`: No ptrace at all (maximum security)
-
-**Check:**
-```bash
-cat /proc/sys/kernel/yama/ptrace_scope
-# Production should be: 2 or 3
-```
-
-#### 3. Memory Locking (mlock)
-
-**Threat:** Sensitive data paged to swap can be recovered from disk
-
-**Mitigation:**
-```go
-// Lock memory pages containing credentials (requires CAP_IPC_LOCK)
-syscall.Mlock(credentialBuffer)
-```
-
-**Production Setup:**
-```bash
-# Grant mlock capability to enclave binary
-setcap cap_ipc_lock=+ep /usr/local/bin/enclave
-
-# Or use systemd
-[Service]
-LockPersonality=yes
-```
-
-#### 4. Secure Buffer Wiping
-
-**Threat:** Decrypted credentials may remain in memory after use
-
-**Mitigation:**
-```go
-// Overwrite sensitive bytes with random data, then zeros
-func WipeBytes(b []byte) {
-    rand.Read(b)  // Fill with random bytes
-    for i := range b {
-        b[i] = 0  // Overwrite with zeros
-    }
+// internal/security/memory_linux.go
+func (m *MemoryProtection) Apply() {
+    m.DisableCoreDumps()      // RLIMIT_CORE = 0 — no credential leak to disk
+    m.CheckPtraceProtection() // warns if yama ptrace_scope < 2
+    m.CheckMlock()            // reports the process VmLck status
 }
 
-// Wipe credentials after use
-apiKey, _ := encryptionSvc.Decrypt(encrypted)
-defer WipeBytes(apiKey) // Securely erase from memory
+// WipeBuffer overwrites a buffer with random data, then zeros.
+func (m *MemoryProtection) WipeBuffer(buf []byte) {
+    rand.Read(buf)
+    for i := range buf {
+        buf[i] = 0
+    }
+}
 ```
 
-#### 5. Cleanup on Shutdown
+| Step | Threat | What the code does |
+|------|--------|--------------------|
+| `DisableCoreDumps` | Core dumps leak decrypted credentials to disk | `syscall.Setrlimit(RLIMIT_CORE, 0)` |
+| `CheckPtraceProtection` | Debuggers attach and read process memory | Reads `yama/ptrace_scope`; warns if `< 2` |
+| `CheckMlock` | Sensitive pages swapped to disk | Reports `VmLck` from `/proc/self/status` |
+| `WipeBuffer` | Decrypted secrets linger in memory | Random-then-zero overwrite |
 
-**Threat:** Secrets in memory may persist after process exit
-
-**Mitigation:**
-```go
-// Register cleanup handlers
-sigCh := make(chan os.Signal, 1)
-signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-
-go func() {
-    <-sigCh
-    cleanup() // Wipe in-memory secrets
-    os.Exit(0)
-}()
-```
+`CheckPtraceProtection` and `CheckMlock` are **observability checks** — the host
+environment must actually set `ptrace_scope` and grant `CAP_IPC_LOCK` (see
+Production Recommendations below). The SEV-SNP VM is the primary memory
+protection; these steps are defence-in-depth on top of it.
 
 ### Production Recommendations
 
@@ -621,7 +559,7 @@ CREATE TABLE sync_statuses (
 
 **Security:**
 - Proves snapshots are systematic (not cherry-picked)
-- 23-hour cooldown enforced (see Rate Limiting)
+- One snapshot per day enforced (see Rate Limiting)
 - Gateway has NO access (prevents manipulation)
 
 ### SQL Injection Prevention
@@ -640,8 +578,8 @@ rows, err := pool.Query(ctx,
 ```
 
 **Verification:**
-- All repository methods in `internal/repository/` use `$1`, `$2`, … placeholders
-- No string-interpolated SQL (auditable via grep for `fmt.Sprintf.*SELECT`)
+- Query *values* are always passed as `$1`, `$2`, … parameters — never interpolated
+- Some queries assemble static column lists with `fmt.Sprintf` / `strings.Join`; these carry no caller input
 - pgx handles quoting and escaping internally
 
 ---
@@ -667,28 +605,28 @@ Day 3: Portfolio up +5% → User triggers snapshot (shows profit)
 
 **Result:** Performance appears better than reality (deceptive track record)
 
-### Mitigation: 23-Hour Cooldown
+### Mitigation: One Snapshot Per Day
 
-**Enforcement:**
+A manual sync cannot create a second snapshot for a day that already has one.
+`SyncService.isManualSyncAllowed` runs a targeted existence check before any
+manual sync, and fails *closed* on a database error:
+
 ```go
-// Minimum 23 hours between syncs for same user/exchange
-const rateLimitHours = 23
-
-func (s *SyncService) checkRateLimit(ctx context.Context, userUID, exchange string) error {
-    status, err := s.syncStatusRepo.Get(ctx, userUID, exchange, "daily")
-    if err != nil || status == nil {
-        return nil // First sync — allowed
+// internal/service/sync.go
+func (s *SyncService) isManualSyncAllowed(ctx context.Context, userUID, exchange, label string) (bool, error) {
+    exists, err := s.snapshotRepo.ExistsForUserExchangeLabel(ctx, userUID, exchange, label)
+    if err != nil {
+        // Fail closed: surface the DB error instead of silently letting a
+        // manual sync overwrite an existing committed snapshot.
+        return false, fmt.Errorf("anti-cherry-pick check failed: %w", err)
     }
-
-    elapsed := time.Since(status.LastSyncTime)
-    if elapsed >= rateLimitHours*time.Hour {
-        return nil // Cooldown elapsed — allowed
-    }
-
-    nextAllowed := status.LastSyncTime.Add(rateLimitHours * time.Hour)
-    return fmt.Errorf("rate limit: next sync allowed at %s", nextAllowed.UTC())
+    return !exists, nil
 }
 ```
+
+Daily snapshots are otherwise produced systematically by the in-enclave
+scheduler, not on demand — so the series cannot be cherry-picked by choosing
+when to sync.
 
 ### Audit Trail
 
@@ -714,39 +652,33 @@ userUid                              | exchange | lastSyncTime         | status
 
 **Proof of systematic snapshots:**
 - Auditors can verify timestamps are ~24 hours apart
-- No gaps in snapshot sequence (except rate limit violations)
-- Manual syncs blocked if cooldown not elapsed
+- No gaps in the snapshot sequence
+- Manual syncs cannot create a second snapshot for a day that already has one
 
 ### Autonomous Scheduler
 
-**Daily snapshots triggered automatically** at 00:00 UTC:
+Location: [internal/scheduler/daily.go](internal/scheduler/daily.go)
 
-Location: [internal/scheduler/](internal/scheduler/)
+`SyncScheduler` fires at the next 00:00 UTC, then every 24 hours. The timezone
+is forced to UTC so the snapshot cadence cannot be shifted:
 
 ```go
-// Cron: Every day at 00:00 UTC
-c := cron.New(cron.WithLocation(time.UTC))
-c.AddFunc("0 0 * * *", func() {
-    logger.Info("[SCHEDULER] Daily sync started at 00:00 UTC")
-
-    users, _ := userRepo.ListActive(ctx)
-    for _, user := range users {
-        connections, _ := connRepo.ListActive(ctx, user.UID)
-        for _, conn := range connections {
-            if err := syncSvc.SyncConnection(ctx, user.UID, conn.ID); err != nil {
-                logger.Warn("sync skipped", zap.Error(err))
-            }
-        }
-    }
-})
-c.Start()
+// internal/scheduler/daily.go
+func timeUntilMidnightUTC() time.Duration {
+    now := time.Now().UTC()
+    nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+    return nextMidnight.Sub(now)
+}
 ```
 
+On each tick, `executeDailySync` syncs every user via
+`SyncService.SyncUserScheduledDueAtomic` (bounded to 3 concurrent users).
+
 **Properties:**
-- Runs inside hardware-attested enclave (cannot be manipulated)
-- Systematic timing (00:00 UTC daily)
-- Rate limiter prevents manual abuse
-- Audit trail proves systematic execution
+- Runs inside the hardware-attested enclave (cannot be manipulated)
+- Systematic timing (00:00 UTC daily), not user-triggered
+- The anti-cherry-pick guard prevents manual abuse
+- `sync_statuses` audit trail proves systematic execution
 
 ---
 
@@ -799,9 +731,10 @@ ORDER BY "lastSyncTime" DESC;
 grep -i "api.key\|password\|secret" /var/log/enclave/*.log
 # Should return ZERO results (all redacted)
 
-# 5. Verify no raw string concatenation in SQL
-grep -r 'Sprintf.*SELECT\|Sprintf.*INSERT\|Sprintf.*UPDATE' internal/repository/
-# Should return ZERO results
+# 5. Verify SQL values are parameterized
+#    Repository queries pass values as $1, $2, … — never interpolated.
+#    Static column lists may be assembled with fmt.Sprintf/strings.Join;
+#    those carry no caller input.
 ```
 
 ---
@@ -910,7 +843,7 @@ curl http://localhost:50051/health
 - `go.sum` pins exact module versions and SHA-256 hashes
 - Reproducible builds allow verification of deployed binary
 - Regular `govulncheck` scans for known vulnerabilities
-- Minimal dependencies (~15 modules, all auditable)
+- Minimal dependencies (9 direct modules, all auditable)
 
 **Verification:**
 ```bash
@@ -980,8 +913,8 @@ if !report.Verified {
 - Auditors can independently verify build
 
 ✅ **Systematic Snapshots**
-- Daily scheduler runs at 00:00 UTC (inside attested enclave)
-- Rate limiter enforces 23-hour cooldown
+- Daily scheduler runs inside the attested enclave
+- Anti-cherry-pick guard: one snapshot per day per user/exchange/label
 - Audit trail proves systematic execution (not cherry-picked)
 
 ✅ **Hypervisor Isolation**
@@ -1106,5 +1039,5 @@ We welcome responsible security research and will:
 ---
 
 **Document Version:** 1.0.0
-**Last Updated:** 2026-04-13
+**Last Updated:** 2026-05-17
 **Maintained by:** AuditZK Security Team

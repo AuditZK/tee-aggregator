@@ -83,6 +83,15 @@ func (s *MetricsService) CalculateWithFilters(
 	return s.calculateFromSnapshots(filtered)
 }
 
+// CalculateFromSnapshots computes metrics from an already-fetched snapshot
+// slice. The report path uses this so it computes metrics over the SAME
+// verifiable-only set it built the report from (SEC-001) — re-fetching via
+// CalculateWithFilters would silently re-include external-rebuilder history.
+// The caller is responsible for any exchange-exclusion filtering.
+func (s *MetricsService) CalculateFromSnapshots(snapshots []*repository.Snapshot) (*PerformanceMetrics, error) {
+	return s.calculateFromSnapshots(snapshots)
+}
+
 func (s *MetricsService) calculateFromSnapshots(snapshots []*repository.Snapshot) (*PerformanceMetrics, error) {
 	if len(snapshots) < 2 {
 		return nil, errors.New("insufficient data: need at least 2 snapshots")

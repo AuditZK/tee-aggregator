@@ -11,6 +11,11 @@
 package connector
 
 import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,10 +25,10 @@ import (
 )
 
 // Retry policy for CONN-004: max 3 attempts with exponential backoff and
-// Retry-After support for 429 / 5xx responses. The primary DoRequest is
-// single-shot (preserves the old behaviour for HMAC-signed callers where
-// the request timestamp would drift on replay); callers that know their
-// request is idempotent should invoke DoRequestWithRetry instead.
+// Retry-After support for 429 / 5xx responses. DoRequest is single-shot;
+// retryHTTP rebuilds (and therefore re-signs) the request on every attempt,
+// so an HMAC-signed read survives a transient failure without replaying a
+// stale, time-windowed signature.
 const (
 	maxRetryAttempts = 3
 	baseBackoff      = 500 * time.Millisecond
@@ -155,8 +160,8 @@ func NewCryptoBase(apiKey, apiSecret, baseURL string) CryptoBase {
 }
 
 // DoRequest executes an HTTP request and returns the raw body (single-shot).
-// Use DoRequestWithRetry for idempotent requests that should survive
-// transient 429 / 5xx responses (CONN-004).
+// Use retryHTTP for signed reads that should survive a transient 429 / 5xx
+// (CONN-004) — it re-signs the request on each attempt.
 func (b *CryptoBase) DoRequest(req *http.Request) ([]byte, error) {
 	resp, err := b.Client.Do(req)
 	if err != nil {
@@ -177,23 +182,28 @@ func (b *CryptoBase) DoRequest(req *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-// DoRequestWithRetry is like DoRequest but retries 429 / 5xx responses up to
-// maxRetryAttempts times with exponential backoff (CONN-004). Honours the
-// Retry-After header when present (capped at maxBackoff). Respects req.Context
-// cancellation: a context deadline aborts the retry loop immediately.
-//
-// NOTE: callers must ensure the request is idempotent AND does not embed a
-// time-sensitive signature (e.g. Binance's 5 s receive-window HMAC timestamp).
-// Read endpoints such as /balance and /trades are safe; signed write endpoints
-// should continue to use DoRequest and handle retry at a higher level.
-func (b *CryptoBase) DoRequestWithRetry(req *http.Request) ([]byte, error) {
-	ctx := req.Context()
+// retryHTTP sends the request produced by buildReq and returns the response
+// body. On a transient failure — a network error, HTTP 429, or HTTP 5xx — it
+// calls buildReq AGAIN (rebuilding, and therefore re-signing, the request with
+// a fresh timestamp) and retries, up to maxRetryAttempts, with exponential
+// backoff that honours a Retry-After header. A non-transient status (4xx
+// auth/argument errors) returns immediately; context cancellation aborts the
+// loop. CONN-004 — taking a builder rather than a prebuilt *http.Request is
+// precisely what makes retry safe for HMAC-signed requests whose signature is
+// bound to a short receive window.
+func retryHTTP(client *http.Client, buildReq func() (*http.Request, error)) ([]byte, error) {
 	var lastBody []byte
 	var lastErr error
 	backoff := baseBackoff
 
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
-		resp, err := b.Client.Do(req)
+		req, err := buildReq()
+		if err != nil {
+			return nil, err
+		}
+		ctx := req.Context()
+
+		resp, err := client.Do(req)
 		if err != nil {
 			// Network error — retry unless the context is already done.
 			lastErr = err
@@ -248,4 +258,45 @@ func (b *CryptoBase) DoJSON(req *http.Request, out interface{}) error {
 // Subclasses should add their own signing logic to the request before calling DoRequest.
 func (b *CryptoBase) GET(url string) (*http.Request, error) {
 	return http.NewRequest("GET", url, nil)
+}
+
+// signHMACHex returns the hex-encoded HMAC-SHA256 of msg under secret — the
+// request-signing primitive shared by the Binance-family connectors (Binance,
+// BingX, MEXC, Bybit, Coinbase). Each connector still builds its own signing
+// payload; only the keyed-hash itself is centralised here.
+func signHMACHex(secret, msg string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(msg))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// signHMACBase64 returns the base64-encoded HMAC-SHA256 of msg under secret —
+// the signing primitive shared by the OKX-family connectors (OKX, Bitget,
+// KuCoin, Huobi).
+func signHMACBase64(secret, msg string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(msg))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// signedQueryGET performs the Binance-family query-signed GET: it appends
+// `timestamp=<unixMillis>` to params, HMAC-signs the resulting query string,
+// appends `&signature=<hex>`, and sends the API key under apiKeyHeader. BingX
+// and MEXC (spot) share this exact scheme bar the header name.
+func (b *CryptoBase) signedQueryGET(ctx context.Context, apiKeyHeader, path, params string) ([]byte, error) {
+	return retryHTTP(b.Client, func() (*http.Request, error) {
+		query := params
+		if query != "" {
+			query += "&"
+		}
+		query += "timestamp=" + strconv.FormatInt(time.Now().UnixMilli(), 10)
+
+		reqURL := b.BaseURL + path + "?" + query + "&signature=" + signHMACHex(b.APISecret, query)
+		req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set(apiKeyHeader, b.APIKey)
+		return req, nil
+	})
 }

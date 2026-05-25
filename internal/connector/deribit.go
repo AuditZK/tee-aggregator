@@ -312,28 +312,20 @@ func (d *Deribit) ensureToken(ctx context.Context) error {
 	// header rather than as URL query parameters. URLs are logged by every
 	// intermediate proxy, CDN, TLS terminator, and crash-dump pipeline; Deribit's
 	// own documentation recommends Basic auth precisely for that reason.
-	values := url.Values{}
-	values.Set("grant_type", "client_credentials")
+	body, err := retryHTTP(d.client, func() (*http.Request, error) {
+		values := url.Values{}
+		values.Set("grant_type", "client_credentials")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, deribitAPI+"/public/auth?"+values.Encode(), nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, deribitAPI+"/public/auth?"+values.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		basic := base64.StdEncoding.EncodeToString([]byte(d.apiKey + ":" + d.apiSecret))
+		req.Header.Set("Authorization", "Basic "+basic)
+		return req, nil
+	})
 	if err != nil {
 		return err
-	}
-	basic := base64.StdEncoding.EncodeToString([]byte(d.apiKey + ":" + d.apiSecret))
-	req.Header.Set("Authorization", "Basic "+basic)
-
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return err
-	}
-
-	// CONN-AUDIT-001: bounded read.
-	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("deribit auth status %d: %s", resp.StatusCode, TruncatedBody(body))
 	}
 
 	var authResp struct {
@@ -367,33 +359,25 @@ func (d *Deribit) privateGET(ctx context.Context, path string, params url.Values
 		return nil, err
 	}
 
-	u := deribitAPI + path
-	if len(params) > 0 {
-		u += "?" + params.Encode()
-	}
+	body, err := retryHTTP(d.client, func() (*http.Request, error) {
+		u := deribitAPI + path
+		if len(params) > 0 {
+			u += "?" + params.Encode()
+		}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		d.mu.Lock()
+		token := d.token
+		d.mu.Unlock()
+		req.Header.Set("Authorization", "Bearer "+token)
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	d.mu.Lock()
-	token := d.token
-	d.mu.Unlock()
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
-	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("deribit API status %d: %s", resp.StatusCode, TruncatedBody(body))
 	}
 
 	var envelope struct {
@@ -408,30 +392,13 @@ func (d *Deribit) privateGET(ctx context.Context, path string, params url.Values
 }
 
 func (d *Deribit) publicGET(ctx context.Context, path string, params url.Values) ([]byte, error) {
-	u := deribitAPI + path
-	if len(params) > 0 {
-		u += "?" + params.Encode()
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
-	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("deribit public API status %d: %s", resp.StatusCode, TruncatedBody(body))
-	}
-	return body, nil
+	return retryHTTP(d.client, func() (*http.Request, error) {
+		u := deribitAPI + path
+		if len(params) > 0 {
+			u += "?" + params.Encode()
+		}
+		return http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	})
 }
 
 // GetCashflows returns deposits and withdrawals with USD conversion.

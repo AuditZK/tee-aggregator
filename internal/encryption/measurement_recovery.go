@@ -116,10 +116,13 @@ func (s *KeyManagementService) tryMeasurementRecovery(ctx context.Context, wrapp
 
 	tried := 0
 	for _, c := range candidates {
-		// Verify the ECDSA signature before trusting this measurement. Filters
-		// out corrupt records (bit rot, partial writes) and ensures the
-		// measurement was embedded in a consistently-signed payload rather than
-		// injected as a bare value into the DB.
+		// Check the ECDSA signature before deriving a key from this measurement.
+		// SEC-008: this is self-referential — the signature is verified against
+		// the public key embedded in the SAME signed_reports row, so it does
+		// NOT authenticate the measurement against a trusted key. It only
+		// filters out corrupt / partially-written rows. The real gate is the
+		// UnwrapKey call below: a measurement an attacker chose cannot derive
+		// the key that wrapped the genuine DEK (HKDF preimage resistance).
 		ok, verifyErr := verifyECDSAReportSignature(c.reportHash, c.signature, c.publicKey, c.algorithm)
 		if verifyErr != nil || !ok {
 			if s.logger != nil {

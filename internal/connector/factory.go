@@ -2,6 +2,7 @@ package connector
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/trackrecord/enclave/internal/proxy"
@@ -84,8 +85,12 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 	case "mt4", "mt5", "exness":
 		return NewMetaTrader(creds), nil
 
-	// Testing
+	// Testing. The mock connector fabricates balances and trades; it must never
+	// feed the signed-report pipeline, so it is unavailable in production.
 	case "mock":
+		if isProductionEnv() {
+			return nil, fmt.Errorf("%w: mock is disabled in production", ErrUnsupportedExchange)
+		}
 		return NewMock(), nil
 
 	default:
@@ -100,7 +105,7 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 
 // SupportedExchanges returns list of supported exchanges
 func (f *Factory) SupportedExchanges() []string {
-	return []string{
+	exchanges := []string{
 		"binance",
 		"binance_futures",
 		"binanceusdm",
@@ -124,6 +129,20 @@ func (f *Factory) SupportedExchanges() []string {
 		"mt4",
 		"mt5",
 		"exness",
-		"mock",
 	}
+	// mock is a test-only connector — not advertised (nor creatable) in
+	// production; see Create.
+	if !isProductionEnv() {
+		exchanges = append(exchanges, "mock")
+	}
+	return exchanges
+}
+
+// isProductionEnv reports whether the enclave runs in production. The mock
+// connector is gated on this so fabricated balances/trades cannot enter the
+// signed-report pipeline. Mirrors the ENV / NODE_ENV check the gRPC and REST
+// layers use.
+func isProductionEnv() bool {
+	return strings.EqualFold(os.Getenv("ENV"), "production") ||
+		strings.EqualFold(os.Getenv("NODE_ENV"), "production")
 }

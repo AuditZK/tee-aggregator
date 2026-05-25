@@ -44,26 +44,27 @@ func (g *Gate) sign(method, path, query, hashedBody, timestamp string) string {
 }
 
 func (g *Gate) doRequest(ctx context.Context, method, path, query string) ([]byte, error) {
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	hashedBody := g.hashBody("")
-	signature := g.sign(method, path, query, hashedBody, timestamp)
+	return retryHTTP(g.base.Client, func() (*http.Request, error) {
+		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+		hashedBody := g.hashBody("")
+		signature := g.sign(method, path, query, hashedBody, timestamp)
 
-	reqURL := g.base.BaseURL + path
-	if query != "" {
-		reqURL += "?" + query
-	}
+		reqURL := g.base.BaseURL + path
+		if query != "" {
+			reqURL += "?" + query
+		}
 
-	req, err := http.NewRequestWithContext(ctx, method, reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
+		req, err := http.NewRequestWithContext(ctx, method, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
 
-	req.Header.Set("KEY", g.base.APIKey)
-	req.Header.Set("SIGN", signature)
-	req.Header.Set("Timestamp", timestamp)
-	req.Header.Set("Content-Type", "application/json")
-
-	return g.base.DoRequest(req)
+		req.Header.Set("KEY", g.base.APIKey)
+		req.Header.Set("SIGN", signature)
+		req.Header.Set("Timestamp", timestamp)
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 }
 
 func (g *Gate) TestConnection(ctx context.Context) error {

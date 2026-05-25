@@ -15,10 +15,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/trackrecord/enclave/internal/auth"
 	"github.com/trackrecord/enclave/internal/config"
-	"github.com/trackrecord/enclave/internal/encryption"
-	"github.com/trackrecord/enclave/internal/repository"
-	"github.com/trackrecord/enclave/internal/service"
-	"github.com/trackrecord/enclave/internal/signing"
 	"go.uber.org/zap"
 )
 
@@ -78,39 +74,17 @@ func (s *Server) SetHandoffHandler(h http.Handler) {
 	s.handoffHandler = h
 }
 
-func New(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool, signer *signing.ReportSigner) *Server {
-	var connSvc *service.ConnectionService
-	var syncSvc *service.SyncService
-	var metricsSvc *service.MetricsService
-	var reportSvc *service.ReportService
-	var snapshotRepo *repository.SnapshotRepo
-	var userRepo *repository.UserRepo
-
-	if pool != nil {
-		enc, err := encryption.New(cfg.EncryptionKey)
-		if err != nil {
-			logger.Error("encryption init failed", zap.Error(err))
-		} else {
-			connRepo := repository.NewConnectionRepo(pool)
-			snapshotRepo = repository.NewSnapshotRepo(pool)
-			userRepo = repository.NewUserRepo(pool)
-
-			connSvc = service.NewConnectionService(connRepo, enc)
-			syncSvc = service.NewSyncService(connSvc, snapshotRepo, nil, logger)
-			metricsSvc = service.NewMetricsService(snapshotRepo)
-
-			if signer != nil {
-				reportSvc = service.NewReportService(metricsSvc, snapshotRepo, signer)
-				reportSvc.SetConnectionService(connSvc)
-			}
-		}
-	}
-
+// New creates a REST Server shell. The caller MUST wire the request handler
+// via SetHandler before Start — New deliberately builds none. This keeps the
+// handler's services bound to the same DEK-unwrapped encryption service as the
+// rest of the enclave (see cmd/enclave/main.go) instead of re-deriving one from
+// cfg.EncryptionKey, which in production is not the DEK. Start fails closed if
+// SetHandler was not called.
+func New(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool) *Server {
 	return &Server{
-		cfg:     cfg,
-		logger:  logger,
-		handler: NewHandler(logger, connSvc, syncSvc, metricsSvc, reportSvc, snapshotRepo, userRepo),
-		pool:    pool,
+		cfg:    cfg,
+		logger: logger,
+		pool:   pool,
 	}
 }
 
@@ -127,10 +101,10 @@ func (s *Server) Start(ctx context.Context) error {
 	credRateLimiter := NewIPRateLimiter(5, 15*time.Minute, s.cfg.RateLimitTrustedProxies...)
 
 	// Public routes (no auth required):
-	//   /health            — liveness probe
-	//   /api/v1/tls/fingerprint — public by design (used by clients before attestation)
-	//   /api/v1/attestation     — public by design (attestation quote)
-	//   /api/v1/verify          — public by design (stateless signature check)
+	//   /health                 — liveness probe
+	//   /api/v1/tls/fingerprint  — public by design (used by clients before attestation)
+	//   /api/v1/attestation      — public by design (attestation quote)
+	// (/api/v1/verify is public too, but only registered under EnableLegacyREST.)
 	mux.HandleFunc("/health", s.handler.HealthCheck)
 	mux.HandleFunc("/api/v1/tls/fingerprint", s.handler.GetTLSFingerprint)
 	mux.HandleFunc("/api/v1/attestation", s.handler.GetAttestation)

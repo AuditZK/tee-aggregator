@@ -27,6 +27,7 @@ import (
 	"github.com/trackrecord/enclave/internal/logstream"
 	"github.com/trackrecord/enclave/internal/metrics"
 	proxyPkg "github.com/trackrecord/enclave/internal/proxy"
+	"github.com/trackrecord/enclave/internal/rebuilderclient"
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/scheduler"
 	"github.com/trackrecord/enclave/internal/security"
@@ -256,7 +257,6 @@ func main() {
 	var snapshotRepo *repository.SnapshotRepo
 	var userRepo *repository.UserRepo
 	var signedReportRepo *repository.SignedReportRepo
-	var rateLimitRepo *repository.RateLimitRepo
 	var syncStatusRepo *repository.SyncStatusRepo
 
 	if pool != nil {
@@ -264,7 +264,6 @@ func main() {
 		snapshotRepo = repository.NewSnapshotRepo(pool)
 		userRepo = repository.NewUserRepo(pool)
 		signedReportRepo = repository.NewSignedReportRepo(pool)
-		rateLimitRepo = repository.NewRateLimitRepo(pool)
 		syncStatusRepo = repository.NewSyncStatusRepo(pool)
 	}
 
@@ -273,7 +272,6 @@ func main() {
 	var syncSvc *service.SyncService
 	var metricsSvc *service.MetricsService
 	var reportSvc *service.ReportService
-	var rateLimiterSvc *service.RateLimiterService
 	benchmarkSvc := service.NewBenchmarkService()
 
 	// 11b. Init connector cache (TS parity: UniversalConnectorCache)
@@ -282,15 +280,52 @@ func main() {
 
 	if pool != nil {
 		connSvc = service.NewConnectionService(connRepo, enc)
+		connSvc.SetLogger(logger)
 		syncSvc = service.NewSyncService(connSvc, snapshotRepo, connectorCache, logger)
+		if cfg.HistorySyncNotifyURL != "" {
+			syncSvc.SetHistoryNotifyURL(cfg.HistorySyncNotifyURL)
+			logger.Info("history-rebuilt notify wired", zap.String("url", cfg.HistorySyncNotifyURL))
+		}
 		if syncStatusRepo != nil {
 			syncSvc.SetSyncStatusRepo(syncStatusRepo)
 		}
-		metricsSvc = service.NewMetricsService(snapshotRepo)
-
-		if rateLimitRepo != nil {
-			rateLimiterSvc = service.NewRateLimiterService(rateLimitRepo, logger)
+		// SEC-ZK-001: wire the (optional, NON-ZK) external history-rebuilder-service
+		// client. When configured, non-IBKR exchanges (Hyperliquid, …) get
+		// their historical equity rebuilt out-of-perimeter on connect; IBKR
+		// stays in-enclave via Flex (signed by the report chain).
+		// CFG-002: REBUILDER_SERVICE_URL must come paired with a strong
+		// internal token — refusing to boot without auth prevents shipping a
+		// silently-unauthenticated plaintext-creds endpoint to production.
+		if cfg.RebuilderServiceURL != "" {
+			rebuilderClient := rebuilderclient.New(cfg.RebuilderServiceURL, cfg.RebuilderInternalToken, logger)
+			if !rebuilderClient.Configured() {
+				logger.Fatal("rebuilder URL set without internal token",
+					zap.String("hint", "set REBUILDER_INTERNAL_TOKEN (≥24 chars, must match the rebuilder service) or unset REBUILDER_SERVICE_URL to disable the integration"),
+				)
+			}
+			// CFG-003: the rebuilder POST carries decrypted exchange credentials.
+			// An http:// endpoint exposes them in cleartext, so production refuses
+			// to boot on a non-https URL — the same fail-closed stance as CFG-002
+			// for the missing token. Dev is allowed http:// (loopback rebuilder).
+			if !strings.HasPrefix(strings.ToLower(cfg.RebuilderServiceURL), "https://") {
+				if cfg.IsDevelopment() {
+					logger.Warn("rebuilder URL is not https; plaintext credentials would transit in cleartext",
+						zap.String("hint", "acceptable for local dev only — production REBUILDER_SERVICE_URL must be https://"),
+					)
+				} else {
+					logger.Fatal("rebuilder URL must be https in production",
+						zap.String("hint", "REBUILDER_SERVICE_URL ships decrypted exchange credentials; set an https:// URL or unset it to disable the integration"),
+					)
+				}
+			}
+			syncSvc.SetRebuilderClient(rebuilderClient)
+			logger.Info("rebuilder client wired", zap.String("url", cfg.RebuilderServiceURL))
 		}
+		// Trigger historical snapshot backfill on connection creation. For IBKR
+		// the rebuild runs in-enclave (ZK-native); for other exchanges the
+		// hook delegates to the external rebuilder when configured.
+		connSvc.SetPostCreateHook(syncSvc.ReconstructHistoryOnConnect)
+		metricsSvc = service.NewMetricsService(snapshotRepo)
 	}
 
 	// 11c. Wire HTTP proxy for geo-restricted exchanges (e.g. Binance from EU).
@@ -453,7 +488,7 @@ func main() {
 	logger.Info("gRPC server started", zap.Int("port", cfg.GRPCPort))
 
 	// 15. Start REST server (with TLS, attestation, ECIES, CORS, rate limiting)
-	restServer := server.New(cfg, logger, pool, signer)
+	restServer := server.New(cfg, logger, pool)
 	// SEC-002: share the same HS256 secret with the REST surface so sensitive
 	// endpoints enforce JWT just like the gRPC authInterceptor does.
 	restServer.SetJWTSecret(jwtSecret)
@@ -539,9 +574,6 @@ func main() {
 		zap.Bool("log_stream", logStreamServer != nil),
 		zap.Bool("metrics", metricsServer != nil),
 	)
-
-	// Suppress unused variable warnings for services used only indirectly
-	_ = rateLimiterSvc
 
 	// 19. Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
@@ -777,11 +809,11 @@ func refreshSignerAttestation(
 }
 
 // enforceProductionAttestation refuses to continue in production when the
-// SEV-SNP attestation is missing, unverified, or unbound to the enclave's
-// keys (OPS-AUDIT-001 (b)). This guard is independent of which Dockerfile
-// produced the running image: even if the runtime ships without snpguest,
-// the resulting "unattested-dev" platform is rejected loudly instead of
-// signing reports that quietly carry attested=false.
+// SEV-SNP attestation is missing, unverified, not chained to the AMD root, or
+// unbound to the enclave's keys (OPS-AUDIT-001 (b)). This guard is independent
+// of which Dockerfile produced the running image: even if the runtime ships
+// without snpguest, the resulting "unattested-dev" platform is rejected loudly
+// instead of signing reports that quietly carry attested=false.
 //
 // initial=true (startup) → Fatal so the container restarts under the
 // orchestrator's eye.
@@ -801,6 +833,14 @@ func enforceProductionAttestation(cfg *config.Config, report *attestation.Attest
 		reason = "non-sev-snp platform=" + report.Platform
 	case !report.Attestation.Verified:
 		reason = "snpguest report not verified"
+	case !report.Attestation.VcekVerified:
+		// SEC-002: Verified only means snpguest produced a parseable report.
+		// VcekVerified is the real trust anchor — the quote's signature chains
+		// to the AMD root. Without it a host-fabricated blob would pass. The
+		// VCEK is cached 7d (attestation.vcekTTL), so a transient AMD KDS
+		// outage does not block routine reboots; only a cold-cache boot while
+		// KDS is unreachable trips this — which is correct fail-closed.
+		reason = "VCEK/VLEK certificate chain not verified against AMD root (KDS unreachable with a cold cert cache?)"
 	case !report.Attestation.ReportDataBoundToRequest:
 		reason = "snpguest --random fallback used: REPORT_DATA not bound to enclave keys"
 	default:
