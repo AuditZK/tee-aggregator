@@ -1286,11 +1286,19 @@ func buildHistoricalSnapshots(
 				breakdown.Spot = metrics
 			}
 		}
-		// TS-compat global aggregate: dashboard reads breakdown.global.equity,
-		// without it the IBKR equity shows as 0 on the frontend.
+		// TS-compat global aggregate: dashboard reads breakdown.global.equity
+		// (without it IBKR equity shows as 0 on the frontend) AND
+		// breakdown.global.volume / .trades / .trading_fees for the per-day
+		// activity widgets. The rebuilder doesn't split volume/trades per
+		// market type, so they live only at the global level for historical
+		// snapshots; live-sync still populates per-market breakdowns from
+		// the actual fill stream.
 		breakdown.Global = &repository.MarketMetrics{
 			Equity:          h.TotalEquity,
 			AvailableMargin: totalAvailMargin,
+			Volume:          h.TotalVolume,
+			Trades:          h.TotalTrades,
+			TradingFees:     h.TotalFees,
 		}
 
 		snapshots = append(snapshots, &repository.Snapshot{
