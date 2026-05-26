@@ -1348,16 +1348,32 @@ func buildHistoricalSnapshots(
 	return snapshots, skippedToday
 }
 
-// isFirstSync returns true when no sync_status row exists for the connection
-// (i.e. the daily scheduler / manual sync has never previously completed for
-// this exchange+label). Falls back to "not first" if the repo isn't wired or
-// the lookup errors — better to under-log than to spuriously claim "first".
+// isFirstSync returns true only when this connection has NEVER produced any
+// snapshot — neither via a live sync (sync_status row) nor via a historical
+// rebuild (snapshot_data rows). Without the second check, a freshly re-added
+// connection that just got 156 days of rebuilt history would still appear as
+// "first sync" on the next daily run, causing the inception-deposit convention
+// (UX-001) to fire a SECOND time and inflate today's deposits to today's full
+// equity (visible as a $5K spike at the right edge of the equity chart).
+//
+// Falls back to "not first" if neither repo is wired or both lookups error —
+// better to under-log than to spuriously claim "first".
 func (s *SyncService) isFirstSync(ctx context.Context, connMeta *repository.ExchangeConnection) bool {
 	if s.syncStatus == nil {
 		return false
 	}
-	_, err := s.syncStatus.GetByUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
-	return err == repository.ErrNotFound
+	// Primary: sync_status row presence (live sync ever completed).
+	if _, err := s.syncStatus.GetByUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label); err != repository.ErrNotFound {
+		return false
+	}
+	// Fallback: historical snapshots from the rebuilder already exist, so the
+	// inception deposit was set in buildHistoricalSnapshots — don't re-apply.
+	if s.snapshotRepo != nil {
+		if hasAny, err := s.snapshotRepo.ExistsForUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label); err == nil && hasAny {
+			return false
+		}
+	}
+	return true
 }
 
 // logHistoryExpansion compares the earliest day Flex returned to the earliest
