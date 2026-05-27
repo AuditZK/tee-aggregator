@@ -51,6 +51,12 @@ type RebuildRequest struct {
 	Exchange    string      `json:"exchange"`
 	Label       string      `json:"label"`
 	Credentials Credentials `json:"credentials"`
+	// EndEquityOverride: optional. When > 0, the rebuilder skips its
+	// live-equity API call and anchors the MTM walk's offset calibration on
+	// this value. Used by the midnight UTC recalibration pass to align
+	// historical equities to the exact midnight snapshot value without
+	// re-fetching live equity (avoiding API drift between 00:00 and ~00:04).
+	EndEquityOverride float64 `json:"endEquityOverride,omitempty"`
 }
 
 // rebuildResponse is the wire shape returned by the rebuilder. Internal —
