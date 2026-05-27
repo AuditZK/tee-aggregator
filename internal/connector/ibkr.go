@@ -634,6 +634,26 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 		cashflowsByDate[dateKey] = entry
 	}
 
+	// Parse trades grouped by date so daily snapshots carry trade count,
+	// notional volume and commission fees. Reuses parseTradesFromReport so
+	// the per-trade parsing logic stays in one place. Without this the
+	// analytics dashboard's per-day volume / trades-per-day widgets show 0
+	// for IBKR users (only the per-day equity walks).
+	trades, _ := i.parseTradesFromReport(report, since, time.Now().Add(24*time.Hour))
+	tradesByDate := make(map[string]struct {
+		count  int
+		volume float64
+		fees   float64
+	})
+	for _, t := range trades {
+		dateKey := t.Timestamp.Format("20060102")
+		entry := tradesByDate[dateKey]
+		entry.count++
+		entry.volume += t.Price * t.Quantity
+		entry.fees += t.Fee
+		tradesByDate[dateKey] = entry
+	}
+
 	var snapshots []*HistoricalSnapshot
 	for _, s := range flex.FlexStatements.FlexStatement.EquitySummaryInBase.EquitySummaryByReportDateInBase {
 		date, err := time.Parse("20060102", s.ReportDate)
@@ -677,12 +697,16 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 		}
 
 		cf := cashflowsByDate[s.ReportDate]
+		tr := tradesByDate[s.ReportDate]
 		snapshots = append(snapshots, &HistoricalSnapshot{
 			Date:            time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC),
 			TotalEquity:     total,
 			RealizedBalance: total - unrealized,
 			Deposits:        cf.deposits,
 			Withdrawals:     cf.withdrawals,
+			TotalTrades:     tr.count,
+			TotalVolume:     tr.volume,
+			TotalFees:       tr.fees,
 			Breakdown:       breakdown,
 		})
 	}
