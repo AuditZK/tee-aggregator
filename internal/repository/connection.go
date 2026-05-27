@@ -45,6 +45,14 @@ type ExchangeConnection struct {
 	IsActive            bool      `json:"is_active"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+	// RebuildFinalizedAt: set by the midnight UTC recalibration pass once the
+	// connection's rebuilt history has been re-anchored on the exact midnight
+	// snapshot equity. NULL = still calibrated to the imprecise connect-time
+	// live value, OR the connection's history wasn't produced by the external
+	// rebuilder (IBKR Flex / MT5 paths skip this). Only populated by
+	// ListUnfinalizedExternalRebuilds + MarkRebuildFinalized; other scan
+	// paths leave it nil.
+	RebuildFinalizedAt *time.Time `json:"rebuild_finalized_at,omitempty"`
 }
 
 // ConnectionRepo handles exchange connection persistence.
@@ -52,14 +60,15 @@ type ExchangeConnection struct {
 type ConnectionRepo struct {
 	pool *pgxpool.Pool
 
-	capMu                   sync.Mutex
-	capabilitiesLoaded      bool
-	hasCredentialsHashCol   bool
-	hasSyncIntervalMinsCol  bool
-	hasExcludeFromReportCol bool
-	hasKYCLevelCol          bool
-	hasIsPaperCol           bool
-	isTSSchema              bool // true = TS Prisma camelCase columns
+	capMu                     sync.Mutex
+	capabilitiesLoaded        bool
+	hasCredentialsHashCol     bool
+	hasSyncIntervalMinsCol    bool
+	hasExcludeFromReportCol   bool
+	hasKYCLevelCol            bool
+	hasIsPaperCol             bool
+	hasRebuildFinalizedAtCol  bool
+	isTSSchema                bool // true = TS Prisma camelCase columns
 }
 
 // NewConnectionRepo creates a new connection repository
@@ -833,15 +842,31 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 	excludeFromReportCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("exclude_from_report"))
 	kycLevelCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("kyc_level"))
 	isPaperCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("is_paper"))
+	rebuildFinalizedCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("rebuild_finalized_at"))
 
 	r.hasCredentialsHashCol = credHashCol
 	r.hasSyncIntervalMinsCol = syncIntervalCol
 	r.hasExcludeFromReportCol = excludeFromReportCol
 	r.hasKYCLevelCol = kycLevelCol
 	r.hasIsPaperCol = isPaperCol
+	r.hasRebuildFinalizedAtCol = rebuildFinalizedCol
 	r.capabilitiesLoaded = true
 
 	return r.hasCredentialsHashCol, r.hasSyncIntervalMinsCol, r.hasExcludeFromReportCol, r.hasKYCLevelCol, r.hasIsPaperCol
+}
+
+// HasRebuildFinalizedAtCol reports whether the schema includes the
+// rebuild_finalized_at / rebuildFinalizedAt column (migration 017). Callers
+// must check this before invoking ListUnfinalizedExternalRebuilds or
+// MarkRebuildFinalized — if the migration hasn't been applied yet, those
+// methods will return ErrNotFound. The scheduler in service/sync.go uses
+// this to silently no-op on pre-migration DBs (dev environments) rather
+// than spamming errors every nightly tick.
+func (r *ConnectionRepo) HasRebuildFinalizedAtCol(ctx context.Context) bool {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.hasRebuildFinalizedAtCol
 }
 
 // colName returns the raw column name (without quotes) for columnExists checks.
@@ -885,4 +910,100 @@ var tsColumnMap = map[string]string{
 	"kyc_level":             "kycLevel",
 	"created_at":            "createdAt",
 	"updated_at":            "updatedAt",
+	"rebuild_finalized_at":  "rebuildFinalizedAt",
+}
+
+// ListUnfinalizedExternalRebuilds returns active connections whose history
+// was rebuilt via the external rebuilder service AND whose rebuild has not
+// yet been finalized by the midnight UTC recalibration pass. The caller
+// (service/sync.go daily-sync hook) iterates these sequentially and calls
+// the rebuilder with EndEquityOverride = the latest snapshot's totalEquity
+// so the MTM walk's offset aligns to the exact midnight equity.
+//
+// Filters:
+//   - rebuild_finalized_at IS NULL (not yet processed)
+//   - createdAt < beforeCutoff (the connection had time to produce at least
+//     one midnight snapshot — typically beforeCutoff = today_midnight)
+//   - isActive = true
+//   - exchange in the externalRebuilderExchanges allowlist (HL / Lighter /
+//     MEXC — connectors that route through the rebuilder service; IBKR /
+//     MT5 use in-enclave history paths that don't need recalibration)
+//
+// Returns ErrNotFound's empty-slice equivalent (nil, nil) if the
+// rebuild_finalized_at column doesn't exist (migration not applied).
+// Caller can probe HasRebuildFinalizedAtCol up-front to skip the call.
+func (r *ConnectionRepo) ListUnfinalizedExternalRebuilds(ctx context.Context, beforeCutoff time.Time, externalRebuilderExchanges []string) ([]*ExchangeConnection, error) {
+	if !r.HasRebuildFinalizedAtCol(ctx) {
+		return nil, nil
+	}
+	if len(externalRebuilderExchanges) == 0 {
+		return nil, nil
+	}
+
+	// Build the WHERE IN clause params. Lowercase exchange names for safety —
+	// the DB might mix cases historically.
+	exchanges := make([]string, 0, len(externalRebuilderExchanges))
+	for _, e := range externalRebuilderExchanges {
+		exchanges = append(exchanges, strings.ToLower(strings.TrimSpace(e)))
+	}
+
+	uid := r.qcol("user_uid")
+	createdAt := r.qcol("created_at")
+	rebFin := r.qcol("rebuild_finalized_at")
+	isAct := r.qcol("is_active")
+	query := `
+		SELECT id, ` + uid + `, exchange, label, ` + createdAt + `
+		FROM exchange_connections
+		WHERE ` + rebFin + ` IS NULL
+		  AND ` + createdAt + ` < $1
+		  AND ` + isAct + ` = true
+		  AND lower(exchange) = ANY($2)
+		ORDER BY ` + createdAt + ` ASC
+	`
+
+	rows, err := r.pool.Query(ctx, query, beforeCutoff, exchanges)
+	if err != nil {
+		return nil, fmt.Errorf("list unfinalized external rebuilds: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*ExchangeConnection
+	for rows.Next() {
+		conn := &ExchangeConnection{}
+		if err := rows.Scan(&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label, &conn.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan unfinalized connection: %w", err)
+		}
+		out = append(out, conn)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate unfinalized connections: %w", err)
+	}
+	return out, nil
+}
+
+// MarkRebuildFinalized stamps rebuild_finalized_at = at on the given
+// connection. Called after the midnight UTC recalibration rebuild succeeds.
+// No-op if the column doesn't exist (migration not applied). Idempotent:
+// re-setting on an already-finalized row is harmless.
+func (r *ConnectionRepo) MarkRebuildFinalized(ctx context.Context, connID string, at time.Time) error {
+	if !r.HasRebuildFinalizedAtCol(ctx) {
+		return nil
+	}
+	col := r.qcol("rebuild_finalized_at")
+	query := `UPDATE exchange_connections SET ` + col + ` = $1 WHERE id = $2`
+	tag, err := r.pool.Exec(ctx, query, at.UTC(), connID)
+	if err != nil {
+		return fmt.Errorf("mark rebuild finalized: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// qcol returns the schema-aware, double-quoted column name suitable for
+// embedding in raw SQL. Uses colName() for snake/camel selection then wraps
+// with quotes — safe to splice because the input is a hardcoded constant.
+func (r *ConnectionRepo) qcol(snakeName string) string {
+	return `"` + r.colName(snakeName) + `"`
 }
