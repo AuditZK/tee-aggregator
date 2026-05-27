@@ -150,6 +150,20 @@ func (s *SyncScheduler) executeDailySync() {
 
 	wg.Wait()
 
+	// Midnight UTC recalibration pass. By this point every user's live sync
+	// has produced today's snapshot, so the external-rebuilder connections
+	// have an exact midnight-equity anchor in DB. Re-runs the rebuilder
+	// sequentially for connections still on the imprecise connect-time
+	// calibration — see SyncService.RecalibrateRebuiltHistories docstring
+	// for the full rationale.
+	//
+	// Sequential by design (bounds exchange-API pressure: 1 rebuilder request
+	// at a time across all users). Failures are isolated per-connection and
+	// retried on the next nightly tick (RebuildFinalizedAt only stamps on
+	// success). Silent no-op when the rebuilder is unconfigured (dev) or the
+	// migration hasn't been applied (HasRebuildFinalizedAtCol → false).
+	s.syncSvc.RecalibrateRebuiltHistories(ctx)
+
 	s.logger.Info("daily sync completed",
 		zap.Int("users_synced", userSyncedCount),
 		zap.Int("total_users", len(users)),

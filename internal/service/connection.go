@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/trackrecord/enclave/internal/connector"
 	"github.com/trackrecord/enclave/internal/encryption"
@@ -318,6 +319,21 @@ func (s *ConnectionService) GetExcludedExchanges(ctx context.Context, userUID st
 // GetExcludedConnectionKeys returns exclusion keys "exchange" or "exchange/label".
 func (s *ConnectionService) GetExcludedConnectionKeys(ctx context.Context, userUID string) (map[string]struct{}, error) {
 	return s.repo.GetExcludedConnectionKeysByUser(ctx, userUID)
+}
+
+// ListUnfinalizedExternalRebuilds passes through to ConnectionRepo. Used by
+// the daily SyncScheduler's midnight recalibration pass to find connections
+// whose external-rebuilder history hasn't been re-anchored on a midnight
+// snapshot equity yet. See the repo method docstring for filtering rules.
+func (s *ConnectionService) ListUnfinalizedExternalRebuilds(ctx context.Context, beforeCutoff time.Time, exchanges []string) ([]*repository.ExchangeConnection, error) {
+	return s.repo.ListUnfinalizedExternalRebuilds(ctx, beforeCutoff, exchanges)
+}
+
+// MarkRebuildFinalized passes through to ConnectionRepo. Stamps the connection
+// once its rebuilt history has been recalibrated against the midnight snapshot,
+// so subsequent nightly ticks skip it.
+func (s *ConnectionService) MarkRebuildFinalized(ctx context.Context, connID string, at time.Time) error {
+	return s.repo.MarkRebuildFinalized(ctx, connID, at)
 }
 
 // GetExchangeMetadata returns exchange-level metadata for active connections.

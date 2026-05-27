@@ -1126,6 +1126,144 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 	s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
 }
 
+// externalRebuilderExchanges lists the exchanges routed through the external
+// history-rebuilder-go service. Keep in sync with the rebuilder's registry
+// in track_record_site/history-rebuilder-go/cmd/rebuilder/main.go. Exchanges
+// NOT in this list (IBKR, MT5, etc.) use in-enclave history providers whose
+// daily-equity summaries don't require midnight recalibration.
+var externalRebuilderExchanges = []string{"hyperliquid", "lighter", "mexc"}
+
+// RecalibrateRebuiltHistories re-runs the external rebuilder for connections
+// whose initial rebuild was anchored on the imprecise connect-time live
+// equity (= live perp+spot fetched at e.g. 14:32 UTC, when the user clicked
+// "Rebuild full history"). Uses the just-written midnight snapshot equity as
+// EndEquityOverride so the MTM walk's offset calibration aligns to the exact
+// 00:00 UTC ground truth.
+//
+// Called by SyncScheduler.executeDailySync AFTER all live syncs complete —
+// by that point today's snapshots are in DB and provide the anchor.
+//
+// SECURITY (SEC-ZK-001): identical credential path to reconstructHistory's
+// first-time rebuild. Each connection's creds live only inside recalibrateOne's
+// scope and are dropped after the rebuilder call returns. No new surface area
+// vs the existing connect-time rebuild flow.
+//
+// Sequential processing (no concurrency) bounds exchange-API pressure: at
+// most one rebuilder request in flight across the entire user base. Failures
+// per connection log + skip + DO NOT MarkFinalized — that connection naturally
+// retries on the next nightly tick.
+//
+// No-op cases (silent early return):
+//   - Rebuilder client not configured (dev environment)
+//   - rebuild_finalized_at column missing (migration not applied)
+//   - No unfinalized connections matching the filter
+func (s *SyncService) RecalibrateRebuiltHistories(ctx context.Context) {
+	if s.rebuilder == nil || !s.rebuilder.Configured() {
+		return
+	}
+	// Cutoff = today's midnight. Connections created AFTER today_midnight
+	// (i.e. earlier today, post-tick) skip this pass — their first midnight
+	// snapshot doesn't exist yet, so there's nothing to anchor on. They'll be
+	// picked up on the next nightly tick.
+	cutoff := time.Now().UTC().Truncate(24 * time.Hour)
+
+	conns, err := s.connSvc.ListUnfinalizedExternalRebuilds(ctx, cutoff, externalRebuilderExchanges)
+	if err != nil {
+		s.logger.Error("midnight recalibration: list unfinalized failed", zap.Error(err))
+		return
+	}
+	if len(conns) == 0 {
+		return
+	}
+
+	s.logger.Info("midnight recalibration: starting", zap.Int("count", len(conns)))
+	start := time.Now()
+	var success, failed int
+
+	for _, conn := range conns {
+		if err := s.recalibrateOne(ctx, conn); err != nil {
+			failed++
+			// LOG-CREDS-001: identifiers only — recalibrateOne wraps every
+			// error so the resulting string never contains plaintext creds.
+			s.logger.Warn("midnight recalibration: connection failed",
+				zap.String("user_uid", conn.UserUID),
+				zap.String("exchange", conn.Exchange),
+				zap.String("label", conn.Label),
+				zap.Error(err),
+			)
+			continue
+		}
+		success++
+	}
+
+	s.logger.Info("midnight recalibration: done",
+		zap.Int("success", success),
+		zap.Int("failed", failed),
+		zap.Duration("duration", time.Since(start)),
+	)
+}
+
+// recalibrateOne re-runs one connection's external rebuild with the
+// EndEquityOverride anchor. Returns an error so the caller can log/count;
+// the caller is responsible for the next-connection retry policy.
+//
+// SEC-ZK-001: the decrypted `creds` value is dropped after the rebuilder
+// call. Errors returned from this function never embed `creds` (rebuilder
+// errors carry HTTP status only, decryption errors carry the encryption
+// library's message which never echoes the ciphertext).
+func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.ExchangeConnection) error {
+	// 1. Read the just-written midnight live snapshot as ground-truth anchor.
+	latest, err := s.snapshotRepo.GetLatestByUserExchangeLabel(ctx, conn.UserUID, conn.Exchange, conn.Label)
+	if err != nil {
+		return fmt.Errorf("get latest snapshot: %w", err)
+	}
+	if latest == nil || latest.TotalEquity <= 0 {
+		return fmt.Errorf("no usable midnight snapshot (equity zero or missing)")
+	}
+
+	// 2. Decrypt credentials. Identical path to reconstructHistory.
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, conn.UserUID, conn.Exchange, conn.Label)
+	if err != nil {
+		return fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	// 3. Dispatch to rebuilder with EndEquityOverride. Skips fetchLiveEquity
+	// on the rebuilder side — anchors the walk's offset on latest.TotalEquity.
+	res, err := s.rebuilder.Rebuild(ctx, rebuilderclient.RebuildRequest{
+		UserUID:  conn.UserUID,
+		Exchange: conn.Exchange,
+		Label:    conn.Label,
+		Credentials: rebuilderclient.Credentials{
+			// HL stores wallet in APIKey; harmless for other exchanges (the
+			// rebuilder picks the right credential field per its registry).
+			WalletAddress: creds.APIKey,
+			APIKey:        creds.APIKey,
+			APISecret:     creds.APISecret,
+			Passphrase:    creds.Passphrase,
+		},
+		EndEquityOverride: latest.TotalEquity,
+	})
+	// LOG-CREDS-001: drop the local plaintext reference promptly. Best-effort
+	// (Go strings are immutable — the original heap allocation may live until
+	// GC) but prevents accidental reuse of `creds` later in this scope.
+	creds = nil
+	if err != nil {
+		return fmt.Errorf("rebuilder request: %w", err)
+	}
+
+	// 4. Overwrite the previously-rebuilt snapshots with the recalibrated ones.
+	// persistHistoricalSnapshots is upsert — re-writing the same date keys
+	// just updates equity/breakdown in place. firstSync=false because we
+	// know history already exists (we wouldn't be in this list otherwise).
+	s.persistHistoricalSnapshots(ctx, conn, res.Snapshots, false, sourceExternalRebuilder)
+
+	// 5. Stamp finalized so we don't reprocess this connection.
+	if err := s.connSvc.MarkRebuildFinalized(ctx, conn.ID, time.Now().UTC()); err != nil {
+		return fmt.Errorf("mark finalized: %w", err)
+	}
+	return nil
+}
+
 // syncIbkrFromFlex upserts every daily snapshot returned by the user's Flex
 // Query, EXCEPT today's bucket — that one is built by the live branch
 // (GetBalance + 24h trades) right after this call returns, so writing it
