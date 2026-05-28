@@ -1126,12 +1126,22 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 	s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
 }
 
-// externalRebuilderExchanges lists the exchanges routed through the external
-// history-rebuilder-go service. Keep in sync with the rebuilder's registry
-// in track_record_site/history-rebuilder-go/cmd/rebuilder/main.go. Exchanges
-// NOT in this list (IBKR, MT5, etc.) use in-enclave history providers whose
-// daily-equity summaries don't require midnight recalibration.
-var externalRebuilderExchanges = []string{"hyperliquid", "lighter", "mexc"}
+// externalRebuilderExchanges lists the exchanges the deployed rebuilder
+// actually supports AND that we've validated end-to-end for midnight
+// recalibration. MUST stay a subset of the rebuilder's live registry
+// (track_record_site/history-rebuilder-go/cmd/rebuilder/main.go) — listing an
+// exchange the deployed rebuilder doesn't register makes it answer HTTP 400
+// "unsupported exchange" on every nightly tick (no MarkFinalized on failure →
+// retried forever). On 2026-05-28 the prod rebuilder registered only
+// hyperliquid, so lighter/mexc/alpaca connections produced 5 failed
+// recalibrations per tick. Re-add each exchange here only after it's both
+// (a) committed + deployed in the rebuilder registry and (b) confirmed to
+// honour EndEquityOverride with an MTM-walk offset that depends on endEquity.
+//
+// Exchanges NOT in this list (IBKR, MT5, …) use in-enclave history providers
+// whose daily-equity summaries come straight from the broker statement — no
+// MTM walk, no calibration drift, nothing to recalibrate.
+var externalRebuilderExchanges = []string{"hyperliquid"}
 
 // RecalibrateRebuiltHistories re-runs the external rebuilder for connections
 // whose initial rebuild was anchored on the imprecise connect-time live
