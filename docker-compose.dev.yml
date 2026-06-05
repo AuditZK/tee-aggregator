@@ -55,6 +55,11 @@ services:
       - ENABLE_DAILY_SYNC=true
       - DATA_RETENTION_DAYS=30
       - ENABLE_LEGACY_REST=true
+      # cTrader OAuth app credentials for the enclave's cTrader connector
+      # (app auth + token refresh). Values come from the gitignored .env via
+      # ${...} interpolation, so no secret is committed to this file.
+      - CTRADER_CLIENT_ID=${CTRADER_CLIENT_ID:-}
+      - CTRADER_CLIENT_SECRET=${CTRADER_CLIENT_SECRET:-}
       # Wire to the external (NON-ZK) history-rebuilder-service running in
       # track_record_site's compose. The container reaches the host-mapped
       # port 8082 via the special host.docker.internal DNS (Docker Desktop).

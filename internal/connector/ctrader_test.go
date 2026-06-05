@@ -270,3 +270,51 @@ func sendWSError(t *testing.T, conn *websocket.Conn, clientMsgID, code, descript
 		"description": description,
 	})
 }
+
+func TestTradeSideUnmarshal_StringAndEnum(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want tradeSide
+	}{
+		{"string buy", `"BUY"`, "BUY"},
+		{"string sell", `"SELL"`, "SELL"},
+		{"enum buy", `1`, "BUY"},
+		{"enum sell", `2`, "SELL"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got tradeSide
+			if err := json.Unmarshal([]byte(tc.raw), &got); err != nil {
+				t.Fatalf("unmarshal %s: %v", tc.raw, err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCTraderReconcileUnmarshal_RealPayload(t *testing.T) {
+	// Exact reconcile payload captured from a live cTrader demo account holding
+	// one open EURUSD position. Reproduces two prod decode failures at once:
+	//   - tradeSide arrives as the ProtoOATradeSide enum integer (1 = BUY)
+	//   - price arrives as a double (1.15229), not a scaled integer
+	raw := `{"ctidTraderAccountId":46043853,"position":[{"positionId":264207985,"tradeData":{"symbolId":1,"volume":10000000,"tradeSide":1,"openTimestamp":1780688563637,"guaranteedStopLoss":false,"comment":"","measurementUnits":"EUR"},"positionStatus":1,"swap":0,"price":1.15229,"utcLastUpdateTimestamp":1780688563637,"commission":-450,"marginRate":1.0,"mirroringCommission":0,"guaranteedStopLoss":false,"usedMargin":100000,"moneyDigits":2}]}`
+	var resp struct {
+		Position []cTraderPosition `json:"position"`
+	}
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		t.Fatalf("unmarshal reconcile: %v", err)
+	}
+	if len(resp.Position) != 1 {
+		t.Fatalf("got %d positions, want 1", len(resp.Position))
+	}
+	p := resp.Position[0]
+	if p.TradeData.TradeSide != "BUY" {
+		t.Fatalf("tradeSide: got %q, want BUY", p.TradeData.TradeSide)
+	}
+	if p.Price != 1.15229 {
+		t.Fatalf("price: got %v, want 1.15229", p.Price)
+	}
+}

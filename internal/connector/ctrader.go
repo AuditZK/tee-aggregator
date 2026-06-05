@@ -80,25 +80,55 @@ type cTraderTrader struct {
 	MoneyDigits         int   `json:"moneyDigits"`
 }
 
+// tradeSide accepts either the string name ("BUY"/"SELL") or the
+// ProtoOATradeSide enum integer (BUY=1, SELL=2) that cTrader sometimes
+// returns over the JSON Open API. It normalizes to the string name so
+// downstream EqualFold comparisons keep working.
+type tradeSide string
+
+func (t *tradeSide) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*t = tradeSide(s)
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	switch n {
+	case 1:
+		*t = "BUY"
+	case 2:
+		*t = "SELL"
+	}
+	return nil
+}
+
 type cTraderPosition struct {
 	PositionID int64 `json:"positionId"`
 	TradeData  struct {
-		SymbolID   int64  `json:"symbolId"`
-		Volume     int64  `json:"volume"`
-		TradeSide  string `json:"tradeSide"`
-		UsedMargin int64  `json:"usedMargin"`
+		SymbolID   int64     `json:"symbolId"`
+		Volume     int64     `json:"volume"`
+		TradeSide  tradeSide `json:"tradeSide"`
+		UsedMargin int64     `json:"usedMargin"`
 	} `json:"tradeData"`
-	Price               int64 `json:"price"`
-	UnrealizedNetProfit int64 `json:"unrealizedNetProfit"`
-	UsedMargin          int64 `json:"usedMargin"`
+	// cTrader's ProtoOAPosition.price is a double (the actual entry price, e.g.
+	// 1.15229), NOT a scaled integer — decode it as float64 and use it directly.
+	Price               float64 `json:"price"`
+	UnrealizedNetProfit int64   `json:"unrealizedNetProfit"`
+	UsedMargin          int64   `json:"usedMargin"`
 }
 
 type cTraderDeal struct {
-	DealID              int64  `json:"dealId"`
-	OrderID             int64  `json:"orderId"`
-	SymbolID            int64  `json:"symbolId"`
-	TradeSide           string `json:"tradeSide"`
-	FilledVolume        int64  `json:"filledVolume"`
+	DealID              int64     `json:"dealId"`
+	OrderID             int64     `json:"orderId"`
+	SymbolID            int64     `json:"symbolId"`
+	TradeSide           tradeSide `json:"tradeSide"`
+	FilledVolume        int64     `json:"filledVolume"`
 	ExecutionPrice      int64  `json:"executionPrice"`
 	ExecutionTimestamp  int64  `json:"executionTimestamp"`
 	Commission          int64  `json:"commission"`
@@ -252,7 +282,7 @@ func (c *CTrader) GetPositions(ctx context.Context) ([]*Position, error) {
 	for _, p := range rawPositions {
 		symbol := c.getSymbolName(ctx, p.TradeData.SymbolID, accountID)
 		side := "long"
-		if strings.EqualFold(p.TradeData.TradeSide, "SELL") {
+		if strings.EqualFold(string(p.TradeData.TradeSide), "SELL") {
 			side = "short"
 		}
 
@@ -260,7 +290,7 @@ func (c *CTrader) GetPositions(ctx context.Context) ([]*Position, error) {
 			Symbol:        symbol,
 			Side:          side,
 			Size:          float64(p.TradeData.Volume) / 100.0,
-			EntryPrice:    float64(p.Price) / 100000.0,
+			EntryPrice:    p.Price,
 			MarkPrice:     0,
 			UnrealizedPnL: float64(p.UnrealizedNetProfit) / 100.0,
 			MarketType:    detectCTraderMarketType(symbol),
@@ -289,7 +319,7 @@ func (c *CTrader) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade
 
 		symbol := c.getSymbolName(ctx, d.SymbolID, accountID)
 		side := "buy"
-		if strings.EqualFold(d.TradeSide, "SELL") {
+		if strings.EqualFold(string(d.TradeSide), "SELL") {
 			side = "sell"
 		}
 
@@ -368,6 +398,27 @@ func (c *CTrader) ensureAccountID(ctx context.Context) (int64, error) {
 			selected = acct
 			break
 		}
+	}
+
+	// Route the WS endpoint by the selected account's live/demo flag. c.isLive is
+	// initially derived from the passphrase, but OAuth connections never carry
+	// "demo" there, so it defaults to true — a demo account then gets queried on
+	// the live endpoint and cTrader rejects account auth with CANT_ROUTE_REQUEST.
+	// When the account's endpoint differs from the one we're connected to, switch
+	// and drop the socket so the next connect dials the matching host (getAccounts
+	// works on either endpoint, so listing accounts first is safe).
+	c.connMu.Lock()
+	endpointMismatch := selected.IsLive != c.isLive
+	if endpointMismatch {
+		c.isLive = selected.IsLive
+	}
+	c.connMu.Unlock()
+	if endpointMismatch {
+		mode := "demo"
+		if selected.IsLive {
+			mode = "live"
+		}
+		c.disconnect(fmt.Errorf("cTrader: routing to %s endpoint for account %d", mode, selected.CtidTraderAccountID))
 	}
 
 	c.accountMu.Lock()
