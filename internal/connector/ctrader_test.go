@@ -318,3 +318,59 @@ func TestCTraderReconcileUnmarshal_RealPayload(t *testing.T) {
 		t.Fatalf("price: got %v, want 1.15229", p.Price)
 	}
 }
+
+func TestParseCTraderCashflows_RealPayload(t *testing.T) {
+	// Real ProtoOACashFlowHistoryListRes from a demo account: one $1000 deposit
+	// (operationType 0 = BALANCE_DEPOSIT, delta 100000, moneyDigits 2).
+	raw := []byte(`{"ctidTraderAccountId":46043853,"depositWithdraw":[{"operationType":0,"balanceHistoryId":144969818,"balance":100889,"delta":100000,"changeBalanceTimestamp":1780688558274,"moneyDigits":2}]}`)
+	cfs, err := parseCTraderCashflows(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfs) != 1 {
+		t.Fatalf("got %d cashflows, want 1", len(cfs))
+	}
+	if cfs[0].Amount != 1000.0 {
+		t.Fatalf("deposit amount: got %v, want 1000", cfs[0].Amount)
+	}
+}
+
+func TestParseCTraderCashflows_WithdrawAndNonCashflowFiltered(t *testing.T) {
+	// A withdrawal (op 1) -> negative amount; a swap (op 21) -> excluded.
+	raw := []byte(`{"depositWithdraw":[{"operationType":1,"delta":50000,"moneyDigits":2},{"operationType":21,"delta":-12,"moneyDigits":2}]}`)
+	cfs, err := parseCTraderCashflows(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfs) != 1 {
+		t.Fatalf("got %d cashflows, want 1 (swap must be excluded)", len(cfs))
+	}
+	if cfs[0].Amount != -500.0 {
+		t.Fatalf("withdraw amount: got %v, want -500", cfs[0].Amount)
+	}
+}
+
+func TestCTraderDealUnmarshal_RealPayload(t *testing.T) {
+	// Real deal from the deal list: dealStatus as enum int (2 = FILLED) and
+	// executionPrice as a double (1.15229). Both previously broke GetTrades.
+	raw := `{"deal":[{"dealId":320455222,"positionId":264207985,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":1780688563637,"executionPrice":1.15229,"tradeSide":1,"dealStatus":2,"commission":-450,"moneyDigits":2}]}`
+	var resp struct {
+		Deal []cTraderDeal `json:"deal"`
+	}
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		t.Fatalf("unmarshal deal list: %v", err)
+	}
+	if len(resp.Deal) != 1 {
+		t.Fatalf("got %d deals, want 1", len(resp.Deal))
+	}
+	d := resp.Deal[0]
+	if d.DealStatus != "FILLED" {
+		t.Fatalf("dealStatus: got %q, want FILLED", d.DealStatus)
+	}
+	if d.TradeSide != "BUY" {
+		t.Fatalf("tradeSide: got %q, want BUY", d.TradeSide)
+	}
+	if d.ExecutionPrice != 1.15229 {
+		t.Fatalf("executionPrice: got %v, want 1.15229", d.ExecutionPrice)
+	}
+}

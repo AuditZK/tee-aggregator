@@ -36,6 +36,10 @@ const (
 	ctraderPayloadReconcileRes   = 2125
 	ctraderPayloadDealListReq    = 2133
 	ctraderPayloadDealListRes    = 2134
+	// ProtoOACashFlowHistoryList — the dedicated deposit/withdrawal endpoint.
+	// cTrader does NOT expose cash flows in the deal list (2133/2134).
+	ctraderPayloadCashFlowHistoryReq = 2143
+	ctraderPayloadCashFlowHistoryRes = 2144
 	ctraderPayloadSymbolByIDReq  = 2116
 	ctraderPayloadSymbolByIDRes  = 2117
 
@@ -108,6 +112,33 @@ func (t *tradeSide) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// dealStatus accepts either the string name or the ProtoOADealStatus enum
+// integer that cTrader returns (FILLED=2, PARTIALLY_FILLED=3). It normalizes to
+// the string name so the GetTrades filter keeps working.
+type dealStatus string
+
+func (d *dealStatus) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*d = dealStatus(s)
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	switch n {
+	case 2:
+		*d = "FILLED"
+	case 3:
+		*d = "PARTIALLY_FILLED"
+	}
+	return nil
+}
+
 type cTraderPosition struct {
 	PositionID int64 `json:"positionId"`
 	TradeData  struct {
@@ -129,10 +160,10 @@ type cTraderDeal struct {
 	SymbolID            int64     `json:"symbolId"`
 	TradeSide           tradeSide `json:"tradeSide"`
 	FilledVolume        int64     `json:"filledVolume"`
-	ExecutionPrice      int64  `json:"executionPrice"`
-	ExecutionTimestamp  int64  `json:"executionTimestamp"`
-	Commission          int64  `json:"commission"`
-	DealStatus          string `json:"dealStatus"`
+	ExecutionPrice      float64    `json:"executionPrice"`
+	ExecutionTimestamp  int64      `json:"executionTimestamp"`
+	Commission          int64      `json:"commission"`
+	DealStatus          dealStatus `json:"dealStatus"`
 	ClosePositionDetail *struct {
 		GrossProfit int64 `json:"grossProfit"`
 		Commission  int64 `json:"commission"`
@@ -332,7 +363,7 @@ func (c *CTrader) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade
 			ID:          strconv.FormatInt(d.DealID, 10),
 			Symbol:      symbol,
 			Side:        side,
-			Price:       float64(d.ExecutionPrice) / 100000.0,
+			Price:       d.ExecutionPrice,
 			Quantity:    float64(d.FilledVolume) / 100.0,
 			Fee:         float64(d.Commission) / 100.0,
 			FeeCurrency: "USD",
@@ -1125,8 +1156,15 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// GetCashflows returns deposits/withdrawals from cTrader deal list.
-// cTrader amounts are in cents -- divide by 100.
+// GetCashflows returns user deposits/withdrawals from cTrader's dedicated
+// cash-flow history (ProtoOACashFlowHistoryListReq, 2143). cTrader does NOT
+// surface cash flows in the deal list, so the deal-list approach never
+// detected anything. Each entry is a ProtoOADepositWithdraw with an
+// operationType (ProtoOAChangeBalanceType) and a delta scaled by moneyDigits.
+//
+// Only BALANCE_DEPOSIT (0) and BALANCE_WITHDRAW (1) are treated as cash flows:
+// every other operationType (swap, commission, rebate, dividend, fee…) is a
+// trading effect already reflected in equity/PnL and must not be double-counted.
 func (c *CTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
 	accountID, err := c.ensureAccountID(ctx)
 	if err != nil {
@@ -1140,56 +1178,65 @@ func (c *CTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflo
 	raw, err := c.sendWithTokenRefresh(ctx, func() (json.RawMessage, error) {
 		return c.sendMessage(
 			ctx,
-			ctraderPayloadDealListReq,
+			ctraderPayloadCashFlowHistoryReq,
 			map[string]any{
 				"ctidTraderAccountId": accountID,
 				"fromTimestamp":       since.UnixMilli(),
 				"toTimestamp":         time.Now().UTC().UnixMilli(),
 			},
-			ctraderPayloadDealListRes,
+			ctraderPayloadCashFlowHistoryRes,
 		)
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	return parseCTraderCashflows(raw)
+}
+
+// parseCTraderCashflows extracts user deposits/withdrawals from a
+// ProtoOACashFlowHistoryListRes payload. Only BALANCE_DEPOSIT (0) and
+// BALANCE_WITHDRAW (1) are kept; every other ProtoOAChangeBalanceType (swap,
+// commission, rebate, dividend, fee…) is a trading effect already in equity/PnL.
+// Deltas are scaled by the entry's moneyDigits (cents when moneyDigits == 2).
+func parseCTraderCashflows(raw json.RawMessage) ([]*Cashflow, error) {
+	const (
+		balanceDeposit  = 0 // ProtoOAChangeBalanceType.BALANCE_DEPOSIT
+		balanceWithdraw = 1 // ProtoOAChangeBalanceType.BALANCE_WITHDRAW
+	)
+
 	var resp struct {
-		Deposit  []json.RawMessage `json:"deposit"`
-		Withdraw []json.RawMessage `json:"withdraw"`
+		DepositWithdraw []struct {
+			OperationType int   `json:"operationType"`
+			Delta         int64 `json:"delta"`
+			Timestamp     int64 `json:"changeBalanceTimestamp"`
+			MoneyDigits   int   `json:"moneyDigits"`
+		} `json:"depositWithdraw"`
 	}
 	if err := decodeRawPayload(raw, &resp); err != nil {
 		return nil, err
 	}
 
 	var cashflows []*Cashflow
-
-	for _, d := range resp.Deposit {
-		var m struct {
-			Balance            int64 `json:"balance"`
-			ExecutionTimestamp int64 `json:"executionTimestamp"`
-		}
-		if json.Unmarshal(d, &m) != nil || m.Balance <= 0 {
+	for _, dw := range resp.DepositWithdraw {
+		if dw.OperationType != balanceDeposit && dw.OperationType != balanceWithdraw {
 			continue
 		}
-		cashflows = append(cashflows, &Cashflow{
-			Amount:    float64(m.Balance) / 100,
-			Currency:  "USD",
-			Timestamp: time.UnixMilli(m.ExecutionTimestamp).UTC(),
-		})
-	}
-
-	for _, w := range resp.Withdraw {
-		var m struct {
-			Balance            int64 `json:"balance"`
-			ExecutionTimestamp int64 `json:"executionTimestamp"`
+		divisor := 100.0
+		if dw.MoneyDigits > 0 {
+			divisor = math.Pow10(dw.MoneyDigits)
 		}
-		if json.Unmarshal(w, &m) != nil || m.Balance <= 0 {
+		amount := math.Abs(float64(dw.Delta)) / divisor
+		if amount == 0 {
 			continue
 		}
+		if dw.OperationType == balanceWithdraw {
+			amount = -amount
+		}
 		cashflows = append(cashflows, &Cashflow{
-			Amount:    -float64(m.Balance) / 100,
+			Amount:    amount,
 			Currency:  "USD",
-			Timestamp: time.UnixMilli(m.ExecutionTimestamp).UTC(),
+			Timestamp: time.UnixMilli(dw.Timestamp).UTC(),
 		})
 	}
 
