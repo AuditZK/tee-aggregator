@@ -30,6 +30,43 @@ const (
 	sourceInEnclave         = "in-enclave"
 )
 
+// ctraderRecurringReconstructDays bounds cTrader's every-sync reconstruction
+// window. The deep historical backfill runs once at connect (since=zero); the
+// recurring re-run only needs to re-own the recent boundary day(s) so the live
+// path's 24h-window deposit — attributed to the NEXT day — is overwritten by
+// the reconstruction's correct calendar-day attribution. Must comfortably
+// exceed the max plausible lag between a deposit and the next daily sync.
+const ctraderRecurringReconstructDays = 14
+
+// reconstructsEverySync reports whether an exchange's in-enclave history
+// provider is re-run on every sync (not just at connect). IBKR's Flex is a
+// single cheap call; cTrader re-runs a bounded recent window (see
+// everySyncReconstructSince) to self-heal the live/reconstruction boundary
+// double-count — its connect-time deposit lands on the reconstruction's
+// calendar-day row AND on the next live snapshot's 24h window, so the recurring
+// re-run re-emits that boundary day with deposits=0, overwriting the live row.
+//
+// IMPORTANT: only ever consulted INSIDE a conn.(connector.HistoricalSnapshotProvider)
+// type assertion. Non-reconstructed exchanges (Hyperliquid/MEXC/Lighter) never
+// satisfy that interface, so their mandatory live 24h cash-flow gap-deposit
+// window is untouched. Do NOT promote this to a standalone gate.
+func reconstructsEverySync(exchange string) bool {
+	e := strings.ToLower(exchange)
+	return e == "ibkr" || e == "ctrader"
+}
+
+// everySyncReconstructSince returns the lookback for an every-sync
+// reconstruction. IBKR re-emits its full Flex window cheaply (zero = full);
+// cTrader's walk is expensive (paginated deals + weekly cash-flow chunks), so
+// the recurring re-run is bounded — the deep backfill happens once at connect
+// or via the admin reconstruct endpoint (both pass since=zero).
+func everySyncReconstructSince(exchange string) time.Time {
+	if strings.EqualFold(exchange, "ctrader") {
+		return time.Now().UTC().AddDate(0, 0, -ctraderRecurringReconstructDays)
+	}
+	return time.Time{}
+}
+
 // SyncService orchestrates exchange synchronization.
 type SyncService struct {
 	connSvc      *ConnectionService
@@ -410,12 +447,14 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	//     sync — once the historical backfill is in DB, subsequent syncs only produce
 	//     the live (today) snapshot.
 	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
-		// IBKR keeps the every-sync Flex refresh because Flex is a single cheap
-		// call and can carry retroactive corrections. Other connectors
-		// (Hyperliquid, …) reconstruct ONCE at connection time via
-		// ReconstructHistoryOnConnect — the sync flow is live-only afterwards.
-		if strings.ToLower(connMeta.Exchange) == "ibkr" {
-			s.syncFromHistoricalProvider(ctx, connMeta, hsp)
+		// IBKR and cTrader re-run reconstruction every sync; others reconstruct
+		// ONCE at connect via ReconstructHistoryOnConnect. IBKR re-emits its full
+		// Flex window cheaply; cTrader re-runs a BOUNDED recent window
+		// (everySyncReconstructSince) to self-heal the live/reconstruction
+		// boundary deposit double-count. Gated INSIDE the HistoricalSnapshotProvider
+		// type assertion, so live-only exchanges (HL/MEXC/Lighter) are unaffected.
+		if reconstructsEverySync(connMeta.Exchange) {
+			s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange))
 		}
 	}
 
@@ -758,12 +797,14 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	// scheduler path goes through buildConnectionSnapshot, not syncConnection,
 	// so we duplicate the call here to cover both manual and scheduled syncs.
 	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
-		// IBKR keeps the every-sync Flex refresh because Flex is a single cheap
-		// call and can carry retroactive corrections. Other connectors
-		// (Hyperliquid, …) reconstruct ONCE at connection time via
-		// ReconstructHistoryOnConnect — the sync flow is live-only afterwards.
-		if strings.ToLower(connMeta.Exchange) == "ibkr" {
-			s.syncFromHistoricalProvider(ctx, connMeta, hsp)
+		// IBKR and cTrader re-run reconstruction every sync; others reconstruct
+		// ONCE at connect via ReconstructHistoryOnConnect. IBKR re-emits its full
+		// Flex window cheaply; cTrader re-runs a BOUNDED recent window
+		// (everySyncReconstructSince) to self-heal the live/reconstruction
+		// boundary deposit double-count. Gated INSIDE the HistoricalSnapshotProvider
+		// type assertion, so live-only exchanges (HL/MEXC/Lighter) are unaffected.
+		if reconstructsEverySync(connMeta.Exchange) {
+			s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange))
 		}
 	}
 
@@ -1063,7 +1104,9 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
 		// IBKR (and any future ZK-native provider) keeps the in-enclave path:
 		// signed by the report chain, stays inside the SEV-SNP perimeter.
-		s.syncFromHistoricalProvider(ctx, connMeta, hsp)
+		// since=zero => full backfill (connect time + admin reconstruct); the
+		// every-sync path uses a bounded window.
+		s.syncFromHistoricalProvider(ctx, connMeta, hsp, time.Time{})
 		s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
 		return
 	}
@@ -1288,7 +1331,7 @@ func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.Excha
 // their Flex query (e.g. 30d → 365d) sees the new earlier days flow into
 // the DB on the next sync — we log "history reconstruction detected" the
 // first time we see Flex go further back than what we already have.
-func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.HistoricalSnapshotProvider) {
+func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.HistoricalSnapshotProvider, since time.Time) {
 	firstSync := s.isFirstSync(ctx, connMeta)
 	if firstSync {
 		s.logger.Info("history backfill — first sync",
@@ -1304,7 +1347,7 @@ func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *
 		)
 	}
 
-	historicalSnapshots, err := provider.GetHistoricalSnapshots(ctx, time.Time{})
+	historicalSnapshots, err := provider.GetHistoricalSnapshots(ctx, since)
 	if err != nil {
 		s.logger.Error("historical snapshots fetch failed",
 			zap.String("user_uid", connMeta.UserUID),

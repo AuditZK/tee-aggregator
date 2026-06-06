@@ -452,3 +452,53 @@ func floatNear(a, b, tol float64) bool {
 	}
 	return d <= tol
 }
+
+// compile-time guard: cTrader must keep implementing the in-enclave
+// reconstruction interface that gates every-sync reconstruction (sync.go
+// reconstructsEverySync). If this breaks, cTrader silently stops backfilling.
+var _ HistoricalSnapshotProvider = (*CTrader)(nil)
+
+func TestBuildCTraderHistoricalSnapshots_BoundaryHeal(t *testing.T) {
+	// Real round-trip + deposit on 2026-06-05, reconstructed on a LATER heal day
+	// (now=2026-06-07). The recurring re-run must emit the boundary day 06-06
+	// with Deposits=0 (overwriting the live path's spurious 24h-window deposit)
+	// while keeping 06-05 as the single real deposit, equity carried forward.
+	dealJSON := `{"deal":[{"dealId":320460360,"positionId":264207985,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":1780689978964,"executionPrice":1.15225,"tradeSide":2,"dealStatus":2,"commission":-450,"closePositionDetail":{"grossProfit":-347,"swap":0,"commission":-900,"balance":99642,"moneyDigits":2},"moneyDigits":2},{"dealId":320455222,"positionId":264207985,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":1780688563637,"executionPrice":1.15229,"tradeSide":1,"dealStatus":2,"commission":-450,"moneyDigits":2}]}`
+	var dr struct {
+		Deal []cTraderDeal `json:"deal"`
+	}
+	if err := json.Unmarshal([]byte(dealJSON), &dr); err != nil {
+		t.Fatalf("unmarshal deals: %v", err)
+	}
+	cfs, err := parseCTraderDepositWithdraws([]byte(`{"depositWithdraw":[{"operationType":0,"balance":100889,"delta":100000,"changeBalanceTimestamp":1780688558274,"moneyDigits":2}]}`))
+	if err != nil {
+		t.Fatalf("parse cashflows: %v", err)
+	}
+
+	now := time.Date(2026, 6, 7, 10, 0, 0, 0, time.UTC)
+	snaps := buildCTraderHistoricalSnapshots(dr.Deal, cfs, now)
+
+	byDay := map[string]*HistoricalSnapshot{}
+	var total float64
+	for _, s := range snaps {
+		byDay[s.Date.Format("20060102")] = s
+		total += s.Deposits
+	}
+
+	if d := byDay["20260605"]; d == nil || d.Deposits != 1000 {
+		t.Fatalf("06-05: want deposits=1000, got %+v", d)
+	}
+	d06 := byDay["20260606"]
+	if d06 == nil {
+		t.Fatalf("06-06 boundary-heal row missing (cannot overwrite the live spurious deposit)")
+	}
+	if d06.Deposits != 0 {
+		t.Fatalf("06-06 deposits: want 0 (heal), got %v", d06.Deposits)
+	}
+	if !floatNear(d06.TotalEquity, 996.42, 0.01) {
+		t.Fatalf("06-06 equity: want 996.42 carry-forward, got %v", d06.TotalEquity)
+	}
+	if total != 1000 {
+		t.Fatalf("total deposits across series: want 1000 (counted exactly once), got %v", total)
+	}
+}
