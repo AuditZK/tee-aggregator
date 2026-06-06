@@ -374,3 +374,81 @@ func TestCTraderDealUnmarshal_RealPayload(t *testing.T) {
 		t.Fatalf("executionPrice: got %v, want 1.15229", d.ExecutionPrice)
 	}
 }
+
+func TestBuildCTraderHistoricalSnapshots_RealRoundTrip(t *testing.T) {
+	// Real captured payloads: a $1000 deposit (balance 8.89 -> 1008.89) then a
+	// 1-lot EURUSD round-trip closing at balance 996.42, all on 2026-06-05 UTC.
+	dealJSON := `{"deal":[{"dealId":320460360,"positionId":264207985,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":1780689978964,"executionPrice":1.15225,"tradeSide":2,"dealStatus":2,"commission":-450,"closePositionDetail":{"grossProfit":-347,"swap":0,"commission":-900,"balance":99642,"moneyDigits":2},"moneyDigits":2},{"dealId":320455222,"positionId":264207985,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":1780688563637,"executionPrice":1.15229,"tradeSide":1,"dealStatus":2,"commission":-450,"moneyDigits":2}]}`
+	var dr struct {
+		Deal []cTraderDeal `json:"deal"`
+	}
+	if err := json.Unmarshal([]byte(dealJSON), &dr); err != nil {
+		t.Fatalf("unmarshal deals: %v", err)
+	}
+	cfs, err := parseCTraderDepositWithdraws([]byte(`{"depositWithdraw":[{"operationType":0,"balance":100889,"delta":100000,"changeBalanceTimestamp":1780688558274,"moneyDigits":2}]}`))
+	if err != nil {
+		t.Fatalf("parse cashflows: %v", err)
+	}
+
+	now := time.Date(2026, 6, 6, 10, 0, 0, 0, time.UTC)
+	snaps := buildCTraderHistoricalSnapshots(dr.Deal, cfs, now)
+
+	if len(snaps) != 1 {
+		t.Fatalf("got %d snapshots, want 1", len(snaps))
+	}
+	s := snaps[0]
+	if s.Date.Format("20060102") != "20260605" {
+		t.Fatalf("date: got %s, want 20260605", s.Date.Format("20060102"))
+	}
+	if !floatNear(s.TotalEquity, 996.42, 0.01) {
+		t.Fatalf("equity: got %v, want 996.42", s.TotalEquity)
+	}
+	if s.Deposits != 1000 {
+		t.Fatalf("deposits: got %v, want 1000", s.Deposits)
+	}
+	if s.Withdrawals != 0 {
+		t.Fatalf("withdrawals: got %v, want 0", s.Withdrawals)
+	}
+	if s.TotalTrades != 2 {
+		t.Fatalf("trades: got %d, want 2", s.TotalTrades)
+	}
+	if !floatNear(s.TotalVolume, 230454, 0.5) {
+		t.Fatalf("volume: got %v, want ~230454", s.TotalVolume)
+	}
+}
+
+func TestBuildCTraderHistoricalSnapshots_CarryForwardAndWithdraw(t *testing.T) {
+	day1 := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	day3 := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 6, 4, 9, 0, 0, 0, time.UTC)
+
+	cashflows := []ctraderDepositWithdraw{
+		{OperationType: 0, Balance: 100000, Delta: 100000, Timestamp: day1.UnixMilli(), MoneyDigits: 2}, // +$1000 -> 1000
+		{OperationType: 1, Balance: 80000, Delta: -20000, Timestamp: day3.UnixMilli(), MoneyDigits: 2},  // -$200  -> 800
+	}
+	snaps := buildCTraderHistoricalSnapshots(nil, cashflows, now)
+
+	if len(snaps) != 3 {
+		t.Fatalf("got %d snapshots, want 3 (06-01..06-03)", len(snaps))
+	}
+	// 06-01: deposit day, equity 1000
+	if snaps[0].Date.Format("20060102") != "20260601" || snaps[0].TotalEquity != 1000 || snaps[0].Deposits != 1000 {
+		t.Fatalf("day1: %+v", snaps[0])
+	}
+	// 06-02: no activity, equity carried forward
+	if snaps[1].Date.Format("20060102") != "20260602" || snaps[1].TotalEquity != 1000 || snaps[1].Deposits != 0 || snaps[1].Withdrawals != 0 {
+		t.Fatalf("day2 (carry-forward): %+v", snaps[1])
+	}
+	// 06-03: withdrawal, equity 800
+	if snaps[2].Date.Format("20060102") != "20260603" || snaps[2].TotalEquity != 800 || snaps[2].Withdrawals != 200 {
+		t.Fatalf("day3: %+v", snaps[2])
+	}
+}
+
+func floatNear(a, b, tol float64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d <= tol
+}

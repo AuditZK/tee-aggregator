@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,10 +165,15 @@ type cTraderDeal struct {
 	ExecutionTimestamp  int64      `json:"executionTimestamp"`
 	Commission          int64      `json:"commission"`
 	DealStatus          dealStatus `json:"dealStatus"`
+	MoneyDigits         int        `json:"moneyDigits"`
 	ClosePositionDetail *struct {
 		GrossProfit int64 `json:"grossProfit"`
 		Commission  int64 `json:"commission"`
 		Swap        int64 `json:"swap"`
+		// Balance is the authoritative account balance AFTER this closing deal
+		// (scaled by MoneyDigits). Used to reconstruct the historical equity curve.
+		Balance     int64 `json:"balance"`
+		MoneyDigits int   `json:"moneyDigits"`
 	} `json:"closePositionDetail"`
 }
 
@@ -1194,44 +1200,72 @@ func (c *CTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflo
 	return parseCTraderCashflows(raw)
 }
 
-// parseCTraderCashflows extracts user deposits/withdrawals from a
-// ProtoOACashFlowHistoryListRes payload. Only BALANCE_DEPOSIT (0) and
-// BALANCE_WITHDRAW (1) are kept; every other ProtoOAChangeBalanceType (swap,
-// commission, rebate, dividend, fee…) is a trading effect already in equity/PnL.
-// Deltas are scaled by the entry's moneyDigits (cents when moneyDigits == 2).
-func parseCTraderCashflows(raw json.RawMessage) ([]*Cashflow, error) {
-	const (
-		balanceDeposit  = 0 // ProtoOAChangeBalanceType.BALANCE_DEPOSIT
-		balanceWithdraw = 1 // ProtoOAChangeBalanceType.BALANCE_WITHDRAW
-	)
+// ctraderDepositWithdraw is a single ProtoOADepositWithdraw entry from a
+// ProtoOACashFlowHistoryListRes payload.
+type ctraderDepositWithdraw struct {
+	OperationType int   `json:"operationType"`
+	Balance       int64 `json:"balance"` // account balance AFTER the operation (scaled by MoneyDigits)
+	Delta         int64 `json:"delta"`   // signed change to the balance
+	Timestamp     int64 `json:"changeBalanceTimestamp"`
+	MoneyDigits   int   `json:"moneyDigits"`
+}
 
+const (
+	ctraderOpDeposit  = 0 // ProtoOAChangeBalanceType.BALANCE_DEPOSIT
+	ctraderOpWithdraw = 1 // ProtoOAChangeBalanceType.BALANCE_WITHDRAW
+)
+
+// ctraderMoneyDivisor returns 10^moneyDigits (default 100 = 2 digits) used to
+// convert cTrader's integer money values to a decimal amount.
+func ctraderMoneyDivisor(moneyDigits int) float64 {
+	if moneyDigits > 0 {
+		return math.Pow10(moneyDigits)
+	}
+	return 100.0
+}
+
+// parseCTraderDepositWithdraws decodes the depositWithdraw entries from a
+// ProtoOACashFlowHistoryListRes payload (all operation types, unfiltered).
+func parseCTraderDepositWithdraws(raw json.RawMessage) ([]ctraderDepositWithdraw, error) {
 	var resp struct {
-		DepositWithdraw []struct {
-			OperationType int   `json:"operationType"`
-			Delta         int64 `json:"delta"`
-			Timestamp     int64 `json:"changeBalanceTimestamp"`
-			MoneyDigits   int   `json:"moneyDigits"`
-		} `json:"depositWithdraw"`
+		DepositWithdraw []ctraderDepositWithdraw `json:"depositWithdraw"`
 	}
 	if err := decodeRawPayload(raw, &resp); err != nil {
 		return nil, err
 	}
+	return resp.DepositWithdraw, nil
+}
 
+// ctraderCashflowAmount returns the signed amount for a deposit/withdraw entry
+// (positive deposit, negative withdrawal), or ok=false when the entry is not a
+// user capital flow (swap/commission/rebate/dividend/fee/etc., which are
+// trading effects already reflected in equity/PnL).
+func ctraderCashflowAmount(dw ctraderDepositWithdraw) (float64, bool) {
+	if dw.OperationType != ctraderOpDeposit && dw.OperationType != ctraderOpWithdraw {
+		return 0, false
+	}
+	amount := math.Abs(float64(dw.Delta)) / ctraderMoneyDivisor(dw.MoneyDigits)
+	if amount == 0 {
+		return 0, false
+	}
+	if dw.OperationType == ctraderOpWithdraw {
+		amount = -amount
+	}
+	return amount, true
+}
+
+// parseCTraderCashflows extracts user deposits/withdrawals from a
+// ProtoOACashFlowHistoryListRes payload.
+func parseCTraderCashflows(raw json.RawMessage) ([]*Cashflow, error) {
+	entries, err := parseCTraderDepositWithdraws(raw)
+	if err != nil {
+		return nil, err
+	}
 	var cashflows []*Cashflow
-	for _, dw := range resp.DepositWithdraw {
-		if dw.OperationType != balanceDeposit && dw.OperationType != balanceWithdraw {
+	for _, dw := range entries {
+		amount, ok := ctraderCashflowAmount(dw)
+		if !ok {
 			continue
-		}
-		divisor := 100.0
-		if dw.MoneyDigits > 0 {
-			divisor = math.Pow10(dw.MoneyDigits)
-		}
-		amount := math.Abs(float64(dw.Delta)) / divisor
-		if amount == 0 {
-			continue
-		}
-		if dw.OperationType == balanceWithdraw {
-			amount = -amount
 		}
 		cashflows = append(cashflows, &Cashflow{
 			Amount:    amount,
@@ -1239,6 +1273,307 @@ func parseCTraderCashflows(raw json.RawMessage) ([]*Cashflow, error) {
 			Timestamp: time.UnixMilli(dw.Timestamp).UTC(),
 		})
 	}
-
 	return cashflows, nil
+}
+
+// --- in-enclave history reconstruction --------------------------------------
+
+const (
+	// ctraderCashflowWindow is cTrader's max range for a single
+	// ProtoOACashFlowHistoryListReq (toTimestamp - fromTimestamp <= 1 week).
+	ctraderCashflowWindow = 7 * 24 * time.Hour
+	// ctraderMaxLookback bounds the reconstruction when `since` is the zero
+	// time (= "from inception"), keeping the weekly cash-flow pagination tractable.
+	ctraderMaxLookback = 2 * 365 * 24 * time.Hour
+	// ctraderInceptionBuffer extends the cash-flow scan before the first trade
+	// so the inception deposit (which usually precedes trading) is captured.
+	ctraderInceptionBuffer = 90 * 24 * time.Hour
+	// ctraderMaxDealPages caps deal-list pagination as a runaway guard.
+	ctraderMaxDealPages = 200
+	// ctraderHistRequestDelay paces historical pagination under cTrader's
+	// per-payload-type rate limit — rapid DealList / CashFlowHistory requests
+	// trigger "BLOCKED_PAYLOAD_TYPE: You are being rate limited".
+	ctraderHistRequestDelay = 600 * time.Millisecond
+)
+
+// ctraderThrottle sleeps between paginated historical requests to stay under
+// cTrader's rate limit, returning early if the context is cancelled.
+func ctraderThrottle(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(ctraderHistRequestDelay):
+		return nil
+	}
+}
+
+// GetHistoricalSnapshots reconstructs the account's daily equity timeline
+// entirely in-enclave (ZK-native — no credentials leave the SEV-SNP perimeter).
+//
+// cTrader exposes no daily-NAV history, so the curve is computed from
+// authoritative balance-after values: every closing deal and every
+// deposit/withdrawal carries the account balance after it. Daily equity is the
+// latest such balance at or before the end of each day (carry-forward).
+//
+// Caveat: historical UNREALIZED PnL on positions held overnight is not
+// reconstructed (no historical mark prices here) — the realized balance is used
+// as the daily equity. Accurate for accounts that are flat or short-held
+// intraday; slightly understates equity while a position is carried overnight.
+func (c *CTrader) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*HistoricalSnapshot, error) {
+	accountID, err := c.ensureAccountID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	start := since.UTC()
+	if start.IsZero() || start.Before(now.Add(-ctraderMaxLookback)) {
+		start = now.Add(-ctraderMaxLookback)
+	}
+
+	deals, err := c.getAllDeals(ctx, accountID, start, now)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bound the weekly-paginated cash-flow scan to the trading period (plus a
+	// buffer for the inception deposit that precedes the first trade), so a
+	// recently-active account doesn't scan the entire lookback window.
+	cashflowStart := start
+	if len(deals) > 0 {
+		earliest := deals[0].ExecutionTimestamp
+		for _, d := range deals {
+			if d.ExecutionTimestamp < earliest {
+				earliest = d.ExecutionTimestamp
+			}
+		}
+		if cs := time.UnixMilli(earliest).UTC().Add(-ctraderInceptionBuffer); cs.After(cashflowStart) {
+			cashflowStart = cs
+		}
+	}
+	cashflows, err := c.getAllCashflows(ctx, accountID, cashflowStart, now)
+	if err != nil {
+		return nil, err
+	}
+
+	return buildCTraderHistoricalSnapshots(deals, cashflows, now), nil
+}
+
+// getAllDeals fetches every deal in [start, end], following hasMore pagination.
+// Deals are returned ascending by executionTimestamp, so each page advances the
+// window past the last deal seen.
+func (c *CTrader) getAllDeals(ctx context.Context, accountID int64, start, end time.Time) ([]cTraderDeal, error) {
+	if err := c.authenticateAccount(ctx, accountID); err != nil {
+		return nil, err
+	}
+	from := start.UnixMilli()
+	to := end.UnixMilli()
+	var all []cTraderDeal
+	for page := 0; page < ctraderMaxDealPages; page++ {
+		if page > 0 {
+			if err := ctraderThrottle(ctx); err != nil {
+				return nil, err
+			}
+		}
+		fromTS := from
+		raw, err := c.sendWithTokenRefresh(ctx, func() (json.RawMessage, error) {
+			return c.sendMessage(ctx, ctraderPayloadDealListReq, map[string]any{
+				"ctidTraderAccountId": accountID,
+				"fromTimestamp":       fromTS,
+				"toTimestamp":         to,
+				"maxRows":             1000,
+			}, ctraderPayloadDealListRes)
+		})
+		if err != nil {
+			return nil, err
+		}
+		var resp struct {
+			Deal    []cTraderDeal `json:"deal"`
+			HasMore bool          `json:"hasMore"`
+		}
+		if err := decodeRawPayload(raw, &resp); err != nil {
+			return nil, err
+		}
+		all = append(all, resp.Deal...)
+		if !resp.HasMore || len(resp.Deal) == 0 {
+			break
+		}
+		last := resp.Deal[len(resp.Deal)-1].ExecutionTimestamp
+		if last <= from {
+			break // no forward progress — stop to avoid a loop
+		}
+		from = last + 1
+	}
+	return all, nil
+}
+
+// getAllCashflows fetches deposits/withdrawals in [start, end] in <=1-week
+// chunks (cTrader caps ProtoOACashFlowHistoryListReq to a 7-day range).
+func (c *CTrader) getAllCashflows(ctx context.Context, accountID int64, start, end time.Time) ([]ctraderDepositWithdraw, error) {
+	if err := c.authenticateAccount(ctx, accountID); err != nil {
+		return nil, err
+	}
+	var all []ctraderDepositWithdraw
+	for chunkStart := start; chunkStart.Before(end); chunkStart = chunkStart.Add(ctraderCashflowWindow) {
+		if err := ctraderThrottle(ctx); err != nil {
+			return nil, err
+		}
+		chunkEnd := chunkStart.Add(ctraderCashflowWindow)
+		if chunkEnd.After(end) {
+			chunkEnd = end
+		}
+		fromTS, toTS := chunkStart.UnixMilli(), chunkEnd.UnixMilli()
+		raw, err := c.sendWithTokenRefresh(ctx, func() (json.RawMessage, error) {
+			return c.sendMessage(ctx, ctraderPayloadCashFlowHistoryReq, map[string]any{
+				"ctidTraderAccountId": accountID,
+				"fromTimestamp":       fromTS,
+				"toTimestamp":         toTS,
+			}, ctraderPayloadCashFlowHistoryRes)
+		})
+		if err != nil {
+			return nil, err
+		}
+		entries, err := parseCTraderDepositWithdraws(raw)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, entries...)
+	}
+	return all, nil
+}
+
+// ctraderBalPoint is a (timestamp, account balance) sample used to rebuild the
+// daily equity curve.
+type ctraderBalPoint struct {
+	t   time.Time
+	bal float64
+}
+
+type ctraderCashflowDay struct{ deposits, withdrawals float64 }
+
+type ctraderTradeDay struct {
+	count  int
+	volume float64
+	fees   float64
+}
+
+func truncUTCDay(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// ctraderBalancePoints returns sorted authoritative balance-after samples from
+// closing deals and cash flows (cTrader reports the account balance after each).
+func ctraderBalancePoints(deals []cTraderDeal, cashflows []ctraderDepositWithdraw) []ctraderBalPoint {
+	var points []ctraderBalPoint
+	for _, d := range deals {
+		if d.ClosePositionDetail == nil || d.ClosePositionDetail.Balance == 0 {
+			continue
+		}
+		md := d.ClosePositionDetail.MoneyDigits
+		if md == 0 {
+			md = d.MoneyDigits
+		}
+		points = append(points, ctraderBalPoint{
+			t:   time.UnixMilli(d.ExecutionTimestamp).UTC(),
+			bal: float64(d.ClosePositionDetail.Balance) / ctraderMoneyDivisor(md),
+		})
+	}
+	for _, cf := range cashflows {
+		if _, ok := ctraderCashflowAmount(cf); !ok {
+			continue
+		}
+		points = append(points, ctraderBalPoint{
+			t:   time.UnixMilli(cf.Timestamp).UTC(),
+			bal: float64(cf.Balance) / ctraderMoneyDivisor(cf.MoneyDigits),
+		})
+	}
+	sort.Slice(points, func(i, j int) bool { return points[i].t.Before(points[j].t) })
+	return points
+}
+
+// ctraderBalanceAt returns the latest balance strictly before t (carry-forward),
+// or 0 when no point precedes t (pre-inception).
+func ctraderBalanceAt(points []ctraderBalPoint, t time.Time) float64 {
+	bal := 0.0
+	for _, p := range points {
+		if !p.t.Before(t) {
+			break
+		}
+		bal = p.bal
+	}
+	return bal
+}
+
+func ctraderCashflowsByDay(cashflows []ctraderDepositWithdraw) map[string]*ctraderCashflowDay {
+	byDay := map[string]*ctraderCashflowDay{}
+	for _, cf := range cashflows {
+		amount, ok := ctraderCashflowAmount(cf)
+		if !ok {
+			continue
+		}
+		key := time.UnixMilli(cf.Timestamp).UTC().Format("20060102")
+		e := byDay[key]
+		if e == nil {
+			e = &ctraderCashflowDay{}
+			byDay[key] = e
+		}
+		if amount > 0 {
+			e.deposits += amount
+		} else {
+			e.withdrawals += -amount
+		}
+	}
+	return byDay
+}
+
+func ctraderTradesByDay(deals []cTraderDeal) map[string]*ctraderTradeDay {
+	byDay := map[string]*ctraderTradeDay{}
+	for _, d := range deals {
+		if d.DealStatus != "FILLED" && d.DealStatus != "PARTIALLY_FILLED" {
+			continue
+		}
+		key := time.UnixMilli(d.ExecutionTimestamp).UTC().Format("20060102")
+		e := byDay[key]
+		if e == nil {
+			e = &ctraderTradeDay{}
+			byDay[key] = e
+		}
+		e.count++
+		e.volume += (float64(d.FilledVolume) / 100.0) * d.ExecutionPrice
+		e.fees += float64(d.Commission) / ctraderMoneyDivisor(d.MoneyDigits)
+	}
+	return byDay
+}
+
+// buildCTraderHistoricalSnapshots turns raw deal + cash-flow history into a
+// daily equity timeline. Pure (no I/O) so it is unit-testable against captured
+// payloads. Today is intentionally excluded — it is owned by the live sync.
+func buildCTraderHistoricalSnapshots(deals []cTraderDeal, cashflows []ctraderDepositWithdraw, now time.Time) []*HistoricalSnapshot {
+	points := ctraderBalancePoints(deals, cashflows)
+	if len(points) == 0 {
+		return nil
+	}
+	cfByDay := ctraderCashflowsByDay(cashflows)
+	tByDay := ctraderTradesByDay(deals)
+
+	firstDay := truncUTCDay(points[0].t)
+	lastDay := truncUTCDay(now).Add(-24 * time.Hour) // yesterday; today is the live branch's
+
+	var out []*HistoricalSnapshot
+	for day := firstDay; !day.After(lastDay); day = day.Add(24 * time.Hour) {
+		bal := ctraderBalanceAt(points, day.Add(24*time.Hour))
+		snap := &HistoricalSnapshot{Date: day, TotalEquity: bal, RealizedBalance: bal}
+		key := day.Format("20060102")
+		if e := cfByDay[key]; e != nil {
+			snap.Deposits = e.deposits
+			snap.Withdrawals = e.withdrawals
+		}
+		if e := tByDay[key]; e != nil {
+			snap.TotalTrades = e.count
+			snap.TotalVolume = e.volume
+			snap.TotalFees = e.fees
+		}
+		out = append(out, snap)
+	}
+	return out
 }

@@ -119,6 +119,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// and only set by the front proxy anyway). Non-loopback peers get 403.
 	mux.HandleFunc("/api/v1/admin/sync-now", s.localhostOnly(s.handleAdminSyncNow))
 	mux.HandleFunc("/api/v1/admin/cashflows", s.localhostOnly(s.handleAdminDumpCashflows))
+	mux.HandleFunc("/api/v1/admin/reconstruct", s.localhostOnly(s.handleAdminReconstruct))
 
 	// B2 handoff: deliberately NOT gated by localhostOnly because the
 	// successor enclave runs in a different container with a non-loopback
@@ -214,6 +215,45 @@ func (s *Server) handleAdminSyncNow(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("admin sync-now triggered")
 	go s.scheduler.RunNow()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "sync triggered, check logs"})
+}
+
+// handleAdminReconstruct triggers in-enclave historical reconstruction for an
+// existing connection. The connect-time hook only fires once at connect, so
+// this is how a previously-connected account — or one whose connector just
+// gained HistoricalSnapshotProvider support (cTrader) — gets backfilled.
+//
+// Usage: POST /api/v1/admin/reconstruct?user_uid=X&exchange=ctrader&label=Y
+func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+	if userUID == "" || exchange == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "user_uid and exchange are required"})
+		return
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	s.logger.Info("admin reconstruct triggered",
+		zap.String("user_uid", userUID),
+		zap.String("exchange", exchange),
+		zap.String("label", label),
+	)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		s.handler.syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "reconstruction triggered, check logs"})
 }
 
 // handleAdminDumpCashflows dumps all BALANCE deals for a user/exchange/label since a date.
