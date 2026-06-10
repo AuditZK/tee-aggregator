@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -21,25 +23,37 @@ type BenchmarkMetrics struct {
 }
 
 // BenchmarkService fetches benchmark data and calculates relative metrics.
+//
+// Benchmark prices come exclusively from the central benchmark-service
+// (BENCHMARK_SERVICE_URL): the enclave never talks to market-data providers
+// (Yahoo, CoinGecko, Binance...) directly, so the whole platform consumes a
+// single price series per benchmark.
 type BenchmarkService struct {
 	httpClient *http.Client
+	baseURL    string
 }
 
 // NewBenchmarkService creates a new benchmark service.
-func NewBenchmarkService() *BenchmarkService {
+// baseURL is the benchmark-service root URL (BENCHMARK_SERVICE_URL). When
+// empty, Calculate fails with a clear error and the report service falls back
+// to generating reports without benchmark metrics.
+func NewBenchmarkService(baseURL string) *BenchmarkService {
 	return &BenchmarkService{
 		httpClient: &http.Client{Timeout: 15 * time.Second},
+		baseURL:    strings.TrimRight(baseURL, "/"),
 	}
 }
 
 // Calculate computes benchmark comparison metrics.
-// portfolioReturns are daily net returns, benchmark is "SPY" or "BTC-USD".
+// portfolioReturns are daily net returns; benchmark is any symbol the
+// benchmark-service supports (SPY, QQQ, VTI, BTC-USD, CD20, CD100, ... —
+// aliases like "BTC" are resolved server-side).
 func (s *BenchmarkService) Calculate(ctx context.Context, portfolioReturns []float64, benchmark string, startDate, endDate time.Time) (*BenchmarkMetrics, error) {
 	if len(portfolioReturns) < 5 {
 		return nil, fmt.Errorf("need at least 5 data points for benchmark comparison")
 	}
 
-	benchReturns, err := s.fetchBenchmarkReturns(ctx, benchmark, startDate, endDate, len(portfolioReturns))
+	benchReturns, err := s.fetchBenchmarkReturns(ctx, benchmark, startDate, endDate)
 	if err != nil {
 		return nil, fmt.Errorf("fetch benchmark data: %w", err)
 	}
@@ -118,107 +132,73 @@ func (s *BenchmarkService) Calculate(ctx context.Context, portfolioReturns []flo
 	}, nil
 }
 
-func (s *BenchmarkService) fetchBenchmarkReturns(ctx context.Context, benchmark string, startDate, endDate time.Time, expectedLen int) ([]float64, error) {
-	switch benchmark {
-	case "SPY", "spy":
-		return s.fetchYahooReturns(ctx, "SPY", startDate, endDate)
-	case "BTC-USD", "btc-usd", "BTC", "btc":
-		return s.fetchCoinGeckoReturns(ctx, "bitcoin", startDate, endDate)
-	case "ETH-USD", "eth-usd", "ETH", "eth":
-		return s.fetchCoinGeckoReturns(ctx, "ethereum", startDate, endDate)
-	default:
-		return nil, fmt.Errorf("unsupported benchmark: %s (supported: SPY, BTC-USD, ETH-USD)", benchmark)
+// fetchBenchmarkReturns fetches the daily close series from the central
+// benchmark-service and converts it to daily returns. Symbol aliases
+// (BTC-USD -> BTCUSDT...) are resolved by the benchmark-service itself.
+func (s *BenchmarkService) fetchBenchmarkReturns(ctx context.Context, benchmark string, startDate, endDate time.Time) ([]float64, error) {
+	if s.baseURL == "" {
+		return nil, fmt.Errorf("BENCHMARK_SERVICE_URL not configured")
 	}
-}
 
-// fetchYahooReturns fetches daily returns from Yahoo Finance v8 API.
-func (s *BenchmarkService) fetchYahooReturns(ctx context.Context, symbol string, startDate, endDate time.Time) ([]float64, error) {
-	url := fmt.Sprintf(
-		"https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d",
-		symbol, startDate.Unix(), endDate.Unix(),
+	reqURL := fmt.Sprintf(
+		"%s/api/v1/benchmarks/%s/daily?startDate=%s&endDate=%s",
+		s.baseURL,
+		url.PathEscape(benchmark),
+		startDate.Format("2006-01-02"),
+		endDate.Format("2006-01-02"),
 	)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "TrackRecord-Enclave/1.0")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("yahoo request: %w", err)
+		return nil, fmt.Errorf("benchmark-service request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("yahoo returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("benchmark-service returned %d for %s", resp.StatusCode, benchmark)
 	}
 
 	var result struct {
-		Chart struct {
-			Result []struct {
-				Indicators struct {
-					AdjClose []struct {
-						AdjClose []float64 `json:"adjclose"`
-					} `json:"adjclose"`
-				} `json:"indicators"`
-			} `json:"result"`
-		} `json:"chart"`
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+		Data    struct {
+			Symbol string `json:"symbol"`
+			Data   []struct {
+				Date          string  `json:"date"`
+				Close         float64 `json:"close"`
+				AdjustedClose float64 `json:"adjustedClose"`
+			} `json:"data"`
+		} `json:"data"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("yahoo decode: %w", err)
+		return nil, fmt.Errorf("benchmark-service decode: %w", err)
 	}
 
-	if len(result.Chart.Result) == 0 || len(result.Chart.Result[0].Indicators.AdjClose) == 0 {
-		return nil, fmt.Errorf("no data from Yahoo for %s", symbol)
+	if !result.Success {
+		return nil, fmt.Errorf("benchmark-service error for %s: %s", benchmark, result.Error)
 	}
 
-	prices := result.Chart.Result[0].Indicators.AdjClose[0].AdjClose
-	return pricesToReturns(prices), nil
-}
-
-// fetchCoinGeckoReturns fetches daily returns from CoinGecko.
-func (s *BenchmarkService) fetchCoinGeckoReturns(ctx context.Context, coinID string, startDate, endDate time.Time) ([]float64, error) {
-	url := fmt.Sprintf(
-		"https://api.coingecko.com/api/v3/coins/%s/market_chart/range?vs_currency=usd&from=%d&to=%d",
-		coinID, startDate.Unix(), endDate.Unix(),
-	)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
+	if len(result.Data.Data) < 2 {
+		return nil, fmt.Errorf("insufficient benchmark data for %s", benchmark)
 	}
 
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("coingecko request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("coingecko returned %d", resp.StatusCode)
-	}
-
-	var result struct {
-		Prices [][]float64 `json:"prices"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("coingecko decode: %w", err)
-	}
-
-	if len(result.Prices) < 2 {
-		return nil, fmt.Errorf("insufficient data from CoinGecko for %s", coinID)
-	}
-
-	// Extract daily prices (CoinGecko returns [timestamp_ms, price])
-	prices := make([]float64, len(result.Prices))
-	for i, p := range result.Prices {
-		if len(p) < 2 {
-			continue
+	prices := make([]float64, 0, len(result.Data.Data))
+	for _, p := range result.Data.Data {
+		price := p.AdjustedClose
+		if price <= 0 {
+			price = p.Close
 		}
-		prices[i] = p[1]
+		if price > 0 {
+			prices = append(prices, price)
+		}
 	}
 
 	return pricesToReturns(prices), nil

@@ -272,7 +272,12 @@ func main() {
 	var syncSvc *service.SyncService
 	var metricsSvc *service.MetricsService
 	var reportSvc *service.ReportService
-	benchmarkSvc := service.NewBenchmarkService()
+	benchmarkSvc := service.NewBenchmarkService(cfg.BenchmarkServiceURL)
+	if cfg.BenchmarkServiceURL != "" {
+		logger.Info("benchmark-service wired", zap.String("url", cfg.BenchmarkServiceURL))
+	} else {
+		logger.Warn("BENCHMARK_SERVICE_URL not set - signed reports will omit benchmark metrics")
+	}
 
 	// 11b. Init connector cache (TS parity: UniversalConnectorCache)
 	connectorCache := cache.NewConnectorCache()

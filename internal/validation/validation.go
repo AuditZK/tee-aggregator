@@ -25,6 +25,9 @@ var (
 	uuidRegex     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	cuidRegex     = regexp.MustCompile(`^c[a-z0-9]{20,30}$`)
 	exchangeRegex = regexp.MustCompile(`^[a-z0-9_-]+$`)
+	// Format check only — the benchmark-service is the authority on which
+	// symbols exist (SPY, QQQ, VTI, BTC-USD, CD20, CD100, ...).
+	benchmarkRegex = regexp.MustCompile(`^[A-Za-z0-9-]{1,16}$`)
 )
 
 // ValidateUserUID checks if the UID matches Clerk ID, UUID, or CUID format.
@@ -230,6 +233,11 @@ func ValidateReportRequest(req *ReportRequest) error {
 		if err := ValidateTimestampRange(start, end); err != nil {
 			return err
 		}
+	}
+
+	// Benchmark is optional; when provided, only the format is checked here.
+	if req.Benchmark != "" && !benchmarkRegex.MatchString(req.Benchmark) {
+		return fmt.Errorf("invalid benchmark symbol format")
 	}
 	return nil
 }
