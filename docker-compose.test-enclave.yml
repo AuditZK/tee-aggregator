@@ -93,6 +93,10 @@ services:
       # out: REBUILDER_URL="" docker compose ... up -d.
       REBUILDER_SERVICE_URL: ${REBUILDER_URL-http://${AUDITZK_HOST}:${AUDITZK_REBUILDER_PORT:-3006}}
       REBUILDER_INTERNAL_TOKEN: ${REBUILDER_TOKEN:-test-token-abc123def456ghi789jkl012mno345}
+      # Benchmark prices for signed-report metrics come exclusively from
+      # the central benchmark-service (the enclave no longer fetches
+      # Yahoo/CoinGecko itself). Defaults to the test stack's public route.
+      BENCHMARK_SERVICE_URL: ${BENCHMARK_SERVICE_URL:-http://api-test.auditzk.com}
     ports:
       - "127.0.0.1:8443:8080"
       - "127.0.0.1:50063:50051"
