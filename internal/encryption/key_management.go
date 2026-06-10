@@ -414,6 +414,27 @@ func (s *KeyManagementService) rotateDEKLocked(ctx context.Context) error {
 		return fmt.Errorf("wrap DEK: %w", err)
 	}
 
+	// The DB may use either the Go snake_case schema or the TS Prisma
+	// camelCase schema. s.dekSchema is only set when loadActiveDEK found a
+	// row — when SEEDING a fresh DEK (empty table, e.g. after a prod->test
+	// copy or a DR reset) it is empty, so probe the table shape directly.
+	// Without this, seeding into a camelCase table fails with 42703 and the
+	// enclave fatals at boot.
+	schema := s.dekSchema
+	if schema == "" {
+		var n int
+		if err := s.pool.QueryRow(ctx, `
+			SELECT count(*) FROM information_schema.columns
+			WHERE table_name = 'data_encryption_keys' AND column_name = 'encryptedDEK'`).Scan(&n); err != nil {
+			return fmt.Errorf("probe data_encryption_keys schema: %w", err)
+		}
+		if n > 0 {
+			schema = "ts-camel"
+		} else {
+			schema = "go-snake"
+		}
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin DEK rotation tx: %w", err)
@@ -422,26 +443,46 @@ func (s *KeyManagementService) rotateDEKLocked(ctx context.Context) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if s.dekID != "" {
-		if _, err := tx.Exec(ctx, `
+		deactivateSQL := `
 			UPDATE data_encryption_keys
 			SET is_active = false, rotated_at = NOW()
-			WHERE id = $1`, s.dekID); err != nil {
+			WHERE id = $1`
+		if schema == "ts-camel" {
+			deactivateSQL = `
+			UPDATE data_encryption_keys
+			SET "isActive" = false, "rotatedAt" = NOW()
+			WHERE id = $1`
+		}
+		if _, err := tx.Exec(ctx, deactivateSQL, s.dekID); err != nil {
 			return fmt.Errorf("deactivate old DEK: %w", err)
 		}
 	}
 
-	var newID string
-	err = tx.QueryRow(ctx, `
+	// TS Prisma columns id/keyVersion/updatedAt are NOT NULL without DB
+	// defaults (Prisma fills them client-side), so the camelCase insert
+	// must supply them explicitly.
+	insertSQL := `
 		INSERT INTO data_encryption_keys
 		(encrypted_dek, iv, auth_tag, master_key_id, is_active, created_at)
 		VALUES ($1, $2, $3, $4, true, NOW())
-		RETURNING id`,
+		RETURNING id`
+	if schema == "ts-camel" {
+		insertSQL = `
+		INSERT INTO data_encryption_keys
+		(id, "encryptedDEK", iv, "authTag", "masterKeyId", "keyVersion", "isActive", "createdAt", "updatedAt")
+		VALUES (gen_random_uuid()::text, $1, $2, $3, $4, 'v1', true, NOW(), NOW())
+		RETURNING id`
+	}
+
+	var newID string
+	err = tx.QueryRow(ctx, insertSQL,
 		wrapped.Ciphertext, wrapped.IV, wrapped.AuthTag,
 		s.derivation.GetMasterKeyID(),
 	).Scan(&newID)
 	if err != nil {
 		return fmt.Errorf("store new DEK: %w", err)
 	}
+	s.dekSchema = schema
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit DEK rotation: %w", err)
