@@ -415,6 +415,12 @@ func TestBuildCTraderHistoricalSnapshots_RealRoundTrip(t *testing.T) {
 	if !floatNear(s.TotalVolume, 230454, 0.5) {
 		t.Fatalf("volume: got %v, want ~230454", s.TotalVolume)
 	}
+	if s.LongTrades != 1 || s.ShortTrades != 1 {
+		t.Fatalf("long/short split: got %d/%d, want 1/1", s.LongTrades, s.ShortTrades)
+	}
+	if !floatNear(s.LongVolume, 115229, 0.5) || !floatNear(s.ShortVolume, 115225, 0.5) {
+		t.Fatalf("long/short volume: got %v/%v, want ~115229/~115225", s.LongVolume, s.ShortVolume)
+	}
 }
 
 func TestBuildCTraderHistoricalSnapshots_CarryForwardAndWithdraw(t *testing.T) {

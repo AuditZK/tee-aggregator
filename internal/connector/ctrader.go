@@ -1452,9 +1452,13 @@ type ctraderBalPoint struct {
 type ctraderCashflowDay struct{ deposits, withdrawals float64 }
 
 type ctraderTradeDay struct {
-	count  int
-	volume float64
-	fees   float64
+	count       int
+	volume      float64
+	fees        float64
+	longTrades  int
+	shortTrades int
+	longVolume  float64
+	shortVolume float64
 }
 
 func truncUTCDay(t time.Time) time.Time {
@@ -1539,8 +1543,16 @@ func ctraderTradesByDay(deals []cTraderDeal) map[string]*ctraderTradeDay {
 			byDay[key] = e
 		}
 		e.count++
-		e.volume += (float64(d.FilledVolume) / 100.0) * d.ExecutionPrice
+		notional := (float64(d.FilledVolume) / 100.0) * d.ExecutionPrice
+		e.volume += notional
 		e.fees += float64(d.Commission) / ctraderMoneyDivisor(d.MoneyDigits)
+		if strings.EqualFold(string(d.TradeSide), "SELL") {
+			e.shortTrades++
+			e.shortVolume += notional
+		} else {
+			e.longTrades++
+			e.longVolume += notional
+		}
 	}
 	return byDay
 }
@@ -1572,6 +1584,10 @@ func buildCTraderHistoricalSnapshots(deals []cTraderDeal, cashflows []ctraderDep
 			snap.TotalTrades = e.count
 			snap.TotalVolume = e.volume
 			snap.TotalFees = e.fees
+			snap.LongTrades = e.longTrades
+			snap.ShortTrades = e.shortTrades
+			snap.LongVolume = e.longVolume
+			snap.ShortVolume = e.shortVolume
 		}
 		out = append(out, snap)
 	}

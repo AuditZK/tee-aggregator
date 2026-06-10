@@ -133,6 +133,10 @@ type HistoricalSnapshot struct {
 	TotalTrades     int                       `json:"total_trades"`
 	TotalVolume     float64                   `json:"total_volume"`
 	TotalFees       float64                   `json:"total_fees"`
+	LongTrades      int                       `json:"long_trades"`
+	ShortTrades     int                       `json:"short_trades"`
+	LongVolume      float64                   `json:"long_volume"`
+	ShortVolume     float64                   `json:"short_volume"`
 	Breakdown       map[string]*MarketBalance `json:"breakdown,omitempty"` // per-asset breakdown (stocks, options, futures, etc.)
 }
 

@@ -1490,6 +1490,10 @@ func buildHistoricalSnapshots(
 			Volume:          h.TotalVolume,
 			Trades:          h.TotalTrades,
 			TradingFees:     h.TotalFees,
+			LongTrades:      h.LongTrades,
+			ShortTrades:     h.ShortTrades,
+			LongVolume:      h.LongVolume,
+			ShortVolume:     h.ShortVolume,
 		}
 
 		snapshots = append(snapshots, &repository.Snapshot{

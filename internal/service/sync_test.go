@@ -737,6 +737,7 @@ func TestBuildHistoricalSnapshots_AllMarketTypes(t *testing.T) {
 		Date:        today.AddDate(0, 0, -1),
 		TotalEquity: 100, RealizedBalance: 70,
 		TotalTrades: 9, TotalVolume: 1234, TotalFees: 5.5,
+		LongTrades: 6, ShortTrades: 3, LongVolume: 1000, ShortVolume: 234,
 		Breakdown: map[string]*connector.MarketBalance{
 			connector.MarketStocks:  {Equity: 1, AvailableMargin: 1},
 			connector.MarketOptions: {Equity: 2, AvailableMargin: 2},
@@ -766,5 +767,15 @@ func TestBuildHistoricalSnapshots_AllMarketTypes(t *testing.T) {
 	if got := snapshots[0]; got.TotalTrades != 9 || got.TotalVolume != 1234 || got.TotalFees != 5.5 {
 		t.Errorf("trade aggregates not propagated: trades=%d volume=%f fees=%f",
 			got.TotalTrades, got.TotalVolume, got.TotalFees)
+	}
+	// Long/short must reach breakdown.Global — the dashboard's Long/Short
+	// Proportion chart reads breakdown.global.long_trades/short_trades.
+	if b.Global.LongTrades != 6 || b.Global.ShortTrades != 3 {
+		t.Errorf("long/short trades not propagated to global: long=%d short=%d",
+			b.Global.LongTrades, b.Global.ShortTrades)
+	}
+	if b.Global.LongVolume != 1000 || b.Global.ShortVolume != 234 {
+		t.Errorf("long/short volume not propagated to global: long=%f short=%f",
+			b.Global.LongVolume, b.Global.ShortVolume)
 	}
 }

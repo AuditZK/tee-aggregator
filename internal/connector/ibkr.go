@@ -595,6 +595,39 @@ func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*
 // raw Flex XML payload. Split out from GetHistoricalSnapshots so callers can
 // replay a captured XML offline (fixture-based tests, debug tools) without
 // triggering an IBKR Flex generation cooldown.
+// flexDayTrades accumulates one day's trade activity from the Flex report,
+// split by direction so historical snapshots feed the long/short widgets.
+type flexDayTrades struct {
+	count       int
+	volume      float64
+	fees        float64
+	longTrades  int
+	shortTrades int
+	longVolume  float64
+	shortVolume float64
+}
+
+func aggregateFlexTradesByDate(trades []*Trade) map[string]flexDayTrades {
+	byDate := make(map[string]flexDayTrades)
+	for _, t := range trades {
+		dateKey := t.Timestamp.Format("20060102")
+		entry := byDate[dateKey]
+		entry.count++
+		notional := t.Price * t.Quantity
+		entry.volume += notional
+		entry.fees += t.Fee
+		if t.Side == "sell" {
+			entry.shortTrades++
+			entry.shortVolume += notional
+		} else {
+			entry.longTrades++
+			entry.longVolume += notional
+		}
+		byDate[dateKey] = entry
+	}
+	return byDate
+}
+
 func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time) ([]*HistoricalSnapshot, error) {
 	// Parse all daily equity summaries with per-asset breakdown
 	var flex struct {
@@ -640,19 +673,7 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 	// analytics dashboard's per-day volume / trades-per-day widgets show 0
 	// for IBKR users (only the per-day equity walks).
 	trades, _ := i.parseTradesFromReport(report, since, time.Now().Add(24*time.Hour))
-	tradesByDate := make(map[string]struct {
-		count  int
-		volume float64
-		fees   float64
-	})
-	for _, t := range trades {
-		dateKey := t.Timestamp.Format("20060102")
-		entry := tradesByDate[dateKey]
-		entry.count++
-		entry.volume += t.Price * t.Quantity
-		entry.fees += t.Fee
-		tradesByDate[dateKey] = entry
-	}
+	tradesByDate := aggregateFlexTradesByDate(trades)
 
 	var snapshots []*HistoricalSnapshot
 	for _, s := range flex.FlexStatements.FlexStatement.EquitySummaryInBase.EquitySummaryByReportDateInBase {
@@ -707,6 +728,10 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 			TotalTrades:     tr.count,
 			TotalVolume:     tr.volume,
 			TotalFees:       tr.fees,
+			LongTrades:      tr.longTrades,
+			ShortTrades:     tr.shortTrades,
+			LongVolume:      tr.longVolume,
+			ShortVolume:     tr.shortVolume,
 			Breakdown:       breakdown,
 		})
 	}
