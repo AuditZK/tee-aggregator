@@ -202,6 +202,7 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 	input := &signing.ReportInput{
 		UserUID:          req.UserUID,
 		ReportName:       req.ReportName,
+		RiskFreeRate:     req.RiskFreeRate,
 		PeriodStart:      metrics.PeriodStart,
 		PeriodEnd:        metrics.PeriodEnd,
 		TotalReturn:      metrics.TotalReturn,

@@ -265,8 +265,8 @@ func TestVerifiabilityClassSignAndVerifyRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
-	if report.PayloadVersion != "1.3" {
-		t.Fatalf("expected new reports to carry PayloadVersion 1.3, got %q", report.PayloadVersion)
+	if report.PayloadVersion != PayloadVersion {
+		t.Fatalf("expected new reports to carry PayloadVersion %s, got %q", PayloadVersion, report.PayloadVersion)
 	}
 
 	ok, err := VerifyReport(report)
@@ -285,6 +285,74 @@ func TestVerifiabilityClassSignAndVerifyRoundtrip(t *testing.T) {
 	}
 	if ok {
 		t.Fatalf("tampered verifiabilityClass slipped past VerifyReport")
+	}
+}
+
+// TestRiskFreeRateInPayload pins the PayloadVersion-gated behaviour of
+// metrics.riskFreeRate. The contract is:
+//
+//   - Pre-1.4 reports carry no riskFreeRate in the signed metrics block, so
+//     VerifyReport on legacy reports still reproduces their hash.
+//   - 1.4+ reports always emit the key (even at 0), so a verifier can rely
+//     on its presence to read the Sharpe/Sortino assumption.
+func TestRiskFreeRateInPayload(t *testing.T) {
+	cases := []struct {
+		name           string
+		payloadVersion string
+		wantKey        bool
+	}{
+		{name: "legacy_1.3", payloadVersion: "1.3", wantKey: false},
+		{name: "current_1.4", payloadVersion: "1.4", wantKey: true},
+		{name: "empty_version_treated_as_legacy", payloadVersion: "", wantKey: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			report := &SignedReport{PayloadVersion: tc.payloadVersion, RiskFreeRate: 2.5}
+			payload := buildFinancialPayload(report)
+			metrics := payload["metrics"].(map[string]any)
+			rf, hasKey := metrics["riskFreeRate"]
+			if hasKey != tc.wantKey {
+				t.Errorf("payloadVersion=%q: riskFreeRate present=%v, want=%v", tc.payloadVersion, hasKey, tc.wantKey)
+			}
+			if tc.wantKey && rf != 2.5 {
+				t.Errorf("riskFreeRate = %v, want 2.5", rf)
+			}
+		})
+	}
+}
+
+// TestRiskFreeRateSignAndVerifyRoundtrip pins the signature invariant for
+// 1.4 reports: tampering with the risk-free rate assumption must invalidate
+// the signature, since it changes the meaning of the signed Sharpe/Sortino.
+func TestRiskFreeRateSignAndVerifyRoundtrip(t *testing.T) {
+	signer := MustNewReportSignerGenerate()
+	report, err := signer.Sign(&ReportInput{
+		UserUID:      "u",
+		ReportName:   "r",
+		PeriodStart:  time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		PeriodEnd:    time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC),
+		DataPoints:   2,
+		BaseCurrency: "USD",
+		RiskFreeRate: 2.5,
+		SharpeRatio:  1.1,
+	})
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	ok, err := VerifyReport(report)
+	if err != nil || !ok {
+		t.Fatalf("verify untampered report: ok=%v err=%v", ok, err)
+	}
+
+	report.RiskFreeRate = 0
+	ok, err = VerifyReport(report)
+	if err != nil {
+		t.Fatalf("verify tampered report errored unexpectedly: %v", err)
+	}
+	if ok {
+		t.Fatalf("tampered riskFreeRate slipped past VerifyReport")
 	}
 }
 

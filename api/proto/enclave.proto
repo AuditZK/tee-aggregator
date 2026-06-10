@@ -275,6 +275,10 @@ message SignedReportResponse {
   double tracking_error = 43;
   double correlation = 44;
 
+  // Risk-free rate assumption behind sharpe/sortino (annual %, signed at
+  // payload version >= 1.4; 0 = legacy rf-free ratios)
+  double risk_free_rate = 45;
+
   // Drawdown data (optional, if include_drawdown=true)
   int32 max_drawdown_duration = 50;
   double current_drawdown = 51;

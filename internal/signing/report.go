@@ -32,7 +32,10 @@ const (
 	//       coarse SEC-001 gate that excluded external-rebuilder snapshots.
 	//       The signature now covers the full history (live + reconstructed)
 	//       and a verifier filters by class at consumption time.
-	PayloadVersion = "1.3"
+	// 1.4 = adds metrics.riskFreeRate (annual %, 0 = rf-free legacy ratios) —
+	//       the assumption behind sharpeRatio/sortinoRatio must sit under the
+	//       same signature, otherwise a signed Sharpe is ambiguous.
+	PayloadVersion = "1.4"
 )
 
 // payloadVersionsWithoutWinRate are the pre-1.2 signed-payload shapes whose
@@ -53,6 +56,17 @@ var payloadVersionsWithoutVerifiabilityClass = map[string]struct{}{
 	"1.0": {},
 	"1.1": {},
 	"1.2": {},
+}
+
+// payloadVersionsWithoutRiskFreeRate are the pre-1.4 signed-payload shapes
+// whose metrics block carries no riskFreeRate assumption. Older reports keep
+// their original shape so VerifyReport reproduces their hash.
+var payloadVersionsWithoutRiskFreeRate = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+	"1.2": {},
+	"1.3": {},
 }
 
 // EnclaveAttestation binds the signed report to a specific SEV-SNP measurement
@@ -277,6 +291,8 @@ type ReportInput struct {
 	DataPoints       int
 	BaseCurrency     string
 	BenchmarkUsed    string
+	// Annual %, the assumption behind SharpeRatio/SortinoRatio (0 = rf-free)
+	RiskFreeRate float64
 
 	// Extended data
 	Exchanges        []string
@@ -313,6 +329,7 @@ type SignedReport struct {
 	DataPoints       int     `json:"data_points"`
 	BaseCurrency     string  `json:"base_currency"`
 	Benchmark        string  `json:"benchmark"`
+	RiskFreeRate     float64 `json:"risk_free_rate"` // annual %, signed at PayloadVersion >= 1.4
 
 	// Extended data
 	Exchanges        []string          `json:"exchanges,omitempty"`
@@ -367,6 +384,7 @@ func (s *ReportSigner) Sign(input *ReportInput) (*SignedReport, error) {
 		DataPoints:         input.DataPoints,
 		BaseCurrency:       input.BaseCurrency,
 		Benchmark:          input.BenchmarkUsed,
+		RiskFreeRate:       input.RiskFreeRate,
 		Exchanges:          input.Exchanges,
 		ExchangeDetails:    input.ExchangeDetails,
 		DailyReturns:       input.DailyReturns,
@@ -437,6 +455,14 @@ func buildFinancialPayload(report *SignedReport) map[string]any {
 		metrics := payload["metrics"].(map[string]any)
 		metrics["winRate"] = report.WinRate
 		metrics["profitFactor"] = report.ProfitFactor
+	}
+
+	// The risk-free rate is the assumption behind sharpeRatio/sortinoRatio,
+	// so a verifier must see it under the same signature (annual %, 0 =
+	// rf-free legacy ratios). Entered the signed payload at PayloadVersion 1.4.
+	if _, legacy := payloadVersionsWithoutRiskFreeRate[report.PayloadVersion]; !legacy {
+		metrics := payload["metrics"].(map[string]any)
+		metrics["riskFreeRate"] = report.RiskFreeRate
 	}
 
 	// enclaveAttestation binds the signed report to a specific SEV-SNP

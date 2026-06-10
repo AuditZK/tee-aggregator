@@ -807,6 +807,7 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 		PeriodEnd:          report.PeriodEnd,
 		BaseCurrency:       report.BaseCurrency,
 		Benchmark:          report.Benchmark,
+		RiskFreeRate:       report.RiskFreeRate,
 		DataPoints:         int32(report.DataPoints),
 		Exchanges:          report.Exchanges,
 		TotalReturn:        report.TotalReturn,

@@ -1539,6 +1539,9 @@ type SignedReportResponse struct {
 	InformationRatio float64 `protobuf:"fixed64,42,opt,name=information_ratio,json=informationRatio,proto3" json:"information_ratio,omitempty"`
 	TrackingError    float64 `protobuf:"fixed64,43,opt,name=tracking_error,json=trackingError,proto3" json:"tracking_error,omitempty"`
 	Correlation      float64 `protobuf:"fixed64,44,opt,name=correlation,proto3" json:"correlation,omitempty"`
+	// Risk-free rate assumption behind sharpe/sortino (annual %, signed at
+	// payload version >= 1.4; 0 = legacy rf-free ratios)
+	RiskFreeRate float64 `protobuf:"fixed64,45,opt,name=risk_free_rate,json=riskFreeRate,proto3" json:"risk_free_rate,omitempty"`
 	// Drawdown data (optional, if include_drawdown=true)
 	MaxDrawdownDuration int32                 `protobuf:"varint,50,opt,name=max_drawdown_duration,json=maxDrawdownDuration,proto3" json:"max_drawdown_duration,omitempty"`
 	CurrentDrawdown     float64               `protobuf:"fixed64,51,opt,name=current_drawdown,json=currentDrawdown,proto3" json:"current_drawdown,omitempty"`
@@ -1797,6 +1800,13 @@ func (x *SignedReportResponse) GetTrackingError() float64 {
 func (x *SignedReportResponse) GetCorrelation() float64 {
 	if x != nil {
 		return x.Correlation
+	}
+	return 0
+}
+
+func (x *SignedReportResponse) GetRiskFreeRate() float64 {
+	if x != nil {
+		return x.RiskFreeRate
 	}
 	return 0
 }
@@ -2518,7 +2528,7 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\vreport_name\x18\a \x01(\tR\n" +
 	"reportName\x12#\n" +
 	"\rbase_currency\x18\b \x01(\tR\fbaseCurrency\x12$\n" +
-	"\x0erisk_free_rate\x18\t \x01(\x01R\friskFreeRate\"\xca\f\n" +
+	"\x0erisk_free_rate\x18\t \x01(\x01R\friskFreeRate\"\xf0\f\n" +
 	"\x14SignedReportResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x1b\n" +
@@ -2554,7 +2564,8 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\x04beta\x18) \x01(\x01R\x04beta\x12+\n" +
 	"\x11information_ratio\x18* \x01(\x01R\x10informationRatio\x12%\n" +
 	"\x0etracking_error\x18+ \x01(\x01R\rtrackingError\x12 \n" +
-	"\vcorrelation\x18, \x01(\x01R\vcorrelation\x122\n" +
+	"\vcorrelation\x18, \x01(\x01R\vcorrelation\x12$\n" +
+	"\x0erisk_free_rate\x18- \x01(\x01R\friskFreeRate\x122\n" +
 	"\x15max_drawdown_duration\x182 \x01(\x05R\x13maxDrawdownDuration\x12)\n" +
 	"\x10current_drawdown\x183 \x01(\x01R\x0fcurrentDrawdown\x12F\n" +
 	"\x10drawdown_periods\x184 \x03(\v2\x1b.enclave.DrawdownPeriodDataR\x0fdrawdownPeriods\x12=\n" +
