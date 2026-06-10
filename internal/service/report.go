@@ -176,6 +176,30 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 	// 2. Convert to daily returns (TWR with multi-exchange support)
 	dailyReturns := convertSnapshotsToDailyReturns(snapshots)
 
+	// 2b. Enrich daily returns with the benchmark series (same decimal unit
+	// as netReturn) BEFORE monthly aggregation and signing, so the signed
+	// report carries per-day benchmark data for charts (rolling beta,
+	// portfolio-vs-benchmark) — not just the aggregate metrics. One fetch
+	// serves both this enrichment and section 9's metrics. Failure is
+	// non-fatal: the series stays at zero, as before.
+	var benchmarkSeries map[string]float64
+	if req.Benchmark != "" && s.benchmarkSvc != nil && len(dailyReturns) > 0 {
+		series, err := s.benchmarkSvc.DailyReturnsByDate(ctx, req.Benchmark, req.StartDate, req.EndDate)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("benchmark series fetch failed, continuing without", zap.Error(err))
+			}
+		} else {
+			benchmarkSeries = series
+			for i := range dailyReturns {
+				if br, ok := benchmarkSeries[dailyReturns[i].date]; ok {
+					dailyReturns[i].benchmarkReturn = br
+					dailyReturns[i].outperformance = dailyReturns[i].netReturn - br
+				}
+			}
+		}
+	}
+
 	// 3. Calculate core metrics over the SAME verifiable, exchange-filtered
 	// snapshot set. Re-fetching via the MetricsService would silently
 	// re-include the external-rebuilder history excluded in step 1 (SEC-001).
@@ -249,13 +273,18 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 		input.DrawdownData = toSigningDrawdownData(dd)
 	}
 
-	// 9. Optional benchmark metrics
-	if req.Benchmark != "" && s.benchmarkSvc != nil && len(dailyReturns) > 0 {
-		portfolioReturns := make([]float64, len(dailyReturns))
-		for i, dr := range dailyReturns {
-			portfolioReturns[i] = dr.netReturn
+	// 9. Optional benchmark metrics — computed over the date-aligned series
+	// fetched in 2b (only days where both portfolio and benchmark have data).
+	if benchmarkSeries != nil {
+		alignedPortfolio := make([]float64, 0, len(dailyReturns))
+		alignedBenchmark := make([]float64, 0, len(dailyReturns))
+		for _, dr := range dailyReturns {
+			if br, ok := benchmarkSeries[dr.date]; ok {
+				alignedPortfolio = append(alignedPortfolio, dr.netReturn)
+				alignedBenchmark = append(alignedBenchmark, br)
+			}
 		}
-		bm, err := s.benchmarkSvc.Calculate(ctx, portfolioReturns, req.Benchmark, req.StartDate, req.EndDate)
+		bm, err := s.benchmarkSvc.CalculateFromSeries(alignedPortfolio, alignedBenchmark, req.Benchmark)
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Warn("benchmark calculation failed, continuing without", zap.Error(err))

@@ -44,21 +44,37 @@ func NewBenchmarkService(baseURL string) *BenchmarkService {
 	}
 }
 
-// Calculate computes benchmark comparison metrics.
-// portfolioReturns are daily net returns; benchmark is any symbol the
-// benchmark-service supports (SPY, QQQ, VTI, BTC-USD, CD20, CD100, ... —
-// aliases like "BTC" are resolved server-side).
-func (s *BenchmarkService) Calculate(ctx context.Context, portfolioReturns []float64, benchmark string, startDate, endDate time.Time) (*BenchmarkMetrics, error) {
-	if len(portfolioReturns) < 5 {
-		return nil, fmt.Errorf("need at least 5 data points for benchmark comparison")
-	}
-
-	benchReturns, err := s.fetchBenchmarkReturns(ctx, benchmark, startDate, endDate)
+// DailyReturnsByDate fetches the benchmark's daily return series from the
+// central benchmark-service, keyed by date ("YYYY-MM-DD", the day the return
+// realizes on). Returns are decimals, the same unit as the report's daily
+// netReturn, so callers can enrich per-day data directly.
+func (s *BenchmarkService) DailyReturnsByDate(ctx context.Context, benchmark string, startDate, endDate time.Time) (map[string]float64, error) {
+	points, err := s.fetchBenchmarkSeries(ctx, benchmark, startDate, endDate)
 	if err != nil {
 		return nil, fmt.Errorf("fetch benchmark data: %w", err)
 	}
+	if len(points) < 2 {
+		return nil, fmt.Errorf("insufficient benchmark data for %s", benchmark)
+	}
 
-	// Align lengths
+	series := make(map[string]float64, len(points)-1)
+	for i := 1; i < len(points); i++ {
+		if points[i-1].close > 0 {
+			series[points[i].date] = (points[i].close - points[i-1].close) / points[i-1].close
+		}
+	}
+	return series, nil
+}
+
+// CalculateFromSeries computes benchmark comparison metrics from two
+// date-aligned daily return series (decimals). benchmark is only used to
+// label the result.
+func (s *BenchmarkService) CalculateFromSeries(portfolioReturns, benchReturns []float64, benchmark string) (*BenchmarkMetrics, error) {
+	if len(portfolioReturns) < 5 || len(benchReturns) < 5 {
+		return nil, fmt.Errorf("need at least 5 aligned data points for benchmark comparison")
+	}
+
+	// Align lengths (defensive — callers align by date already)
 	n := len(portfolioReturns)
 	if len(benchReturns) < n {
 		n = len(benchReturns)
@@ -132,10 +148,16 @@ func (s *BenchmarkService) Calculate(ctx context.Context, portfolioReturns []flo
 	}, nil
 }
 
-// fetchBenchmarkReturns fetches the daily close series from the central
-// benchmark-service and converts it to daily returns. Symbol aliases
-// (BTC-USD -> BTCUSDT...) are resolved by the benchmark-service itself.
-func (s *BenchmarkService) fetchBenchmarkReturns(ctx context.Context, benchmark string, startDate, endDate time.Time) ([]float64, error) {
+// benchPoint is one daily close from the benchmark-service series.
+type benchPoint struct {
+	date  string // YYYY-MM-DD
+	close float64
+}
+
+// fetchBenchmarkSeries fetches the daily close series from the central
+// benchmark-service. Symbol aliases (BTC-USD -> BTCUSDT...) are resolved by
+// the benchmark-service itself.
+func (s *BenchmarkService) fetchBenchmarkSeries(ctx context.Context, benchmark string, startDate, endDate time.Time) ([]benchPoint, error) {
 	if s.baseURL == "" {
 		return nil, fmt.Errorf("BENCHMARK_SERVICE_URL not configured")
 	}
@@ -190,35 +212,18 @@ func (s *BenchmarkService) fetchBenchmarkReturns(ctx context.Context, benchmark 
 		return nil, fmt.Errorf("insufficient benchmark data for %s", benchmark)
 	}
 
-	prices := make([]float64, 0, len(result.Data.Data))
+	points := make([]benchPoint, 0, len(result.Data.Data))
 	for _, p := range result.Data.Data {
 		price := p.AdjustedClose
 		if price <= 0 {
 			price = p.Close
 		}
 		if price > 0 {
-			prices = append(prices, price)
+			points = append(points, benchPoint{date: p.Date, close: price})
 		}
 	}
 
-	return pricesToReturns(prices), nil
-}
-
-// pricesToReturns converts a price series to daily returns.
-func pricesToReturns(prices []float64) []float64 {
-	if len(prices) < 2 {
-		return nil
-	}
-
-	returns := make([]float64, 0, len(prices)-1)
-	for i := 1; i < len(prices); i++ {
-		if prices[i-1] > 0 {
-			returns = append(returns, (prices[i]-prices[i-1])/prices[i-1])
-		} else {
-			returns = append(returns, 0)
-		}
-	}
-	return returns
+	return points, nil
 }
 
 // mean and stddev helper functions are defined in metrics.go
