@@ -197,10 +197,11 @@ func ValidateSyncRequest(req *SyncJobRequest) error {
 
 // ReportRequest represents validated report input.
 type ReportRequest struct {
-	UserUID   string
-	StartDate string
-	EndDate   string
-	Benchmark string
+	UserUID      string
+	StartDate    string
+	EndDate      string
+	Benchmark    string
+	RiskFreeRate float64 // annual %, e.g. 2.5
 }
 
 // ValidateReportRequest validates report request fields.
@@ -238,6 +239,11 @@ func ValidateReportRequest(req *ReportRequest) error {
 	// Benchmark is optional; when provided, only the format is checked here.
 	if req.Benchmark != "" && !benchmarkRegex.MatchString(req.Benchmark) {
 		return fmt.Errorf("invalid benchmark symbol format")
+	}
+
+	// Risk-free rate: annual percent, sane range only (0 = legacy behavior).
+	if req.RiskFreeRate < 0 || req.RiskFreeRate > 25 {
+		return fmt.Errorf("risk_free_rate must be between 0 and 25 (annual %%)")
 	}
 	return nil
 }

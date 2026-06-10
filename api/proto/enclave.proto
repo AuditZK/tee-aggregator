@@ -232,6 +232,7 @@ message ReportRequest {
   bool include_drawdown = 6;
   string report_name = 7;
   string base_currency = 8;     // USD, EUR, etc. (default: USD)
+  double risk_free_rate = 9;    // annual %, e.g. 2.5 (0 = legacy behavior, rf excluded)
 }
 
 // Response with cryptographically signed report

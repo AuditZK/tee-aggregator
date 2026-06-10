@@ -80,7 +80,7 @@ func (s *MetricsService) CalculateWithFilters(
 	}
 
 	filtered := filterSnapshots(snapshots, exchange, excludedConnectionKeys)
-	return s.calculateFromSnapshots(filtered)
+	return s.calculateFromSnapshots(filtered, 0)
 }
 
 // CalculateFromSnapshots computes metrics from an already-fetched snapshot
@@ -88,11 +88,13 @@ func (s *MetricsService) CalculateWithFilters(
 // verifiable-only set it built the report from (SEC-001) — re-fetching via
 // CalculateWithFilters would silently re-include external-rebuilder history.
 // The caller is responsible for any exchange-exclusion filtering.
-func (s *MetricsService) CalculateFromSnapshots(snapshots []*repository.Snapshot) (*PerformanceMetrics, error) {
-	return s.calculateFromSnapshots(snapshots)
+// riskFreeRatePct is the annual risk-free rate in percent (e.g. 2.5);
+// zero keeps the legacy rf-free Sharpe/Sortino.
+func (s *MetricsService) CalculateFromSnapshots(snapshots []*repository.Snapshot, riskFreeRatePct float64) (*PerformanceMetrics, error) {
+	return s.calculateFromSnapshots(snapshots, riskFreeRatePct)
 }
 
-func (s *MetricsService) calculateFromSnapshots(snapshots []*repository.Snapshot) (*PerformanceMetrics, error) {
+func (s *MetricsService) calculateFromSnapshots(snapshots []*repository.Snapshot, riskFreeRatePct float64) (*PerformanceMetrics, error) {
 	if len(snapshots) < 2 {
 		return nil, errors.New("insufficient data: need at least 2 snapshots")
 	}
@@ -139,15 +141,18 @@ func (s *MetricsService) calculateFromSnapshots(snapshots []*repository.Snapshot
 	totalReturn := dailyReturns[len(dailyReturns)-1].cumulativeReturn
 	periodStart, periodEnd, dataPoints := summarizePeriod(snapshots)
 
-	// Risk-adjusted ratios (risk-free rate = 0)
+	// Risk-adjusted ratios. Returns here are decimals, so convert the
+	// annual percent rate; rf=0 reproduces the legacy behavior.
+	rf := riskFreeRatePct / 100
+
 	sharpe := 0.0
 	if annualizedVol > 0 {
-		sharpe = annualizedReturn / annualizedVol
+		sharpe = (annualizedReturn - rf) / annualizedVol
 	}
 
 	sortino := 0.0
 	if annualizedDownside > 0 {
-		sortino = annualizedReturn / annualizedDownside
+		sortino = (annualizedReturn - rf) / annualizedDownside
 	}
 
 	calmar := 0.0

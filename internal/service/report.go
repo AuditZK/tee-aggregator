@@ -69,6 +69,7 @@ type GenerateReportRequest struct {
 	ReportName         string
 	Benchmark          string
 	BaseCurrency       string
+	RiskFreeRate       float64 // annual %, e.g. 2.5 (0 = legacy rf-free ratios)
 	IncludeRiskMetrics bool
 	IncludeDrawdown    bool
 	ExcludedExchanges  map[string]struct{} // keys: "exchange" or "exchange/label"
@@ -178,7 +179,7 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 	// 3. Calculate core metrics over the SAME verifiable, exchange-filtered
 	// snapshot set. Re-fetching via the MetricsService would silently
 	// re-include the external-rebuilder history excluded in step 1 (SEC-001).
-	metrics, err := s.metricsSvc.CalculateFromSnapshots(snapshots)
+	metrics, err := s.metricsSvc.CalculateFromSnapshots(snapshots, req.RiskFreeRate)
 	if err != nil {
 		return nil, fmt.Errorf("calculate metrics: %w", err)
 	}
@@ -298,6 +299,11 @@ func (s *ReportService) checkReportCache(ctx context.Context, req *GenerateRepor
 	if len(req.ExcludedExchanges) > 0 {
 		return nil
 	}
+	// Cache key does not include the risk-free rate either; only the legacy
+	// rf=0 reports are cacheable.
+	if req.RiskFreeRate != 0 {
+		return nil
+	}
 
 	cached, err := s.signedReportRepo.GetCached(ctx, req.UserUID, req.StartDate, req.EndDate, req.Benchmark)
 	if err != nil {
@@ -325,6 +331,10 @@ func (s *ReportService) cacheReport(ctx context.Context, req *GenerateReportRequ
 	}
 	// Current cache key does not include exclusions; avoid storing filtered variants.
 	if len(req.ExcludedExchanges) > 0 {
+		return
+	}
+	// Same for custom risk-free rates — the key has no rf dimension.
+	if req.RiskFreeRate != 0 {
 		return
 	}
 

@@ -728,10 +728,11 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 	userUID := resolveUserUID(ctx, req.UserUid)
 
 	if err := validation.ValidateReportRequest(&validation.ReportRequest{
-		UserUID:   userUID,
-		StartDate: req.StartDate,
-		EndDate:   req.EndDate,
-		Benchmark: req.Benchmark,
+		UserUID:      userUID,
+		StartDate:    req.StartDate,
+		EndDate:      req.EndDate,
+		Benchmark:    req.Benchmark,
+		RiskFreeRate: req.RiskFreeRate,
 	}); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -784,6 +785,7 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 		ReportName:         req.ReportName,
 		Benchmark:          req.Benchmark,
 		BaseCurrency:       req.BaseCurrency,
+		RiskFreeRate:       req.RiskFreeRate,
 		IncludeRiskMetrics: req.IncludeRiskMetrics,
 		IncludeDrawdown:    req.IncludeDrawdown,
 		ExcludedExchanges:  excludedConnectionKeys,
