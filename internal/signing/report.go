@@ -751,6 +751,7 @@ var (
 	ErrUnknownAlgorithm    = fmt.Errorf("unknown signature algorithm")
 	ErrPublicKeyMismatch   = fmt.Errorf("signing public key does not match expected key")
 	ErrAttestationNotBound = fmt.Errorf("sev-snp report_data is not bound to the enclave keys")
+	ErrVcekUnverified      = fmt.Errorf("sev-snp VCEK certificate chain not verified")
 )
 
 // Verify checks a signature against a report hash, dispatching on algorithm.
@@ -825,7 +826,14 @@ func verifyEd25519Legacy(reportHash, signatureB64, publicKey string) (bool, erro
 //  3. ECDSA signature over report.ReportHash is valid
 //  4. When expectSevSnp is true, the embedded enclaveAttestation must be
 //     platform == "sev-snp" AND attested == true AND
-//     reportDataBoundToRequest == true (SEC-104 binding check).
+//     reportDataBoundToRequest == true (SEC-104 binding check) AND
+//     vcekVerified == true (SEC-04 — the AMD VCEK chain was validated at
+//     signing time).
+//
+// It does NOT check the measurement allowlist or perform out-of-band VCEK
+// chain validation. pkg/reportverify.Verifier is the only fully-supported
+// verification path: it wraps this primitive and adds the measurement
+// allowlist, report_data recomputation, and an optional out-of-band VCEKChecker.
 //
 // Returns (true, nil) only if every step passes. Any mismatch returns a
 // specific sentinel error so callers can log it rather than treating it as a
@@ -864,6 +872,9 @@ func VerifyReportStrict(report *SignedReport, expectedPubKey string, expectSevSn
 		}
 		if !att.ReportDataBoundToRequest {
 			return false, ErrAttestationNotBound
+		}
+		if !att.VcekVerified {
+			return false, ErrVcekUnverified
 		}
 	}
 

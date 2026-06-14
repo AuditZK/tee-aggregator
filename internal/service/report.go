@@ -149,17 +149,11 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 	// label the verifiabilityClass of each daily return (1.3+ payload).
 	externalRebuilderDays, err := s.snapshotRepo.GetExternalRebuilderDays(ctx, req.UserUID, req.StartDate, req.EndDate)
 	if err != nil {
-		// Non-fatal: degrade gracefully by treating the set as empty (no
-		// per-day rebuilder taint). The signed report is still produced;
-		// the worst case is a strict verifier accepting a day they would
-		// otherwise filter — which the same verifier can detect by cross-
-		// referencing the user's exchange list. Logged so an operator can
-		// chase the underlying query failure.
-		s.logger.Warn("fetch external-rebuilder day set failed; verifiabilityClass labels may underreport rebuilder taint",
-			zap.String("user_uid", req.UserUID),
-			zap.Error(err),
-		)
-		externalRebuilderDays = map[time.Time]struct{}{}
+		// SEC-09: fail closed. Proceeding with an empty set would label
+		// rebuilder-tainted days as live/in-enclave — over-declaring
+		// verifiability on a signed report. Refuse to sign rather than emit a
+		// report whose provenance labels under-report the rebuilder taint.
+		return nil, fmt.Errorf("resolve external-rebuilder day set: %w", err)
 	}
 
 	snapshots = filterSnapshotsByExcludedExchanges(snapshots, req.ExcludedExchanges)
@@ -774,10 +768,11 @@ func toSigningDailyReturns(daily []dailyReturn, snapshots []*repository.Snapshot
 		var class string
 		switch {
 		case parseErr != nil:
-			// Defensive: if the date format ever drifts, fall back to "live"
-			// (the most permissive label). The signature still binds the
-			// returned class, so any tamper detection downstream is preserved.
-			class = signing.VerifiabilityClassLive
+			// SEC-09: an unparseable date must not be optimistically labelled.
+			// Fall back to the MOST restrictive class so a strict verifier
+			// filters the day rather than trusting it. The signature still binds
+			// the returned class.
+			class = signing.VerifiabilityClassRebuilderService
 		default:
 			dayKey = dayKey.UTC()
 			if _, taint := externalRebuilderDays[dayKey]; taint {

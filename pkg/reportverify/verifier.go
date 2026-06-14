@@ -108,9 +108,13 @@ func (v *Verifier) Verify(report *signing.SignedReport) error {
 		return fmt.Errorf("%w: ExpectedSigningPublicKey", ErrMissingExpectedInput)
 	}
 
-	// Steps 1-3: pin the signing key, recompute hash, verify ECDSA signature.
-	// VerifyReportStrict uses constant-time comparison for the pubkey check.
-	ok, err := signing.VerifyReportStrict(report, v.ExpectedSigningPublicKey, v.RequireSevSnp)
+	// Steps 1-3 only: pin the signing key, recompute the hash, verify the
+	// ECDSA signature (constant-time pubkey comparison). We deliberately pass
+	// expectSevSnp=false and own the full SEV-SNP posture below — since SEC-04,
+	// VerifyReportStrict hard-requires att.VcekVerified under expectSevSnp,
+	// which would short-circuit the optional out-of-band VCEK checker handled
+	// in step 6.
+	ok, err := signing.VerifyReportStrict(report, v.ExpectedSigningPublicKey, false)
 	if err != nil {
 		switch {
 		case errors.Is(err, signing.ErrPublicKeyMismatch):
