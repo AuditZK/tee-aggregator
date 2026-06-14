@@ -53,6 +53,12 @@ type ExchangeConnection struct {
 	// ListUnfinalizedExternalRebuilds + MarkRebuildFinalized; other scan
 	// paths leave it nil.
 	RebuildFinalizedAt *time.Time `json:"rebuild_finalized_at,omitempty"`
+	// RebuildRequestedAt records when the user explicitly opted into external
+	// history reconstruction (rebuild_history=true at create). NULL = no opt-in
+	// → the midnight recalibration pass, which decrypts and POSTs credentials to
+	// the external rebuilder, MUST skip this connection (SEC-08). Set by
+	// MarkRebuildRequested; other scan paths leave it nil.
+	RebuildRequestedAt *time.Time `json:"rebuild_requested_at,omitempty"`
 }
 
 // ConnectionRepo handles exchange connection persistence.
@@ -68,6 +74,7 @@ type ConnectionRepo struct {
 	hasKYCLevelCol            bool
 	hasIsPaperCol             bool
 	hasRebuildFinalizedAtCol  bool
+	hasRebuildRequestedAtCol  bool
 	isTSSchema                bool // true = TS Prisma camelCase columns
 }
 
@@ -843,6 +850,7 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 	kycLevelCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("kyc_level"))
 	isPaperCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("is_paper"))
 	rebuildFinalizedCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("rebuild_finalized_at"))
+	rebuildRequestedCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("rebuild_requested_at"))
 
 	r.hasCredentialsHashCol = credHashCol
 	r.hasSyncIntervalMinsCol = syncIntervalCol
@@ -850,6 +858,7 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 	r.hasKYCLevelCol = kycLevelCol
 	r.hasIsPaperCol = isPaperCol
 	r.hasRebuildFinalizedAtCol = rebuildFinalizedCol
+	r.hasRebuildRequestedAtCol = rebuildRequestedCol
 	r.capabilitiesLoaded = true
 
 	return r.hasCredentialsHashCol, r.hasSyncIntervalMinsCol, r.hasExcludeFromReportCol, r.hasKYCLevelCol, r.hasIsPaperCol
@@ -867,6 +876,18 @@ func (r *ConnectionRepo) HasRebuildFinalizedAtCol(ctx context.Context) bool {
 	r.capMu.Lock()
 	defer r.capMu.Unlock()
 	return r.hasRebuildFinalizedAtCol
+}
+
+// HasRebuildRequestedAtCol reports whether the schema includes the
+// rebuild_requested_at column (migration 018). ListUnfinalizedExternalRebuilds
+// requires it to scope recalibration credential egress to connections that
+// recorded an explicit opt-in (SEC-08); when the column is absent the
+// recalibration pass is a no-op (fail-closed — no egress without consent).
+func (r *ConnectionRepo) HasRebuildRequestedAtCol(ctx context.Context) bool {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.hasRebuildRequestedAtCol
 }
 
 // colName returns the raw column name (without quotes) for columnExists checks.
@@ -911,6 +932,28 @@ var tsColumnMap = map[string]string{
 	"created_at":            "createdAt",
 	"updated_at":            "updatedAt",
 	"rebuild_finalized_at":  "rebuildFinalizedAt",
+	"rebuild_requested_at":  "rebuildRequestedAt",
+}
+
+// unfinalizedExternalRebuildsQuery builds the SELECT used by
+// ListUnfinalizedExternalRebuilds. Extracted as a pure function so the SEC-08
+// consent predicate (rebuild_requested_at IS NOT NULL) and the retry-window
+// bound (created_at > $3) can be regression-tested without a live DB — dropping
+// either predicate would re-open unscoped credential egress. Params are the
+// already-quoted, schema-aware column names; $1=beforeCutoff, $2=exchanges,
+// $3=createdAfter.
+func unfinalizedExternalRebuildsQuery(uid, createdAt, rebFin, rebReq, isAct string) string {
+	return `
+		SELECT id, ` + uid + `, exchange, label, ` + createdAt + `
+		FROM exchange_connections
+		WHERE ` + rebReq + ` IS NOT NULL
+		  AND ` + rebFin + ` IS NULL
+		  AND ` + createdAt + ` < $1
+		  AND ` + createdAt + ` > $3
+		  AND ` + isAct + ` = true
+		  AND lower(exchange) = ANY($2)
+		ORDER BY ` + createdAt + ` ASC
+	`
 }
 
 // ListUnfinalizedExternalRebuilds returns active connections whose history
@@ -921,19 +964,27 @@ var tsColumnMap = map[string]string{
 // so the MTM walk's offset aligns to the exact midnight equity.
 //
 // Filters:
+//   - rebuild_requested_at IS NOT NULL — the user explicitly opted into
+//     external reconstruction (SEC-08). This pass decrypts and POSTs
+//     credentials to the external rebuilder, so it MUST be scoped to recorded
+//     consent; connections without an opt-in (including every row created
+//     before migration 018) are excluded.
 //   - rebuild_finalized_at IS NULL (not yet processed)
 //   - createdAt < beforeCutoff (the connection had time to produce at least
 //     one midnight snapshot — typically beforeCutoff = today_midnight)
+//   - createdAt > createdAfter — retry window (SEC-08): a connection that never
+//     finalizes ages out after maxRebuildRetryDays instead of being re-egressed
+//     to the rebuilder on every nightly tick forever.
 //   - isActive = true
 //   - exchange in the externalRebuilderExchanges allowlist (HL / Lighter /
 //     MEXC — connectors that route through the rebuilder service; IBKR /
 //     MT5 use in-enclave history paths that don't need recalibration)
 //
-// Returns ErrNotFound's empty-slice equivalent (nil, nil) if the
-// rebuild_finalized_at column doesn't exist (migration not applied).
-// Caller can probe HasRebuildFinalizedAtCol up-front to skip the call.
-func (r *ConnectionRepo) ListUnfinalizedExternalRebuilds(ctx context.Context, beforeCutoff time.Time, externalRebuilderExchanges []string) ([]*ExchangeConnection, error) {
-	if !r.HasRebuildFinalizedAtCol(ctx) {
+// Returns (nil, nil) if either the rebuild_finalized_at (migration 017) or
+// rebuild_requested_at (migration 018) column is missing — recalibration stays
+// disabled until both exist, so credential egress is never unscoped.
+func (r *ConnectionRepo) ListUnfinalizedExternalRebuilds(ctx context.Context, beforeCutoff, createdAfter time.Time, externalRebuilderExchanges []string) ([]*ExchangeConnection, error) {
+	if !r.HasRebuildFinalizedAtCol(ctx) || !r.HasRebuildRequestedAtCol(ctx) {
 		return nil, nil
 	}
 	if len(externalRebuilderExchanges) == 0 {
@@ -947,21 +998,12 @@ func (r *ConnectionRepo) ListUnfinalizedExternalRebuilds(ctx context.Context, be
 		exchanges = append(exchanges, strings.ToLower(strings.TrimSpace(e)))
 	}
 
-	uid := r.qcol("user_uid")
-	createdAt := r.qcol("created_at")
-	rebFin := r.qcol("rebuild_finalized_at")
-	isAct := r.qcol("is_active")
-	query := `
-		SELECT id, ` + uid + `, exchange, label, ` + createdAt + `
-		FROM exchange_connections
-		WHERE ` + rebFin + ` IS NULL
-		  AND ` + createdAt + ` < $1
-		  AND ` + isAct + ` = true
-		  AND lower(exchange) = ANY($2)
-		ORDER BY ` + createdAt + ` ASC
-	`
+	query := unfinalizedExternalRebuildsQuery(
+		r.qcol("user_uid"), r.qcol("created_at"),
+		r.qcol("rebuild_finalized_at"), r.qcol("rebuild_requested_at"), r.qcol("is_active"),
+	)
 
-	rows, err := r.pool.Query(ctx, query, beforeCutoff, exchanges)
+	rows, err := r.pool.Query(ctx, query, beforeCutoff, exchanges, createdAfter)
 	if err != nil {
 		return nil, fmt.Errorf("list unfinalized external rebuilds: %w", err)
 	}
@@ -994,6 +1036,28 @@ func (r *ConnectionRepo) MarkRebuildFinalized(ctx context.Context, connID string
 	tag, err := r.pool.Exec(ctx, query, at.UTC(), connID)
 	if err != nil {
 		return fmt.Errorf("mark rebuild finalized: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkRebuildRequested stamps rebuild_requested_at = at, recording the user's
+// explicit opt-in to external history reconstruction (SEC-08). Called from the
+// connection-create flow when rebuild_history=true, before the post-create
+// hook fires, so the nightly recalibration pass can scope credential egress to
+// consenting connections. No-op if the column doesn't exist (migration not
+// applied) — recalibration is then disabled, so consent is never bypassed.
+func (r *ConnectionRepo) MarkRebuildRequested(ctx context.Context, connID string, at time.Time) error {
+	if !r.HasRebuildRequestedAtCol(ctx) {
+		return nil
+	}
+	col := r.qcol("rebuild_requested_at")
+	query := `UPDATE exchange_connections SET ` + col + ` = $1 WHERE id = $2`
+	tag, err := r.pool.Exec(ctx, query, at.UTC(), connID)
+	if err != nil {
+		return fmt.Errorf("mark rebuild requested: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

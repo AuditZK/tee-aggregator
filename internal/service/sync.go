@@ -1186,6 +1186,12 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 // MTM walk, no calibration drift, nothing to recalibrate.
 var externalRebuilderExchanges = []string{"hyperliquid"}
 
+// maxRebuildRetryDays bounds how long the midnight recalibration keeps retrying
+// a consenting connection that never finalizes (SEC-08): past this many days
+// from creation it ages out of ListUnfinalizedExternalRebuilds instead of
+// re-egressing credentials to the rebuilder on every nightly tick forever.
+const maxRebuildRetryDays = 7
+
 // RecalibrateRebuiltHistories re-runs the external rebuilder for connections
 // whose initial rebuild was anchored on the imprecise connect-time live
 // equity (= live perp+spot fetched at e.g. 14:32 UTC, when the user clicked
@@ -1219,8 +1225,12 @@ func (s *SyncService) RecalibrateRebuiltHistories(ctx context.Context) {
 	// snapshot doesn't exist yet, so there's nothing to anchor on. They'll be
 	// picked up on the next nightly tick.
 	cutoff := time.Now().UTC().Truncate(24 * time.Hour)
+	// SEC-08 retry window: only recalibrate connections created within the last
+	// maxRebuildRetryDays so a perpetually-failing connection ages out rather
+	// than re-egressing credentials to the rebuilder every night forever.
+	createdAfter := cutoff.AddDate(0, 0, -maxRebuildRetryDays)
 
-	conns, err := s.connSvc.ListUnfinalizedExternalRebuilds(ctx, cutoff, externalRebuilderExchanges)
+	conns, err := s.connSvc.ListUnfinalizedExternalRebuilds(ctx, cutoff, createdAfter, externalRebuilderExchanges)
 	if err != nil {
 		s.logger.Error("midnight recalibration: list unfinalized failed", zap.Error(err))
 		return
@@ -1308,7 +1318,13 @@ func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.Excha
 	// persistHistoricalSnapshots is upsert — re-writing the same date keys
 	// just updates equity/breakdown in place. firstSync=false because we
 	// know history already exists (we wouldn't be in this list otherwise).
-	s.persistHistoricalSnapshots(ctx, conn, res.Snapshots, false, sourceExternalRebuilder)
+	// SEC-08: only finalize after the snapshots actually persist. A persist
+	// failure leaves rebuild_finalized_at NULL so the connection retries on the
+	// next tick (bounded by maxRebuildRetryDays) instead of being silently
+	// marked done with no recalibrated history written.
+	if err := s.persistHistoricalSnapshots(ctx, conn, res.Snapshots, false, sourceExternalRebuilder); err != nil {
+		return fmt.Errorf("persist recalibrated snapshots: %w", err)
+	}
 
 	// 5. Stamp finalized so we don't reprocess this connection.
 	if err := s.connSvc.MarkRebuildFinalized(ctx, conn.ID, time.Now().UTC()); err != nil {
@@ -1370,7 +1386,7 @@ func (s *SyncService) persistHistoricalSnapshots(
 	historicalSnapshots []*connector.HistoricalSnapshot,
 	firstSync bool,
 	source string,
-) {
+) error {
 	// Today is owned by the live branch — never reconstruct it.
 	now := time.Now().UTC()
 	todayKey := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
@@ -1379,7 +1395,7 @@ func (s *SyncService) persistHistoricalSnapshots(
 
 	snapshots, skippedToday := buildHistoricalSnapshots(connMeta, historicalSnapshots, todayKey, source == sourceExternalRebuilder)
 	if len(snapshots) == 0 {
-		return
+		return nil
 	}
 
 	// ENG-002: write the whole reconstructed series in ONE transaction. The
@@ -1402,7 +1418,7 @@ func (s *SyncService) persistHistoricalSnapshots(
 			zap.String("hint", "transient retries exhausted; re-create the connection to re-run the backfill"),
 			zap.Error(err),
 		)
-		return
+		return err
 	}
 
 	s.logger.Info("history reconstruction completed",
@@ -1413,6 +1429,7 @@ func (s *SyncService) persistHistoricalSnapshots(
 		zap.Int("skipped_today", skippedToday),
 		zap.Int("total_days", len(historicalSnapshots)),
 	)
+	return nil
 }
 
 // retryWithBackoff calls fn up to maxAttempts times, sleeping attempt*base

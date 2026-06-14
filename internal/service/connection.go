@@ -221,6 +221,20 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 	// default-false stance ensures terminals/CLIs that don't pass the field
 	// don't trigger that side effect silently.
 	if s.postCreateHook != nil && req.RebuildHistory {
+		// SEC-08: persist the opt-in BEFORE firing the hook so the nightly
+		// recalibration pass can scope decrypted-credential egress to
+		// connections that explicitly consented. Without this durable record
+		// the pass would re-egress credentials for every active external-
+		// rebuilder connection regardless of consent. Non-fatal: a missing
+		// record only means recalibration skips this connection (the safe
+		// direction).
+		if err := s.repo.MarkRebuildRequested(ctx, conn.ID, time.Now().UTC()); err != nil && s.logger != nil {
+			s.logger.Warn("failed to persist rebuild opt-in; nightly recalibration will skip this connection",
+				zap.String("user_uid", conn.UserUID),
+				zap.String("exchange", conn.Exchange),
+				zap.Error(err),
+			)
+		}
 		go s.postCreateHook(context.Background(), conn.UserUID, conn.Exchange, conn.Label)
 	}
 
@@ -325,8 +339,8 @@ func (s *ConnectionService) GetExcludedConnectionKeys(ctx context.Context, userU
 // the daily SyncScheduler's midnight recalibration pass to find connections
 // whose external-rebuilder history hasn't been re-anchored on a midnight
 // snapshot equity yet. See the repo method docstring for filtering rules.
-func (s *ConnectionService) ListUnfinalizedExternalRebuilds(ctx context.Context, beforeCutoff time.Time, exchanges []string) ([]*repository.ExchangeConnection, error) {
-	return s.repo.ListUnfinalizedExternalRebuilds(ctx, beforeCutoff, exchanges)
+func (s *ConnectionService) ListUnfinalizedExternalRebuilds(ctx context.Context, beforeCutoff, createdAfter time.Time, exchanges []string) ([]*repository.ExchangeConnection, error) {
+	return s.repo.ListUnfinalizedExternalRebuilds(ctx, beforeCutoff, createdAfter, exchanges)
 }
 
 // MarkRebuildFinalized passes through to ConnectionRepo. Stamps the connection
