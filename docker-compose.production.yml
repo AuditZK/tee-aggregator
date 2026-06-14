@@ -49,8 +49,12 @@ services:
     # Required when REBUILDER_SERVICE_URL is set (see environment: below):
     #   REBUILDER_INTERNAL_TOKEN (≥24 chars; same value as the rebuilder's
     #     env, otherwise the rebuilder rejects with 401)
+    # Required when BENCHMARK_SERVICE_URL is set in production (CFG-004 — the
+    # series feeds the signed report, so an unauthenticated source is refused
+    # at boot): BENCHMARK_SERVICE_URL must be https:// AND
+    #   BENCHMARK_INTERNAL_TOKEN (≥24 chars; same value as the benchmark service)
     # Optional:
-    #   LOG_LEVEL (default: info), BENCHMARK_SERVICE_URL,
+    #   LOG_LEVEL (default: info), BENCHMARK_SERVICE_URL (omit to disable),
     #   ERRTRACK_CAPACITY, ERRTRACK_NEW_GROUP_RATE
     env_file:
       - .env.production

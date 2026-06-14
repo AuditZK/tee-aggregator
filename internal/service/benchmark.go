@@ -4,11 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+)
+
+const (
+	// maxBenchmarkResponseBytes caps the benchmark-service response read
+	// (BENCH-02). The series feeds the SIGNED report, so an unbounded decode
+	// is both a memory-DoS vector and a poisoning surface. 4 MiB sits far
+	// above any legitimate daily series and bounds the enclave heap.
+	maxBenchmarkResponseBytes = 4 << 20
+
+	// maxBenchmarkPoints bounds the decoded series length independently of the
+	// byte cap. 20 000 daily points is ~54 years — well beyond any real window.
+	maxBenchmarkPoints = 20_000
 )
 
 // BenchmarkMetrics holds computed benchmark comparison metrics.
@@ -29,18 +42,21 @@ type BenchmarkMetrics struct {
 // (Yahoo, CoinGecko, Binance...) directly, so the whole platform consumes a
 // single price series per benchmark.
 type BenchmarkService struct {
-	httpClient *http.Client
-	baseURL    string
+	httpClient    *http.Client
+	baseURL       string
+	internalToken string
 }
 
-// NewBenchmarkService creates a new benchmark service.
-// baseURL is the benchmark-service root URL (BENCHMARK_SERVICE_URL). When
-// empty, Calculate fails with a clear error and the report service falls back
-// to generating reports without benchmark metrics.
-func NewBenchmarkService(baseURL string) *BenchmarkService {
+// NewBenchmarkService creates a new benchmark service. baseURL is the
+// benchmark-service root URL (BENCHMARK_SERVICE_URL); when empty, Calculate
+// fails with a clear error and the report service falls back to reports without
+// benchmark metrics. internalToken (BENCHMARK_INTERNAL_TOKEN), when non-empty,
+// is sent as X-Internal-Token to authenticate the fetch (BENCH-01).
+func NewBenchmarkService(baseURL, internalToken string) *BenchmarkService {
 	return &BenchmarkService{
-		httpClient: &http.Client{Timeout: 15 * time.Second},
-		baseURL:    strings.TrimRight(baseURL, "/"),
+		httpClient:    &http.Client{Timeout: 15 * time.Second},
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		internalToken: internalToken,
 	}
 }
 
@@ -176,6 +192,12 @@ func (s *BenchmarkService) fetchBenchmarkSeries(ctx context.Context, benchmark s
 	}
 	req.Header.Set("User-Agent", "TrackRecord-Enclave/1.0")
 	req.Header.Set("Accept", "application/json")
+	// BENCH-01: authenticate the fetch so this signed-report input can't be
+	// served by an unauthenticated / MITM source. Only sent when configured —
+	// dev/test benchmark stacks run without a token.
+	if s.internalToken != "" {
+		req.Header.Set("X-Internal-Token", s.internalToken)
+	}
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -200,12 +222,24 @@ func (s *BenchmarkService) fetchBenchmarkSeries(ctx context.Context, benchmark s
 		} `json:"data"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBenchmarkResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("benchmark-service read: %w", err)
+	}
+	if int64(len(body)) > maxBenchmarkResponseBytes {
+		return nil, fmt.Errorf("benchmark-service response exceeds %d bytes for %s", maxBenchmarkResponseBytes, benchmark)
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("benchmark-service decode: %w", err)
 	}
 
 	if !result.Success {
 		return nil, fmt.Errorf("benchmark-service error for %s: %s", benchmark, result.Error)
+	}
+
+	if len(result.Data.Data) > maxBenchmarkPoints {
+		return nil, fmt.Errorf("benchmark-service returned too many points (%d > %d) for %s",
+			len(result.Data.Data), maxBenchmarkPoints, benchmark)
 	}
 
 	if len(result.Data.Data) < 2 {

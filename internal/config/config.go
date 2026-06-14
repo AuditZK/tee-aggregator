@@ -34,6 +34,12 @@ type Config struct {
 	// Benchmark service
 	BenchmarkServiceURL string
 
+	// BenchmarkInternalToken is the shared secret sent as X-Internal-Token to
+	// authenticate the enclave→benchmark-service GET. The benchmark series feeds
+	// the SIGNED report, so production refuses to boot when BenchmarkServiceURL
+	// is set without it (CFG-004). Empty is allowed in dev.
+	BenchmarkInternalToken string
+
 	// Data retention
 	DataRetentionDays int
 
@@ -203,7 +209,8 @@ func Load() *Config {
 
 		CORSOrigin: getEnv("CORS_ORIGIN", ""),
 
-		BenchmarkServiceURL: getEnv("BENCHMARK_SERVICE_URL", ""),
+		BenchmarkServiceURL:    getEnv("BENCHMARK_SERVICE_URL", ""),
+		BenchmarkInternalToken: strings.TrimSpace(getEnv("BENCHMARK_INTERNAL_TOKEN", "")),
 
 		DataRetentionDays: getEnvInt("DATA_RETENTION_DAYS", 30),
 

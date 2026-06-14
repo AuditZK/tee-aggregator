@@ -272,8 +272,22 @@ func main() {
 	var syncSvc *service.SyncService
 	var metricsSvc *service.MetricsService
 	var reportSvc *service.ReportService
-	benchmarkSvc := service.NewBenchmarkService(cfg.BenchmarkServiceURL)
+	benchmarkSvc := service.NewBenchmarkService(cfg.BenchmarkServiceURL, cfg.BenchmarkInternalToken)
 	if cfg.BenchmarkServiceURL != "" {
+		// CFG-004: the benchmark series enters the SIGNED report (per-day
+		// benchmarkReturn/outperformance + aggregate alpha/beta/IR/TE). An
+		// unauthenticated http:// source lets whoever controls or MITMs that
+		// link poison the signed metrics, so production refuses to boot without
+		// https:// + an internal token — the same fail-closed stance as the
+		// rebuilder (CFG-002/CFG-003). Dev allows http:// without a token.
+		if err := checkBenchmarkConfig(cfg.BenchmarkServiceURL, cfg.BenchmarkInternalToken, cfg.IsDevelopment()); err != nil {
+			logger.Fatal("benchmark configuration rejected (CFG-004)", zap.Error(err))
+		}
+		if cfg.IsDevelopment() && !isHTTPSURL(cfg.BenchmarkServiceURL) {
+			logger.Warn("benchmark URL is not https; signed-report inputs would transit unauthenticated in cleartext",
+				zap.String("hint", "acceptable for local dev only — production BENCHMARK_SERVICE_URL must be https://"),
+			)
+		}
 		logger.Info("benchmark-service wired", zap.String("url", cfg.BenchmarkServiceURL))
 	} else {
 		logger.Warn("BENCHMARK_SERVICE_URL not set - signed reports will omit benchmark metrics")
@@ -811,6 +825,30 @@ func refreshSignerAttestation(
 			zap.String("measurement_prefix", measurementPrefix),
 		)
 	}
+}
+
+// isHTTPSURL reports whether url uses the https scheme (case-insensitive).
+func isHTTPSURL(url string) bool {
+	return strings.HasPrefix(strings.ToLower(url), "https://")
+}
+
+// checkBenchmarkConfig returns a non-nil error when the benchmark integration
+// is misconfigured for production (CFG-004): the benchmark series enters the
+// SIGNED report, so a URL set in production must be https:// and carry an
+// internal token. Returns nil when the URL is unset (integration disabled) or
+// in development (http + tokenless test stacks are allowed; main logs a Warn
+// for http separately).
+func checkBenchmarkConfig(url, token string, isDev bool) error {
+	if url == "" || isDev {
+		return nil
+	}
+	if !isHTTPSURL(url) {
+		return fmt.Errorf("BENCHMARK_SERVICE_URL must be https:// in production (it feeds the signed report); set https:// or unset it to omit benchmark metrics")
+	}
+	if token == "" {
+		return fmt.Errorf("BENCHMARK_INTERNAL_TOKEN is required when BENCHMARK_SERVICE_URL is set in production (≥24 chars, must match the benchmark service)")
+	}
+	return nil
 }
 
 // enforceProductionAttestation refuses to continue in production when the
