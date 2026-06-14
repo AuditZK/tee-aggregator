@@ -26,3 +26,8 @@ jobs:
 
       - name: Test
         run: go test ./internal/... ./pkg/... -count=1
+
+      - name: Vulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

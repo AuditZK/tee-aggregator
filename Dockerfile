@@ -1,15 +1,12 @@
 # syntax=docker/dockerfile:1.7
 
 # Go build stage.
-# VULN-001: pinned to 1.26.3-alpine so stdlib CVEs GO-2026-4947/4946/4870/
-# 4866/4865/4603/4602/4601/4600/4599 (1.26.1 / 1.26.2) plus GO-2026-4982/
-# 4980/4971/4918 (html/template XSS, net NUL-byte panic, net/http HTTP/2
-# SETTINGS infinite loop — fixed in 1.26.3) are picked up deterministically.
-# For fully reproducible builds the next step is a digest pin
-# (`golang:1.26.3-alpine@sha256:<digest>`); do that once CI resolves the
-# upstream digest via `docker pull + inspect` and mirrors the result here.
-# Same applies to the alpine runtime tag below.
-FROM golang:1.26.3-alpine AS builder
+# VULN-001: pinned to 1.26.4-alpine (matches go.mod) so stdlib CVEs through
+# 1.26.4 — incl. GO-2026-5037 (crypto/x509) and GO-2026-5039 (net/textproto)
+# reachable at this commit — are picked up deterministically. Pinned by digest
+# (SUP-02); bump it when bumping the tag via
+# `docker buildx imagetools inspect golang:1.26.4-alpine`.
+FROM golang:1.26.4-alpine@sha256:7a3e50096189ad57c9f9f865e7e4aa8585ed1585248513dc5cda498e2f41812c AS builder
 
 WORKDIR /app
 
@@ -38,10 +35,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     ./cmd/enclave
 
 # Runtime stage.
-# Same note as the builder: pin by digest in CI. 3.20 receives security updates
-# for the life of the branch; a future audit should also pin the exact patch
-# version (e.g. 3.20.3) for strict reproducibility.
-FROM alpine:3.20
+# Pinned by digest (SUP-02). 3.20 receives security updates for the life of the
+# branch; bump the digest for the latest patch (or pin the exact patch tag, e.g.
+# 3.20.3, for strict reproducibility).
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 WORKDIR /app
 

@@ -1,15 +1,16 @@
 # Production Dockerfile with SEV-SNP attestation support.
 #
-# Reproducibility notes (SEC audit pass 5):
-#   - Base images are pinned to minor tags; for fully reproducible builds,
-#     switch each FROM to `image@sha256:<digest>` once CI resolves the digest.
+# Reproducibility notes (SEC audit pass 5; SUP-02):
+#   - Base images are pinned by digest (`image@sha256:<digest>`) for
+#     reproducible builds. Bump the digest whenever you bump the tag —
+#     resolve it with `docker buildx imagetools inspect <tag>`.
 #   - snpguest is pinned to an explicit version + --locked so transitive crates
 #     cannot drift between builds.
 #   - Rust stable is preferred over nightly — nightly's tag mutates daily.
 
 # snpguest build stage (AMD SEV-SNP attestation tool).
 # snpguest 0.10.0 requires rustc >= 1.86, so the base image must stay at or above 1.86.
-FROM rust:1.86-alpine AS snpguest-builder
+FROM rust:1.86-alpine@sha256:661d708cc863ce32007cf46807a72062a80d2944a6fae9e0d83742d2e04d5375 AS snpguest-builder
 
 # perl + make are required because a transitive dep of snpguest 0.10.0
 # (openssl-sys with the `vendored` feature) builds OpenSSL from source
@@ -22,11 +23,12 @@ RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static git perl make
 RUN cargo install snpguest --version 0.10.0 --root /usr/local --locked
 
 # Go build stage.
-# VULN-001: pinned to 1.26.3-alpine so stdlib CVEs fixed in 1.26.1 / 1.26.2
-# (GO-2026-4947/4946/4870/4866/4865/4603/4602/4601/4600/4599) and 1.26.3
-# (GO-2026-4982/4980/4971/4918) are picked up deterministically. Next
-# step: digest pin (`@sha256:<digest>`) once CI resolves it.
-FROM golang:1.26.3-alpine AS builder
+# VULN-001: pinned to 1.26.4-alpine so stdlib CVEs fixed in 1.26.1 / 1.26.2
+# (GO-2026-4947/4946/4870/4866/4865/4603/4602/4601/4600/4599), 1.26.3
+# (GO-2026-4982/4980/4971/4918) and 1.26.4 (GO-2026-5037 crypto/x509,
+# GO-2026-5039 net/textproto, GO-2026-5038 mime) are picked up
+# deterministically. Pinned by digest (SUP-02) — bump it when bumping the tag.
+FROM golang:1.26.4-alpine@sha256:7a3e50096189ad57c9f9f865e7e4aa8585ed1585248513dc5cda498e2f41812c AS builder
 
 WORKDIR /app
 
@@ -48,7 +50,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     ./cmd/enclave
 
 # Runtime stage.
-FROM alpine:3.20
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 WORKDIR /app
 
