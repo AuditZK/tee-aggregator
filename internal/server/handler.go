@@ -785,6 +785,15 @@ func (h *Handler) GetMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// SEC-06: enforce the same max-range cap the gRPC metrics endpoints use.
+	if err := validation.ValidateTimestampRange(start, end); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
 	excludedConnectionKeys := map[string]struct{}{}
 	if h.connSvc != nil {
 		excluded, err := h.connSvc.GetExcludedConnectionKeys(r.Context(), userUID)

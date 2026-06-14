@@ -205,3 +205,50 @@ func TestCleanup_DropsExpiredEntries(t *testing.T) {
 		t.Fatalf("insertionOrder must also be compacted, got %d", len(rl.insertionOrder))
 	}
 }
+
+// SEC-02: only the POST (nonce) path of /api/v1/attestation forks snpguest and
+// must be metered; cheap GET probes pass through unmetered.
+func TestAttestationPOSTRateLimit(t *testing.T) {
+	called := 0
+	next := func(w http.ResponseWriter, r *http.Request) {
+		called++
+		w.WriteHeader(http.StatusOK)
+	}
+	rl := NewIPRateLimiter(1, time.Minute)
+	h := attestationPOSTRateLimit(rl, next)
+
+	const ip = "203.0.113.7:1234"
+	do := func(method, addr string) int {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(method, "/api/v1/attestation", nil)
+		r.RemoteAddr = addr
+		h(rec, r)
+		return rec.Code
+	}
+
+	// GET is never metered.
+	for i := 0; i < 3; i++ {
+		if got := do(http.MethodGet, ip); got != http.StatusOK {
+			t.Fatalf("GET #%d: got %d, want 200", i+1, got)
+		}
+	}
+
+	// First POST passes; the second from the same IP is throttled.
+	if got := do(http.MethodPost, ip); got != http.StatusOK {
+		t.Fatalf("POST #1: got %d, want 200", got)
+	}
+	if got := do(http.MethodPost, ip); got != http.StatusTooManyRequests {
+		t.Fatalf("POST #2: got %d, want 429", got)
+	}
+
+	// A different IP has its own bucket.
+	if got := do(http.MethodPost, "198.51.100.9:5678"); got != http.StatusOK {
+		t.Fatalf("POST from fresh IP: got %d, want 200", got)
+	}
+
+	// 3 GET + 1 POST(ok) + 1 POST(fresh IP) = 5; the throttled POST never
+	// reaches the inner handler.
+	if called != 5 {
+		t.Fatalf("inner handler called %d times, want 5", called)
+	}
+}

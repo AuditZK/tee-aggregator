@@ -282,39 +282,53 @@ func (s *Server) sanitizeErrorForClient(err error) string {
 	return s.sanitizeMessageForClient(err.Error())
 }
 
-// userFacingErrorPatterns are substrings that mark an error message as safe
-// to surface to the end-user even in production. These describe a category
-// of failure the user can act on (wrong credentials, typo in server name,
-// IP not whitelisted, etc.) without leaking infrastructure details — they
-// never carry file paths, internal hostnames, IPs, or stack traces.
-//
-// Anything not matching these is replaced by the generic "Internal server
-// error" message in production to avoid leaking implementation specifics.
-var userFacingErrorPatterns = []string{
-	"invalid credentials",
-	"invalid api key",
-	"invalid signature",
-	"auth_failed",
-	"unauthorized",
-	"no such host",
-	"connection refused",
-	"deadline exceeded",
-	"timeout",
-	"ip not whitelist",
-	"ip restricted",
-	"whitelist",
-	"permission denied",
-	"insufficient permission",
-	"validation failed",
-	"protocol_error",
-	"failed to create connection",
-	"failed to create user",
-	"database not configured",
-	"service not available",
-	"sync service not available",
-	"report service not available",
-	"already exists",
-	"not found",
+// userFacingErrorPatterns maps a substring that marks an error as safe to
+// surface to the end-user (a category of failure they can act on — wrong
+// credentials, IP not whitelisted, etc.) to a fixed, infrastructure-free
+// message. SEC-07: returning the RAW error text on a match leaked internal
+// detail (e.g. "dial tcp internal-db:5432: connect: connection refused"
+// matches "connection refused"); we now return the category's canonical
+// message and never the raw text. First match wins, so list more specific
+// substrings before more general ones.
+type userFacingError struct {
+	substr  string
+	message string
+}
+
+// Category messages shared by several match substrings — kept as constants so
+// the same user-facing text isn't duplicated across rows.
+const (
+	msgExchangeUnreachable = "could not reach the exchange endpoint"
+	msgExchangeTimeout     = "the exchange request timed out"
+	msgIPNotWhitelisted    = "server IP not whitelisted on the exchange"
+	msgServiceUnavailable  = "service temporarily unavailable"
+)
+
+var userFacingErrorPatterns = []userFacingError{
+	{"invalid credentials", "invalid credentials"},
+	{"invalid api key", "invalid API key"},
+	{"invalid signature", "invalid API signature"},
+	{"auth_failed", "authentication failed"},
+	{"unauthorized", "unauthorized"},
+	{"insufficient permission", "insufficient API key permissions"},
+	{"permission denied", "permission denied"},
+	{"ip not whitelist", msgIPNotWhitelisted},
+	{"ip restricted", msgIPNotWhitelisted},
+	{"whitelist", msgIPNotWhitelisted},
+	{"no such host", msgExchangeUnreachable},
+	{"connection refused", msgExchangeUnreachable},
+	{"deadline exceeded", msgExchangeTimeout},
+	{"timeout", msgExchangeTimeout},
+	{"validation failed", "validation failed"},
+	{"protocol_error", "protocol error"},
+	{"failed to create connection", "failed to create connection"},
+	{"failed to create user", "failed to create user"},
+	{"already exists", "resource already exists"},
+	{"not found", "resource not found"},
+	{"database not configured", msgServiceUnavailable},
+	{"sync service not available", msgServiceUnavailable},
+	{"report service not available", msgServiceUnavailable},
+	{"service not available", msgServiceUnavailable},
 }
 
 func (s *Server) sanitizeMessageForClient(msg string) string {
@@ -326,8 +340,8 @@ func (s *Server) sanitizeMessageForClient(msg string) string {
 	}
 	lower := strings.ToLower(msg)
 	for _, p := range userFacingErrorPatterns {
-		if strings.Contains(lower, p) {
-			return msg
+		if strings.Contains(lower, p.substr) {
+			return p.message
 		}
 	}
 	return genericInternalError
@@ -509,6 +523,19 @@ func (s *Server) GetPerformanceMetrics(ctx context.Context, req *pb.PerformanceM
 	}
 	if rawExchange != "" {
 		if err := validation.ValidateExchange(rawExchange); err != nil {
+			return &pb.PerformanceMetricsResponse{Success: false, Error: err.Error()}, nil
+		}
+	}
+	// SEC-06: bound the requested range like GetSnapshotTimeSeries does, so
+	// every metrics entrypoint enforces the same max-range cap.
+	if err := validation.ValidateOptionalTimestampMillis(req.StartDate, "start_date"); err != nil {
+		return &pb.PerformanceMetricsResponse{Success: false, Error: err.Error()}, nil
+	}
+	if err := validation.ValidateOptionalTimestampMillis(req.EndDate, "end_date"); err != nil {
+		return &pb.PerformanceMetricsResponse{Success: false, Error: err.Error()}, nil
+	}
+	if req.StartDate != 0 && req.EndDate != 0 {
+		if err := validation.ValidateTimestampRange(time.UnixMilli(req.StartDate), time.UnixMilli(req.EndDate)); err != nil {
 			return &pb.PerformanceMetricsResponse{Success: false, Error: err.Error()}, nil
 		}
 	}

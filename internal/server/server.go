@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/trackrecord/enclave/internal/auth"
 	"github.com/trackrecord/enclave/internal/config"
+	"github.com/trackrecord/enclave/internal/validation"
 	"go.uber.org/zap"
 )
 
@@ -100,14 +101,20 @@ func (s *Server) Start(ctx context.Context) error {
 	// X-Forwarded-For is honoured only for peers in RATE_LIMIT_TRUSTED_PROXIES.
 	credRateLimiter := NewIPRateLimiter(5, 15*time.Minute, s.cfg.RateLimitTrustedProxies...)
 
+	// attestationRateLimiter bounds the POST (nonce) path of the attestation
+	// endpoint, which is never cached and forks snpguest ~5x plus KDS round
+	// trips per call (SEC-02). ≤6 uncached quotes/min/IP kills the cheap DoS
+	// while tolerating a verify+retry burst; cheap GET probes stay unmetered.
+	attestationRateLimiter := NewIPRateLimiter(6, time.Minute, s.cfg.RateLimitTrustedProxies...)
+
 	// Public routes (no auth required):
 	//   /health                 — liveness probe
 	//   /api/v1/tls/fingerprint  — public by design (used by clients before attestation)
-	//   /api/v1/attestation      — public by design (attestation quote)
+	//   /api/v1/attestation      — public by design; POST (nonce) path rate-limited (SEC-02)
 	// (/api/v1/verify is public too, but only registered under EnableLegacyREST.)
 	mux.HandleFunc("/health", s.handler.HealthCheck)
 	mux.HandleFunc("/api/v1/tls/fingerprint", s.handler.GetTLSFingerprint)
-	mux.HandleFunc("/api/v1/attestation", s.handler.GetAttestation)
+	mux.HandleFunc("/api/v1/attestation", attestationPOSTRateLimit(attestationRateLimiter, s.handler.GetAttestation))
 
 	// Gated routes: carry user data or mutate state. Must go through jwtRequired
 	// when ENCLAVE_JWT_SECRET is set (SEC-002). In dev mode, jwtRequired logs
@@ -233,9 +240,22 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 	userUID := q.Get("user_uid")
 	exchange := q.Get("exchange")
 	label := q.Get("label")
-	if userUID == "" || exchange == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "user_uid and exchange are required"})
+	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
+	// (Egress-consent gating for non-IBKR reconstruction is tracked under
+	// SEC-08, which persists the opt-in this endpoint would key off.)
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	if s.handler == nil || s.handler.syncSvc == nil {
@@ -381,6 +401,21 @@ func (s *Server) localhostOnly(next http.HandlerFunc) http.HandlerFunc {
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"error": "admin endpoints are restricted to loopback callers",
 			})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// attestationPOSTRateLimit applies per-IP rate limiting to the POST (nonce)
+// path only. GET probes — which clients hit before they trust the enclave —
+// pass through unmetered; the POST path forks snpguest and is never cached
+// (SEC-02).
+func attestationPOSTRateLimit(rl *IPRateLimiter, next http.HandlerFunc) http.HandlerFunc {
+	limited := rl.Middleware(next)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			limited(w, r)
 			return
 		}
 		next(w, r)

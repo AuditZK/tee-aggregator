@@ -164,9 +164,10 @@ func TestCreateUserConnection_ProductionSanitization(t *testing.T) {
 	}
 }
 
-// Counterpart: in production mode, errors that match the user-facing
-// whitelist (typo in server name, broker rejected credentials, …) must
-// reach the client so they can act on them.
+// Counterpart: in production mode, errors that match a user-facing category
+// (broker rejected credentials, IP not whitelisted, …) surface that category's
+// fixed message — enough for the caller to act on — without leaking the raw
+// error text or any vendor suffix (SEC-07).
 func TestCreateUserConnection_ProductionPassesUserFacingError(t *testing.T) {
 	t.Setenv("NODE_ENV", "production")
 
@@ -191,7 +192,7 @@ func TestCreateUserConnection_ProductionPassesUserFacingError(t *testing.T) {
 	if resp.Success {
 		t.Fatalf("expected success=false, got true")
 	}
-	if resp.Error != "invalid credentials: broker rejected the login" {
-		t.Fatalf("expected user-facing error to pass through in prod, got %q", resp.Error)
+	if resp.Error != "invalid credentials" {
+		t.Fatalf("expected the fixed user-facing category message in prod, got %q", resp.Error)
 	}
 }
