@@ -7,4 +7,4 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_users_uid ON users(uid);
+CREATE INDEX IF NOT EXISTS idx_users_uid ON users(uid);

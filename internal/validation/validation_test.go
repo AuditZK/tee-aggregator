@@ -73,6 +73,19 @@ func TestValidateLabel(t *testing.T) {
 	if err := ValidateLabel(strings.Repeat("x", 101)); err == nil {
 		t.Error("label > 100 chars should be invalid")
 	}
+	// SEC-05: the composite-key delimiter and control characters are rejected
+	// so connection keys ("exchange/label") stay unambiguous.
+	for _, bad := range []string{"acc/ount", "a\\b", "tab\there", "null\x00byte", "del\x7f"} {
+		if err := ValidateLabel(bad); err == nil {
+			t.Errorf("label %q should be rejected (delimiter/control char)", bad)
+		}
+	}
+	// Common punctuation that is NOT the delimiter stays allowed.
+	for _, ok := range []string{"My Account #1", "fund (live)", "a.b_c-d"} {
+		if err := ValidateLabel(ok); err != nil {
+			t.Errorf("label %q should be valid: %v", ok, err)
+		}
+	}
 }
 
 func TestValidateAPIKey(t *testing.T) {

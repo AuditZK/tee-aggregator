@@ -67,6 +67,16 @@ func ValidateLabel(label string) error {
 	if len(label) > maxLabelLen {
 		return fmt.Errorf("label too long: max %d characters", maxLabelLen)
 	}
+	// SEC-05: the label is joined into the composite connection key
+	// "exchange/label" used for include/exclude matching. A '/' (the delimiter),
+	// a backslash, or a control character would make those keys ambiguous.
+	// Reject them at the trust boundary rather than re-encoding the key in every
+	// builder and checker.
+	for _, r := range label {
+		if r == '/' || r == '\\' || r < 0x20 || r == 0x7f {
+			return fmt.Errorf("label contains an illegal character (no '/', '\\', or control characters)")
+		}
+	}
 	return nil
 }
 

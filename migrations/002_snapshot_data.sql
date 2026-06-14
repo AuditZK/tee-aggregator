@@ -27,6 +27,6 @@ CREATE TABLE IF NOT EXISTS snapshot_data (
     UNIQUE(user_uid, exchange, timestamp)
 );
 
-CREATE INDEX idx_snapshot_data_user_uid ON snapshot_data(user_uid);
-CREATE INDEX idx_snapshot_data_timestamp ON snapshot_data(timestamp);
-CREATE INDEX idx_snapshot_data_user_time ON snapshot_data(user_uid, timestamp);
+CREATE INDEX IF NOT EXISTS idx_snapshot_data_user_uid ON snapshot_data(user_uid);
+CREATE INDEX IF NOT EXISTS idx_snapshot_data_timestamp ON snapshot_data(timestamp);
+CREATE INDEX IF NOT EXISTS idx_snapshot_data_user_time ON snapshot_data(user_uid, timestamp);

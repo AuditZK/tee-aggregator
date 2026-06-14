@@ -303,8 +303,14 @@ func (r *SnapshotRepo) GetExternalRebuilderDays(ctx context.Context, userUID str
 	if !r.hasFromExternalRebuilderColumn(ctx) {
 		return out, nil
 	}
+	// DATA-05: truncate in UTC, not the Postgres session timezone. `timestamp`
+	// is TIMESTAMPTZ; `date_trunc('day', timestamp)` alone buckets by the
+	// session TZ, so on a non-UTC connection the day keys would not line up with
+	// the midnight-UTC keys the signing layer builds — silently dropping
+	// rebuilder taint. `AT TIME ZONE 'UTC'` pins the bucket to the UTC calendar
+	// day regardless of session settings.
 	rows, err := r.pool.Query(ctx, `
-		SELECT DISTINCT date_trunc('day', timestamp) AS day
+		SELECT DISTINCT date_trunc('day', timestamp AT TIME ZONE 'UTC') AS day
 		FROM snapshot_data
 		WHERE user_uid = $1 AND timestamp >= $2 AND timestamp <= $3
 		  AND from_external_rebuilder = TRUE`,
@@ -319,7 +325,9 @@ func (r *SnapshotRepo) GetExternalRebuilderDays(ctx context.Context, userUID str
 		if err := rows.Scan(&day); err != nil {
 			return nil, err
 		}
-		out[day.UTC()] = struct{}{}
+		// Rebuild the key as midnight UTC from the calendar components so it
+		// matches the signing layer's keys exactly, whatever location pgx used.
+		out[time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)] = struct{}{}
 	}
 	return out, rows.Err()
 }
