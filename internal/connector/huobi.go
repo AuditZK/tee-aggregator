@@ -68,7 +68,7 @@ func (h *Huobi) signedGET(ctx context.Context, path string, extra url.Values) ([
 	}
 	json.Unmarshal(body, &result)
 	if result.Status == "error" {
-		return nil, fmt.Errorf("huobi API error: %s (%s)", result.ErrMsg, result.ErrCode)
+		return nil, fmt.Errorf("huobi API error: %s (%s)", vendorErrorDetail(result.ErrMsg), result.ErrCode)
 	}
 
 	return body, nil

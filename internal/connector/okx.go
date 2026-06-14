@@ -64,7 +64,7 @@ func (o *OKX) doRequest(ctx context.Context, method, path string) ([]byte, error
 	}
 	json.Unmarshal(body, &result)
 	if result.Code != "0" {
-		return nil, fmt.Errorf("okx API error: %s", result.Msg)
+		return nil, fmt.Errorf("okx API error: %s", vendorErrorDetail(result.Msg))
 	}
 
 	return body, nil

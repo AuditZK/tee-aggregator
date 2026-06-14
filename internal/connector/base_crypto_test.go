@@ -410,3 +410,24 @@ func TestErrResponseTooLarge_Stringer(t *testing.T) {
 // Retry-After numeric parsing in the helper. The compiler will catch
 // any drift between this test file and the helper's signature.
 var _ = strconv.Itoa
+
+// CONN-04: vendor error messages are bounded and scrubbed before they reach a
+// Go error string.
+func TestVendorErrorDetail(t *testing.T) {
+	// Oversized vendor messages are truncated to errorBodyMaxLen + marker.
+	long := strings.Repeat("A", errorBodyMaxLen+50)
+	got := vendorErrorDetail(long)
+	if len(got) <= errorBodyMaxLen || !strings.Contains(got, "[truncated]") {
+		t.Fatalf("long vendor message not truncated: len=%d", len(got))
+	}
+
+	// A credential fragment echoed in a vendor message is scrubbed.
+	if got := vendorErrorDetail("invalid signature for api_key=sk_live_DEADBEEF"); strings.Contains(got, "sk_live_DEADBEEF") {
+		t.Fatalf("credential leaked through vendor message: %q", got)
+	}
+
+	// Benign messages pass through unchanged.
+	if got := vendorErrorDetail("order not found"); got != "order not found" {
+		t.Fatalf("benign vendor message altered: %q", got)
+	}
+}

@@ -22,6 +22,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/trackrecord/enclave/internal/logredact"
 )
 
 // Retry policy for CONN-004: max 3 attempts with exponential backoff and
@@ -74,6 +76,15 @@ func TruncatedBody(body []byte) string {
 		return string(body)
 	}
 	return string(body[:errorBodyMaxLen]) + "...[truncated]"
+}
+
+// vendorErrorDetail bounds and scrubs an upstream vendor error string before
+// it is interpolated into a Go error (CONN-04). TruncatedBody caps the window
+// a verbose or hostile upstream can occupy in logs/errors; ScrubMessage is
+// defense-in-depth over the logredact core for the case where a vendor echoes
+// a credential fragment back in its own error message.
+func vendorErrorDetail(msg string) string {
+	return logredact.ScrubMessage(TruncatedBody([]byte(msg)))
 }
 
 // ReadCappedBody reads up to max bytes from r and closes it. Returns

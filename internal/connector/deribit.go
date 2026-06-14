@@ -385,7 +385,7 @@ func (d *Deribit) privateGET(ctx context.Context, path string, params url.Values
 	}
 	_ = json.Unmarshal(body, &envelope)
 	if envelope.Error != nil {
-		return nil, fmt.Errorf("deribit API error: %v", envelope.Error)
+		return nil, fmt.Errorf("deribit API error: %s", vendorErrorDetail(fmt.Sprintf("%v", envelope.Error)))
 	}
 
 	return body, nil

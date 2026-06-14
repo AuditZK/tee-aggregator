@@ -1369,6 +1369,7 @@ func (c *CTrader) getAllDeals(ctx context.Context, accountID int64, start, end t
 	from := start.UnixMilli()
 	to := end.UnixMilli()
 	var all []cTraderDeal
+	seen := make(map[int64]struct{})
 	for page := 0; page < ctraderMaxDealPages; page++ {
 		if page > 0 {
 			if err := ctraderThrottle(ctx); err != nil {
@@ -1394,17 +1395,40 @@ func (c *CTrader) getAllDeals(ctx context.Context, accountID int64, start, end t
 		if err := decodeRawPayload(raw, &resp); err != nil {
 			return nil, err
 		}
-		all = append(all, resp.Deal...)
+		var added int
+		all, added = appendUnseenDeals(all, seen, resp.Deal)
 		if !resp.HasMore || len(resp.Deal) == 0 {
 			break
 		}
 		last := resp.Deal[len(resp.Deal)-1].ExecutionTimestamp
-		if last <= from {
-			break // no forward progress — stop to avoid a loop
+		// CONN-05: re-fetch from `last` (not last+1) so a deal sharing the
+		// boundary millisecond with the page's last deal isn't skipped; the
+		// dedup-by-dealId above drops the re-read overlap. If the window neither
+		// advanced nor yielded anything new, stop — a full page packed into a
+		// single millisecond, where we can't progress without skipping.
+		if last <= from && added == 0 {
+			break
 		}
-		from = last + 1
+		from = last
 	}
 	return all, nil
+}
+
+// appendUnseenDeals appends deals whose dealId hasn't been seen yet (recording
+// them in seen) and returns the grown slice plus the count of newly-added
+// deals. Pagination re-reads the boundary millisecond (from = last), so dedup
+// by dealId is what keeps a re-fetched deal from being counted twice (CONN-05).
+func appendUnseenDeals(all []cTraderDeal, seen map[int64]struct{}, page []cTraderDeal) ([]cTraderDeal, int) {
+	added := 0
+	for _, d := range page {
+		if _, ok := seen[d.DealID]; ok {
+			continue
+		}
+		seen[d.DealID] = struct{}{}
+		all = append(all, d)
+		added++
+	}
+	return all, added
 }
 
 // getAllCashflows fetches deposits/withdrawals in [start, end] in <=1-week

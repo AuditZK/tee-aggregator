@@ -66,7 +66,7 @@ func (b *Bybit) doRequest(ctx context.Context, method, path, params string) ([]b
 	}
 	json.Unmarshal(body, &result)
 	if result.RetCode != 0 {
-		return nil, fmt.Errorf("bybit API error: %s", result.RetMsg)
+		return nil, fmt.Errorf("bybit API error: %s", vendorErrorDetail(result.RetMsg))
 	}
 
 	return body, nil

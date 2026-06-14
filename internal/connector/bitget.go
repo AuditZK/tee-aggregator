@@ -60,7 +60,7 @@ func (b *Bitget) doRequest(ctx context.Context, method, path string) ([]byte, er
 	}
 	json.Unmarshal(body, &result)
 	if result.Code != "00000" {
-		return nil, fmt.Errorf("bitget API error: %s (code %s)", result.Msg, result.Code)
+		return nil, fmt.Errorf("bitget API error: %s (code %s)", vendorErrorDetail(result.Msg), result.Code)
 	}
 
 	return body, nil
