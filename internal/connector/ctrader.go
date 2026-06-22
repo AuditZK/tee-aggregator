@@ -847,13 +847,19 @@ func (c *CTrader) refreshAccessToken(ctx context.Context) error {
 		c.refreshToken = strings.TrimSpace(tokenResp.RefreshToken)
 	}
 
-	// Persist refreshed tokens to DB if callback is set (TS parity)
+	// Persist refreshed tokens to DB SYNCHRONOUSLY, with the error checked.
+	// cTrader rotates single-use refresh tokens (each refresh invalidates the
+	// previous one), so the new token MUST be durably saved before we return.
+	// The previous fire-and-forget goroutine with a swallowed error lost the
+	// rotated token whenever the persist failed or the process moved on/restarted
+	// before it landed, leaving only the now-consumed token in the DB — every
+	// subsequent refresh then failed with ACCESS_DENIED, bricking the connection.
 	if c.tokenPersister != nil {
-		go func() {
-			persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			_ = c.tokenPersister(persistCtx, c.accessToken, c.refreshToken)
-		}()
+		persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := c.tokenPersister(persistCtx, c.accessToken, c.refreshToken); err != nil {
+			return fmt.Errorf("persist rotated cTrader tokens: %w", err)
+		}
 	}
 
 	return nil
