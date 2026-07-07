@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	binanceSpotAPI    = "https://api.binance.com"
-	binanceFuturesAPI = "https://fapi.binance.com"
+	binanceSpotAPI         = "https://api.binance.com"
+	binanceFuturesAPI      = "https://fapi.binance.com"
+	binanceCoinMFuturesAPI = "https://dapi.binance.com"
 
 	// QUAL-001: extracted to remove duplication across signed-request sites.
 	binancePathAccount = "/api/v3/account"
@@ -87,25 +88,44 @@ func (b *Binance) TestConnection(ctx context.Context) error {
 }
 
 func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
-	// Get spot balance
-	spotBalance, err := b.getSpotBalance(ctx)
+	// One public ticker fetch, shared by every wallet that needs pricing (spot
+	// alts, COIN-M collateral coins, margin BTC valuation). Best-effort: on
+	// failure stablecoins still value 1:1 and coin-priced wallets contribute 0
+	// rather than failing the whole balance.
+	priceMap, _ := FetchBinanceStylePriceMap(ctx, b.client, binanceSpotAPI)
+	if priceMap == nil {
+		priceMap = map[string]float64{}
+	}
+
+	spotBalance, err := b.getSpotBalance(ctx, priceMap)
 	if err != nil {
 		return nil, fmt.Errorf("spot balance: %w", err)
 	}
-
-	// Get futures balance (ignore error - account may not have futures)
-	futuresBalance, _ := b.getFuturesBalance(ctx)
-
 	total := spotBalance
-	if futuresBalance != nil {
-		total.Equity += futuresBalance.Equity
-		total.UnrealizedPnL += futuresBalance.UnrealizedPnL
+
+	// USDⓈ-M futures (ignore error — account may not have futures).
+	if fut, ferr := b.getFuturesBalance(ctx); ferr == nil && fut != nil {
+		total.Equity += fut.Equity
+		total.UnrealizedPnL += fut.UnrealizedPnL
+	}
+
+	// Additional wallets. Each is best-effort: a key without the permission or
+	// a product the user never enabled must not zero the whole balance. These
+	// are distinct wallets from spot/USDⓈ-M, so summing never double-counts.
+	if eq, cerr := b.getCoinMFuturesEquity(ctx, priceMap); cerr == nil {
+		total.Equity += eq
+	}
+	if eq, merr := b.getCrossMarginEquity(ctx, priceMap); merr == nil {
+		total.Equity += eq
+	}
+	if eq, ierr := b.getIsolatedMarginEquity(ctx, priceMap); ierr == nil {
+		total.Equity += eq
 	}
 
 	return total, nil
 }
 
-func (b *Binance) getSpotBalance(ctx context.Context) (*Balance, error) {
+func (b *Binance) getSpotBalance(ctx context.Context, priceMap map[string]float64) (*Balance, error) {
 	params := url.Values{}
 	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, binancePathAccount, params, true)
 	if err != nil {
@@ -126,11 +146,10 @@ func (b *Binance) getSpotBalance(ctx context.Context) (*Balance, error) {
 
 	// Collect every non-zero holding, not just stablecoins. The old code summed
 	// only USDT/BUSD/USD, so any account holding BTC/ETH/altcoins reported an
-	// equity of ~0 (CONN-VALUE-001). Stablecoins are valued 1:1 below; all
-	// other assets are priced from the public ticker map.
+	// equity of ~0 (CONN-VALUE-001). ValueSpotHoldingsUSD prices them from the
+	// shared ticker map (stablecoins 1:1).
 	var holdings []SpotHolding
 	var stableAvailable float64 // free stablecoins = liquid USD available
-	hasNonStable := false
 	for _, bal := range resp.Balances {
 		free, _ := strconv.ParseFloat(bal.Free, 64)
 		locked, _ := strconv.ParseFloat(bal.Locked, 64)
@@ -141,19 +160,6 @@ func (b *Binance) getSpotBalance(ctx context.Context) (*Balance, error) {
 		holdings = append(holdings, SpotHolding{Asset: bal.Asset, Amount: total})
 		if IsStablecoinUSD(bal.Asset) {
 			stableAvailable += free
-		} else {
-			hasNonStable = true
-		}
-	}
-
-	// Only pay for the ticker call when there is a non-stable asset to price. A
-	// pure-USDT account skips the round-trip entirely. If the fetch fails we
-	// fall back to an empty map: stablecoins still value correctly and the sync
-	// is never failed over a pricing hiccup.
-	priceMap := map[string]float64{}
-	if hasNonStable {
-		if pm, perr := FetchBinanceStylePriceMap(ctx, b.client, binanceSpotAPI); perr == nil {
-			priceMap = pm
 		}
 	}
 
@@ -162,6 +168,75 @@ func (b *Binance) getSpotBalance(ctx context.Context) (*Balance, error) {
 		Equity:    ValueSpotHoldingsUSD(holdings, priceMap),
 		Currency:  "USDT",
 	}, nil
+}
+
+// getCoinMFuturesEquity returns the COIN-M (coin-margined) futures equity in
+// USD. Each collateral asset's margin balance (walletBalance + crossUnPnl, in
+// the coin — e.g. BTC/ETH) is valued via priceMap. /dapi/v1/balance mirrors the
+// USDⓈ-M /fapi/v2/balance shape. Best-effort: a key without COIN-M permission
+// or an account that never enabled it returns an error the caller ignores.
+func (b *Binance) getCoinMFuturesEquity(ctx context.Context, priceMap map[string]float64) (float64, error) {
+	params := url.Values{}
+	body, err := b.doRequest(ctx, "GET", binanceCoinMFuturesAPI, "/dapi/v1/balance", params, true)
+	if err != nil {
+		return 0, err
+	}
+
+	var resp []struct {
+		Asset      string `json:"asset"`
+		Balance    string `json:"balance"`
+		CrossUnPnl string `json:"crossUnPnl"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, err
+	}
+
+	var holdings []SpotHolding
+	for _, a := range resp {
+		bal, _ := strconv.ParseFloat(a.Balance, 64)
+		upnl, _ := strconv.ParseFloat(a.CrossUnPnl, 64)
+		if mb := bal + upnl; mb != 0 {
+			holdings = append(holdings, SpotHolding{Asset: a.Asset, Amount: mb})
+		}
+	}
+	return ValueSpotHoldingsUSD(holdings, priceMap), nil
+}
+
+// getCrossMarginEquity returns the cross margin wallet's net equity in USD:
+// totalNetAssetOfBtc (assets − borrowed liabilities, in BTC) × BTCUSDT.
+func (b *Binance) getCrossMarginEquity(ctx context.Context, priceMap map[string]float64) (float64, error) {
+	return b.marginNetEquityUSD(ctx, "/sapi/v1/margin/account", priceMap)
+}
+
+// getIsolatedMarginEquity returns the isolated margin wallet's net equity in
+// USD (same totalNetAssetOfBtc shape, aggregated across all isolated pairs).
+func (b *Binance) getIsolatedMarginEquity(ctx context.Context, priceMap map[string]float64) (float64, error) {
+	return b.marginNetEquityUSD(ctx, "/sapi/v1/margin/isolated/account", priceMap)
+}
+
+// marginNetEquityUSD reads a SAPI margin account endpoint that reports
+// totalNetAssetOfBtc (net of borrowed funds, in BTC) and converts it to USD via
+// the BTCUSDT price. Best-effort: a key without margin permission errors and
+// the caller skips it.
+func (b *Binance) marginNetEquityUSD(ctx context.Context, path string, priceMap map[string]float64) (float64, error) {
+	params := url.Values{}
+	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, path, params, true)
+	if err != nil {
+		return 0, err
+	}
+
+	var resp struct {
+		TotalNetAssetOfBtc string `json:"totalNetAssetOfBtc"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, err
+	}
+
+	netBtc, _ := strconv.ParseFloat(resp.TotalNetAssetOfBtc, 64)
+	if netBtc == 0 {
+		return 0, nil
+	}
+	return netBtc * priceMap["BTCUSDT"], nil
 }
 
 func (b *Binance) getFuturesBalance(ctx context.Context) (*Balance, error) {
