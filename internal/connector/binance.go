@@ -124,52 +124,75 @@ func (b *Binance) getSpotBalance(ctx context.Context) (*Balance, error) {
 		return nil, err
 	}
 
-	var totalUSDT float64
+	// Collect every non-zero holding, not just stablecoins. The old code summed
+	// only USDT/BUSD/USD, so any account holding BTC/ETH/altcoins reported an
+	// equity of ~0 (CONN-VALUE-001). Stablecoins are valued 1:1 below; all
+	// other assets are priced from the public ticker map.
+	var holdings []SpotHolding
+	var stableAvailable float64 // free stablecoins = liquid USD available
+	hasNonStable := false
 	for _, bal := range resp.Balances {
-		if bal.Asset == "USDT" || bal.Asset == "BUSD" || bal.Asset == "USD" {
-			free, _ := strconv.ParseFloat(bal.Free, 64)
-			locked, _ := strconv.ParseFloat(bal.Locked, 64)
-			totalUSDT += free + locked
+		free, _ := strconv.ParseFloat(bal.Free, 64)
+		locked, _ := strconv.ParseFloat(bal.Locked, 64)
+		total := free + locked
+		if total <= 0 {
+			continue
+		}
+		holdings = append(holdings, SpotHolding{Asset: bal.Asset, Amount: total})
+		if IsStablecoinUSD(bal.Asset) {
+			stableAvailable += free
+		} else {
+			hasNonStable = true
+		}
+	}
+
+	// Only pay for the ticker call when there is a non-stable asset to price. A
+	// pure-USDT account skips the round-trip entirely. If the fetch fails we
+	// fall back to an empty map: stablecoins still value correctly and the sync
+	// is never failed over a pricing hiccup.
+	priceMap := map[string]float64{}
+	if hasNonStable {
+		if pm, perr := FetchBinanceStylePriceMap(ctx, b.client, binanceSpotAPI); perr == nil {
+			priceMap = pm
 		}
 	}
 
 	return &Balance{
-		Available: totalUSDT,
-		Equity:    totalUSDT,
+		Available: stableAvailable,
+		Equity:    ValueSpotHoldingsUSD(holdings, priceMap),
 		Currency:  "USDT",
 	}, nil
 }
 
 func (b *Binance) getFuturesBalance(ctx context.Context) (*Balance, error) {
 	params := url.Values{}
-	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v2/balance", params, true)
+	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v2/account", params, true)
 	if err != nil {
 		return nil, err
 	}
 
-	var resp []struct {
-		Asset            string `json:"asset"`
-		Balance          string `json:"balance"`
-		CrossUnPnl       string `json:"crossUnPnl"`
-		AvailableBalance string `json:"availableBalance"`
+	// totalMarginBalance already folds in unrealized PnL and every margin asset
+	// in multi-asset mode, so it is the true USDⓈ-M futures equity — strictly
+	// better than the previous "USDT wallet balance only" read, which dropped
+	// non-USDT collateral. It never overlaps the spot wallet, so summing the two
+	// in GetBalance does not double-count.
+	var resp struct {
+		TotalMarginBalance    string `json:"totalMarginBalance"`
+		TotalUnrealizedProfit string `json:"totalUnrealizedProfit"`
+		AvailableBalance      string `json:"availableBalance"`
 	}
 
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
 
-	var balance, unrealized float64
-	for _, b := range resp {
-		if b.Asset == "USDT" {
-			balance, _ = strconv.ParseFloat(b.Balance, 64)
-			unrealized, _ = strconv.ParseFloat(b.CrossUnPnl, 64)
-			break
-		}
-	}
+	equity, _ := strconv.ParseFloat(resp.TotalMarginBalance, 64)
+	unrealized, _ := strconv.ParseFloat(resp.TotalUnrealizedProfit, 64)
+	available, _ := strconv.ParseFloat(resp.AvailableBalance, 64)
 
 	return &Balance{
-		Available:     balance,
-		Equity:        balance + unrealized,
+		Available:     available,
+		Equity:        equity,
 		UnrealizedPnL: unrealized,
 		Currency:      "USDT",
 	}, nil

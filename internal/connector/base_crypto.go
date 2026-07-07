@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/trackrecord/enclave/internal/logredact"
@@ -310,4 +311,104 @@ func (b *CryptoBase) signedQueryGET(ctx context.Context, apiKeyHeader, path, par
 		req.Header.Set(apiKeyHeader, b.APIKey)
 		return req, nil
 	})
+}
+
+// --- Spot asset valuation (CONN-VALUE-001) -------------------------------
+//
+// Several native connectors (Binance, BingX, Bitget, Gate, Coinbase, Huobi,
+// KuCoin, Kraken) historically summed ONLY stablecoin spot balances and
+// silently dropped every BTC/ETH/altcoin holding, so any account holding
+// crypto rather than USDT reported an equity of ~0. MEXC is the reference that
+// got it right: value every non-zero holding at its market price. These helpers
+// centralise that valuation so each connector only has to supply its own price
+// map.
+
+// stablecoinsUSD lists the assets valued 1:1 with USD. Kept deliberately small
+// and well-known — pricing an unknown "stable" through the ticker map is safer
+// than mis-pegging it to exactly 1.
+var stablecoinsUSD = map[string]struct{}{
+	"USDT": {}, "USDC": {}, "USD": {}, "BUSD": {},
+	"DAI": {}, "FDUSD": {}, "TUSD": {},
+}
+
+// IsStablecoinUSD reports whether asset is a USD-pegged stablecoin valued 1:1.
+func IsStablecoinUSD(asset string) bool {
+	_, ok := stablecoinsUSD[strings.ToUpper(strings.TrimSpace(asset))]
+	return ok
+}
+
+// SpotHolding is one non-zero spot balance line: an asset and the total amount
+// held (free + locked).
+type SpotHolding struct {
+	Asset  string
+	Amount float64
+}
+
+// ValueSpotHoldingsUSD converts spot holdings to a total USD value. Stablecoins
+// are valued 1:1; every other asset is priced from priceMap, a Binance-style
+// symbol→price map (e.g. "BTCUSDT"→65000). Lookup order per asset:
+//
+//	1. <ASSET>USDT   2. <ASSET>USDC   3. bridge via <ASSET>BTC × BTCUSDT
+//
+// Assets with no resolvable price (dust, delisted, exotic) contribute 0 rather
+// than failing the whole balance — pricing must never crash a sync. Callers
+// pass a single wallet's holdings, so nothing is double-counted here.
+func ValueSpotHoldingsUSD(holdings []SpotHolding, priceMap map[string]float64) float64 {
+	btcUSD := priceMap["BTCUSDT"]
+	var total float64
+	for _, h := range holdings {
+		if h.Amount <= 0 {
+			continue
+		}
+		asset := strings.ToUpper(strings.TrimSpace(h.Asset))
+		if IsStablecoinUSD(asset) {
+			total += h.Amount
+			continue
+		}
+		if p := priceMap[asset+"USDT"]; p > 0 {
+			total += h.Amount * p
+			continue
+		}
+		if p := priceMap[asset+"USDC"]; p > 0 {
+			total += h.Amount * p
+			continue
+		}
+		if btcUSD > 0 {
+			if p := priceMap[asset+"BTC"]; p > 0 {
+				total += h.Amount * p * btcUSD
+			}
+		}
+	}
+	return total
+}
+
+// FetchBinanceStylePriceMap fetches every symbol price from a Binance-compatible
+// public spot ticker: GET {baseURL}/api/v3/ticker/price with no symbol returns
+// [{"symbol","price"}] for all pairs. Binance and MEXC share this exact path.
+// The call is public (unsigned) and costs one request regardless of asset count
+// (weight 4 on Binance). client is threaded through so a region-proxied
+// connector reuses its configured transport.
+func FetchBinanceStylePriceMap(ctx context.Context, client *http.Client, baseURL string) (map[string]float64, error) {
+	body, err := retryHTTP(client, func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, "GET", baseURL+"/api/v3/ticker/price", nil)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var tickers []struct {
+		Symbol string `json:"symbol"`
+		Price  string `json:"price"`
+	}
+	if err := json.Unmarshal(body, &tickers); err != nil {
+		return nil, err
+	}
+
+	prices := make(map[string]float64, len(tickers))
+	for _, t := range tickers {
+		if p, perr := strconv.ParseFloat(t.Price, 64); perr == nil && p > 0 {
+			prices[strings.ToUpper(t.Symbol)] = p
+		}
+	}
+	return prices, nil
 }

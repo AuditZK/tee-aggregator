@@ -411,6 +411,105 @@ func TestErrResponseTooLarge_Stringer(t *testing.T) {
 // any drift between this test file and the helper's signature.
 var _ = strconv.Itoa
 
+// CONN-VALUE-001: stablecoin recognition is case/whitespace-insensitive and
+// only covers the known USD pegs — anything else must be priced via the ticker
+// map, never assumed to be worth 1.
+func TestIsStablecoinUSD(t *testing.T) {
+	stable := []string{"USDT", "usdc", " USD ", "BUSD", "DAI", "FDUSD", "TUSD"}
+	notStable := []string{"BTC", "ETH", "USDD", "EUR", "", "USDT1"}
+	for _, s := range stable {
+		if !IsStablecoinUSD(s) {
+			t.Errorf("%q should be a USD stablecoin", s)
+		}
+	}
+	for _, s := range notStable {
+		if IsStablecoinUSD(s) {
+			t.Errorf("%q should NOT be treated as a USD stablecoin", s)
+		}
+	}
+}
+
+// CONN-VALUE-001: the shared spot valuation must value stablecoins 1:1, price
+// alts via <ASSET>USDT, fall back to <ASSET>USDC, bridge BTC-only pairs through
+// BTCUSDT, and silently drop unpriceable dust — never crash or count wallets
+// twice.
+func TestValueSpotHoldingsUSD(t *testing.T) {
+	prices := map[string]float64{
+		"BTCUSDT":  65000,
+		"ETHUSDT":  3000,
+		"XMRUSDC":  150, // only a USDC pair exists
+		"RUNEBTC":  0.0001,
+	}
+	cases := []struct {
+		name     string
+		holdings []SpotHolding
+		want     float64
+	}{
+		{"stablecoins 1:1", []SpotHolding{{"USDT", 100}, {"USDC", 50}}, 150},
+		{"usdt pair", []SpotHolding{{"BTC", 2}}, 130000},
+		{"usdc fallback", []SpotHolding{{"XMR", 3}}, 450},
+		{"btc bridge", []SpotHolding{{"RUNE", 1000}}, 1000 * 0.0001 * 65000},
+		{"unpriceable dust skipped", []SpotHolding{{"SCAMCOIN", 999999}}, 0},
+		{"zero and negative skipped", []SpotHolding{{"BTC", 0}, {"ETH", -5}}, 0},
+		{"mixed", []SpotHolding{{"USDT", 1000}, {"ETH", 2}, {"SCAM", 1}}, 7000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ValueSpotHoldingsUSD(tc.holdings, prices)
+			if got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A missing BTCUSDT price must not blow up a BTC-bridged lookup — the asset is
+// simply skipped (contributes 0) rather than dividing/multiplying by zero into
+// a wrong number.
+func TestValueSpotHoldingsUSD_NoBTCAnchor(t *testing.T) {
+	got := ValueSpotHoldingsUSD([]SpotHolding{{"RUNE", 1000}}, map[string]float64{"RUNEBTC": 0.0001})
+	if got != 0 {
+		t.Fatalf("got %v, want 0 (no BTCUSDT anchor)", got)
+	}
+}
+
+// FetchBinanceStylePriceMap parses the public all-tickers array into an
+// upper-cased symbol→price map and drops non-parseable / non-positive prices.
+func TestFetchBinanceStylePriceMap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/ticker/price" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		if r.URL.Query().Get("symbol") != "" {
+			t.Errorf("must be called with no symbol to get all tickers")
+		}
+		_, _ = w.Write([]byte(`[
+			{"symbol":"BTCUSDT","price":"65000.5"},
+			{"symbol":"ethusdt","price":"3000"},
+			{"symbol":"BADPRICE","price":"not-a-number"},
+			{"symbol":"ZEROPRICE","price":"0"}
+		]`))
+	}))
+	defer srv.Close()
+
+	m, err := FetchBinanceStylePriceMap(context.Background(), srv.Client(), srv.URL)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if m["BTCUSDT"] != 65000.5 {
+		t.Errorf("BTCUSDT=%v", m["BTCUSDT"])
+	}
+	if m["ETHUSDT"] != 3000 { // upper-cased key
+		t.Errorf("ETHUSDT=%v", m["ETHUSDT"])
+	}
+	if _, ok := m["BADPRICE"]; ok {
+		t.Error("non-parseable price must be dropped")
+	}
+	if _, ok := m["ZEROPRICE"]; ok {
+		t.Error("non-positive price must be dropped")
+	}
+}
+
 // CONN-04: vendor error messages are bounded and scrubbed before they reach a
 // Go error string.
 func TestVendorErrorDetail(t *testing.T) {
