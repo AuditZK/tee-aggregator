@@ -84,6 +84,12 @@ type SyncService struct {
 	// credentials, ignores the response — lets analytics run a per-user sync
 	// without waiting for its daily cron. Empty = no ping.
 	historyNotifyURL string
+
+	// deferredRetries dedups in-memory 6h rate-limit retries keyed by connection
+	// ID, so a connection that 1018s on every daily pass (IBKR CTO+PEA sharing one
+	// Flex token) doesn't stack overlapping timers. Guarded by deferMu.
+	deferMu         sync.Mutex
+	deferredRetries map[string]bool
 }
 
 // NewSyncService creates a new sync service
@@ -761,7 +767,111 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		}
 	}
 
+	// Phase 5: shared-token rate-limit recovery. IBKR enforces a token-level Flex
+	// rate limit (1018). When two connections share one token (e.g. IBKR CTO+PEA)
+	// the parallel daily pass races them and the loser gets 1018, leaving that
+	// account stale until tomorrow. Retry the loser once after the token's window
+	// clears (~6h) so both refresh the same day. A failed sync records no status,
+	// so the connection stays "due" — the deferred retry, or failing that the next
+	// daily pass, recovers it.
+	for _, r := range results {
+		if isRateLimitError(r.Error) {
+			if conn := findConnection(connections, r.Exchange, r.Label); conn != nil {
+				s.scheduleDeferredRetry(conn, rateLimitRetryDelay)
+			}
+		}
+	}
+
 	return results, nil
+}
+
+// rateLimitRetryDelay is how long to wait before re-syncing a connection that
+// lost a shared-token Flex race (IBKR 1018). It must exceed IBKR's ~3h
+// token-level window with margin; 6h was chosen after 3h proved too tight.
+const rateLimitRetryDelay = 6 * time.Hour
+
+// isRateLimitError reports whether a sync result error is the IBKR Flex
+// token-level rate limit (1018). Other transient Flex codes (1001/1019 "busy")
+// are NOT treated as rate limits — they clear in seconds, not hours.
+func isRateLimitError(errStr string) bool {
+	return strings.Contains(errStr, "1018") || strings.Contains(errStr, "Too many requests")
+}
+
+// scheduleDeferredRetry re-syncs a single connection once, after delay, to
+// recover the loser of a shared-token Flex race so both accounts refresh the
+// same day. The timer is in-memory: if the enclave restarts within the window it
+// is lost, and the next daily pass retries (a failed sync records no status, so
+// the connection stays "due"). Dedup'd per connection ID so repeated 1018s don't
+// stack timers.
+func (s *SyncService) scheduleDeferredRetry(conn *repository.ExchangeConnection, delay time.Duration) {
+	if conn == nil {
+		return
+	}
+	s.deferMu.Lock()
+	if s.deferredRetries == nil {
+		s.deferredRetries = make(map[string]bool)
+	}
+	if s.deferredRetries[conn.ID] {
+		s.deferMu.Unlock()
+		return // a retry is already pending for this connection
+	}
+	s.deferredRetries[conn.ID] = true
+	s.deferMu.Unlock()
+
+	s.logger.Info("scheduling deferred sync retry after rate limit",
+		zap.String("user_uid", conn.UserUID),
+		zap.String("exchange", conn.Exchange),
+		zap.String("label", conn.Label),
+		zap.Duration("delay", delay),
+	)
+
+	time.AfterFunc(delay, func() {
+		defer func() {
+			s.deferMu.Lock()
+			delete(s.deferredRetries, conn.ID)
+			s.deferMu.Unlock()
+		}()
+		s.retryConnectionDeferred(conn)
+	})
+}
+
+// retryConnectionDeferred re-syncs one connection out-of-band and saves its
+// snapshot independently of the daily batch. It never schedules another deferral:
+// one retry per daily cycle bounds the work, and if it still fails the next daily
+// pass picks the connection up.
+func (s *SyncService) retryConnectionDeferred(conn *repository.ExchangeConnection) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	result := s.buildConnectionSnapshot(ctx, conn)
+	if result.Error != "" {
+		s.logger.Warn("deferred rate-limit retry still failing",
+			zap.String("user_uid", conn.UserUID),
+			zap.String("exchange", conn.Exchange),
+			zap.String("label", conn.Label),
+			zap.String("error", result.Error),
+		)
+		return
+	}
+	if result.snapshot == nil {
+		return
+	}
+	if err := s.snapshotRepo.UpsertBatch(ctx, []*repository.Snapshot{result.snapshot}); err != nil {
+		s.logger.Error("deferred rate-limit retry save failed",
+			zap.String("user_uid", conn.UserUID),
+			zap.String("exchange", conn.Exchange),
+			zap.String("label", conn.Label),
+			zap.Error(err),
+		)
+		return
+	}
+	result.Success = true
+	s.recordSyncStatus(ctx, conn, result, time.Now().UTC())
+	s.logger.Info("deferred rate-limit retry succeeded",
+		zap.String("user_uid", conn.UserUID),
+		zap.String("exchange", conn.Exchange),
+		zap.String("label", conn.Label),
+	)
 }
 
 // buildConnectionSnapshot builds a snapshot without saving (for atomic batch).
