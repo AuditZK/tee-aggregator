@@ -1294,7 +1294,15 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 // Exchanges NOT in this list (IBKR, MT5, …) use in-enclave history providers
 // whose daily-equity summaries come straight from the broker statement — no
 // MTM walk, no calibration drift, nothing to recalibrate.
-var externalRebuilderExchanges = []string{"hyperliquid"}
+//
+// bitget: the rebuilder's walk is ABSOLUTE (account bills carry balance-after
+// values, statement-is-truth like IBKR) and deliberately ignores
+// EndEquityOverride — the midnight pass is therefore not a re-anchor but an
+// idempotent refresh (re-walk with bills that now include the connect day)
+// whose real purpose is MarkRebuildFinalized, so bitget connections follow
+// the same rebuild→finalize lifecycle as hyperliquid instead of sitting
+// unfinalized until they age out of the retry window.
+var externalRebuilderExchanges = []string{"hyperliquid", "bitget"}
 
 // maxRebuildRetryDays bounds how long the midnight recalibration keeps retrying
 // a consenting connection that never finalizes (SEC-08): past this many days
