@@ -1448,6 +1448,12 @@ func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.Excha
 	if err := s.connSvc.MarkRebuildFinalized(ctx, conn.ID, time.Now().UTC()); err != nil {
 		return fmt.Errorf("mark finalized: %w", err)
 	}
+
+	// 6. Nudge analytics like every other rebuild path does — without this
+	// the finalized (re-anchored) history sits in the enclave DB while Neon
+	// serves the pre-recalibration metrics until the analytics cron catches
+	// up. Best-effort by design.
+	s.notifyHistoryRebuilt(ctx, conn.UserUID)
 	return nil
 }
 
