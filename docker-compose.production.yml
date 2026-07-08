@@ -16,12 +16,15 @@ services:
     # the image's `USER enclave` applies, and add `group_add: ["<gid of sev>"]`.
     user: root
     ports:
-      # CORS-002: enclave terminates public TLS itself (no Caddy in front),
-      # so the REST listener owns 443. The container still binds 3060
-      # internally — Docker maps host:443 → container:3060. Keeping the
-      # internal port unprivileged means the enclave process doesn't need
-      # CAP_NET_BIND_SERVICE.
-      - "443:3060"
+      # CORS-002: public TLS is terminated by the caddy_tls_proxy sidecar, which
+      # owns host 80/443 and reverse-proxies to this container over the shared
+      # external network (see `networks:` below) by container DNS —
+      # enclave_go_prod:3060 (REST) and :50062 (log-stream/SSE). The REST
+      # listener therefore MUST NOT publish host 443: caddy already binds it and
+      # the container fails to start ("port is already allocated"). The listener
+      # still binds 3060 internally (REST_PORT below) with its own TLS cert;
+      # caddy connects with tls_insecure_skip_verify.
+      # gRPC (50061) is published because gateway-service dials it from off-host.
       - "50061:50061"
       - "50062:50062"
     # CFG-MIGRATION (2026-05-08): single source of truth.
@@ -61,10 +64,10 @@ services:
     environment:
       - ENV=production
       - GRPC_PORT=50061
-      # PORT-001: must match the container-side port in the 443:3060 mapping
-      # above. Without this the REST listener falls back to config.go default
-      # 8080, which is not exposed on the host — the port forward looks open
-      # at the Docker layer but nothing answers.
+      # PORT-001: the container-side REST port caddy reverse-proxies to
+      # (enclave_go_prod:3060). Without this the REST listener falls back to
+      # config.go default 8080, which caddy is not configured to reach — the
+      # upstream looks up but nothing answers /api/*.
       - REST_PORT=3060
       # PERF-002: tell the Go runtime about the 512 MiB cgroup cap so the GC
       # can target it instead of computing its heap goal from the host's
