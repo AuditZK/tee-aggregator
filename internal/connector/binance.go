@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -479,4 +480,159 @@ func (b *Binance) getFuturesTrades(ctx context.Context, start, end time.Time) ([
 	}
 
 	return trades, nil
+}
+
+// binanceExternalTransferTypes are the universal-transfer types with exactly
+// one side inside the tracked perimeter (spot MAIN + UMFUTURE): money through
+// them is a real deposit/withdrawal from the timeline's perspective. Sign:
+// +1 = into the perimeter, -1 = out. MAIN_UMFUTURE / UMFUTURE_MAIN move value
+// between the two tracked wallets and are deliberately absent (they cancel).
+// Must mirror the rebuilder's table (history-rebuilder-go exchanges/binance)
+// so live and rebuilt cashflows stay consistent across the stitch.
+var binanceExternalTransferTypes = map[string]float64{
+	"FUNDING_MAIN":     +1,
+	"MAIN_FUNDING":     -1,
+	"FUNDING_UMFUTURE": +1,
+	"UMFUTURE_FUNDING": -1,
+	"MARGIN_MAIN":      +1,
+	"MAIN_MARGIN":      -1,
+	"CMFUTURE_MAIN":    +1,
+	"MAIN_CMFUTURE":    -1,
+	"MAIN_OPTION":      -1,
+	"OPTION_MAIN":      +1,
+	"MAIN_MINING":      -1,
+	"MINING_MAIN":      +1,
+}
+
+func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
+	now := time.Now().UTC()
+
+	var flows []*Cashflow
+	add := func(t time.Time, usd float64) {
+		if usd != 0 {
+			flows = append(flows, &Cashflow{Amount: usd, Currency: "USDT", Timestamp: t})
+		}
+	}
+
+	// Price map only fetched lazily, on the first non-stable coin seen.
+	var priceMap map[string]float64
+	usdValue := func(coin string, qty float64) float64 {
+		if IsStablecoinUSD(coin) {
+			return qty
+		}
+		if priceMap == nil {
+			pm, perr := FetchBinanceStylePriceMap(ctx, b.client, binanceSpotAPI)
+			if perr != nil {
+				pm = map[string]float64{}
+			}
+			priceMap = pm
+		}
+		if p := priceMap[strings.ToUpper(coin)+"USDT"]; p > 0 {
+			return qty * p
+		}
+		return 0 // unpriceable dust — never fabricate a flow from it
+	}
+
+	// On-chain flows are load-bearing: a broken deposit feed silently books
+	// every inflow as trading gain, so their errors fail the fetch.
+	if err := b.fetchOnChainDeposits(ctx, since, now, add, usdValue); err != nil {
+		return nil, err
+	}
+	if err := b.fetchOnChainWithdrawals(ctx, since, now, add, usdValue); err != nil {
+		return nil, err
+	}
+	// Universal transfers are best-effort per type: a key without a given
+	// wallet product errors for that type, which must not zero the flows above.
+	b.fetchExternalTransfers(ctx, since, now, add, usdValue)
+
+	return flows, nil
+}
+
+func (b *Binance) fetchOnChainDeposits(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) error {
+	params := url.Values{}
+	params.Set("startTime", strconv.FormatInt(since.UnixMilli(), 10))
+	params.Set("endTime", strconv.FormatInt(now.UnixMilli(), 10))
+	params.Set("status", "1") // success
+	params.Set("limit", "1000")
+	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, "/sapi/v1/capital/deposit/hisrec", params, true)
+	if err != nil {
+		return fmt.Errorf("deposit history: %w", err)
+	}
+	var deps []struct {
+		Coin       string `json:"coin"`
+		Amount     string `json:"amount"`
+		InsertTime int64  `json:"insertTime"`
+	}
+	if err := json.Unmarshal(body, &deps); err != nil {
+		return fmt.Errorf("parse deposit history: %w", err)
+	}
+	for _, d := range deps {
+		amt, _ := strconv.ParseFloat(d.Amount, 64)
+		add(time.UnixMilli(d.InsertTime).UTC(), usdValue(d.Coin, amt))
+	}
+	return nil
+}
+
+func (b *Binance) fetchOnChainWithdrawals(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) error {
+	params := url.Values{}
+	params.Set("startTime", strconv.FormatInt(since.UnixMilli(), 10))
+	params.Set("endTime", strconv.FormatInt(now.UnixMilli(), 10))
+	params.Set("status", "6") // completed
+	params.Set("limit", "1000")
+	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, "/sapi/v1/capital/withdraw/history", params, true)
+	if err != nil {
+		return fmt.Errorf("withdraw history: %w", err)
+	}
+	var wds []struct {
+		Coin           string `json:"coin"`
+		Amount         string `json:"amount"`
+		TransactionFee string `json:"transactionFee"`
+		CompleteTime   string `json:"completeTime"` // "2026-07-01 12:34:56" UTC
+	}
+	if err := json.Unmarshal(body, &wds); err != nil {
+		return fmt.Errorf("parse withdraw history: %w", err)
+	}
+	for _, w := range wds {
+		t, terr := time.Parse("2006-01-02 15:04:05", w.CompleteTime)
+		if terr != nil {
+			continue
+		}
+		amt, _ := strconv.ParseFloat(w.Amount, 64)
+		fee, _ := strconv.ParseFloat(w.TransactionFee, 64)
+		// The network fee left the account too.
+		add(t.UTC(), -usdValue(w.Coin, amt+fee))
+	}
+	return nil
+}
+
+func (b *Binance) fetchExternalTransfers(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) {
+	for typ, sign := range binanceExternalTransferTypes {
+		params := url.Values{}
+		params.Set("type", typ)
+		params.Set("startTime", strconv.FormatInt(since.UnixMilli(), 10))
+		params.Set("endTime", strconv.FormatInt(now.UnixMilli(), 10))
+		params.Set("size", "100")
+		body, err := b.doRequest(ctx, "GET", binanceSpotAPI, "/sapi/v1/asset/transfer", params, true)
+		if err != nil {
+			continue
+		}
+		var resp struct {
+			Rows []struct {
+				Asset     string `json:"asset"`
+				Amount    string `json:"amount"`
+				Timestamp int64  `json:"timestamp"`
+				Status    string `json:"status"`
+			} `json:"rows"`
+		}
+		if json.Unmarshal(body, &resp) != nil {
+			continue
+		}
+		for _, row := range resp.Rows {
+			if row.Status != "" && !strings.EqualFold(row.Status, "CONFIRMED") {
+				continue
+			}
+			amt, _ := strconv.ParseFloat(row.Amount, 64)
+			add(time.UnixMilli(row.Timestamp).UTC(), sign*usdValue(row.Asset, amt))
+		}
+	}
 }
