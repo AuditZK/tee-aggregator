@@ -1302,7 +1302,14 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 // whose real purpose is MarkRebuildFinalized, so bitget connections follow
 // the same rebuild→finalize lifecycle as hyperliquid instead of sitting
 // unfinalized until they age out of the retry window.
-var externalRebuilderExchanges = []string{"hyperliquid", "bitget"}
+//
+// binance: same absolute family as bitget — the rebuilder reads Binance's
+// own daily accountSnapshot statements (30-day retention, so the rebuilt
+// window is shorter than bitget's 90) and likewise ignores EndEquityOverride.
+// The rebuilt rows upsert over the connect-day live snapshot, which also
+// retires that day's UX-001 inception deposit (deposits recomputed from the
+// on-chain + universal-transfer ledger instead of deposits=equity).
+var externalRebuilderExchanges = []string{"hyperliquid", "bitget", "binance"}
 
 // maxRebuildRetryDays bounds how long the midnight recalibration keeps retrying
 // a consenting connection that never finalizes (SEC-08): past this many days
