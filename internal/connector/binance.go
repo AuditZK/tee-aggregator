@@ -271,6 +271,19 @@ func (b *Binance) getFuturesBalance(ctx context.Context) (*Balance, error) {
 	unrealized, _ := strconv.ParseFloat(resp.TotalUnrealizedProfit, 64)
 	available, _ := strconv.ParseFloat(resp.AvailableBalance, 64)
 
+	// /fapi/v2/account is being retired and returns HTTP 200 with an empty
+	// totalMarginBalance for some accounts — NOT an error, so the fallback
+	// above never fires (observed in the field: a $20k USDⓈ-M master account
+	// read as $0 while /fapi/v2/balance still answered $20k). A genuine zero and
+	// a degraded-empty response are indistinguishable here, so when the account
+	// endpoint reports nothing, cross-check the balance endpoint and prefer it
+	// when it finds funds; a truly empty futures wallet still reads 0 from both.
+	if equity == 0 {
+		if bal, berr := b.getFuturesBalanceFromBalanceEndpoint(ctx); berr == nil && bal.Equity > 0 {
+			return bal, nil
+		}
+	}
+
 	return &Balance{
 		Available:     available,
 		Equity:        equity,
