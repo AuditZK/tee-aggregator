@@ -244,7 +244,12 @@ func (b *Binance) getFuturesBalance(ctx context.Context) (*Balance, error) {
 	params := url.Values{}
 	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v2/account", params, true)
 	if err != nil {
-		return nil, err
+		// /fapi/v2/account is being retired by Binance and already errors for
+		// some accounts while /fapi/v2/balance still answers (observed in the
+		// field: a sub-account whose $16k USDⓈ-M wallet silently vanished from
+		// the summed equity because the caller treats this read as
+		// best-effort). Fall back to the balance endpoint before giving up.
+		return b.getFuturesBalanceFromBalanceEndpoint(ctx)
 	}
 
 	// totalMarginBalance already folds in unrealized PnL and every margin asset
@@ -272,6 +277,43 @@ func (b *Binance) getFuturesBalance(ctx context.Context) (*Balance, error) {
 		UnrealizedPnL: unrealized,
 		Currency:      "USDT",
 	}, nil
+}
+
+// getFuturesBalanceFromBalanceEndpoint sums the stable-asset wallet balances
+// and cross unrealized PnL from /fapi/v2/balance — the same read the history
+// rebuilder uses. Slightly narrower than /fapi/v2/account (non-stable
+// collateral in multi-asset mode is not priced here) but proven to answer on
+// accounts where the account endpoint fails.
+func (b *Binance) getFuturesBalanceFromBalanceEndpoint(ctx context.Context) (*Balance, error) {
+	params := url.Values{}
+	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v2/balance", params, true)
+	if err != nil {
+		return nil, err
+	}
+
+	var rows []struct {
+		Asset            string `json:"asset"`
+		Balance          string `json:"balance"`
+		CrossUnPnl       string `json:"crossUnPnl"`
+		AvailableBalance string `json:"availableBalance"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return nil, err
+	}
+
+	out := &Balance{Currency: "USDT"}
+	for _, a := range rows {
+		if !IsStablecoinUSD(a.Asset) {
+			continue
+		}
+		bal, _ := strconv.ParseFloat(a.Balance, 64)
+		upnl, _ := strconv.ParseFloat(a.CrossUnPnl, 64)
+		avail, _ := strconv.ParseFloat(a.AvailableBalance, 64)
+		out.Equity += bal + upnl
+		out.UnrealizedPnL += upnl
+		out.Available += avail
+	}
+	return out, nil
 }
 
 func (b *Binance) GetPositions(ctx context.Context) ([]*Position, error) {
