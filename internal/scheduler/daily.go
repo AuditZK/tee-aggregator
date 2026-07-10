@@ -162,7 +162,13 @@ func (s *SyncScheduler) executeDailySync() {
 	// retried on the next nightly tick (RebuildFinalizedAt only stamps on
 	// success). Silent no-op when the rebuilder is unconfigured (dev) or the
 	// migration hasn't been applied (HasRebuildFinalizedAtCol → false).
-	s.syncSvc.RecalibrateRebuiltHistories(ctx)
+	//
+	// Own context, NOT the 30-minute sync budget: one binance 90-day HF
+	// rebuild pages its income ledger for up to ~25 min, and a night with
+	// several queued connections must not cancel itself mid-rebuild.
+	recalCtx, recalCancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	s.syncSvc.RecalibrateRebuiltHistories(recalCtx)
+	recalCancel()
 
 	s.logger.Info("daily sync completed",
 		zap.Int("users_synced", userSyncedCount),

@@ -269,10 +269,10 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		zap.String("label", label),
 	)
 	go func() {
-		// Must exceed the rebuilder-client chain (720s): a binance HF income
-		// paging rebuild runs 6-9 min, and this context cancelling first
-		// aborts it server-side mid-page.
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		// Must exceed the rebuilder-client chain (1920s): a binance HF 90-day
+		// income paging rebuild runs up to ~25 min, and this context
+		// cancelling first aborts it server-side mid-page.
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 		defer cancel()
 		s.handler.syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
 	}()

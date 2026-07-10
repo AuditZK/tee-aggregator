@@ -124,13 +124,14 @@ func New(baseURL, authToken string, logger *zap.Logger) *Client {
 		httpClient: &http.Client{
 			// /history/rebuild is synchronous on the rebuilder side: the
 			// response body lands AFTER the per-exchange reconstruction
-			// completes. Binance HF accounts page their income ledger paced
-			// against Binance's request-weight cap (~70 calls/min), which
-			// runs up to ~8-9 min — the whole chain must survive it: this
-			// client, the rebuilder's REBUILD_TIMEOUT_SECONDS and nginx's
-			// proxy_read_timeout on the rebuilder vhost (the shortest link
-			// cancels the request context and aborts the rebuild mid-page).
-			Timeout: 720 * time.Second,
+			// completes. Binance HF accounts page a 90-day income ledger
+			// paced against Binance's request-weight cap (~70 calls/min),
+			// which runs up to ~20-25 min worst case — the whole chain must
+			// survive it: this client, the rebuilder's
+			// REBUILD_TIMEOUT_SECONDS and nginx's proxy_read_timeout on the
+			// rebuilder vhost (the shortest link cancels the request context
+			// and aborts the rebuild mid-page).
+			Timeout: 1920 * time.Second,
 		},
 		logger: logger,
 	}
