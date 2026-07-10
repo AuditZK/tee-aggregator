@@ -1980,6 +1980,26 @@ func (a *aggregatedBreakdown) totalFees() float64 {
 		a.margin.fees + a.earn.fees + a.cfd.fees + a.forex.fees + a.commodities.fees
 }
 
+func (a *aggregatedBreakdown) totalLongTrades() int {
+	return a.stocks.longTrades + a.spot.longTrades + a.swap.longTrades + a.futures.longTrades + a.options.longTrades +
+		a.margin.longTrades + a.earn.longTrades + a.cfd.longTrades + a.forex.longTrades + a.commodities.longTrades
+}
+
+func (a *aggregatedBreakdown) totalShortTrades() int {
+	return a.stocks.shortTrades + a.spot.shortTrades + a.swap.shortTrades + a.futures.shortTrades + a.options.shortTrades +
+		a.margin.shortTrades + a.earn.shortTrades + a.cfd.shortTrades + a.forex.shortTrades + a.commodities.shortTrades
+}
+
+func (a *aggregatedBreakdown) totalLongVolume() float64 {
+	return a.stocks.longVolume + a.spot.longVolume + a.swap.longVolume + a.futures.longVolume + a.options.longVolume +
+		a.margin.longVolume + a.earn.longVolume + a.cfd.longVolume + a.forex.longVolume + a.commodities.longVolume
+}
+
+func (a *aggregatedBreakdown) totalShortVolume() float64 {
+	return a.stocks.shortVolume + a.spot.shortVolume + a.swap.shortVolume + a.futures.shortVolume + a.options.shortVolume +
+		a.margin.shortVolume + a.earn.shortVolume + a.cfd.shortVolume + a.forex.shortVolume + a.commodities.shortVolume
+}
+
 // toRepo converts the aggregated breakdown to repository format and, if
 // globalEquity > 0, populates the `global` aggregate that TS consumers
 // (frontend dashboard, analytics-service) read to get total equity, volume
@@ -2038,6 +2058,10 @@ func (a *aggregatedBreakdown) toRepo(globalEquity, globalAvailableMargin float64
 			Volume:          a.totalVolume(),
 			Trades:          totalTrades,
 			TradingFees:     a.totalFees(), // toRepoMetrics splits fees by kind; aggregate only keeps total
+			LongTrades:      a.totalLongTrades(),
+			ShortTrades:     a.totalShortTrades(),
+			LongVolume:      a.totalLongVolume(),
+			ShortVolume:     a.totalShortVolume(),
 		}
 	}
 

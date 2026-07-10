@@ -461,6 +461,29 @@ func TestAggregateTrades_FundingFeesCarry(t *testing.T) {
 	}
 }
 
+// The live snapshot's breakdown.global must carry the buy/sell split summed
+// across markets — the dashboard's Long/Short Proportion chart reads
+// breakdown.global.long_trades/short_trades, and a live day left it at zero
+// (the split lived only in the per-market buckets the chart doesn't read).
+func TestToRepo_GlobalCarriesLongShortSplit(t *testing.T) {
+	svc := &SyncService{}
+	trades := []*connector.Trade{
+		{Price: 100, Quantity: 2, MarketType: connector.MarketSpot, Side: "buy"},  // long, vol 200
+		{Price: 100, Quantity: 1, MarketType: connector.MarketSpot, Side: "sell"}, // short, vol 100
+		{Price: 50, Quantity: 4, MarketType: connector.MarketSwap, Side: "buy"},   // long, vol 200
+	}
+	repo := svc.aggregateTrades(trades).toRepo(1000, 0, len(trades))
+	if repo.Global == nil {
+		t.Fatal("expected global metrics")
+	}
+	if repo.Global.LongTrades != 2 || repo.Global.ShortTrades != 1 {
+		t.Fatalf("global long/short trades: got %d/%d want 2/1", repo.Global.LongTrades, repo.Global.ShortTrades)
+	}
+	if repo.Global.LongVolume != 400 || repo.Global.ShortVolume != 100 {
+		t.Fatalf("global long/short volume: got %f/%f want 400/100", repo.Global.LongVolume, repo.Global.ShortVolume)
+	}
+}
+
 func TestEarnBalanceEnrichment(t *testing.T) {
 	agg := &aggregatedBreakdown{}
 	agg.earn.equity = 5000
