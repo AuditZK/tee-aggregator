@@ -81,6 +81,10 @@ type rebuildSnapshotOnWire struct {
 	TotalTrades     int                             `json:"totalTrades"`
 	TotalVolume     float64                         `json:"totalVolume"`
 	TotalFees       float64                         `json:"totalFees"`
+	LongTrades      int                             `json:"longTrades"`
+	ShortTrades     int                             `json:"shortTrades"`
+	LongVolume      float64                         `json:"longVolume"`
+	ShortVolume     float64                         `json:"shortVolume"`
 	Breakdown       map[string]*marketBalanceOnWire `json:"breakdown,omitempty"`
 }
 
@@ -209,6 +213,10 @@ func mapWireSnapshots(in []rebuildSnapshotOnWire) []*connector.HistoricalSnapsho
 			TotalTrades:     s.TotalTrades,
 			TotalVolume:     s.TotalVolume,
 			TotalFees:       s.TotalFees,
+			LongTrades:      s.LongTrades,
+			ShortTrades:     s.ShortTrades,
+			LongVolume:      s.LongVolume,
+			ShortVolume:     s.ShortVolume,
 			Breakdown:       mapWireBreakdown(s.Breakdown),
 		})
 	}
