@@ -120,10 +120,13 @@ func New(baseURL, authToken string, logger *zap.Logger) *Client {
 		httpClient: &http.Client{
 			// /history/rebuild is synchronous on the rebuilder side: the
 			// response body lands AFTER the per-exchange reconstruction
-			// completes. Hyperliquid's worst observed run is ~60s; 180s
-			// gives headroom for slower exchanges and OHLCV-cache-cold
-			// rebuilds without leaving the post-create hook hung forever.
-			Timeout: 180 * time.Second,
+			// completes. Binance HF accounts page their income ledger paced
+			// against Binance's request-weight cap (~70 calls/min), which
+			// runs up to ~8-9 min — the whole chain must survive it: this
+			// client, the rebuilder's REBUILD_TIMEOUT_SECONDS and nginx's
+			// proxy_read_timeout on the rebuilder vhost (the shortest link
+			// cancels the request context and aborts the rebuild mid-page).
+			Timeout: 720 * time.Second,
 		},
 		logger: logger,
 	}
