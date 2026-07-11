@@ -30,6 +30,21 @@ const (
 	sourceInEnclave         = "in-enclave"
 )
 
+// SANITY-001 collapse guard: exchange backends can answer 200-with-zeros
+// during their daily settlement window (observed: Binance fapi at 00:00 UTC
+// read both futures-balance endpoints as empty with NO error — invisible to
+// the transient-error guard — and two accounts persisted snapshots missing
+// their whole USDⓈ-M wallet). When a fresh read collapses versus the last
+// persisted snapshot of the SAME connection, re-read once after a delay and
+// take the second reading: a transient zero heals, a real crash reads the
+// same twice and stands.
+const (
+	collapseGuardRatio    = 0.5             // re-read when equity < 50% of the last snapshot
+	collapseGuardFloorUSD = 100.0           // dust accounts skip the guard (noise)
+	collapseGuardDelay    = 2 * time.Minute // long enough to exit a settlement window
+	collapseGuardLookback = 5 * 24 * time.Hour
+)
+
 // ctraderRecurringReconstructDays bounds cTrader's every-sync reconstruction
 // window. The deep historical backfill runs once at connect (since=zero); the
 // recurring re-run only needs to re-own the recent boundary day(s) so the live
@@ -465,7 +480,7 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	}
 
 	// 3. Get balance
-	balance, err := conn.GetBalance(ctx)
+	balance, err := s.fetchBalanceWithCollapseGuard(ctx, conn, connMeta)
 	if err != nil {
 		result.Error = fmt.Sprintf("get balance: %v", err)
 		s.logger.Error("sync failed: get balance",
@@ -918,7 +933,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		}
 	}
 
-	balance, err := conn.GetBalance(ctx)
+	balance, err := s.fetchBalanceWithCollapseGuard(ctx, conn, connMeta)
 	if err != nil {
 		result.Error = fmt.Sprintf("get balance: %v", err)
 		s.logger.Error(classifySyncError(result.Error), zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.String("step", "get_balance"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
@@ -1779,6 +1794,67 @@ type marketAgg struct {
 	shortTrades     int
 	longVolume      float64
 	shortVolume     float64
+}
+
+// fetchBalanceWithCollapseGuard reads the balance and, when it collapses
+// below collapseGuardRatio of this connection's last persisted snapshot,
+// re-reads once after collapseGuardDelay and returns the second reading.
+// See the SANITY-001 constants for the rationale. Best-effort on the
+// history lookup: no prior snapshot (fresh connection) means no guard.
+func (s *SyncService) fetchBalanceWithCollapseGuard(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection) (*connector.Balance, error) {
+	balance, err := conn.GetBalance(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	prior, herr := s.snapshotRepo.GetByUserAndDateRange(ctx, connMeta.UserUID, now.Add(-collapseGuardLookback), now)
+	if herr != nil {
+		return balance, nil
+	}
+	var lastEquity float64
+	var lastAt time.Time
+	for _, snap := range prior {
+		// Same connection only, and exclude today's own row — it may itself
+		// be the poisoned reading this guard exists to prevent.
+		if snap.Exchange != connMeta.Exchange || snap.Label != connMeta.Label || !snap.Timestamp.Before(startOfDay) {
+			continue
+		}
+		if snap.Timestamp.After(lastAt) {
+			lastAt = snap.Timestamp
+			lastEquity = snap.TotalEquity
+		}
+	}
+	if lastEquity < collapseGuardFloorUSD || balance.Equity >= lastEquity*collapseGuardRatio {
+		return balance, nil
+	}
+
+	s.logger.Warn("balance collapsed vs last snapshot — re-reading once (SANITY-001)",
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("label", connMeta.Label),
+		zap.Float64("read_equity", balance.Equity),
+		zap.Float64("last_equity", lastEquity),
+		zap.Duration("delay", collapseGuardDelay),
+	)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(collapseGuardDelay):
+	}
+	second, err2 := conn.GetBalance(ctx)
+	if err2 != nil {
+		return nil, fmt.Errorf("collapse-guard re-read: %w", err2)
+	}
+	s.logger.Info("collapse-guard re-read result (SANITY-001)",
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("label", connMeta.Label),
+		zap.Float64("first_equity", balance.Equity),
+		zap.Float64("second_equity", second.Equity),
+	)
+	return second, nil
 }
 
 func (s *SyncService) aggregateTrades(trades []*connector.Trade) *aggregatedBreakdown {
