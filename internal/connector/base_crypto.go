@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -253,6 +254,15 @@ func retryHTTP(client *http.Client, buildReq func() (*http.Request, error)) ([]b
 		if backoff *= 2; backoff > maxBackoff {
 			backoff = maxBackoff
 		}
+	}
+	// Only retryable failures (429/5xx, network) reach retry exhaustion —
+	// permanent statuses returned above. Mark them so callers can tell a
+	// rate-limit blip from a real refusal: a best-effort wallet read must
+	// FAIL the sync on transient errors instead of silently writing a
+	// snapshot without the wallet (observed: the midnight herd 429'd the
+	// futures reads and equity persisted $16k-$20k short).
+	if lastErr != nil && !errors.Is(lastErr, ErrTransient) {
+		lastErr = fmt.Errorf("%w: %w", ErrTransient, lastErr)
 	}
 	return lastBody, lastErr
 }

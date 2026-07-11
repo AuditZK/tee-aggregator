@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -90,10 +91,13 @@ func (b *Binance) TestConnection(ctx context.Context) error {
 
 func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	// One public ticker fetch, shared by every wallet that needs pricing (spot
-	// alts, COIN-M collateral coins, margin BTC valuation). Best-effort: on
-	// failure stablecoins still value 1:1 and coin-priced wallets contribute 0
-	// rather than failing the whole balance.
-	priceMap, _ := FetchBinanceStylePriceMap(ctx, b.client, binanceSpotAPI)
+	// alts, COIN-M collateral coins, margin BTC valuation). A transient failure
+	// must fail the sync: a margin-heavy account valued without prices would
+	// persist near-zero equity.
+	priceMap, perr := FetchBinanceStylePriceMap(ctx, b.client, binanceSpotAPI)
+	if errors.Is(perr, ErrTransient) {
+		return nil, fmt.Errorf("price map: %w", perr)
+	}
 	if priceMap == nil {
 		priceMap = map[string]float64{}
 	}
@@ -104,23 +108,33 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	}
 	total := spotBalance
 
-	// USDⓈ-M futures (ignore error — account may not have futures).
+	// Non-spot wallets are best-effort ONLY for permission-style refusals (a
+	// key without the futures/margin scope, a product never enabled). A
+	// TRANSIENT failure (429/5xx/network — e.g. the midnight herd rate-limiting
+	// fapi through the shared egress) must fail the whole sync instead:
+	// silently dropping a wallet persisted snapshots $16k-$20k short, and a
+	// failed sync is a retry while a wrong snapshot is a lie on the curve.
 	if fut, ferr := b.getFuturesBalance(ctx); ferr == nil && fut != nil {
 		total.Equity += fut.Equity
 		total.UnrealizedPnL += fut.UnrealizedPnL
+	} else if errors.Is(ferr, ErrTransient) {
+		return nil, fmt.Errorf("futures balance: %w", ferr)
 	}
 
-	// Additional wallets. Each is best-effort: a key without the permission or
-	// a product the user never enabled must not zero the whole balance. These
-	// are distinct wallets from spot/USDⓈ-M, so summing never double-counts.
 	if eq, cerr := b.getCoinMFuturesEquity(ctx, priceMap); cerr == nil {
 		total.Equity += eq
+	} else if errors.Is(cerr, ErrTransient) {
+		return nil, fmt.Errorf("coin-m balance: %w", cerr)
 	}
 	if eq, merr := b.getCrossMarginEquity(ctx, priceMap); merr == nil {
 		total.Equity += eq
+	} else if errors.Is(merr, ErrTransient) {
+		return nil, fmt.Errorf("cross margin balance: %w", merr)
 	}
 	if eq, ierr := b.getIsolatedMarginEquity(ctx, priceMap); ierr == nil {
 		total.Equity += eq
+	} else if errors.Is(ierr, ErrTransient) {
+		return nil, fmt.Errorf("isolated margin balance: %w", ierr)
 	}
 
 	return total, nil
