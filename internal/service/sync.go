@@ -1723,26 +1723,14 @@ func buildHistoricalSnapshots(
 		})
 	}
 
-	// Inception-deposit convention (UX-001) for historical reconstructions:
-	// the earliest reconstructed day inherits its TotalEquity as an inception
-	// deposit unless the connector already reported a non-zero cashflow.
-	// Without this the dashboard's cumulative-return curve has no base
-	// reference, just like the live-sync first-snapshot case. The connector
-	// list is small enough (IBKR Flex, history-rebuilder for HL/Lighter/MEXC)
-	// that a single "patch the earliest entry" pass is enough — no need to
-	// sort by date since both sources emit a chronologically sorted slice
-	// today, but use min() in case that drifts.
-	if len(snapshots) > 0 {
-		earliest := snapshots[0]
-		for _, s := range snapshots[1:] {
-			if s.Timestamp.Before(earliest.Timestamp) {
-				earliest = s
-			}
-		}
-		if earliest.Deposits == 0 && earliest.TotalEquity > 0 {
-			earliest.Deposits = earliest.TotalEquity
-		}
-	}
+	// Inception-deposit convention (UX-001) moved to applyInceptionDeposit in
+	// persistHistoricalSnapshots: stamping the BATCH-earliest day here was
+	// wrong for rolling reconstruction windows — every re-run whose window
+	// start had advanced stamped a NEW day while the previous stamp stayed in
+	// DB, compounding phantom deposits day after day (observed: a $253k
+	// account carrying $506k of "deposits" across two consecutive days). The
+	// replacement checks the DB for older rows and stamps only the true
+	// inception day.
 
 	return snapshots, skippedToday
 }
@@ -1766,7 +1754,7 @@ func (s *SyncService) isFirstSync(ctx context.Context, connMeta *repository.Exch
 		return false
 	}
 	// Fallback: historical snapshots from the rebuilder already exist, so the
-	// inception deposit was set in buildHistoricalSnapshots — don't re-apply.
+	// inception deposit was set by applyInceptionDeposit — don't re-apply.
 	if s.snapshotRepo != nil {
 		if hasAny, err := s.snapshotRepo.ExistsForUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label); err == nil && hasAny {
 			return false
