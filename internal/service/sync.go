@@ -1544,6 +1544,8 @@ func (s *SyncService) persistHistoricalSnapshots(
 		return nil
 	}
 
+	s.applyInceptionDeposit(ctx, connMeta, snapshots)
+
 	// ENG-002: write the whole reconstructed series in ONE transaction. The
 	// previous per-row Upsert loop left a silent hole in the timeline when a
 	// single day failed, and a holed series quietly skews the report's TWR.
@@ -1576,6 +1578,45 @@ func (s *SyncService) persistHistoricalSnapshots(
 		zap.Int("total_days", len(historicalSnapshots)),
 	)
 	return nil
+}
+
+// applyInceptionDeposit stamps the inception-deposit convention (UX-001) on a
+// reconstructed series: when the EARLIEST day of the batch carries equity but
+// no deposit AND no older snapshot exists for this connection, that equity is
+// the account's starting capital — record it as a deposit, or the aggregated
+// view books it as pure gain the day the connection joins (observed: an IBKR
+// PEA funded by an in-kind transfer predating the Flex window showed +73% the
+// day it appeared, inflating the user's TWR from ~83% to 216%). The
+// no-older-row check makes the rule stable as the Flex window rolls forward:
+// the old first day stays in DB, so later window starts never get a phantom
+// mid-series deposit. Best-effort — a failed history lookup changes nothing.
+func (s *SyncService) applyInceptionDeposit(ctx context.Context, connMeta *repository.ExchangeConnection, snapshots []*repository.Snapshot) {
+	earliest := snapshots[0]
+	for _, sn := range snapshots {
+		if sn.Timestamp.Before(earliest.Timestamp) {
+			earliest = sn
+		}
+	}
+	if earliest.Deposits != 0 || earliest.TotalEquity <= 0 {
+		return
+	}
+	prior, err := s.snapshotRepo.GetByUserAndDateRange(ctx, connMeta.UserUID, time.Unix(0, 0).UTC(), earliest.Timestamp.Add(-time.Second))
+	if err != nil {
+		return
+	}
+	for _, p := range prior {
+		if p.Exchange == connMeta.Exchange && p.Label == connMeta.Label {
+			return // history extends further back — this is not the inception day
+		}
+	}
+	earliest.Deposits = earliest.TotalEquity
+	s.logger.Info("inception deposit stamped on reconstructed series (UX-001)",
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("label", connMeta.Label),
+		zap.Time("inception_day", earliest.Timestamp),
+		zap.Float64("deposit", earliest.Deposits),
+	)
 }
 
 // retryWithBackoff calls fn up to maxAttempts times, sleeping attempt*base
