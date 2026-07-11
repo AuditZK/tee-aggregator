@@ -65,6 +65,12 @@ func (b *Binance) doRequest(ctx context.Context, method, baseURL, path string, p
 			// the previous attempt's signature, which must not be part of the
 			// next signed payload.
 			params.Del("signature")
+			// Binance's default recvWindow is 5000ms; through the egress proxy
+			// a signed call regularly exceeds it and dies with -1021 (HTTP 400,
+			// non-retryable) — observed as wallet reads silently dropping while
+			// the rebuilder, which already sends 30000, read the same account
+			// fine from the same IP.
+			params.Set("recvWindow", "30000")
 			params.Set("timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
 			params.Set("signature", b.sign(params))
 		}
