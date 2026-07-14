@@ -266,10 +266,29 @@ func (c *CTrader) SetTokenPersister(persister TokenPersister) {
 	c.tokenPersister = persister
 }
 
-// DetectIsPaper mirrors TS behavior:
-// passphrase=\"demo\" selects demo endpoint, otherwise live.
-func (c *CTrader) DetectIsPaper(_ context.Context) (bool, error) {
-	return !c.isLive, nil
+// DetectIsPaper reports whether the connection's account is a cTrader demo
+// account, from the authoritative per-account IsLive flag in the account list.
+// c.isLive is only a WS-routing seed derived from the passphrase, and OAuth
+// connections never carry "demo" there — so it defaults to live and every OAuth
+// demo account was classified real, presenting a resettable demo balance as a
+// verifiable track record. Mirror ensureAccountID's prefer-live selection so
+// the flag matches the account that actually gets synced.
+func (c *CTrader) DetectIsPaper(ctx context.Context) (bool, error) {
+	accounts, err := c.getAccounts(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(accounts) == 0 {
+		return false, fmt.Errorf("no cTrader accounts found")
+	}
+	selected := accounts[0]
+	for _, acct := range accounts {
+		if acct.IsLive {
+			selected = acct
+			break
+		}
+	}
+	return !selected.IsLive, nil
 }
 
 func (c *CTrader) TestConnection(ctx context.Context) error {
