@@ -1576,14 +1576,44 @@ func ctraderBalanceAt(points []ctraderBalPoint, t time.Time) float64 {
 	return bal
 }
 
-func ctraderCashflowsByDay(cashflows []ctraderDepositWithdraw) map[string]*ctraderCashflowDay {
+// ctraderResetPriorFloor is the minimum pre-event balance (USD) for a
+// zero-then-fund deposit to be treated as an account reset rather than a
+// genuine inception deposit onto an empty account.
+const ctraderResetPriorFloor = 1.0
+
+// ctraderCashflowsByDay sums each day's recognized deposits/withdrawals,
+// correcting demo-reset deposits. A cTrader demo reset zeroes the account and
+// re-deposits the new starting balance, so its ledger entry reports
+// delta == balanceAfter (ledger balanceBefore == 0) even though the account
+// actually held a non-zero balance. Recording that raw delta counts the
+// discarded prior balance as fresh capital — cumulative deposits then exceed
+// equity and the account shows a phantom loss. When the ledger claims a
+// near-empty prior balance but the reconstructed balance curve says otherwise,
+// record the NET instead: balanceAfter minus the balance immediately before.
+// Reset-to-lower yields a negative net (a withdrawal), which is also correct.
+func ctraderCashflowsByDay(deals []cTraderDeal, cashflows []ctraderDepositWithdraw) map[string]*ctraderCashflowDay {
+	dealBals := ctraderDealBalancePoints(deals)
+	sorted := make([]ctraderDepositWithdraw, len(cashflows))
+	copy(sorted, cashflows)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Timestamp < sorted[j].Timestamp })
+
 	byDay := map[string]*ctraderCashflowDay{}
-	for _, cf := range cashflows {
-		amount, ok := ctraderCashflowAmount(cf)
+	var running float64
+	di := 0
+	for _, cf := range sorted {
+		t := time.UnixMilli(cf.Timestamp).UTC()
+		for di < len(dealBals) && dealBals[di].t.Before(t) {
+			running = dealBals[di].bal
+			di++
+		}
+
+		amount, ok := ctraderResetAwareAmount(cf, running)
 		if !ok {
 			continue
 		}
-		key := time.UnixMilli(cf.Timestamp).UTC().Format("20060102")
+		running = float64(cf.Balance) / ctraderMoneyDivisor(cf.MoneyDigits)
+
+		key := t.Format("20060102")
 		e := byDay[key]
 		if e == nil {
 			e = &ctraderCashflowDay{}
@@ -1596,6 +1626,49 @@ func ctraderCashflowsByDay(cashflows []ctraderDepositWithdraw) map[string]*ctrad
 		}
 	}
 	return byDay
+}
+
+// ctraderResetAwareAmount returns the signed recognized cashflow amount for cf,
+// correcting a demo reset — a zero-then-fund deposit whose ledger delta equals
+// its balanceAfter — to the net capital change against the reconstructed prior
+// balance `running`. Non-reset deposits/withdrawals return their raw amount.
+func ctraderResetAwareAmount(cf ctraderDepositWithdraw, running float64) (float64, bool) {
+	amount, ok := ctraderCashflowAmount(cf)
+	if !ok {
+		return 0, false
+	}
+	if cf.OperationType != ctraderOpDeposit || running <= ctraderResetPriorFloor {
+		return amount, true
+	}
+	div := ctraderMoneyDivisor(cf.MoneyDigits)
+	balanceAfter := float64(cf.Balance) / div
+	ledgerBefore := balanceAfter - float64(cf.Delta)/div
+	if ledgerBefore < 0.5*running {
+		return balanceAfter - running, true
+	}
+	return amount, true
+}
+
+// ctraderDealBalancePoints returns time-sorted (timestamp, balance-after)
+// samples from closing deals — the balance curve between cashflows, used to
+// know the true balance just before a reset deposit.
+func ctraderDealBalancePoints(deals []cTraderDeal) []ctraderBalPoint {
+	var points []ctraderBalPoint
+	for _, d := range deals {
+		if d.ClosePositionDetail == nil || d.ClosePositionDetail.Balance == 0 {
+			continue
+		}
+		md := d.ClosePositionDetail.MoneyDigits
+		if md == 0 {
+			md = d.MoneyDigits
+		}
+		points = append(points, ctraderBalPoint{
+			t:   time.UnixMilli(d.ExecutionTimestamp).UTC(),
+			bal: float64(d.ClosePositionDetail.Balance) / ctraderMoneyDivisor(md),
+		})
+	}
+	sort.Slice(points, func(i, j int) bool { return points[i].t.Before(points[j].t) })
+	return points
 }
 
 func ctraderTradesByDay(deals []cTraderDeal) map[string]*ctraderTradeDay {
@@ -1633,7 +1706,7 @@ func buildCTraderHistoricalSnapshots(deals []cTraderDeal, cashflows []ctraderDep
 	if len(points) == 0 {
 		return nil
 	}
-	cfByDay := ctraderCashflowsByDay(cashflows)
+	cfByDay := ctraderCashflowsByDay(deals, cashflows)
 	tByDay := ctraderTradesByDay(deals)
 
 	firstDay := truncUTCDay(points[0].t)

@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -600,6 +601,62 @@ func TestBuildCTraderHistoricalSnapshots_CarryForwardAndWithdraw(t *testing.T) {
 	// 06-03: withdrawal, equity 800
 	if snaps[2].Date.Format("20060102") != "20260603" || snaps[2].TotalEquity != 800 || snaps[2].Withdrawals != 200 {
 		t.Fatalf("day3: %+v", snaps[2])
+	}
+}
+
+// A cTrader demo reset logs a BALANCE_DEPOSIT with delta == balanceAfter
+// (ledger balanceBefore 0) even though the account held a real balance. The
+// reconstruction must record the NET capital added (new balance minus the
+// balance just before), not the raw delta — recording the full amount would
+// push cumulative deposits above equity and show a phantom loss.
+// Reproduces youceef.bouanani: $100k funded 05-31, traded to $102,484.54 by
+// 06-13, reset to $1,000,000 on 06-14.
+func TestBuildCTraderHistoricalSnapshots_DemoResetRecordsNetDeposit(t *testing.T) {
+	day531 := time.Date(2026, 5, 31, 0, 0, 0, 0, time.UTC)
+	day613 := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	reset614 := time.Date(2026, 6, 14, 17, 53, 58, 0, time.UTC)
+
+	dealJSON := fmt.Sprintf(`{"deal":[{"dealId":1,"positionId":1,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":%d,"executionPrice":1.1,"tradeSide":2,"dealStatus":2,"commission":-450,"closePositionDetail":{"grossProfit":248454,"balance":10248454,"moneyDigits":2},"moneyDigits":2}]}`, day613.UnixMilli())
+	var dr struct {
+		Deal []cTraderDeal `json:"deal"`
+	}
+	if err := json.Unmarshal([]byte(dealJSON), &dr); err != nil {
+		t.Fatalf("unmarshal deals: %v", err)
+	}
+
+	cfs := []ctraderDepositWithdraw{
+		{OperationType: 0, Balance: 10000000, Delta: 10000000, Timestamp: day531.UnixMilli(), MoneyDigits: 2},    // $100k inception
+		{OperationType: 0, Balance: 100000000, Delta: 100000000, Timestamp: reset614.UnixMilli(), MoneyDigits: 2}, // $1M reset (delta == balance)
+	}
+
+	now := time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC)
+	snaps := buildCTraderHistoricalSnapshots(dr.Deal, cfs, now)
+
+	byDay := map[string]*HistoricalSnapshot{}
+	var totalDeposits float64
+	for _, s := range snaps {
+		byDay[s.Date.Format("20060102")] = s
+		totalDeposits += s.Deposits
+	}
+
+	// Inception is a real deposit (running balance was 0 -> not a reset).
+	if d := byDay["20260531"]; d == nil || d.Deposits != 100000 {
+		t.Fatalf("05-31 inception: want deposits=100000, got %+v", d)
+	}
+	// Reset day: NET capital (1,000,000 - 102,484.54), equity is the new $1M.
+	d614 := byDay["20260614"]
+	if d614 == nil {
+		t.Fatal("06-14 reset row missing")
+	}
+	if !floatNear(d614.Deposits, 897515.46, 0.5) {
+		t.Fatalf("06-14 reset deposit: want ~897515.46 net, got %v (raw 1,000,000 double-counts the discarded balance)", d614.Deposits)
+	}
+	if !floatNear(d614.TotalEquity, 1000000, 0.01) {
+		t.Fatalf("06-14 equity: want 1,000,000, got %v", d614.TotalEquity)
+	}
+	// Cumulative deposits stay below equity — no phantom loss.
+	if totalDeposits >= 1000000 {
+		t.Fatalf("cumulative deposits %v must stay below equity (raw capture would reach 1,100,000)", totalDeposits)
 	}
 }
 
