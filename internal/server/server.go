@@ -315,6 +315,24 @@ func (s *Server) handleAdminDumpCashflows(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// raw=true returns the unfiltered balance-operation ledger (every
+	// operationType) instead of the deposit/withdraw view — for diagnosing
+	// balance jumps the op-0/1 filter can't explain (e.g. demo resets).
+	if q.Get("raw") == "true" {
+		ops, err := s.handler.syncSvc.DumpRawCashflows(r.Context(), userUID, exchange, label, since)
+		if err != nil {
+			s.logger.Error("dump raw cashflows failed", zap.Error(err))
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.handler.sanitizeErr(err)})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"count":   len(ops),
+			"raw_ops": ops,
+		})
+		return
+	}
+
 	cashflows, err := s.handler.syncSvc.DumpCashflows(r.Context(), userUID, exchange, label, since)
 	if err != nil {
 		s.logger.Error("dump cashflows failed", zap.Error(err))

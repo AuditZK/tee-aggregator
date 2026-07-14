@@ -2015,6 +2015,38 @@ func (s *SyncService) DumpCashflows(
 	return cfFetcher.GetCashflows(ctx, since)
 }
 
+// DumpRawCashflows returns the broker's unfiltered balance-operation ledger for
+// a user, every operationType preserved. Diagnostic for balance jumps that the
+// deposit/withdraw filter (op 0/1) can't explain — a demo reset that surfaces
+// as a spurious return has no BALANCE_DEPOSIT entry, so this exposes whichever
+// operation (or none) actually moved the balance.
+func (s *SyncService) DumpRawCashflows(
+	ctx context.Context,
+	userUID, exchange, label string,
+	since time.Time,
+) ([]connector.RawBalanceOp, error) {
+	if s.connSvc == nil {
+		return nil, fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build connector: %w", err)
+	}
+
+	rawFetcher, ok := conn.(connector.RawCashflowFetcher)
+	if !ok {
+		return nil, fmt.Errorf("connector %s does not support raw cashflow fetching", exchange)
+	}
+
+	return rawFetcher.GetRawCashflowEntries(ctx, since)
+}
+
 func appendUnique(slice []string, s string) []string {
 	for _, v := range slice {
 		if v == s {

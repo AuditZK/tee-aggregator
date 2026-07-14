@@ -1197,32 +1197,44 @@ func firstNonEmpty(values ...string) string {
 // every other operationType (swap, commission, rebate, dividend, fee…) is a
 // trading effect already reflected in equity/PnL and must not be double-counted.
 func (c *CTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
+	entries, err := c.getRawCashflows(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	return ctraderCashflowsFromEntries(entries), nil
+}
+
+// getRawCashflows fetches every balance-operation entry in [since, now],
+// weekly-paginated (cTrader caps a single ProtoOACashFlowHistoryListReq to 7
+// days; a single-shot request over a wider range fails INCORRECT_BOUNDARIES).
+func (c *CTrader) getRawCashflows(ctx context.Context, since time.Time) ([]ctraderDepositWithdraw, error) {
 	accountID, err := c.ensureAccountID(ctx)
 	if err != nil {
 		return nil, err
 	}
+	return c.getAllCashflows(ctx, accountID, since, time.Now().UTC())
+}
 
-	if err := c.authenticateAccount(ctx, accountID); err != nil {
-		return nil, err
-	}
-
-	raw, err := c.sendWithTokenRefresh(ctx, func() (json.RawMessage, error) {
-		return c.sendMessage(
-			ctx,
-			ctraderPayloadCashFlowHistoryReq,
-			map[string]any{
-				"ctidTraderAccountId": accountID,
-				"fromTimestamp":       since.UnixMilli(),
-				"toTimestamp":         time.Now().UTC().UnixMilli(),
-			},
-			ctraderPayloadCashFlowHistoryRes,
-		)
-	})
+// GetRawCashflowEntries returns cTrader's balance-operation ledger for
+// [since, now] with every operationType included and money values decoded.
+// GetCashflows recognizes only deposit/withdraw (op 0/1); this exposes the
+// untyped operations (demo resets, adjustments) a balance jump may hide behind.
+func (c *CTrader) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error) {
+	entries, err := c.getRawCashflows(ctx, since)
 	if err != nil {
 		return nil, err
 	}
-
-	return parseCTraderCashflows(raw)
+	ops := make([]RawBalanceOp, 0, len(entries))
+	for _, dw := range entries {
+		div := ctraderMoneyDivisor(dw.MoneyDigits)
+		ops = append(ops, RawBalanceOp{
+			OperationType: dw.OperationType,
+			Delta:         float64(dw.Delta) / div,
+			BalanceAfter:  float64(dw.Balance) / div,
+			Timestamp:     time.UnixMilli(dw.Timestamp).UTC(),
+		})
+	}
+	return ops, nil
 }
 
 // ctraderDepositWithdraw is a single ProtoOADepositWithdraw entry from a
@@ -1286,6 +1298,13 @@ func parseCTraderCashflows(raw json.RawMessage) ([]*Cashflow, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ctraderCashflowsFromEntries(entries), nil
+}
+
+// ctraderCashflowsFromEntries keeps the recognized deposit/withdraw entries
+// (op 0/1) and drops trading effects (swap/commission/…). Shared by the raw
+// payload parser and the paginated GetCashflows so both filter identically.
+func ctraderCashflowsFromEntries(entries []ctraderDepositWithdraw) []*Cashflow {
 	var cashflows []*Cashflow
 	for _, dw := range entries {
 		amount, ok := ctraderCashflowAmount(dw)
@@ -1298,7 +1317,7 @@ func parseCTraderCashflows(raw json.RawMessage) ([]*Cashflow, error) {
 			Timestamp: time.UnixMilli(dw.Timestamp).UTC(),
 		})
 	}
-	return cashflows, nil
+	return cashflows
 }
 
 // --- in-enclave history reconstruction --------------------------------------

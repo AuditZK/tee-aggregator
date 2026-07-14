@@ -216,6 +216,158 @@ func TestCTraderGetAccounts_TokenInvalidWithoutRefreshToken(t *testing.T) {
 	}
 }
 
+// GetCashflows must weekly-paginate: cTrader caps a single
+// ProtoOACashFlowHistoryListReq to 7 days (INCORRECT_BOUNDARIES otherwise), so
+// a single-shot request over a wider range silently returned nothing and the
+// admin backfill tool was broken for its entire purpose.
+func TestCTraderGetCashflows_PaginatesBeyondWeekLimit(t *testing.T) {
+	now := time.Now().UTC()
+	since := now.Add(-20 * 24 * time.Hour)
+	target := since.Add(10 * 24 * time.Hour) // lands in the 2nd weekly chunk
+
+	var cashflowReqs atomic.Int32
+	var windowsMu sync.Mutex
+	var windows [][2]int64
+
+	wsServer := newCTraderWSServer(t, func(conn *websocket.Conn, msg wsTestMessage) {
+		switch msg.PayloadType {
+		case ctraderPayloadAppAuthReq:
+			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadAppAuthRes, map[string]any{})
+		case ctraderPayloadGetAccountsReq:
+			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadGetAccountsRes, map[string]any{
+				"ctidTraderAccount": []map[string]any{{"ctidTraderAccountId": 12345, "isLive": true}},
+			})
+		case ctraderPayloadAccountAuthReq:
+			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadAccountAuthRes, map[string]any{})
+		case ctraderPayloadCashFlowHistoryReq:
+			cashflowReqs.Add(1)
+			fromTS := int64(msg.Payload["fromTimestamp"].(float64))
+			toTS := int64(msg.Payload["toTimestamp"].(float64))
+			windowsMu.Lock()
+			windows = append(windows, [2]int64{fromTS, toTS})
+			windowsMu.Unlock()
+
+			var entries []map[string]any
+			if tms := target.UnixMilli(); fromTS <= tms && tms < toTS {
+				entries = []map[string]any{{
+					"operationType":          ctraderOpDeposit,
+					"delta":                  100000, // $1000 at moneyDigits 2
+					"balance":                100000,
+					"changeBalanceTimestamp": tms,
+					"moneyDigits":            2,
+				}}
+			}
+			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadCashFlowHistoryRes, map[string]any{
+				"depositWithdraw": entries,
+			})
+		default:
+			t.Fatalf("unexpected payloadType: %d", msg.PayloadType)
+		}
+	})
+	defer wsServer.Close()
+
+	c := newTestCTrader(wsServer.URL)
+
+	cashflows, err := c.GetCashflows(context.Background(), since)
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+
+	// 20 days over 7-day windows = 3 requests. A single-shot request would be 1
+	// (and cTrader rejects that with INCORRECT_BOUNDARIES in prod).
+	if got := cashflowReqs.Load(); got != 3 {
+		t.Fatalf("expected 3 weekly cash-flow requests, got %d", got)
+	}
+	windowsMu.Lock()
+	for _, w := range windows {
+		if span := w[1] - w[0]; span > int64(ctraderCashflowWindow/time.Millisecond) {
+			t.Fatalf("window span %dms exceeds the 7-day cap", span)
+		}
+	}
+	windowsMu.Unlock()
+	if len(cashflows) != 1 {
+		t.Fatalf("expected the middle-week deposit returned once, got %d", len(cashflows))
+	}
+	if cashflows[0].Amount != 1000 {
+		t.Fatalf("deposit amount: got %v, want 1000", cashflows[0].Amount)
+	}
+}
+
+// GetRawCashflowEntries preserves every operationType — including the ones
+// GetCashflows drops — so a balance jump that has no deposit/withdraw entry
+// (a demo reset) can be diagnosed instead of read as a spurious return.
+func TestCTraderGetRawCashflowEntries_PreservesUntypedOps(t *testing.T) {
+	now := time.Now().UTC()
+	since := now.Add(-3 * 24 * time.Hour) // single weekly window
+	ts := since.Add(24 * time.Hour).UnixMilli()
+
+	wsServer := newCTraderWSServer(t, func(conn *websocket.Conn, msg wsTestMessage) {
+		switch msg.PayloadType {
+		case ctraderPayloadAppAuthReq:
+			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadAppAuthRes, map[string]any{})
+		case ctraderPayloadGetAccountsReq:
+			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadGetAccountsRes, map[string]any{
+				"ctidTraderAccount": []map[string]any{{"ctidTraderAccountId": 12345, "isLive": true}},
+			})
+		case ctraderPayloadAccountAuthReq:
+			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadAccountAuthRes, map[string]any{})
+		case ctraderPayloadCashFlowHistoryReq:
+			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadCashFlowHistoryRes, map[string]any{
+				"depositWithdraw": []map[string]any{
+					{"operationType": ctraderOpDeposit, "delta": 100000, "balance": 100000, "changeBalanceTimestamp": ts, "moneyDigits": 2},
+					{"operationType": 21, "delta": -50, "balance": 99950, "changeBalanceTimestamp": ts, "moneyDigits": 2}, // swap: not a cashflow
+				},
+			})
+		default:
+			t.Fatalf("unexpected payloadType: %d", msg.PayloadType)
+		}
+	})
+	defer wsServer.Close()
+
+	c := newTestCTrader(wsServer.URL)
+
+	ops, err := c.GetRawCashflowEntries(context.Background(), since)
+	if err != nil {
+		t.Fatalf("GetRawCashflowEntries: %v", err)
+	}
+	if len(ops) != 2 {
+		t.Fatalf("expected 2 raw ops (deposit + swap), got %d", len(ops))
+	}
+	var sawSwap bool
+	for _, op := range ops {
+		if op.OperationType == 21 {
+			sawSwap = true
+			if op.Delta != -0.5 {
+				t.Fatalf("swap delta: got %v, want -0.5", op.Delta)
+			}
+		}
+	}
+	if !sawSwap {
+		t.Fatal("raw ops must include the untyped swap operation GetCashflows drops")
+	}
+
+	// The filtered view keeps only the deposit.
+	filtered := ctraderCashflowsFromEntries([]ctraderDepositWithdraw{
+		{OperationType: ctraderOpDeposit, Delta: 100000, Balance: 100000, Timestamp: ts, MoneyDigits: 2},
+		{OperationType: 21, Delta: -50, Balance: 99950, Timestamp: ts, MoneyDigits: 2},
+	})
+	if len(filtered) != 1 || filtered[0].Amount != 1000 {
+		t.Fatalf("filtered cashflows: got %+v, want single $1000 deposit", filtered)
+	}
+}
+
+func newTestCTrader(wsURL string) *CTrader {
+	return &CTrader{
+		clientID:     "client-id",
+		clientSecret: "client-secret",
+		accessToken:  "token",
+		isLive:       true,
+		wsLiveURL:    toWSURL(wsURL),
+		wsDemoURL:    toWSURL(wsURL),
+		httpClient:   &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
 func toWSURL(httpURL string) string {
 	return "ws" + strings.TrimPrefix(httpURL, "http")
 }

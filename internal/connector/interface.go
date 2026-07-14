@@ -68,6 +68,22 @@ type CashflowFetcher interface {
 	GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error)
 }
 
+// RawBalanceOp is a single broker balance-operation ledger entry with its raw
+// operation type preserved — including the ones GetCashflows drops (swap,
+// commission, and any untyped adjustment/reset). Diagnostic surface for
+// classifying balance jumps a deposit/withdraw filter can't explain.
+type RawBalanceOp struct {
+	OperationType int       `json:"operationType"`
+	Delta         float64   `json:"delta"`        // signed change to the balance
+	BalanceAfter  float64   `json:"balanceAfter"` // account balance after the operation
+	Timestamp     time.Time `json:"timestamp"`
+}
+
+// RawCashflowFetcher optionally exposes the unfiltered balance-operation ledger.
+type RawCashflowFetcher interface {
+	GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error)
+}
+
 // MarketBalance holds equity data for a specific market type.
 type MarketBalance struct {
 	MarketType      string  `json:"market_type"`
