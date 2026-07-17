@@ -228,12 +228,12 @@ func (i *IG) authedOnce(ctx context.Context, version, path string, query url.Val
 	})
 }
 
-// parseIGDecimal reads IG's money and level fields, which arrive as display
+// ParseIGDecimal reads IG's money and level fields, which arrive as display
 // strings rather than numbers: profitAndLoss carries the account's currency
 // symbol ("E12.34", "£-5.00"), sizes carry an explicit sign, and larger values
 // carry thousands separators. Keeping only the numeric characters tolerates
 // every variant instead of pinning a prefix that changes with the account.
-func parseIGDecimal(s string) (float64, error) {
+func ParseIGDecimal(s string) (float64, error) {
 	var b strings.Builder
 	for _, r := range s {
 		if (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '+' {
@@ -403,20 +403,30 @@ func (i *IG) GetPositions(ctx context.Context) ([]*Position, error) {
 	return positions, nil
 }
 
-type igTransaction struct {
+// IGRawTransaction is one unparsed line of IG's transaction ledger, with the
+// vendor's own strings and codes preserved. The parsed views drop what they
+// cannot classify, so this is the surface to read when a balance move does not
+// reconcile — the same role cTrader's raw cash-flow probe plays.
+type IGRawTransaction struct {
 	CashTransaction bool   `json:"cashTransaction"`
 	CloseLevel      string `json:"closeLevel"`
 	Currency        string `json:"currency"`
 	DateUTC         string `json:"dateUtc"`
 	InstrumentName  string `json:"instrumentName"`
+	OpenLevel       string `json:"openLevel"`
 	ProfitAndLoss   string `json:"profitAndLoss"`
 	Reference       string `json:"reference"`
 	Size            string `json:"size"`
 	TransactionType string `json:"transactionType"`
 }
 
-func (i *IG) fetchTransactions(ctx context.Context, from, to time.Time) ([]igTransaction, error) {
-	var out []igTransaction
+// RawTransactions returns the unfiltered ledger for [since, until].
+func (i *IG) RawTransactions(ctx context.Context, since, until time.Time) ([]IGRawTransaction, error) {
+	return i.fetchTransactions(ctx, since, until)
+}
+
+func (i *IG) fetchTransactions(ctx context.Context, from, to time.Time) ([]IGRawTransaction, error) {
+	var out []IGRawTransaction
 
 	for page := 1; page <= igMaxTransactionPages; page++ {
 		q := url.Values{}
@@ -431,7 +441,7 @@ func (i *IG) fetchTransactions(ctx context.Context, from, to time.Time) ([]igTra
 		}
 
 		var resp struct {
-			Transactions []igTransaction `json:"transactions"`
+			Transactions []IGRawTransaction `json:"transactions"`
 			MetaData     struct {
 				PageData struct {
 					TotalPages int `json:"totalPages"`
@@ -466,15 +476,15 @@ func (i *IG) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, err
 		if err != nil {
 			continue
 		}
-		size, err := parseIGDecimal(t.Size)
+		size, err := ParseIGDecimal(t.Size)
 		if err != nil {
 			continue
 		}
-		price, err := parseIGDecimal(t.CloseLevel)
+		price, err := ParseIGDecimal(t.CloseLevel)
 		if err != nil {
 			continue
 		}
-		pnl, err := parseIGDecimal(t.ProfitAndLoss)
+		pnl, err := ParseIGDecimal(t.ProfitAndLoss)
 		if err != nil {
 			continue
 		}
@@ -516,7 +526,7 @@ func (i *IG) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, er
 			continue
 		}
 
-		amount, err := parseIGDecimal(t.ProfitAndLoss)
+		amount, err := ParseIGDecimal(t.ProfitAndLoss)
 		if err != nil {
 			continue
 		}

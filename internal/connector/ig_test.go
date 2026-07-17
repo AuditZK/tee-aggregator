@@ -95,18 +95,18 @@ func TestIGParseDecimal(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.in, func(t *testing.T) {
-			got, err := parseIGDecimal(tc.in)
+			got, err := ParseIGDecimal(tc.in)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("parseIGDecimal(%q) = %v, want error", tc.in, got)
+					t.Fatalf("ParseIGDecimal(%q) = %v, want error", tc.in, got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("parseIGDecimal(%q) returned error: %v", tc.in, err)
+				t.Fatalf("ParseIGDecimal(%q) returned error: %v", tc.in, err)
 			}
 			if got != tc.want {
-				t.Fatalf("parseIGDecimal(%q) = %v, want %v", tc.in, got, tc.want)
+				t.Fatalf("ParseIGDecimal(%q) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
 	}
