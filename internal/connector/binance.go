@@ -26,6 +26,10 @@ type Binance struct {
 	apiKey    string
 	apiSecret string
 	client    *http.Client
+	// cachedBreakdown carries the per-market split computed by the last
+	// GetBalance, served by GetBalanceByMarket without extra API calls (the
+	// midnight herd already rate-limits fapi; same pattern as IBKR).
+	cachedBreakdown []*MarketBalance
 }
 
 // NewBinance creates a new Binance connector
@@ -108,11 +112,16 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 		priceMap = map[string]float64{}
 	}
 
+	b.cachedBreakdown = nil
+
 	spotBalance, err := b.getSpotBalance(ctx, priceMap)
 	if err != nil {
 		return nil, fmt.Errorf("spot balance: %w", err)
 	}
 	total := spotBalance
+	// total aliases spotBalance — snapshot the spot-only equity before the
+	// wallet adds below mutate it through the shared pointer.
+	nonUM := spotBalance.Equity
 
 	// Non-spot wallets are best-effort ONLY for permission-style refusals (a
 	// key without the futures/margin scope, a product never enabled). A
@@ -120,30 +129,57 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	// fapi through the shared egress) must fail the whole sync instead:
 	// silently dropping a wallet persisted snapshots $16k-$20k short, and a
 	// failed sync is a retry while a wrong snapshot is a lie on the curve.
+	var futures *Balance
 	if fut, ferr := b.getFuturesBalance(ctx); ferr == nil && fut != nil {
 		total.Equity += fut.Equity
 		total.UnrealizedPnL += fut.UnrealizedPnL
+		futures = fut
 	} else if errors.Is(ferr, ErrTransient) {
 		return nil, fmt.Errorf("futures balance: %w", ferr)
 	}
 
 	if eq, cerr := b.getCoinMFuturesEquity(ctx, priceMap); cerr == nil {
 		total.Equity += eq
+		nonUM += eq
 	} else if errors.Is(cerr, ErrTransient) {
 		return nil, fmt.Errorf("coin-m balance: %w", cerr)
 	}
 	if eq, merr := b.getCrossMarginEquity(ctx, priceMap); merr == nil {
 		total.Equity += eq
+		nonUM += eq
 	} else if errors.Is(merr, ErrTransient) {
 		return nil, fmt.Errorf("cross margin balance: %w", merr)
 	}
 	if eq, ierr := b.getIsolatedMarginEquity(ctx, priceMap); ierr == nil {
 		total.Equity += eq
+		nonUM += eq
 	} else if errors.Is(ierr, ErrTransient) {
 		return nil, fmt.Errorf("isolated margin balance: %w", ierr)
 	}
 
+	// Per-market split, matching the history rebuilder's two-bucket convention
+	// (its "spot" carries everything non-UM — spot, COIN-M, cross+iso margin —
+	// with available=equity; "swap" is UM futures with the true free margin).
+	// Diverging from that convention makes the margin curve jump at the seam
+	// between rebuilt days and live days.
+	if nonUM != 0 {
+		b.cachedBreakdown = append(b.cachedBreakdown, &MarketBalance{
+			MarketType: MarketSpot, Equity: nonUM, AvailableMargin: nonUM,
+		})
+	}
+	if futures != nil && (futures.Equity != 0 || futures.Available != 0) {
+		b.cachedBreakdown = append(b.cachedBreakdown, &MarketBalance{
+			MarketType: MarketSwap, Equity: futures.Equity, AvailableMargin: futures.Available,
+		})
+	}
+
 	return total, nil
+}
+
+// GetBalanceByMarket returns the split cached by the last GetBalance call —
+// no additional API calls (the midnight herd already rate-limits fapi).
+func (b *Binance) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
+	return b.cachedBreakdown, nil
 }
 
 func (b *Binance) getSpotBalance(ctx context.Context, priceMap map[string]float64) (*Balance, error) {
