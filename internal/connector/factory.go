@@ -82,6 +82,13 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 	// CFD/Forex brokers
 	case "ctrader":
 		return NewCTrader(creds), nil
+	// IG's demo and live environments are separate credential sets on separate
+	// hosts, and all three credential slots are taken (key, password,
+	// identifier), so the environment rides on the exchange id.
+	case "ig":
+		return NewIG(creds, false), nil
+	case "ig_demo":
+		return NewIG(creds, true), nil
 	case "mt4", "mt5", "exness":
 		return NewMetaTrader(creds), nil
 
@@ -126,6 +133,8 @@ func (f *Factory) SupportedExchanges() []string {
 		"hyperliquid",
 		"lighter",
 		"ctrader",
+		"ig",
+		"ig_demo",
 		"mt4",
 		"mt5",
 		"exness",

@@ -19,6 +19,7 @@ func TestAllConnectorsImplementInterface(t *testing.T) {
 	var _ Connector = (*Hyperliquid)(nil)
 	var _ Connector = (*Lighter)(nil)
 	var _ Connector = (*CTrader)(nil)
+	var _ Connector = (*IG)(nil)
 	var _ Connector = (*MetaTrader)(nil)
 	var _ Connector = (*MockConnector)(nil)
 	var _ Connector = (*Bitget)(nil)
@@ -47,6 +48,7 @@ func TestOptionalInterfaces(t *testing.T) {
 		{"Hyperliquid", NewHyperliquid(&Credentials{WalletAddress: "0x1"}), true, true, true, false, false, true},
 		{"Lighter", NewLighter(&Credentials{WalletAddress: "0x1"}), false, true, false, false, false, true},
 		{"MEXC", NewMEXC(&Credentials{APIKey: "k", APISecret: "s"}), true, true, true, false, false, false},
+		{"IG", NewIG(&Credentials{APIKey: "k", APISecret: "s", Passphrase: "u"}, false), true, false, false, false, false, true},
 		{"Mock", NewMock(), false, false, false, false, false, false},
 	}
 
