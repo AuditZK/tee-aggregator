@@ -89,10 +89,21 @@ func TestBinance_GetBalanceByMarket_SplitAndNoExtraCalls(t *testing.T) {
 		t.Fatalf("GetBalanceByMarket made %d extra API calls, want 0", got-before)
 	}
 
+	// balance.Available is persisted as breakdown.global.available_margin —
+	// the field the dashboard's free-margin line reads. It must mirror the
+	// buckets, not the spot wallet's loose stablecoins (0 here).
+	if want := (1000 + 242000) + 14400.0; bal.Available != want {
+		t.Fatalf("balance.Available: got %v, want %v (spot bucket + swap free margin)", bal.Available, want)
+	}
+
 	m := marketMap(t, mbs)
 	spot, swap := m[MarketSpot], m[MarketSwap]
 	if spot == nil || swap == nil {
 		t.Fatalf("want spot+swap buckets, got %+v", mbs)
+	}
+	if bal.Available != spot.AvailableMargin+swap.AvailableMargin {
+		t.Fatalf("global available (%v) must equal spot+swap available (%v)",
+			bal.Available, spot.AvailableMargin+swap.AvailableMargin)
 	}
 	// Seam convention: cross margin folds into spot, available = equity.
 	if spot.Equity != 1000+242000 || spot.AvailableMargin != spot.Equity {

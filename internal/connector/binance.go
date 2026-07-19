@@ -173,6 +173,16 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 		})
 	}
 
+	// Available must mirror the buckets: the sync persists it as
+	// breakdown.global.available_margin, which is the field the dashboard's
+	// free-margin line reads. Left at the spot wallet's free stablecoins it
+	// reads 0 for any account holding no loose stables (margin/futures-heavy
+	// accounts), flattening the curve onto capital.
+	total.Available = nonUM
+	if futures != nil {
+		total.Available += futures.Available
+	}
+
 	return total, nil
 }
 
