@@ -103,11 +103,14 @@ func run() error {
 	var (
 		dekID, encryptedDEK, iv, authTag, masterKeyID string
 	)
+	// Columns are camelCase and therefore case-sensitive — unquoted
+	// snake_case silently passed review but fails at runtime (42703), i.e.
+	// exactly during the migration this tool exists to rescue.
 	err = pool.QueryRow(ctx, `
-		SELECT id, encrypted_dek, iv, auth_tag, master_key_id
+		SELECT id, "encryptedDEK", iv, "authTag", "masterKeyId"
 		FROM data_encryption_keys
-		WHERE is_active = true
-		ORDER BY created_at DESC
+		WHERE "isActive" = true
+		ORDER BY "createdAt" DESC
 		LIMIT 1`).Scan(&dekID, &encryptedDEK, &iv, &authTag, &masterKeyID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
