@@ -62,21 +62,27 @@ func (s *KeyManagementService) tryMeasurementRecovery(ctx context.Context, wrapp
 	// DISTINCT ON picks the most recent report per distinct measurement.
 	// LIMIT 20: bounds unwrap attempts to a predictable cost; a healthy
 	// enclave has at most ~5 distinct measurements over 6 months.
+	// Columns and JSON keys are camelCase and case-sensitive, and the
+	// measurement sits at the ROOT of reportData — not under an
+	// "enclave_attestation" object. The previous snake_case/nested form
+	// raised 42703 on every call, so recovery reported "no historical
+	// measurements" and the enclave died on a measurement change with a
+	// perfectly usable candidate sitting in the table.
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT ON (report_data->'enclave_attestation'->>'measurement')
-			report_data->'enclave_attestation'->>'measurement' AS measurement,
-			report_hash,
+		SELECT DISTINCT ON ("reportData"->>'measurement')
+			"reportData"->>'measurement' AS measurement,
+			"reportHash",
 			signature,
-			report_data->>'public_key' AS public_key,
-			COALESCE(report_data->>'signature_algorithm', 'ECDSA-P256-SHA256') AS sig_algo
+			"reportData"->>'publicKey' AS public_key,
+			COALESCE("reportData"->>'signatureAlgorithm', 'ECDSA-P256-SHA256') AS sig_algo
 		FROM signed_reports
 		WHERE
-			created_at > NOW() - make_interval(days => $1)
-			AND report_data->'enclave_attestation'->>'measurement' IS NOT NULL
-			AND report_data->'enclave_attestation'->>'measurement' != ''
+			"createdAt" > NOW() - make_interval(days => $1)
+			AND "reportData"->>'measurement' IS NOT NULL
+			AND "reportData"->>'measurement' != ''
 		ORDER BY
-			report_data->'enclave_attestation'->>'measurement',
-			created_at DESC
+			"reportData"->>'measurement',
+			"createdAt" DESC
 		LIMIT 20`,
 		s.recoveryLookbackDays,
 	)
