@@ -62,27 +62,44 @@ func (s *KeyManagementService) tryMeasurementRecovery(ctx context.Context, wrapp
 	// DISTINCT ON picks the most recent report per distinct measurement.
 	// LIMIT 20: bounds unwrap attempts to a predictable cost; a healthy
 	// enclave has at most ~5 distinct measurements over 6 months.
-	// Columns and JSON keys are camelCase and case-sensitive, and the
-	// measurement sits at the ROOT of reportData — not under an
-	// "enclave_attestation" object. The previous snake_case/nested form
+	// Two payload shapes coexist in signed_reports and recovery must read both,
+	// because the rows that predate a measurement change are the only ones that
+	// can rescue it:
+	//   - Go (this service): json.Marshal of SignedReport — snake_case keys with
+	//     the measurement nested under enclave_attestation;
+	//   - TypeScript (the predecessor enclave): camelCase keys with the
+	//     measurement at the root. Every row currently in production is this one.
+	// The column names are camelCase in both cases; the previous snake_case form
 	// raised 42703 on every call, so recovery reported "no historical
-	// measurements" and the enclave died on a measurement change with a
-	// perfectly usable candidate sitting in the table.
+	// measurements" and the enclave died on a measurement change with perfectly
+	// usable candidates sitting in the table.
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT ON ("reportData"->>'measurement')
-			"reportData"->>'measurement' AS measurement,
-			"reportHash",
-			signature,
-			"reportData"->>'publicKey' AS public_key,
-			COALESCE("reportData"->>'signatureAlgorithm', 'ECDSA-P256-SHA256') AS sig_algo
-		FROM signed_reports
-		WHERE
-			"createdAt" > NOW() - make_interval(days => $1)
-			AND "reportData"->>'measurement' IS NOT NULL
-			AND "reportData"->>'measurement' != ''
-		ORDER BY
-			"reportData"->>'measurement',
-			"createdAt" DESC
+		WITH candidates AS (
+			SELECT
+				COALESCE(
+					"reportData"->'enclave_attestation'->>'measurement',
+					"reportData"->>'measurement'
+				) AS measurement,
+				"reportHash" AS report_hash,
+				signature,
+				COALESCE(
+					"reportData"->>'public_key',
+					"reportData"->>'publicKey'
+				) AS public_key,
+				COALESCE(
+					"reportData"->>'signature_algorithm',
+					"reportData"->>'signatureAlgorithm',
+					'ECDSA-P256-SHA256'
+				) AS sig_algo,
+				"createdAt"
+			FROM signed_reports
+			WHERE "createdAt" > NOW() - make_interval(days => $1)
+		)
+		SELECT DISTINCT ON (measurement)
+			measurement, report_hash, signature, public_key, sig_algo
+		FROM candidates
+		WHERE measurement IS NOT NULL AND measurement <> ''
+		ORDER BY measurement, "createdAt" DESC
 		LIMIT 20`,
 		s.recoveryLookbackDays,
 	)
