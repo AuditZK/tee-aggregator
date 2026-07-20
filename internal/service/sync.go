@@ -2073,6 +2073,14 @@ func primaryMarketType(exchange string) string {
 		return connector.MarketStocks
 	case "ctrader", "mt4", "mt5":
 		return connector.MarketCFD
+	case "okx":
+		// OKX's GetTrades reads the SWAP fills, so every trade is typed swap,
+		// while the unified-account equity has no per-market split to follow.
+		// Left on the spot default, equity filed under spot with the trades
+		// under swap: one bucket carried the equity with no trades, the other
+		// the trades with no equity, and per-market return divided by that
+		// zero. Send equity where the trades already are.
+		return connector.MarketSwap
 	default:
 		return connector.MarketSpot
 	}
