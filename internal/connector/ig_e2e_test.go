@@ -46,13 +46,11 @@ func (f *igFakeServer) handler() http.HandlerFunc {
 			gen := f.sessionGen.Add(1)
 			f.logins.Add(1)
 			f.authedReqs.Store(0)
-			w.Header().Set("CST", fmt.Sprintf("cst-%d", gen))
-			w.Header().Set("X-SECURITY-TOKEN", fmt.Sprintf("xst-%d", gen))
-			fmt.Fprint(w, `{"currentAccountId":"ACC1","currencyIsoCode":"EUR"}`)
+			fmt.Fprintf(w, `{"accountId":"DEFAULT1","clientId":"C1","oauthToken":{"access_token":"tok-%d","token_type":"Bearer","expires_in":"60"}}`, gen)
 			return
 		}
 
-		if r.Header.Get("CST") == "" || r.Header.Get("X-SECURITY-TOKEN") == "" {
+		if r.Header.Get("Authorization") == "" || r.Header.Get("IG-ACCOUNT-ID") == "" {
 			w.WriteHeader(http.StatusUnauthorized)
 			fmt.Fprint(w, `{"errorCode":"error.security.client-token-missing"}`)
 			return
@@ -60,16 +58,16 @@ func (f *igFakeServer) handler() http.HandlerFunc {
 
 		if n := f.authedReqs.Add(1); f.expireAfter > 0 && n > f.expireAfter {
 			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprint(w, `{"errorCode":"error.security.client-token-invalid"}`)
+			fmt.Fprint(w, `{"errorCode":"error.security.oauth-token-invalid"}`)
 			return
 		}
 
 		if f.rejectGenBelow > 0 {
 			var gen int
-			_, _ = fmt.Sscanf(r.Header.Get("CST"), "cst-%d", &gen)
+			_, _ = fmt.Sscanf(r.Header.Get("Authorization"), "Bearer tok-%d", &gen)
 			if gen < f.rejectGenBelow {
 				w.WriteHeader(http.StatusUnauthorized)
-				fmt.Fprint(w, `{"errorCode":"error.security.client-token-invalid"}`)
+				fmt.Fprint(w, `{"errorCode":"error.security.oauth-token-invalid"}`)
 				return
 			}
 		}
@@ -77,7 +75,7 @@ func (f *igFakeServer) handler() http.HandlerFunc {
 		switch r.URL.Path {
 		case "/accounts":
 			resp := map[string]any{"accounts": []any{
-				map[string]any{"accountId": "OTHER", "currency": "GBP",
+				map[string]any{"accountId": "OTHER", "accountType": "PHYSICAL", "currency": "GBP",
 					"balance": map[string]any{"balance": 1, "profitLoss": 0, "available": 1}},
 				f.balance,
 			}}
@@ -164,7 +162,7 @@ func newIGFake(t *testing.T, f *igFakeServer) *IG {
 	t.Helper()
 	f.t = t
 	if f.balance == nil {
-		f.balance = map[string]any{"accountId": "ACC1", "currency": "EUR",
+		f.balance = map[string]any{"accountId": "ACC1", "accountType": "CFD", "currency": "EUR",
 			"balance": map[string]any{"balance": 10000.0, "profitLoss": 100.0, "available": 9000.0}}
 	}
 	srv := httptest.NewServer(f.handler())

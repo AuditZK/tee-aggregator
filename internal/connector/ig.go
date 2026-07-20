@@ -20,9 +20,12 @@ const (
 
 	igContentType = "application/json; charset=UTF-8"
 
-	// IG's CST/X-SECURITY-TOKEN pair is valid for 6h and silently extended while
-	// in use. Re-login an hour early so a long sync never crosses the boundary.
-	igSessionTTL = 5 * time.Hour
+	// Fallback when the login's expires_in is absent or unreadable — IG's v3
+	// access tokens are documented at 60 seconds.
+	igTokenFallbackLifetime = 60 * time.Second
+	// Re-login this long before the stated expiry so a request in flight does
+	// not straddle it.
+	igTokenSafetyMargin = 10 * time.Second
 
 	igTimeFormat = "2006-01-02T15:04:05"
 
@@ -46,17 +49,18 @@ var igCashflowSign = map[string]float64{
 }
 
 type igSession struct {
-	cst       string
-	xst       string
+	token string
+	// accountID is the login's default account — only a bootstrap identity for
+	// listing accounts. Business requests pin their own account explicitly.
 	accountID string
 	expiry    time.Time
-	// gen identifies which login produced this pair, so a caller holding a
-	// rejected pair can only retire that one.
+	// gen identifies which login produced this token, so a caller holding a
+	// rejected token can only retire that one.
 	gen uint64
 }
 
 func (s igSession) valid() bool {
-	return s.cst != "" && s.xst != "" && time.Now().Before(s.expiry)
+	return s.token != "" && time.Now().Before(s.expiry)
 }
 
 // IG implements Connector for IG Group's REST trading API.
@@ -64,19 +68,33 @@ type IG struct {
 	apiKey   string
 	username string
 	password string
-	baseURL  string
-	isDemo   bool
-	client   *http.Client
+	// pinnedAccountID, when set, bypasses account discovery entirely — see
+	// NewIG for why discovery can be structurally impossible.
+	pinnedAccountID string
+	baseURL         string
+	isDemo          bool
+	client          *http.Client
 
 	sessionMu  sync.Mutex
 	sess       igSession
 	sessionGen uint64
+
+	accountMu         sync.Mutex
+	selectedAccountID string
 }
 
 // NewIG creates an IG connector. Credentials map as:
 //   - apiKey = IG API key (X-IG-API-KEY)
 //   - apiSecret = account password
-//   - passphrase = account identifier (username)
+//   - passphrase = account identifier (username), optionally
+//     "identifier:ACCOUNTID" to pin the account to read
+//
+// The pin exists because account discovery can be structurally impossible:
+// listing accounts requires acting under some account's identity, and when the
+// login's default account is one the Web API refuses (share dealing,
+// exchange-traded), that bootstrap identity is refused too — observed against a
+// real login whose default was a Turbo24 account. The suffix rides in the
+// identifier slot the way MetaTrader rides "broker:port" in its passphrase.
 //
 // Demo and live are separate credential sets on separate hosts, so the caller
 // picks the environment via the exchange id rather than a credential field.
@@ -85,13 +103,22 @@ func NewIG(creds *Credentials, demo bool) *IG {
 	if demo {
 		baseURL = igDemoAPI
 	}
+
+	identifier := strings.TrimSpace(creds.Passphrase)
+	pinned := ""
+	if at := strings.IndexByte(identifier, ':'); at >= 0 {
+		pinned = strings.TrimSpace(identifier[at+1:])
+		identifier = strings.TrimSpace(identifier[:at])
+	}
+
 	return &IG{
-		apiKey:   strings.TrimSpace(creds.APIKey),
-		username: strings.TrimSpace(creds.Passphrase),
-		password: creds.APISecret,
-		baseURL:  baseURL,
-		isDemo:   demo,
-		client:   &http.Client{Timeout: 30 * time.Second},
+		apiKey:          strings.TrimSpace(creds.APIKey),
+		username:        identifier,
+		password:        creds.APISecret,
+		pinnedAccountID: pinned,
+		baseURL:         baseURL,
+		isDemo:          demo,
+		client:          &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -110,12 +137,13 @@ func (i *IG) DetectIsPaper(_ context.Context) (bool, error) {
 }
 
 // igSessionRejected reports whether a response body is IG refusing the session
-// tokens. The 6h TTL is a floor, not a guarantee — a login from the web
-// platform invalidates the pair early — so a rejected token is recoverable by
-// re-authenticating rather than a reason to fail the sync.
+// token. The stated lifetime is short and not a guarantee either way, so a
+// rejected token is recoverable by re-authenticating rather than a reason to
+// fail the sync.
 func igSessionRejected(body []byte) bool {
 	return bytes.Contains(body, []byte("error.security.client-token-invalid")) ||
-		bytes.Contains(body, []byte("error.security.oauth-token-invalid"))
+		bytes.Contains(body, []byte("error.security.oauth-token-invalid")) ||
+		bytes.Contains(body, []byte("error.security.oauth-token-expired"))
 }
 
 func (i *IG) session(ctx context.Context) (igSession, error) {
@@ -153,12 +181,19 @@ func (i *IG) loginLocked(ctx context.Context) error {
 		return fmt.Errorf("encode ig session request: %w", err)
 	}
 
+	// Session v3, deliberately. The v1/v2 CST login is refused outright
+	// (error.public-api.failure.stockbroking-not-supported, observed against a
+	// real account) whenever the login's DEFAULT account is a share-dealing
+	// one — even when an eligible CFD account sits right next to it, and the
+	// login API offers no way to pick. v3 authenticates the client instead and
+	// lets every request pin its account via IG-ACCOUNT-ID, so a user's
+	// default-account setting can't brick the connection.
 	req, err := http.NewRequestWithContext(ctx, "POST", i.baseURL+"/session", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("X-IG-API-KEY", i.apiKey)
-	req.Header.Set("Version", "2")
+	req.Header.Set("Version", "3")
 	req.Header.Set("Content-Type", igContentType)
 	req.Header.Set("Accept", igContentType)
 
@@ -180,50 +215,71 @@ func (i *IG) loginLocked(ctx context.Context) error {
 		if isRetryableStatus(resp.StatusCode) {
 			return fmt.Errorf("%w: ig session HTTP %d: %s", ErrTransient, resp.StatusCode, vendorErrorDetail(string(body)))
 		}
+		// IG's Web API serves CFD and spread-bet accounts only; a share-dealing
+		// login is refused at the session itself. Left as a bare status this
+		// reads as a credential failure, sending the holder of a perfectly good
+		// account to re-check a password that was never the problem.
+		if bytes.Contains(body, []byte("stockbroking-not-supported")) {
+			return fmt.Errorf("ig share-dealing accounts are not served by the Web API: connect a CFD or spread-bet account instead")
+		}
 		return fmt.Errorf("ig session HTTP %d: %s", resp.StatusCode, vendorErrorDetail(string(body)))
 	}
 
-	cst := resp.Header.Get("CST")
-	xst := resp.Header.Get("X-SECURITY-TOKEN")
-	if cst == "" || xst == "" {
-		return fmt.Errorf("ig session returned no CST/X-SECURITY-TOKEN")
-	}
-
 	var parsed struct {
-		CurrentAccountID string `json:"currentAccountId"`
+		AccountID  string `json:"accountId"`
+		OAuthToken struct {
+			AccessToken string `json:"access_token"`
+			ExpiresIn   string `json:"expires_in"`
+		} `json:"oauthToken"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return fmt.Errorf("decode ig session: %w", err)
 	}
+	if parsed.OAuthToken.AccessToken == "" {
+		return fmt.Errorf("ig session returned no access token")
+	}
+
+	lifetime := igTokenFallbackLifetime
+	if secs, perr := strconv.Atoi(strings.TrimSpace(parsed.OAuthToken.ExpiresIn)); perr == nil && secs > 0 {
+		lifetime = time.Duration(secs) * time.Second
+	}
+	if lifetime > igTokenSafetyMargin {
+		lifetime -= igTokenSafetyMargin
+	}
 
 	i.sessionGen++
 	i.sess = igSession{
-		cst:       cst,
-		xst:       xst,
-		accountID: parsed.CurrentAccountID,
-		expiry:    time.Now().Add(igSessionTTL),
+		token:     parsed.OAuthToken.AccessToken,
+		accountID: parsed.AccountID,
+		expiry:    time.Now().Add(lifetime),
 		gen:       i.sessionGen,
 	}
 	return nil
 }
 
-func (i *IG) doAuthed(ctx context.Context, version, path string, query url.Values) ([]byte, error) {
-	body, gen, err := i.authedOnce(ctx, version, path, query)
+// doAuthed issues an authenticated GET against accountID. An empty accountID
+// falls back to the login's default account — only account discovery itself
+// should do that; every business read names the account it wants.
+func (i *IG) doAuthed(ctx context.Context, version, path string, query url.Values, accountID string) ([]byte, error) {
+	body, gen, err := i.authedOnce(ctx, version, path, query, accountID)
 	if err == nil || !igSessionRejected(body) {
 		return body, err
 	}
 	i.invalidateSession(gen)
-	body, _, err = i.authedOnce(ctx, version, path, query)
+	body, _, err = i.authedOnce(ctx, version, path, query, accountID)
 	return body, err
 }
 
 // authedOnce reports the session generation it signed the request with, so a
-// rejection retires that pair and not whichever one happens to be cached by the
-// time the caller reacts.
-func (i *IG) authedOnce(ctx context.Context, version, path string, query url.Values) ([]byte, uint64, error) {
+// rejection retires that token and not whichever one happens to be cached by
+// the time the caller reacts.
+func (i *IG) authedOnce(ctx context.Context, version, path string, query url.Values, accountID string) ([]byte, uint64, error) {
 	sess, err := i.session(ctx)
 	if err != nil {
 		return nil, 0, err
+	}
+	if accountID == "" {
+		accountID = sess.accountID
 	}
 
 	reqURL := i.baseURL + path
@@ -237,8 +293,8 @@ func (i *IG) authedOnce(ctx context.Context, version, path string, query url.Val
 			return nil, rerr
 		}
 		req.Header.Set("X-IG-API-KEY", i.apiKey)
-		req.Header.Set("CST", sess.cst)
-		req.Header.Set("X-SECURITY-TOKEN", sess.xst)
+		req.Header.Set("Authorization", "Bearer "+sess.token)
+		req.Header.Set("IG-ACCOUNT-ID", accountID)
 		req.Header.Set("Version", version)
 		req.Header.Set("Accept", igContentType)
 		return req, nil
@@ -334,27 +390,60 @@ func parseIGTime(s string) (time.Time, error) {
 }
 
 type igAccount struct {
-	AccountID string `json:"accountId"`
-	Currency  string `json:"currency"`
-	Balance   struct {
+	AccountID   string `json:"accountId"`
+	AccountType string `json:"accountType"`
+	Preferred   bool   `json:"preferred"`
+	Currency    string `json:"currency"`
+	Balance     struct {
 		Balance    float64 `json:"balance"`
 		ProfitLoss float64 `json:"profitLoss"`
 		Available  float64 `json:"available"`
 	} `json:"balance"`
 }
 
-// currentAccount returns the account the session is scoped to. /positions and
-// /history/transactions only ever report that account, while /accounts lists
-// every account on the login — reading equity from a different row would pair
-// one account's balance with another's track record.
-func (i *IG) currentAccount(ctx context.Context) (*igAccount, error) {
-	sess, err := i.session(ctx)
-	if err != nil {
-		return nil, err
-	}
+// igEligibleAccount reports whether the Web API serves this account type. CFD
+// and spread-bet are served; share-dealing (PHYSICAL) and the exchange-traded
+// products are not — reading one of those is what the v1/v2 login refused
+// wholesale.
+func igEligibleAccount(a igAccount) bool {
+	t := strings.ToUpper(strings.TrimSpace(a.AccountType))
+	return t == "CFD" || t == "SPREADBET"
+}
 
-	body, err := i.doAuthed(ctx, "1", "/accounts", nil)
+// selectIGAccount picks the account every read is pinned to: the preferred
+// eligible account when the user marked one, the first eligible otherwise.
+// Reading a different account than the one whose trades we fetch would pair
+// one account's balance with another's track record.
+func selectIGAccount(accounts []igAccount) (*igAccount, error) {
+	var first *igAccount
+	for idx := range accounts {
+		if !igEligibleAccount(accounts[idx]) {
+			continue
+		}
+		if accounts[idx].Preferred {
+			return &accounts[idx], nil
+		}
+		if first == nil {
+			first = &accounts[idx]
+		}
+	}
+	if first == nil {
+		return nil, fmt.Errorf("no CFD or spread-bet account on this IG login: the Web API serves only those")
+	}
+	return first, nil
+}
+
+// fetchSelectedAccount lists the login's accounts and picks the account to
+// read. The listing itself must act under some account's identity: the pin
+// when the user set one, the login's default otherwise. A default the Web API
+// refuses (share dealing, exchange-traded) refuses the listing too — that is
+// the one failure the user must resolve, so the error names both ways out.
+func (i *IG) fetchSelectedAccount(ctx context.Context) (*igAccount, error) {
+	body, err := i.doAuthed(ctx, "1", "/accounts", nil, i.pinnedAccountID)
 	if err != nil {
+		if strings.Contains(err.Error(), "stockbroking-not-supported") {
+			return nil, fmt.Errorf("ig refuses this login's default account (share dealing / exchange-traded): set a CFD or spread-bet account as the default in My IG, or pin one as \"identifier:ACCOUNTID\"")
+		}
 		return nil, fmt.Errorf("fetch ig accounts: %w", err)
 	}
 
@@ -368,25 +457,54 @@ func (i *IG) currentAccount(ctx context.Context) (*igAccount, error) {
 		return nil, fmt.Errorf("no ig accounts found")
 	}
 
-	for idx := range resp.Accounts {
-		if resp.Accounts[idx].AccountID == sess.accountID {
-			return &resp.Accounts[idx], nil
+	if i.pinnedAccountID != "" {
+		for idx := range resp.Accounts {
+			if resp.Accounts[idx].AccountID == i.pinnedAccountID {
+				if !igEligibleAccount(resp.Accounts[idx]) {
+					return nil, fmt.Errorf("pinned ig account %s is not a CFD or spread-bet account", i.pinnedAccountID)
+				}
+				return &resp.Accounts[idx], nil
+			}
 		}
+		return nil, fmt.Errorf("pinned ig account %s absent from this login's accounts", i.pinnedAccountID)
 	}
-	return nil, fmt.Errorf("ig session account absent from accounts list")
+	return selectIGAccount(resp.Accounts)
+}
+
+// ensureAccountID returns the selected account's id, resolving it once. The
+// selection is structural (account types on a login don't churn), so the id is
+// cached; balances are NOT read through this cache.
+func (i *IG) ensureAccountID(ctx context.Context) (string, error) {
+	if i.pinnedAccountID != "" {
+		return i.pinnedAccountID, nil
+	}
+
+	i.accountMu.Lock()
+	defer i.accountMu.Unlock()
+
+	if i.selectedAccountID != "" {
+		return i.selectedAccountID, nil
+	}
+	acct, err := i.fetchSelectedAccount(ctx)
+	if err != nil {
+		return "", err
+	}
+	i.selectedAccountID = acct.AccountID
+	return i.selectedAccountID, nil
 }
 
 func (i *IG) TestConnection(ctx context.Context) error {
-	_, err := i.currentAccount(ctx)
+	_, err := i.fetchSelectedAccount(ctx)
 	return err
 }
 
-// GetBalance reports the session account's equity. IG splits it across two
-// fields: `balance` is settled cash and `profitLoss` is the open positions'
-// unrealised P&L, so equity is their sum. IG's `deposit` field is the margin
-// currently tied up, not cash paid in — capital flows come from GetCashflows.
+// GetBalance reports the selected account's equity, re-reading /accounts every
+// time so the figures are fresh. IG splits equity across two fields: `balance`
+// is settled cash and `profitLoss` is the open positions' unrealised P&L, so
+// equity is their sum. IG's `deposit` field is the margin currently tied up,
+// not cash paid in — capital flows come from GetCashflows.
 func (i *IG) GetBalance(ctx context.Context) (*Balance, error) {
-	acct, err := i.currentAccount(ctx)
+	acct, err := i.fetchSelectedAccount(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +531,12 @@ func igMarketType(instrumentType string) string {
 }
 
 func (i *IG) GetPositions(ctx context.Context) ([]*Position, error) {
-	body, err := i.doAuthed(ctx, "2", "/positions", nil)
+	accountID, err := i.ensureAccountID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := i.doAuthed(ctx, "2", "/positions", nil, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch ig positions: %w", err)
 	}
@@ -501,6 +624,11 @@ func (i *IG) RawTransactions(ctx context.Context, since, until time.Time) ([]IGR
 }
 
 func (i *IG) fetchTransactions(ctx context.Context, from, to time.Time) ([]IGRawTransaction, error) {
+	accountID, err := i.ensureAccountID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var out []IGRawTransaction
 	complete := false
 
@@ -511,7 +639,7 @@ func (i *IG) fetchTransactions(ctx context.Context, from, to time.Time) ([]IGRaw
 		q.Set("pageSize", strconv.Itoa(igTransactionPageSize))
 		q.Set("pageNumber", strconv.Itoa(page))
 
-		body, err := i.doAuthed(ctx, "2", "/history/transactions", q)
+		body, err := i.doAuthed(ctx, "2", "/history/transactions", q, accountID)
 		if err != nil {
 			return nil, fmt.Errorf("fetch ig transactions: %w", err)
 		}

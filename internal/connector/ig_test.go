@@ -28,11 +28,11 @@ var (
 )
 
 func igWriteSession(w http.ResponseWriter) {
-	w.Header().Set("CST", "cst-token")
-	w.Header().Set("X-SECURITY-TOKEN", "xst-token")
 	w.Header().Set("Content-Type", igContentType)
-	fmt.Fprintf(w, `{"currentAccountId":%q,"currencyIsoCode":"EUR"}`, igTestAccount)
+	fmt.Fprintf(w, `{"accountId":%q,"clientId":"C1","oauthToken":{"access_token":"tok-1","token_type":"Bearer","expires_in":"60"}}`, igTestAccount)
 }
+
+const igTestAccountsJSON = `{"accounts":[{"accountId":"ABC123","accountType":"CFD","currency":"EUR","balance":{"balance":1,"profitLoss":0,"available":1}}]}`
 
 func newIGTest(t *testing.T, demo bool, handler http.HandlerFunc) *IG {
 	t.Helper()
@@ -206,6 +206,8 @@ func TestIGRawTransactionsKeepsEverything(t *testing.T) {
 		switch r.URL.Path {
 		case "/session":
 			igWriteSession(w)
+		case "/accounts":
+			fmt.Fprint(w, igTestAccountsJSON)
 		case "/history/transactions":
 			fmt.Fprint(w, `{"transactions":[
 				{"transactionType":"DEPO","cashTransaction":true,"profitAndLoss":"E1000.00","size":"0","currency":"EUR","dateUtc":"2026-07-01T10:00:00"},
@@ -250,18 +252,19 @@ func TestIGRawTransactionsKeepsEverything(t *testing.T) {
 	}
 }
 
-// The session's account is the one /positions and /history/transactions report
-// on. Reading equity off any other row pairs one account's balance with
-// another's trades.
-func TestIGGetBalanceUsesSessionAccount(t *testing.T) {
+// Every read is pinned to the selected eligible account. Reading any other row
+// pairs one account's balance with another's trades — and the login's default
+// account is routinely an ineligible share-dealing one (that default is
+// exactly what broke the v1/v2 CST login wholesale).
+func TestIGGetBalanceReadsSelectedEligibleAccount(t *testing.T) {
 	ig := newIGTest(t, false, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/session":
 			igWriteSession(w)
 		case "/accounts":
 			fmt.Fprint(w, `{"accounts":[
-				{"accountId":"OTHER","currency":"GBP","balance":{"balance":9999,"profitLoss":1,"available":9999}},
-				{"accountId":"ABC123","currency":"EUR","balance":{"balance":1000,"profitLoss":250,"available":700}}
+				{"accountId":"OTHER","accountType":"PHYSICAL","currency":"GBP","balance":{"balance":9999,"profitLoss":1,"available":9999}},
+				{"accountId":"ABC123","accountType":"CFD","currency":"EUR","balance":{"balance":1000,"profitLoss":250,"available":700}}
 			]}`)
 		default:
 			t.Errorf("unexpected path: %s", r.URL.Path)
@@ -286,18 +289,116 @@ func TestIGGetBalanceUsesSessionAccount(t *testing.T) {
 	}
 }
 
-func TestIGGetBalanceSessionAccountMissing(t *testing.T) {
+func TestIGGetBalanceNoEligibleAccount(t *testing.T) {
 	ig := newIGTest(t, false, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/session":
 			igWriteSession(w)
 		case "/accounts":
-			fmt.Fprint(w, `{"accounts":[{"accountId":"OTHER","currency":"GBP","balance":{"balance":9999,"profitLoss":1,"available":9999}}]}`)
+			fmt.Fprint(w, `{"accounts":[{"accountId":"OTHER","accountType":"PHYSICAL","currency":"GBP","balance":{"balance":9999,"profitLoss":1,"available":9999}}]}`)
 		}
 	})
 
-	if _, err := ig.GetBalance(context.Background()); err == nil {
-		t.Fatal("GetBalance must fail rather than fall back to an unrelated account")
+	_, err := ig.GetBalance(context.Background())
+	if err == nil {
+		t.Fatal("GetBalance must fail rather than read an account the Web API does not serve")
+	}
+	if !strings.Contains(err.Error(), "CFD or spread-bet") {
+		t.Fatalf("error does not name the account requirement: %v", err)
+	}
+}
+
+// A pinned account must drive both the request identity and the row that is
+// read — pinning exists precisely because the login's default identity can be
+// refused wholesale, taking account discovery down with it.
+func TestIGPinnedAccount(t *testing.T) {
+	var sawIdentity string
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/session":
+			igWriteSession(w)
+		case "/accounts":
+			sawIdentity = r.Header.Get("IG-ACCOUNT-ID")
+			fmt.Fprint(w, `{"accounts":[
+				{"accountId":"DEF1","accountType":"PHYSICAL","preferred":true,"currency":"GBP","balance":{"balance":1,"profitLoss":0,"available":1}},
+				{"accountId":"PIN1","accountType":"CFD","currency":"EUR","balance":{"balance":500,"profitLoss":25,"available":400}}
+			]}`)
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(handler))
+	t.Cleanup(srv.Close)
+	ig := NewIG(&Credentials{APIKey: "k", APISecret: "pw", Passphrase: "user1:PIN1"}, true)
+	ig.baseURL = srv.URL
+
+	bal, err := ig.GetBalance(context.Background())
+	if err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if sawIdentity != "PIN1" {
+		t.Fatalf("accounts listed under identity %q, want PIN1 (default identity may be refused)", sawIdentity)
+	}
+	if bal.Equity != 525 || bal.Currency != "EUR" {
+		t.Fatalf("balance = %+v, want the pinned row (525 EUR)", bal)
+	}
+
+	id, err := ig.ensureAccountID(context.Background())
+	if err != nil {
+		t.Fatalf("ensureAccountID: %v", err)
+	}
+	if id != "PIN1" {
+		t.Fatalf("ensureAccountID = %q, want PIN1", id)
+	}
+}
+
+// Discovery under a refused default identity is the one failure only the user
+// can resolve; the error must name both ways out, not read as a broken key.
+func TestIGBlockedDefaultAccountNamesTheFix(t *testing.T) {
+	ig := newIGTest(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/session":
+			igWriteSession(w)
+		case "/accounts":
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"errorCode":"error.public-api.failure.stockbroking-not-supported"}`)
+		}
+	})
+
+	_, err := ig.GetBalance(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "identifier:ACCOUNTID") || !strings.Contains(err.Error(), "default") {
+		t.Fatalf("error does not name the ways out: %v", err)
+	}
+}
+
+// The user's preferred flag decides among eligible accounts; an ineligible
+// preferred account (share dealing marked as default) must not hijack the
+// selection.
+func TestIGSelectAccount(t *testing.T) {
+	mk := func(id, typ string, pref bool) igAccount {
+		return igAccount{AccountID: id, AccountType: typ, Preferred: pref}
+	}
+
+	sel, err := selectIGAccount([]igAccount{mk("S", "PHYSICAL", true), mk("A", "CFD", false), mk("B", "SPREADBET", true)})
+	if err != nil {
+		t.Fatalf("selectIGAccount: %v", err)
+	}
+	if sel.AccountID != "B" {
+		t.Fatalf("selected %q, want B (preferred eligible beats first eligible)", sel.AccountID)
+	}
+
+	sel, err = selectIGAccount([]igAccount{mk("S", "PHYSICAL", true), mk("A", "CFD", false), mk("B", "SPREADBET", false)})
+	if err != nil {
+		t.Fatalf("selectIGAccount: %v", err)
+	}
+	if sel.AccountID != "A" {
+		t.Fatalf("selected %q, want A (first eligible when none preferred)", sel.AccountID)
+	}
+
+	if _, err := selectIGAccount([]igAccount{mk("S", "PHYSICAL", true)}); err == nil {
+		t.Fatal("want error when no eligible account exists")
 	}
 }
 
@@ -308,6 +409,8 @@ func TestIGGetCashflowsClassifiesByTransactionCode(t *testing.T) {
 		switch r.URL.Path {
 		case "/session":
 			igWriteSession(w)
+		case "/accounts":
+			fmt.Fprint(w, igTestAccountsJSON)
 		case "/history/transactions":
 			fmt.Fprint(w, `{"transactions":[
 				{"transactionType":"DEPO","cashTransaction":true,"profitAndLoss":"E1000.00","currency":"EUR","dateUtc":"2026-07-01T10:00:00"},
@@ -345,6 +448,8 @@ func TestIGGetTradesIgnoresCashAndLocalisedLabels(t *testing.T) {
 		switch r.URL.Path {
 		case "/session":
 			igWriteSession(w)
+		case "/accounts":
+			fmt.Fprint(w, igTestAccountsJSON)
 		case "/history/transactions":
 			fmt.Fprint(w, `{"transactions":[
 				{"transactionType":"DEPO","cashTransaction":true,"profitAndLoss":"E1000.00","size":"0","closeLevel":"0","currency":"EUR","dateUtc":"2026-07-01T10:00:00","reference":"CASH1"},
@@ -378,6 +483,8 @@ func TestIGTransactionsPaginate(t *testing.T) {
 		switch r.URL.Path {
 		case "/session":
 			igWriteSession(w)
+		case "/accounts":
+			fmt.Fprint(w, igTestAccountsJSON)
 		case "/history/transactions":
 			page := r.URL.Query().Get("pageNumber")
 			pages.Add(1)
@@ -415,7 +522,7 @@ func TestIGReLoginsOnRejectedSessionToken(t *testing.T) {
 				fmt.Fprint(w, `{"errorCode":"error.security.client-token-invalid"}`)
 				return
 			}
-			fmt.Fprint(w, `{"accounts":[{"accountId":"ABC123","currency":"EUR","balance":{"balance":100,"profitLoss":0,"available":100}}]}`)
+			fmt.Fprint(w, `{"accounts":[{"accountId":"ABC123","accountType":"CFD","currency":"EUR","balance":{"balance":100,"profitLoss":0,"available":100}}]}`)
 		}
 	})
 
@@ -441,6 +548,27 @@ func TestIGLoginRateLimitIsTransient(t *testing.T) {
 	}
 	if !errors.Is(err, ErrTransient) {
 		t.Fatalf("expected ErrTransient, got %v", err)
+	}
+}
+
+// Observed against a real demo account: IG refuses the session outright for a
+// share-dealing login. Reported as a bare status it reads as a bad password,
+// which sends the holder of a working account chasing the wrong thing.
+func TestIGShareDealingAccountIsNamed(t *testing.T) {
+	ig := newIGTest(t, true, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"errorCode":"error.public-api.failure.stockbroking-not-supported"}`)
+	})
+
+	err := ig.TestConnection(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "CFD or spread-bet") {
+		t.Fatalf("error does not say what to do about it: %v", err)
+	}
+	if errors.Is(err, ErrTransient) {
+		t.Fatalf("account type is permanent, retrying cannot fix it: %v", err)
 	}
 }
 
@@ -481,6 +609,8 @@ func TestIGGetPositions(t *testing.T) {
 		switch r.URL.Path {
 		case "/session":
 			igWriteSession(w)
+		case "/accounts":
+			fmt.Fprint(w, igTestAccountsJSON)
 		case "/positions":
 			fmt.Fprint(w, `{"positions":[
 				{"market":{"instrumentName":"EUR/USD","instrumentType":"CURRENCIES","bid":1.10,"offer":1.11},
@@ -529,7 +659,7 @@ func TestIGConcurrentCallersLoginOnce(t *testing.T) {
 			logins.Add(1)
 			igWriteSession(w)
 		case "/accounts":
-			fmt.Fprint(w, `{"accounts":[{"accountId":"ABC123","currency":"EUR","balance":{"balance":100,"profitLoss":0,"available":100}}]}`)
+			fmt.Fprint(w, `{"accounts":[{"accountId":"ABC123","accountType":"CFD","currency":"EUR","balance":{"balance":100,"profitLoss":0,"available":100}}]}`)
 		}
 	})
 
@@ -563,7 +693,7 @@ func TestIGSessionIsReusedAcrossCalls(t *testing.T) {
 			logins.Add(1)
 			igWriteSession(w)
 		case "/accounts":
-			fmt.Fprint(w, `{"accounts":[{"accountId":"ABC123","currency":"EUR","balance":{"balance":100,"profitLoss":0,"available":100}}]}`)
+			fmt.Fprint(w, `{"accounts":[{"accountId":"ABC123","accountType":"CFD","currency":"EUR","balance":{"balance":100,"profitLoss":0,"available":100}}]}`)
 		}
 	})
 
