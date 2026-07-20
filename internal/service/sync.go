@@ -1252,6 +1252,19 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 		)
 		return
 	}
+	// Dispatch only what the deployed rebuilder registers. Without this gate an
+	// unsupported exchange still shipped plaintext credentials out of the
+	// enclave for a call that can only answer HTTP 400 — egress with zero
+	// payoff (observed live: an okx connect on 2026-07-20, two log lines and
+	// nothing else). Warn, not error: the user's connection is fine, only the
+	// optional backfill is unavailable.
+	if !externalRebuilderSupports(connMeta.Exchange) {
+		s.logger.Warn("history backfill: exchange not supported by the deployed rebuilder, skipping",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+		)
+		return
+	}
 	s.logger.Info("history backfill: dispatching to external rebuilder",
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
@@ -1325,6 +1338,19 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 // retires that day's UX-001 inception deposit (deposits recomputed from the
 // on-chain + universal-transfer ledger instead of deposits=equity).
 var externalRebuilderExchanges = []string{"hyperliquid", "bitget", "binance"}
+
+// externalRebuilderSupports reports whether the deployed rebuilder registers
+// this exchange — the gate for every dispatch that carries plaintext
+// credentials out of the enclave.
+func externalRebuilderSupports(exchange string) bool {
+	e := strings.ToLower(strings.TrimSpace(exchange))
+	for _, supported := range externalRebuilderExchanges {
+		if e == supported {
+			return true
+		}
+	}
+	return false
+}
 
 // maxRebuildRetryDays bounds how long the midnight recalibration keeps retrying
 // a consenting connection that never finalizes (SEC-08): past this many days

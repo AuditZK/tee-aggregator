@@ -751,6 +751,33 @@ func TestReconstructHistory_NonProviderDispatchesToRebuilder(t *testing.T) {
 	}
 }
 
+// An exchange the deployed rebuilder does not register must never be
+// dispatched: the call can only answer HTTP 400, so it would ship plaintext
+// credentials out of the enclave for nothing. Observed live (okx, 2026-07-20)
+// before the gate existed.
+func TestReconstructHistory_UnsupportedExchangeNeverReachesRebuilder(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	svc := &SyncService{
+		logger:    zap.NewNop(),
+		rebuilder: rebuilderclient.New(srv.URL, "internal-token-0123456789", zap.NewNop()),
+	}
+	conn := &fakeHistConnector{exchange: "okx"}
+	connMeta := &repository.ExchangeConnection{UserUID: "u1", Exchange: "okx", Label: "main"}
+
+	svc.reconstructHistory(context.Background(), connMeta, conn,
+		&Credentials{APIKey: "k", APISecret: "s", Passphrase: "pp"})
+
+	if hits != 0 {
+		t.Fatalf("rebuilder received %d request(s) for an unsupported exchange — credentials left the enclave for a guaranteed 400", hits)
+	}
+}
+
 // buildHistoricalSnapshots must map every market type Flex / the rebuilder
 // can return; the tests above only exercise stocks + futures.
 func TestBuildHistoricalSnapshots_AllMarketTypes(t *testing.T) {
