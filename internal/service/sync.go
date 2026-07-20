@@ -538,15 +538,15 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	// 5. Aggregate trades by market type
 	breakdown := s.aggregateTrades(trades)
 
-	// 5a. Fetch funding fees for swap positions (always if supported — funding
-	// applies to all open positions, not just those traded today)
+	// 5a. Fetch funding fees (always if supported — funding applies to all open
+	// positions, not just those traded today)
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
 		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, activityStart); err == nil {
 			totalFunding := 0.0
 			for _, f := range fees {
 				totalFunding += f.Amount
 			}
-			breakdown.swap.fundingFees = totalFunding
+			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = totalFunding
 		}
 	}
 
@@ -989,7 +989,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 			for _, f := range fees {
 				total += f.Amount
 			}
-			breakdown.swap.fundingFees = total
+			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = total
 		}
 	}
 
@@ -2079,7 +2079,24 @@ func primaryMarketType(exchange string) string {
 }
 
 func (m *marketAgg) hasData() bool {
-	return m.trades > 0 || m.equity > 0 || m.availableMargin > 0
+	// fundingFees counts: a market can carry a real cost with no trade and no
+	// equity of its own (a position opened last window and still held charges
+	// funding every night). Omitting it dropped the whole bucket at
+	// persistence, so the cost was fetched and then thrown away.
+	return m.trades > 0 || m.equity > 0 || m.availableMargin > 0 || m.fundingFees != 0
+}
+
+// fundingMarketType names the bucket an exchange's funding charges belong in —
+// the same bucket its trades land in, or the cost sits alone in a market the
+// account never traded. Perp venues fund swaps, which is why that is the
+// default; CFD brokers charge the same overnight cost on a CFD position.
+func fundingMarketType(exchange string) string {
+	switch strings.ToLower(exchange) {
+	case "ig", "ig_demo", "ctrader", "mt4", "mt5":
+		return connector.MarketCFD
+	default:
+		return connector.MarketSwap
+	}
 }
 
 func (a *aggregatedBreakdown) getOrCreateMarket(marketType string) *marketAgg {

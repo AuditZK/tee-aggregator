@@ -764,6 +764,62 @@ func (i *IG) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, err
 	return trades, nil
 }
 
+// GetFundingFees returns the ledger's cost and income lines: overnight
+// funding, commission, interest, dividends.
+//
+// IG books these as their own rows rather than netting them into a deal's P&L
+// ("overnight funding charges appear as separate transactions ... and won't
+// affect your running profit/loss"), so a deal's profitAndLoss is complete for
+// what the deal did and says nothing about what holding it cost. Without this
+// they vanish entirely: equity falls and nothing records why.
+//
+// Any cash line that is NOT a capital movement is such a line. Classifying by
+// exclusion rather than by an allowlist of fee codes is deliberate — IG's fee
+// code strings are not documented and a code we failed to anticipate would
+// otherwise be dropped in silence, which is the failure this method exists to
+// end.
+//
+// symbols is ignored: IG's rows carry their own instrument and are not scoped
+// to the swap symbols a crypto venue would want.
+func (i *IG) GetFundingFees(ctx context.Context, _ []string, since time.Time) ([]*FundingFee, error) {
+	txs, err := i.fetchTransactions(ctx, since, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+
+	fees := make([]*FundingFee, 0)
+	for _, t := range txs {
+		if !t.CashTransaction {
+			continue
+		}
+		if _, isCapital := igCashflowSign[strings.ToUpper(strings.TrimSpace(t.TransactionType))]; isCapital {
+			continue
+		}
+
+		// Unlike a capital line, a cost line that will not parse is skipped
+		// rather than failing the sync: equity already carries the charge, so
+		// performance stays correct and only the cost breakdown is short. A
+		// dropped capital line, by contrast, corrupts TWR outright.
+		amount, aerr := ParseIGDecimal(t.ProfitAndLoss)
+		if aerr != nil || amount == 0 {
+			continue
+		}
+		ts, terr := parseIGTime(t.DateUTC)
+		if terr != nil || ts.Before(since) {
+			continue
+		}
+
+		// Signed as IG reports it — negative when charged — matching the
+		// convention the crypto connectors pass through.
+		fees = append(fees, &FundingFee{
+			Amount:    amount,
+			Symbol:    t.InstrumentName,
+			Timestamp: ts,
+		})
+	}
+	return fees, nil
+}
+
 // GetCashflows returns deposits and withdrawals from the transaction ledger.
 // The amount's sign comes from the transaction code rather than the reported
 // figure, so a withdrawal booked as a negative profitAndLoss and one booked as

@@ -360,6 +360,68 @@ func TestIGEndToEndDropsLinesOutsideWindow(t *testing.T) {
 	}
 }
 
+// IG books overnight funding, commission and interest as their own ledger rows
+// rather than netting them into a deal's P&L. They are neither capital nor
+// trades, so both parsed views skip them — without the funding fetcher the
+// charge vanishes: equity falls and nothing records why.
+func TestIGEndToEndFundingAndCostsAreReported(t *testing.T) {
+	fake := &igFakeServer{ledger: []map[string]any{
+		igCash("DEPO", 1, "E5000.00"),
+		igDeal("D1", 2, "+2", "E150.00"),
+		igCash("WITH", 3, "E-1000.00"),
+		// Cost and income lines. The codes are deliberately not all ones the
+		// connector knows: classification is by exclusion, so an unanticipated
+		// fee code must still be counted rather than silently dropped.
+		igCash("INTEREST", 4, "E-3.20"),
+		igCash("DIVIDEND", 5, "E12.00"),
+		igCash("CHART", 6, "E-30.00"),
+		igCash("SOME_NEW_FEE_CODE", 7, "E-1.50"),
+	}}
+	ig := newIGFake(t, fake)
+	ctx := context.Background()
+	start := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+
+	fees, err := ig.GetFundingFees(ctx, nil, start)
+	if err != nil {
+		t.Fatalf("GetFundingFees: %v", err)
+	}
+	if len(fees) != 4 {
+		t.Fatalf("got %d cost lines, want 4 (capital and deals excluded, unknown codes kept): %+v", len(fees), fees)
+	}
+
+	var total float64
+	for _, f := range fees {
+		total += f.Amount
+	}
+	// -3.20 + 12.00 - 30.00 - 1.50, signed as IG reports them.
+	if diff := total - -22.70; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("net cost = %v, want -22.70", total)
+	}
+
+	// The same rows must not leak into capital, which would corrupt TWR.
+	flows, err := ig.GetCashflows(ctx, start)
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	if len(flows) != 2 {
+		t.Fatalf("got %d cashflows, want 2 (only DEPO and WITH are capital): %+v", len(flows), flows)
+	}
+	for _, cf := range flows {
+		if cf.Amount == -30 || cf.Amount == 12 {
+			t.Fatalf("a cost line was booked as capital: %+v", cf)
+		}
+	}
+
+	// Nor into trades.
+	trades, err := ig.GetTrades(ctx, start, start.AddDate(0, 0, 10))
+	if err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	if len(trades) != 1 {
+		t.Fatalf("got %d trades, want 1: %+v", len(trades), trades)
+	}
+}
+
 // IG's 6h token life is a floor: a login elsewhere kills the pair early. A
 // mid-sequence expiry must re-authenticate and complete, not fail the sync.
 func TestIGEndToEndSurvivesSessionExpiryMidSequence(t *testing.T) {

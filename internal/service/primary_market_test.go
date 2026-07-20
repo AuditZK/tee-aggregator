@@ -37,6 +37,49 @@ func TestPrimaryMarketTypeMatchesTradeBucket(t *testing.T) {
 	}
 }
 
+// A CFD broker's overnight funding belongs with its CFD trades. Routed to the
+// swap bucket it would sit alone in a market the account never traded — and
+// since a funding-only bucket used to fail hasData(), it was then dropped at
+// persistence: fetched, then thrown away.
+func TestFundingFeesLandWithTheirTrades(t *testing.T) {
+	cases := []struct {
+		exchange string
+		want     string
+	}{
+		{exchange: "ig", want: connector.MarketCFD},
+		{exchange: "ig_demo", want: connector.MarketCFD},
+		{exchange: "ctrader", want: connector.MarketCFD},
+		{exchange: "mt5", want: connector.MarketCFD},
+		// Perp venues fund swaps — today's behaviour, which must not move.
+		{exchange: "hyperliquid", want: connector.MarketSwap},
+		{exchange: "deribit", want: connector.MarketSwap},
+		{exchange: "mexc", want: connector.MarketSwap},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.exchange, func(t *testing.T) {
+			if got := fundingMarketType(tc.exchange); got != tc.want {
+				t.Fatalf("fundingMarketType(%q) = %q, want %q", tc.exchange, got, tc.want)
+			}
+		})
+	}
+}
+
+// A position opened in an earlier window and still held charges funding with
+// no trade and no equity of its own in that bucket. Dropping such a bucket
+// discards a real cost that was already fetched.
+func TestFundingOnlyBucketSurvivesPersistence(t *testing.T) {
+	m := &marketAgg{fundingFees: -12.5}
+	if !m.hasData() {
+		t.Fatal("a bucket carrying only funding fees must persist — otherwise the cost is fetched and thrown away")
+	}
+
+	empty := &marketAgg{}
+	if empty.hasData() {
+		t.Fatal("a genuinely empty bucket must not persist")
+	}
+}
+
 // The equity bucket and the trade bucket meeting in the same aggregate is the
 // property that actually matters, so assert it through the aggregation itself
 // rather than trusting the mapping table.

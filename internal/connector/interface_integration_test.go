@@ -48,7 +48,9 @@ func TestOptionalInterfaces(t *testing.T) {
 		{"Hyperliquid", NewHyperliquid(&Credentials{WalletAddress: "0x1"}), true, true, true, false, false, true},
 		{"Lighter", NewLighter(&Credentials{WalletAddress: "0x1"}), false, true, false, false, false, true},
 		{"MEXC", NewMEXC(&Credentials{APIKey: "k", APISecret: "s"}), true, true, true, false, false, false},
-		{"IG", NewIG(&Credentials{APIKey: "k", APISecret: "s", Passphrase: "u"}, false), true, false, false, false, false, true},
+		// IG funds overnight on CFD positions and books it as its own ledger
+		// row, so the funding fetcher is not swap-only.
+		{"IG", NewIG(&Credentials{APIKey: "k", APISecret: "s", Passphrase: "u"}, false), true, false, true, false, false, true},
 		{"Mock", NewMock(), false, false, false, false, false, false},
 	}
 
