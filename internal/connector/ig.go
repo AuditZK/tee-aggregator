@@ -731,6 +731,11 @@ func igTradeFrom(t IGRawTransaction, start, end time.Time) (*Trade, bool) {
 		side = "sell"
 	}
 
+	// Fee stays 0 by decision, not omission: IG's ledger does not itemise
+	// costs per deal — spread, commission and funding are already netted into
+	// the line's profitAndLoss. Nothing is lost (realised P&L is complete);
+	// snapshot TotalFees reads 0 for IG because the itemisation does not exist
+	// upstream. Inventing a split here would double-count costs.
 	return &Trade{
 		ID:          t.Reference,
 		Symbol:      t.InstrumentName,
