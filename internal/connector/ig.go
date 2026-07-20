@@ -517,17 +517,15 @@ func (i *IG) GetBalance(ctx context.Context) (*Balance, error) {
 	}, nil
 }
 
-func igMarketType(instrumentType string) string {
-	switch strings.ToUpper(strings.TrimSpace(instrumentType)) {
-	case "CURRENCIES":
-		return MarketForex
-	case "COMMODITIES":
-		return MarketCommodities
-	case "SHARES":
-		return MarketStocks
-	default:
-		return MarketCFD
-	}
+// igMarketType is MarketCFD for everything these accounts hold. IG's
+// instrumentType describes the UNDERLYING, not the instrument: a live demo
+// returned instrumentType "CURRENCIES" for "Crypto 10 Index", so routing on it
+// files a crypto index under forex. What the account actually holds is a CFD
+// (or a spread bet) whatever the underlying, which is also what the ledger's
+// trades and the account's equity bucket say — so all three now agree. Mirrors
+// MetaTrader, the other CFD-only connector.
+func igMarketType(_ string) string {
+	return MarketCFD
 }
 
 func (i *IG) GetPositions(ctx context.Context) ([]*Position, error) {
@@ -583,9 +581,15 @@ func (i *IG) GetPositions(ctx context.Context) ([]*Position, error) {
 		if side == "short" {
 			move = -move
 		}
-		// Correct while the instrument is denominated in the account currency;
-		// IG applies its own conversion otherwise. The authoritative aggregate
-		// is the account's profitLoss, which GetBalance reports.
+		// Denominated in the INSTRUMENT's currency, which is often not the
+		// account's: IG returns no per-position P&L and no conversion rate, so
+		// this cannot be expressed in account terms and Position carries no
+		// currency to say so. Measured against a live demo — a USD position on
+		// a EUR account computed -79.79 where IG reported -70.79, off by the FX
+		// rate. Correct per instrument, not summable across them. The
+		// authoritative aggregate is the account's own profitLoss, which
+		// GetBalance reports and the pipeline actually consumes; nothing reads
+		// these positions today.
 		unrealized := move * p.Position.Size * contractSize
 
 		positions = append(positions, &Position{

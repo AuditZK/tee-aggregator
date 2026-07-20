@@ -175,24 +175,71 @@ func TestIGParseTime(t *testing.T) {
 	}
 }
 
-func TestIGMarketTypeMapping(t *testing.T) {
-	tests := []struct {
-		instrumentType string
-		want           string
-	}{
-		{instrumentType: "CURRENCIES", want: MarketForex},
-		{instrumentType: "currencies", want: MarketForex},
-		{instrumentType: " COMMODITIES ", want: MarketCommodities},
-		{instrumentType: "SHARES", want: MarketStocks},
-		{instrumentType: "INDICES", want: MarketCFD},
-		{instrumentType: "BINARY", want: MarketCFD},
-		{instrumentType: "", want: MarketCFD},
+// Replays a payload captured from a live demo account: a long Crypto 10 Index
+// CFD, priced in USD on a EUR account.
+//
+// Two things it pins. The mark-to-market is computed against the bid for a
+// long, and against the level the position actually opened at — getting either
+// wrong is invisible in a synthetic fixture where the numbers are round. And
+// the result is in the INSTRUMENT's currency: IG reported -70.79 on the
+// account for what computes to -79.79 here, the two differing by the EUR/USD
+// rate. Position carries no currency, so this figure is per-instrument only
+// and must never be summed across them — the account's own profitLoss is the
+// aggregate, and it is what the pipeline reads.
+func TestIGPositionMathMatchesLiveCapture(t *testing.T) {
+	ig := newIGTest(t, true, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/session":
+			igWriteSession(w)
+		case "/accounts":
+			fmt.Fprint(w, igTestAccountsJSON)
+		case "/positions":
+			fmt.Fprint(w, `{"positions":[{
+				"position":{"contractSize":1.0,"dealId":"DIAAAAX4C4YUDAC","size":1.0,
+					"direction":"BUY","level":13072.18,"currency":"USD"},
+				"market":{"instrumentName":"Crypto 10 Index","instrumentType":"CURRENCIES",
+					"bid":12992.39,"offer":13072.39}
+			}]}`)
+		}
+	})
+
+	positions, err := ig.GetPositions(context.Background())
+	if err != nil {
+		t.Fatalf("GetPositions: %v", err)
+	}
+	if len(positions) != 1 {
+		t.Fatalf("got %d positions, want 1", len(positions))
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.instrumentType, func(t *testing.T) {
-			if got := igMarketType(tc.instrumentType); got != tc.want {
-				t.Fatalf("igMarketType(%q) = %q, want %q", tc.instrumentType, got, tc.want)
+	p := positions[0]
+	if p.Side != "long" || p.Size != 1 || p.EntryPrice != 13072.18 {
+		t.Fatalf("position = %+v, want long/1/13072.18", p)
+	}
+	// A long exits at the bid, so that is what it marks against.
+	if p.MarkPrice != 12992.39 {
+		t.Fatalf("MarkPrice = %v, want the bid 12992.39", p.MarkPrice)
+	}
+	if diff := p.UnrealizedPnL - -79.79; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("UnrealizedPnL = %v, want -79.79 (instrument currency)", p.UnrealizedPnL)
+	}
+	// IG types this crypto index as CURRENCIES; the account holds a CFD.
+	if p.MarketType != MarketCFD {
+		t.Fatalf("MarketType = %q, want %q", p.MarketType, MarketCFD)
+	}
+}
+
+// instrumentType names the UNDERLYING, not the instrument — a live demo
+// returned "CURRENCIES" for "Crypto 10 Index". Routing on it filed a crypto
+// index under forex, and split positions away from the CFD bucket that the
+// same account's trades and equity land in.
+func TestIGMarketTypeIsAlwaysCFD(t *testing.T) {
+	for _, instrumentType := range []string{
+		"CURRENCIES", "currencies", " COMMODITIES ", "SHARES", "INDICES", "BINARY", "",
+	} {
+		t.Run(instrumentType, func(t *testing.T) {
+			if got := igMarketType(instrumentType); got != MarketCFD {
+				t.Fatalf("igMarketType(%q) = %q, want %q — the account holds a CFD whatever the underlying",
+					instrumentType, got, MarketCFD)
 			}
 		})
 	}
@@ -632,16 +679,16 @@ func TestIGGetPositions(t *testing.T) {
 	}
 
 	// Long marks at the bid: (1.10 - 1.00) * 2 = 0.20
-	if positions[0].Side != "long" || positions[0].MarketType != MarketForex {
-		t.Fatalf("position[0] = %+v, want long/forex", positions[0])
+	if positions[0].Side != "long" || positions[0].MarketType != MarketCFD {
+		t.Fatalf("position[0] = %+v, want long/cfd", positions[0])
 	}
 	if diff := positions[0].UnrealizedPnL - 0.20; diff > 1e-9 || diff < -1e-9 {
 		t.Fatalf("position[0].UnrealizedPnL = %v, want 0.20", positions[0].UnrealizedPnL)
 	}
 
 	// Short marks at the offer: (2010 - 2001) * 1 = 9
-	if positions[1].Side != "short" || positions[1].MarketType != MarketCommodities {
-		t.Fatalf("position[1] = %+v, want short/commodities", positions[1])
+	if positions[1].Side != "short" || positions[1].MarketType != MarketCFD {
+		t.Fatalf("position[1] = %+v, want short/cfd", positions[1])
 	}
 	if positions[1].UnrealizedPnL != 9 {
 		t.Fatalf("position[1].UnrealizedPnL = %v, want 9", positions[1].UnrealizedPnL)
