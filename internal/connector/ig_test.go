@@ -91,6 +91,26 @@ func TestIGParseDecimal(t *testing.T) {
 		{in: "", wantErr: true},
 		{in: "£", wantErr: true},
 		{in: "-", wantErr: true},
+
+		// IG renders these for display in the account's locale, so the same
+		// amount arrives both ways. Reading "1.234,56" with the English
+		// convention yields 1.23456 — a thousandfold error nothing downstream
+		// can catch.
+		{in: "1.234,56", want: 1234.56},
+		{in: "E1.234,56", want: 1234.56},
+		{in: "-1.234,56", want: -1234.56},
+		{in: "12,34", want: 12.34},
+		{in: "1.234.567,89", want: 1234567.89},
+		{in: "1,234,567.89", want: 1234567.89},
+		// A lone separator with three digits behind it is ambiguous; grouping
+		// is IG's English form and the safer miss.
+		{in: "1,234", want: 1234},
+		{in: "1.234", want: 1234},
+		// Forex levels keep their fraction: not three digits, so not grouping.
+		{in: "1.1050", want: 1.1050},
+		{in: "0.85", want: 0.85},
+		{in: ".", wantErr: true},
+		{in: ",", wantErr: true},
 	}
 
 	for _, tc := range tests {
@@ -109,6 +129,124 @@ func TestIGParseDecimal(t *testing.T) {
 				t.Fatalf("ParseIGDecimal(%q) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// IG's published sample timestamps carry no zone designator, but the exact
+// shape is unconfirmed against a live account, so the parser accepts RFC3339
+// too. Both must land on the same UTC instant — a silently mis-parsed date
+// files a trade under the wrong day.
+func TestIGParseTime(t *testing.T) {
+	want := time.Date(2026, 7, 15, 14, 30, 5, 0, time.UTC)
+
+	tests := []struct {
+		name    string
+		in      string
+		want    time.Time
+		wantErr bool
+	}{
+		{name: "no zone designator", in: "2026-07-15T14:30:05", want: want},
+		{name: "rfc3339 utc", in: "2026-07-15T14:30:05Z", want: want},
+		{name: "rfc3339 offset", in: "2026-07-15T16:30:05+02:00", want: want},
+		{name: "empty", in: "", wantErr: true},
+		{name: "garbage", in: "not-a-date", wantErr: true},
+		{name: "date only", in: "2026-07-15", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseIGTime(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseIGTime(%q) = %v, want error", tc.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseIGTime(%q) returned error: %v", tc.in, err)
+			}
+			if !got.Equal(tc.want) {
+				t.Fatalf("parseIGTime(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+			if got.Location() != time.UTC {
+				t.Fatalf("parseIGTime(%q) location = %v, want UTC", tc.in, got.Location())
+			}
+		})
+	}
+}
+
+func TestIGMarketTypeMapping(t *testing.T) {
+	tests := []struct {
+		instrumentType string
+		want           string
+	}{
+		{instrumentType: "CURRENCIES", want: MarketForex},
+		{instrumentType: "currencies", want: MarketForex},
+		{instrumentType: " COMMODITIES ", want: MarketCommodities},
+		{instrumentType: "SHARES", want: MarketStocks},
+		{instrumentType: "INDICES", want: MarketCFD},
+		{instrumentType: "BINARY", want: MarketCFD},
+		{instrumentType: "", want: MarketCFD},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.instrumentType, func(t *testing.T) {
+			if got := igMarketType(tc.instrumentType); got != tc.want {
+				t.Fatalf("igMarketType(%q) = %q, want %q", tc.instrumentType, got, tc.want)
+			}
+		})
+	}
+}
+
+// RawTransactions is what the probe reads to settle the ledger questions the
+// docs will not answer, so it must hand back every line unfiltered — including
+// the cash and unclassifiable ones the parsed views drop.
+func TestIGRawTransactionsKeepsEverything(t *testing.T) {
+	ig := newIGTest(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/session":
+			igWriteSession(w)
+		case "/history/transactions":
+			fmt.Fprint(w, `{"transactions":[
+				{"transactionType":"DEPO","cashTransaction":true,"profitAndLoss":"E1000.00","size":"0","currency":"EUR","dateUtc":"2026-07-01T10:00:00"},
+				{"transactionType":"UNKNOWN_CODE","cashTransaction":true,"profitAndLoss":"E7.00","size":"0","currency":"EUR","dateUtc":"2026-07-02T10:00:00"},
+				{"transactionType":"DEAL","cashTransaction":false,"profitAndLoss":"unparseable","size":"+1","openLevel":"1.10","closeLevel":"1.20","currency":"EUR","dateUtc":"2026-07-03T10:00:00"}
+			],"metaData":{"pageData":{"totalPages":1}}}`)
+		}
+	})
+
+	ctx := context.Background()
+	start := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)
+
+	raw, err := ig.RawTransactions(ctx, start, end)
+	if err != nil {
+		t.Fatalf("RawTransactions: %v", err)
+	}
+	if len(raw) != 3 {
+		t.Fatalf("got %d raw lines, want 3 (nothing filtered): %+v", len(raw), raw)
+	}
+	if raw[1].TransactionType != "UNKNOWN_CODE" {
+		t.Fatalf("unclassifiable code was dropped: %+v", raw)
+	}
+	if raw[2].OpenLevel != "1.10" {
+		t.Fatalf("OpenLevel not surfaced: %+v", raw[2])
+	}
+
+	// The parsed views drop exactly what the raw view keeps.
+	flows, err := ig.GetCashflows(ctx, start)
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	if len(flows) != 1 {
+		t.Fatalf("got %d cashflows, want 1 (unknown code not classified): %+v", len(flows), flows)
+	}
+	trades, err := ig.GetTrades(ctx, start, end)
+	if err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	if len(trades) != 0 {
+		t.Fatalf("got %d trades, want 0 (unparseable P&L dropped): %+v", len(trades), trades)
 	}
 }
 

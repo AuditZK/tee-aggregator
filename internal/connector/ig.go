@@ -50,6 +50,9 @@ type igSession struct {
 	xst       string
 	accountID string
 	expiry    time.Time
+	// gen identifies which login produced this pair, so a caller holding a
+	// rejected pair can only retire that one.
+	gen uint64
 }
 
 func (s igSession) valid() bool {
@@ -65,8 +68,9 @@ type IG struct {
 	isDemo   bool
 	client   *http.Client
 
-	sessionMu sync.Mutex
-	sess      igSession
+	sessionMu  sync.Mutex
+	sess       igSession
+	sessionGen uint64
 }
 
 // NewIG creates an IG connector. Credentials map as:
@@ -127,9 +131,16 @@ func (i *IG) session(ctx context.Context) (igSession, error) {
 	return i.sess, nil
 }
 
-func (i *IG) invalidateSession() {
+// invalidateSession retires the session whose generation was rejected. Clearing
+// unconditionally would let a caller destroy a pair a concurrent caller had
+// just logged in for: that caller's retry then goes out with a token this login
+// invalidated, exhausts its single retry, and returns a bare 401 — which
+// connection create reads as bad credentials and rejects a healthy account.
+func (i *IG) invalidateSession(gen uint64) {
 	i.sessionMu.Lock()
-	i.sess = igSession{}
+	if i.sess.gen == gen {
+		i.sess = igSession{}
+	}
 	i.sessionMu.Unlock()
 }
 
@@ -185,28 +196,34 @@ func (i *IG) loginLocked(ctx context.Context) error {
 		return fmt.Errorf("decode ig session: %w", err)
 	}
 
+	i.sessionGen++
 	i.sess = igSession{
 		cst:       cst,
 		xst:       xst,
 		accountID: parsed.CurrentAccountID,
 		expiry:    time.Now().Add(igSessionTTL),
+		gen:       i.sessionGen,
 	}
 	return nil
 }
 
 func (i *IG) doAuthed(ctx context.Context, version, path string, query url.Values) ([]byte, error) {
-	body, err := i.authedOnce(ctx, version, path, query)
+	body, gen, err := i.authedOnce(ctx, version, path, query)
 	if err == nil || !igSessionRejected(body) {
 		return body, err
 	}
-	i.invalidateSession()
-	return i.authedOnce(ctx, version, path, query)
+	i.invalidateSession(gen)
+	body, _, err = i.authedOnce(ctx, version, path, query)
+	return body, err
 }
 
-func (i *IG) authedOnce(ctx context.Context, version, path string, query url.Values) ([]byte, error) {
+// authedOnce reports the session generation it signed the request with, so a
+// rejection retires that pair and not whichever one happens to be cached by the
+// time the caller reacts.
+func (i *IG) authedOnce(ctx context.Context, version, path string, query url.Values) ([]byte, uint64, error) {
 	sess, err := i.session(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	reqURL := i.baseURL + path
@@ -214,10 +231,10 @@ func (i *IG) authedOnce(ctx context.Context, version, path string, query url.Val
 		reqURL += "?" + query.Encode()
 	}
 
-	return retryHTTP(i.client, func() (*http.Request, error) {
-		req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-		if err != nil {
-			return nil, err
+	body, err := retryHTTP(i.client, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+		if rerr != nil {
+			return nil, rerr
 		}
 		req.Header.Set("X-IG-API-KEY", i.apiKey)
 		req.Header.Set("CST", sess.cst)
@@ -226,25 +243,83 @@ func (i *IG) authedOnce(ctx context.Context, version, path string, query url.Val
 		req.Header.Set("Accept", igContentType)
 		return req, nil
 	})
+	return body, sess.gen, err
+}
+
+// igDecimalSeparator reports which of '.' / ',' in digits acts as the decimal
+// point, or 0 when both are grouping.
+//
+// IG renders these fields for display in the account's own locale, so both
+// "1,234.56" and "1.234,56" occur and mean the same amount. Stripping one
+// separator by convention silently turns the second form into 1.23456 — a
+// thousandfold error that no later stage can detect.
+func igDecimalSeparator(digits string) rune {
+	lastDot := strings.LastIndexByte(digits, '.')
+	lastComma := strings.LastIndexByte(digits, ',')
+
+	// Both present: the rightmost one is the decimal point and the other groups.
+	if lastDot >= 0 && lastComma >= 0 {
+		if lastDot > lastComma {
+			return '.'
+		}
+		return ','
+	}
+
+	sep, at := rune(0), -1
+	switch {
+	case lastDot >= 0:
+		sep, at = '.', lastDot
+	case lastComma >= 0:
+		sep, at = ',', lastComma
+	default:
+		return 0
+	}
+
+	// Repeated, so it groups: "1.234.567".
+	if strings.Count(digits, string(sep)) > 1 {
+		return 0
+	}
+	// A lone separator trailed by exactly three digits is the ambiguous case
+	// ("1,234"). Grouping is the reading that matches IG's English samples, and
+	// it is also the safer error: mistaking a decimal point for a group marker
+	// inflates by a thousand, the reverse only shaves a fraction.
+	if len(digits)-at-1 == 3 {
+		return 0
+	}
+	return sep
 }
 
 // ParseIGDecimal reads IG's money and level fields, which arrive as display
 // strings rather than numbers: profitAndLoss carries the account's currency
 // symbol ("E12.34", "£-5.00"), sizes carry an explicit sign, and larger values
-// carry thousands separators. Keeping only the numeric characters tolerates
-// every variant instead of pinning a prefix that changes with the account.
+// carry grouped digits in the account's locale.
 func ParseIGDecimal(s string) (float64, error) {
-	var b strings.Builder
+	var sign, digits strings.Builder
 	for _, r := range s {
-		if (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '+' {
-			b.WriteRune(r)
+		switch {
+		case r >= '0' && r <= '9', r == '.', r == ',':
+			digits.WriteRune(r)
+		case (r == '-' || r == '+') && sign.Len() == 0 && digits.Len() == 0:
+			sign.WriteRune(r)
 		}
 	}
-	cleaned := b.String()
-	if cleaned == "" || cleaned == "-" || cleaned == "+" {
+
+	body := digits.String()
+	if strings.Trim(body, ".,") == "" {
 		return 0, fmt.Errorf("parse ig decimal %q", s)
 	}
-	return strconv.ParseFloat(cleaned, 64)
+
+	switch sep := igDecimalSeparator(body); sep {
+	case 0:
+		body = strings.NewReplacer(".", "", ",", "").Replace(body)
+	case ',':
+		body = strings.ReplaceAll(body, ".", "")
+		body = strings.Replace(body, ",", ".", 1)
+	default:
+		body = strings.ReplaceAll(body, ",", "")
+	}
+
+	return strconv.ParseFloat(sign.String()+body, 64)
 }
 
 func parseIGTime(s string) (time.Time, error) {
@@ -427,6 +502,7 @@ func (i *IG) RawTransactions(ctx context.Context, since, until time.Time) ([]IGR
 
 func (i *IG) fetchTransactions(ctx context.Context, from, to time.Time) ([]IGRawTransaction, error) {
 	var out []IGRawTransaction
+	complete := false
 
 	for page := 1; page <= igMaxTransactionPages; page++ {
 		q := url.Values{}
@@ -453,11 +529,91 @@ func (i *IG) fetchTransactions(ctx context.Context, from, to time.Time) ([]IGRaw
 		}
 
 		out = append(out, resp.Transactions...)
-		if len(resp.Transactions) == 0 || page >= resp.MetaData.PageData.TotalPages {
+		if len(resp.Transactions) == 0 {
+			complete = true
+			break
+		}
+
+		// Trusting the reported page count alone would stop the walk after one
+		// page whenever the count is absent or zero, silently returning a
+		// truncated ledger — and a dropped deposit reads as return. Without a
+		// count, a short page is the end.
+		if total := resp.MetaData.PageData.TotalPages; total > 0 {
+			if page >= total {
+				complete = true
+				break
+			}
+		} else if len(resp.Transactions) < igTransactionPageSize {
+			complete = true
 			break
 		}
 	}
+
+	// Running out of pages is not an end-of-ledger. IG returns newest first, so
+	// the rows beyond the cap are the OLDEST — the inception deposit among them,
+	// and equity that appears from nowhere reads as pure return. Fail loudly
+	// rather than hand back a ledger that looks whole.
+	if !complete {
+		return nil, fmt.Errorf("ig ledger exceeds %d pages of %d for %s..%s: refusing a truncated history",
+			igMaxTransactionPages, igTransactionPageSize,
+			from.UTC().Format(time.DateOnly), to.UTC().Format(time.DateOnly))
+	}
 	return out, nil
+}
+
+// igTradeFrom converts one ledger line to a Trade, reporting false when the
+// line is not a dealt trade inside [start, end] or carries a field that will
+// not parse.
+func igTradeFrom(t IGRawTransaction, start, end time.Time) (*Trade, bool) {
+	if t.CashTransaction {
+		return nil, false
+	}
+
+	ts, err := parseIGTime(t.DateUTC)
+	if err != nil {
+		return nil, false
+	}
+	// The from/to query params carry no zone designator, so an upstream reading
+	// them as account-local hands back lines outside the requested window;
+	// dateUtc is explicitly UTC, so re-cut against it. A leaked line would
+	// otherwise be counted on two consecutive sync days.
+	if ts.Before(start) || ts.After(end) {
+		return nil, false
+	}
+
+	// Size carries the direction and pnl is the headline figure, so neither can
+	// be guessed at. The close level only feeds volume, and IG writes "-" for a
+	// level that does not apply — letting that veto the row would discard a real
+	// trade, and its P&L with it, over a cosmetic field.
+	size, err := ParseIGDecimal(t.Size)
+	if err != nil {
+		return nil, false
+	}
+	pnl, err := ParseIGDecimal(t.ProfitAndLoss)
+	if err != nil {
+		return nil, false
+	}
+	price, err := ParseIGDecimal(t.CloseLevel)
+	if err != nil {
+		price = 0
+	}
+
+	side := "buy"
+	if size < 0 {
+		side = "sell"
+	}
+
+	return &Trade{
+		ID:          t.Reference,
+		Symbol:      t.InstrumentName,
+		Side:        side,
+		Price:       price,
+		Quantity:    math.Abs(size),
+		FeeCurrency: t.Currency,
+		RealizedPnL: pnl,
+		Timestamp:   ts,
+		MarketType:  MarketCFD,
+	}, true
 }
 
 func (i *IG) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
@@ -468,43 +624,9 @@ func (i *IG) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, err
 
 	trades := make([]*Trade, 0, len(txs))
 	for _, t := range txs {
-		if t.CashTransaction {
-			continue
+		if trade, ok := igTradeFrom(t, start, end); ok {
+			trades = append(trades, trade)
 		}
-
-		ts, err := parseIGTime(t.DateUTC)
-		if err != nil {
-			continue
-		}
-		size, err := ParseIGDecimal(t.Size)
-		if err != nil {
-			continue
-		}
-		price, err := ParseIGDecimal(t.CloseLevel)
-		if err != nil {
-			continue
-		}
-		pnl, err := ParseIGDecimal(t.ProfitAndLoss)
-		if err != nil {
-			continue
-		}
-
-		side := "buy"
-		if size < 0 {
-			side = "sell"
-		}
-
-		trades = append(trades, &Trade{
-			ID:          t.Reference,
-			Symbol:      t.InstrumentName,
-			Side:        side,
-			Price:       price,
-			Quantity:    math.Abs(size),
-			FeeCurrency: t.Currency,
-			RealizedPnL: pnl,
-			Timestamp:   ts,
-			MarketType:  MarketCFD,
-		})
 	}
 	return trades, nil
 }
@@ -526,12 +648,22 @@ func (i *IG) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, er
 			continue
 		}
 
+		// The code already told us this row moves capital, so failing to read its
+		// amount or date is not a row we can skip: dropping it understates
+		// capital, and capital that never entered the ledger reads as return.
 		amount, err := ParseIGDecimal(t.ProfitAndLoss)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("ig %s cash line has an unreadable amount: %w", t.TransactionType, err)
 		}
 		ts, err := parseIGTime(t.DateUTC)
 		if err != nil {
+			return nil, fmt.Errorf("ig %s cash line has an unreadable date: %w", t.TransactionType, err)
+		}
+		// Same zone-designator caveat as GetTrades, and it bites harder here: a
+		// deposit that leaks in from before the window was already booked by an
+		// earlier sync, and counting it twice is exactly the phantom capital
+		// inflow that craters TWR.
+		if ts.Before(since) {
 			continue
 		}
 

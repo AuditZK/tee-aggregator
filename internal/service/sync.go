@@ -2071,7 +2071,7 @@ func primaryMarketType(exchange string) string {
 	switch strings.ToLower(exchange) {
 	case "alpaca", "ibkr":
 		return connector.MarketStocks
-	case "ctrader", "mt4", "mt5":
+	case "ctrader", "mt4", "mt5", "ig", "ig_demo":
 		return connector.MarketCFD
 	default:
 		return connector.MarketSpot
