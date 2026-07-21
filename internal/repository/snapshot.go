@@ -703,6 +703,91 @@ func (r *SnapshotRepo) getLatestByUserExchangeLabelTS(ctx context.Context, userU
 	return snapshots[0], nil
 }
 
+// GetLatestByUserExchangeLabelBefore returns the most recent snapshot strictly
+// before `before` for the (user, exchange, label) tuple. Capital-flow
+// reconciliation anchors on the previous day's settled balance; using the
+// unqualified latest would pick up a same-day snapshot on a re-sync and compare
+// a balance against itself.
+func (r *SnapshotRepo) GetLatestByUserExchangeLabelBefore(ctx context.Context, userUID, exchange, label string, before time.Time) (*Snapshot, error) {
+	if r.isTSSchema {
+		query := `
+			SELECT id, "userUid", exchange, label, timestamp,
+				"totalEquity", "realizedBalance", "unrealizedPnL",
+				deposits, withdrawals,
+				breakdown_by_market, "createdAt"
+			FROM snapshot_data
+			WHERE "userUid" = $1 AND exchange = $2 AND label = $3 AND timestamp < $4
+			ORDER BY timestamp DESC
+			LIMIT 1`
+		rows, err := r.pool.Query(ctx, query, userUID, exchange, label, before)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		snapshots, err := r.scanSnapshotsTS(rows)
+		if err != nil {
+			return nil, err
+		}
+		if len(snapshots) == 0 {
+			return nil, ErrNotFound
+		}
+		return snapshots[0], nil
+	}
+
+	hasLabel := r.hasLabelColumn(ctx)
+	hasHist := r.hasIsHistoricalColumn(ctx)
+	histCol := ""
+	if hasHist {
+		histCol = snapshotIsHistoricalCol
+	}
+	if !hasLabel {
+		query := fmt.Sprintf(`
+			SELECT id, user_uid, exchange, timestamp,
+				total_equity, realized_balance, unrealized_pnl,
+				deposits, withdrawals, total_trades, total_volume, total_fees,
+				breakdown_by_market, created_at%s
+			FROM snapshot_data
+			WHERE user_uid = $1 AND exchange = $2 AND timestamp < $3
+			ORDER BY timestamp DESC
+			LIMIT 1`, histCol)
+		rows, err := r.pool.Query(ctx, query, userUID, exchange, before)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		snapshots, err := r.scanSnapshots(rows, false, hasHist)
+		if err != nil {
+			return nil, err
+		}
+		if len(snapshots) == 0 {
+			return nil, ErrNotFound
+		}
+		return snapshots[0], nil
+	}
+	query := fmt.Sprintf(`
+		SELECT id, user_uid, exchange, label, timestamp,
+			total_equity, realized_balance, unrealized_pnl,
+			deposits, withdrawals, total_trades, total_volume, total_fees,
+			breakdown_by_market, created_at%s
+		FROM snapshot_data
+		WHERE user_uid = $1 AND exchange = $2 AND label = $3 AND timestamp < $4
+		ORDER BY timestamp DESC
+		LIMIT 1`, histCol)
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, label, before)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	snapshots, err := r.scanSnapshots(rows, false, hasHist)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+	return snapshots[0], nil
+}
+
 // ExistsForUserExchangeLabel returns true if any snapshot already exists for
 // the given (user_uid, exchange, label) tuple. Used by the anti-cherry-pick
 // guard (ENG-001) — replaces the old full-range scan that was O(all user
@@ -799,7 +884,7 @@ func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) e
 					breakdown_by_market, "createdAt", "updatedAt"
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 				ON CONFLICT ("userUid", exchange, label, timestamp)
-				` + snapshotUpdateSetTS,
+				`+snapshotUpdateSetTS,
 				generateCUID(),
 				s.UserUID, s.Exchange, s.Label, s.Timestamp,
 				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,

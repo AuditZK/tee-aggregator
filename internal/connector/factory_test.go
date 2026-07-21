@@ -26,6 +26,8 @@ func TestFactoryCreateSupportsDeribitAndMetaTrader(t *testing.T) {
 		{name: "gate", exchange: "gate", wantConn: "gate"},
 		{name: "bingx", exchange: "bingx", wantConn: "bingx"},
 		{name: "huobi", exchange: "huobi", wantConn: "huobi"},
+		{name: "ig", exchange: "ig", wantConn: "ig"},
+		{name: "ig_demo", exchange: "ig_demo", wantConn: "ig_demo"},
 	}
 
 	for _, tt := range tests {
@@ -63,6 +65,12 @@ func TestFactorySupportedExchangesIncludesDeribitAndMetaTrader(t *testing.T) {
 	}
 
 	for _, ex := range []string{"bitget", "mexc", "kucoin", "coinbase", "gate", "bingx", "huobi"} {
+		if _, ok := got[ex]; !ok {
+			t.Fatalf("supported exchanges missing %q", ex)
+		}
+	}
+
+	for _, ex := range []string{"ig", "ig_demo"} {
 		if _, ok := got[ex]; !ok {
 			t.Fatalf("supported exchanges missing %q", ex)
 		}

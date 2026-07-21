@@ -113,6 +113,19 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 		return fmt.Errorf("%w: %s", ErrConnectionAlreadyExists, ExistingConnectionNoopMessage)
 	}
 
+	// The label dedup above cannot catch the same account arriving twice under
+	// different labels — same credentials, cosmetically different names. Both
+	// rows would sync the same exchange account and the report aggregation
+	// would sum its equity twice. Identical credentials are the reliable proxy
+	// for "same account" (IG multi-account logins differ in the pinned account
+	// id, which rides in the passphrase and therefore in the hash).
+	credentialsHash := hashCredentials(req.APIKey, req.APISecret, req.Passphrase)
+	if dup, derr := s.repo.ExistsActiveByCredentialsHash(ctx, req.UserUID, credentialsHash); derr != nil {
+		return fmt.Errorf("check duplicate credentials: %w", derr)
+	} else if dup {
+		return fmt.Errorf("%w: these exact credentials are already connected under another label", ErrConnectionAlreadyExists)
+	}
+
 	// Test credentials before saving — fail fast with a clear error
 	testConn, err := s.factory.Create(&connector.Credentials{
 		Exchange:   normalizedExchange,
@@ -140,8 +153,6 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 			return fmt.Errorf("invalid credentials: %w", err)
 		}
 	}
-
-	credentialsHash := hashCredentials(req.APIKey, req.APISecret, req.Passphrase)
 
 	conn := &repository.ExchangeConnection{
 		UserUID:             req.UserUID,

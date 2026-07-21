@@ -283,12 +283,25 @@ func (r *ConnectionRepo) ExistsActiveByCredentialsHash(ctx context.Context, user
 	if !hasCredHash {
 		return false, nil
 	}
+	r.capMu.Lock()
+	isTS := r.isTSSchema
+	r.capMu.Unlock()
 
+	// The TS/Prisma schema quotes camelCase columns; querying the snake_case
+	// names there raises 42703, which the fallback below swallows — turning
+	// this check into a silent no-op on exactly the production schema.
 	query := `
 		SELECT EXISTS (
 			SELECT 1 FROM exchange_connections
 			WHERE user_uid = $1 AND credentials_hash = $2 AND is_active = true
 		)`
+	if isTS {
+		query = `
+		SELECT EXISTS (
+			SELECT 1 FROM exchange_connections
+			WHERE "userUid" = $1 AND "credentialsHash" = $2 AND "isActive" = true
+		)`
+	}
 	var exists bool
 	if err := r.pool.QueryRow(ctx, query, userUID, credentialsHash).Scan(&exists); err != nil {
 		// Graceful fallback if migration has not been applied yet.

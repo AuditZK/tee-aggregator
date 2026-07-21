@@ -70,6 +70,27 @@ func reconstructsEverySync(exchange string) bool {
 	return e == "ibkr" || e == "ctrader"
 }
 
+// balanceReconciledExchanges lists exchanges whose live snapshots derive
+// capital flows from the settled-balance residual rather than trusting the
+// broker's cashflow report alone (see doc/plan-balance-reconciled-cashflow.md).
+// An exchange belongs here only once its ledger is proven complete — realized
+// P&L + charges reconcile to ~0 residual over an account's life (the
+// cmd/ig-probe gate) — otherwise an under-reported fee would surface as a
+// phantom withdrawal. IG earns it: its demo top-ups appear in NO transaction
+// endpoint, so only the balance reveals them. Add others one at a time, each
+// after its own reconciliation check.
+var balanceReconciledExchanges = []string{"ig"}
+
+func isBalanceReconciled(exchange string) bool {
+	e := strings.ToLower(exchange)
+	for _, x := range balanceReconciledExchanges {
+		if x == e {
+			return true
+		}
+	}
+	return false
+}
+
 // everySyncReconstructSince returns the lookback for an every-sync
 // reconstruction. IBKR re-emits its full Flex window cheaply (zero = full);
 // cTrader's walk is expensive (paginated deals + weekly cash-flow chunks), so
@@ -538,15 +559,15 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	// 5. Aggregate trades by market type
 	breakdown := s.aggregateTrades(trades)
 
-	// 5a. Fetch funding fees for swap positions (always if supported — funding
-	// applies to all open positions, not just those traded today)
+	// 5a. Fetch funding fees (always if supported — funding applies to all open
+	// positions, not just those traded today)
+	var fundingCharges float64
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
 		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, activityStart); err == nil {
-			totalFunding := 0.0
 			for _, f := range fees {
-				totalFunding += f.Amount
+				fundingCharges += f.Amount
 			}
-			breakdown.swap.fundingFees = totalFunding
+			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = fundingCharges
 		}
 	}
 
@@ -600,6 +621,11 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		m.equity = balance.Equity
 		m.availableMargin = balance.Available
 	}
+
+	// 6b. Balance-reconciled capital flow: for eligible exchanges the settled
+	// balance overrides the broker's cashflow report, catching hidden deposits
+	// (doc/plan-balance-reconciled-cashflow.md). No-op for everyone else.
+	deposits, withdrawals = s.reconcileCapitalFlow(ctx, connMeta, startOfDay, trades, balance.Equity, balance.UnrealizedPnL, fundingCharges, deposits, withdrawals)
 
 	// 8. Inception-deposit convention (UX-001). When this is the very first
 	// snapshot we write for the connection AND the connector didn't already
@@ -983,13 +1009,13 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 
 	breakdown := s.aggregateTrades(trades)
 
+	var fundingCharges float64
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
 		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, activityStart); err == nil {
-			total := 0.0
 			for _, f := range fees {
-				total += f.Amount
+				fundingCharges += f.Amount
 			}
-			breakdown.swap.fundingFees = total
+			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = fundingCharges
 		}
 	}
 
@@ -1031,6 +1057,10 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		m.equity = balance.Equity
 		m.availableMargin = balance.Available
 	}
+
+	// Balance-reconciled capital flow: same override as the non-atomic path
+	// (doc/plan-balance-reconciled-cashflow.md). No-op for ineligible exchanges.
+	deposits, withdrawals = s.reconcileCapitalFlow(ctx, connMeta, startOfDay, trades, balance.Equity, balance.UnrealizedPnL, fundingCharges, deposits, withdrawals)
 
 	// Inception-deposit convention (UX-001): see the non-atomic path above
 	// for the full rationale. Both call sites need the same fallback,
@@ -1159,6 +1189,56 @@ func (s *SyncService) recordSyncStatus(ctx context.Context, conn *repository.Exc
 	}
 }
 
+// reconcileCapitalFlow returns the snapshot's deposits/withdrawals. For eligible
+// exchanges it replaces the broker-reported figures with balance-reconciled
+// ones: the settled balance is truth, and any change the ledger (realized P&L +
+// charges) and the reported flow do not explain is a hidden capital movement —
+// the failure a demo top-up that appears in no transaction endpoint would
+// otherwise cause. See doc/plan-balance-reconciled-cashflow.md. Falls back to
+// the reported figures when the exchange is not eligible, no prior snapshot
+// exists (first sync — inception-deposit handles that), or the lookup fails.
+func (s *SyncService) reconcileCapitalFlow(
+	ctx context.Context,
+	connMeta *repository.ExchangeConnection,
+	before time.Time,
+	trades []*connector.Trade,
+	equity, unrealizedPnL, fundingCharges, reportedDeposits, reportedWithdrawals float64,
+) (deposits, withdrawals float64) {
+	if !isBalanceReconciled(connMeta.Exchange) {
+		return reportedDeposits, reportedWithdrawals
+	}
+	prev, err := s.snapshotRepo.GetLatestByUserExchangeLabelBefore(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, before)
+	if err != nil || prev == nil {
+		return reportedDeposits, reportedWithdrawals
+	}
+
+	var realizedPnL float64
+	for _, tr := range trades {
+		realizedPnL += tr.RealizedPnL
+	}
+	dep, wd := InferCapitalFlow(
+		ReconInputs{SettledBalance: prev.RealizedBalance},
+		ReconInputs{
+			SettledBalance: equity - unrealizedPnL,
+			RealizedPnL:    realizedPnL,
+			Charges:        fundingCharges,
+			ReportedFlow:   reportedDeposits - reportedWithdrawals,
+		},
+		reconThreshold(equity),
+	)
+	if dep != reportedDeposits || wd != reportedWithdrawals {
+		s.logger.Info("capital flow reconciled from balance",
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Float64("reported_deposits", reportedDeposits),
+			zap.Float64("reported_withdrawals", reportedWithdrawals),
+			zap.Float64("reconciled_deposits", dep),
+			zap.Float64("reconciled_withdrawals", wd),
+		)
+	}
+	return dep, wd
+}
+
 // enrichBreakdownWithBalances populates equity and available_margin per market
 // from the connector's BalanceByMarketFetcher, matching TS parity.
 func (s *SyncService) enrichBreakdownWithBalances(agg *aggregatedBreakdown, balances []*connector.MarketBalance) {
@@ -1252,6 +1332,19 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 		)
 		return
 	}
+	// Dispatch only what the deployed rebuilder registers. Without this gate an
+	// unsupported exchange still shipped plaintext credentials out of the
+	// enclave for a call that can only answer HTTP 400 — egress with zero
+	// payoff (observed live: an okx connect on 2026-07-20, two log lines and
+	// nothing else). Warn, not error: the user's connection is fine, only the
+	// optional backfill is unavailable.
+	if !externalRebuilderSupports(connMeta.Exchange) {
+		s.logger.Warn("history backfill: exchange not supported by the deployed rebuilder, skipping",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+		)
+		return
+	}
 	s.logger.Info("history backfill: dispatching to external rebuilder",
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
@@ -1338,6 +1431,19 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 // /account/activities on top. The midnight pass is the idempotent re-fetch that
 // finalizes.
 var externalRebuilderExchanges = []string{"hyperliquid", "bitget", "binance", "okx", "alpaca"}
+
+// externalRebuilderSupports reports whether the deployed rebuilder registers
+// this exchange — the gate for every dispatch that carries plaintext
+// credentials out of the enclave.
+func externalRebuilderSupports(exchange string) bool {
+	e := strings.ToLower(strings.TrimSpace(exchange))
+	for _, supported := range externalRebuilderExchanges {
+		if e == supported {
+			return true
+		}
+	}
+	return false
+}
 
 // maxRebuildRetryDays bounds how long the midnight recalibration keeps retrying
 // a consenting connection that never finalizes (SEC-08): past this many days
@@ -2085,7 +2191,7 @@ func primaryMarketType(exchange string) string {
 	switch strings.ToLower(exchange) {
 	case "alpaca", "ibkr":
 		return connector.MarketStocks
-	case "ctrader", "mt4", "mt5":
+	case "ctrader", "mt4", "mt5", "ig", "ig_demo":
 		return connector.MarketCFD
 	case "okx":
 		// OKX's GetTrades reads the SWAP fills, so every trade is typed swap,
@@ -2101,7 +2207,24 @@ func primaryMarketType(exchange string) string {
 }
 
 func (m *marketAgg) hasData() bool {
-	return m.trades > 0 || m.equity > 0 || m.availableMargin > 0
+	// fundingFees counts: a market can carry a real cost with no trade and no
+	// equity of its own (a position opened last window and still held charges
+	// funding every night). Omitting it dropped the whole bucket at
+	// persistence, so the cost was fetched and then thrown away.
+	return m.trades > 0 || m.equity > 0 || m.availableMargin > 0 || m.fundingFees != 0
+}
+
+// fundingMarketType names the bucket an exchange's funding charges belong in —
+// the same bucket its trades land in, or the cost sits alone in a market the
+// account never traded. Perp venues fund swaps, which is why that is the
+// default; CFD brokers charge the same overnight cost on a CFD position.
+func fundingMarketType(exchange string) string {
+	switch strings.ToLower(exchange) {
+	case "ig", "ig_demo", "ctrader", "mt4", "mt5":
+		return connector.MarketCFD
+	default:
+		return connector.MarketSwap
+	}
 }
 
 func (a *aggregatedBreakdown) getOrCreateMarket(marketType string) *marketAgg {
