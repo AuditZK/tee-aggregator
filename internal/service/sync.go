@@ -1331,7 +1331,13 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 // IP-locked to the enclave egress reaches OKX from the rebuilder host only
 // through the rebuilder's OKX_EGRESS_PROXY tunnel; without it the rebuild fails
 // 50110 and never finalizes.
-var externalRebuilderExchanges = []string{"hyperliquid", "bitget", "binance", "okx"}
+//
+// alpaca: statement-is-truth like IBKR — the broker's /account/portfolio/history
+// is an authoritative end-of-day equity series (no MTM walk, no offset, so
+// EndEquityOverride is irrelevant). Cash flows/fees/trades are folded from
+// /account/activities on top. The midnight pass is the idempotent re-fetch that
+// finalizes.
+var externalRebuilderExchanges = []string{"hyperliquid", "bitget", "binance", "okx", "alpaca"}
 
 // maxRebuildRetryDays bounds how long the midnight recalibration keeps retrying
 // a consenting connection that never finalizes (SEC-08): past this many days
