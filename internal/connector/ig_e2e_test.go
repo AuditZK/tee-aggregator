@@ -144,13 +144,18 @@ func igDeal(ref string, day int, size string, pnl string) map[string]any {
 	}
 }
 
+// igCash is a real capital transfer. Shaped like the live article: IG reports
+// cashTransaction=false even for a bank transfer, writes size="-", and names
+// the line after the transfer — which is what marks a WITH as a withdrawal
+// rather than a charge.
 func igCash(kind string, day int, pnl string) map[string]any {
 	return map[string]any{
 		"transactionType": kind,
-		"cashTransaction": true,
+		"cashTransaction": false,
 		"reference":       kind + strconv.Itoa(day),
-		"size":            "0",
-		"openLevel":       "0",
+		"instrumentName":  "Virement bancaire",
+		"size":            "-",
+		"openLevel":       "-",
 		"closeLevel":      "0",
 		"profitAndLoss":   pnl,
 		"currency":        "EUR",
@@ -158,14 +163,15 @@ func igCash(kind string, day int, pnl string) map[string]any {
 	}
 }
 
-// igCharge is a cost IG books under a capital code but does NOT flag a cash
-// transaction — the shape the live-demo probe found: WITH, cashTransaction=false,
-// size="-". Classifying by code alone read these as withdrawals.
+// igCharge is a cost line. The live probe found IG books these under the
+// withdrawal code WITH, indistinguishable from a real transfer on every field
+// except the description — hence the fee wording here.
 func igCharge(code string, day int, pnl string) map[string]any {
 	return map[string]any{
 		"transactionType": code,
 		"cashTransaction": false,
 		"reference":       code + "c" + strconv.Itoa(day),
+		"instrumentName":  "Charge administrative journalière",
 		"size":            "-",
 		"openLevel":       "-",
 		"closeLevel":      "0",
@@ -389,10 +395,10 @@ func TestIGEndToEndFundingAndCostsAreReported(t *testing.T) {
 		// Cost and income lines. The codes are deliberately not all ones the
 		// connector knows: classification is by exclusion, so an unanticipated
 		// fee code must still be counted rather than silently dropped.
-		igCash("INTEREST", 4, "E-3.20"),
-		igCash("DIVIDEND", 5, "E12.00"),
-		igCash("CHART", 6, "E-30.00"),
-		igCash("SOME_NEW_FEE_CODE", 7, "E-1.50"),
+		igCharge("INTEREST", 4, "E-3.20"),
+		igCharge("DIVIDEND", 5, "E12.00"),
+		igCharge("CHART", 6, "E-30.00"),
+		igCharge("SOME_NEW_FEE_CODE", 7, "E-1.50"),
 	}}
 	ig := newIGFake(t, fake)
 	ctx := context.Background()

@@ -36,17 +36,26 @@ const (
 	igMaxTransactionPages = 50
 )
 
-// igCashflowSign maps IG's cash-movement codes to a deposit/withdrawal sign.
-// IG localises transactionType for deals to the account language but keeps
-// these codes in English, so they are the only reliable classifier. Interest
-// and dividend lines are also cash transactions yet are P&L, not capital — an
-// allowlist keeps them out of the cash-flow ledger, where they would land as
-// phantom deposits and wreck TWR.
-var igCashflowSign = map[string]float64{
-	"DEPO":   1,
-	"CASHIN": 1,
-	"WITH":   -1,
+// igDepositCodes are IG's unambiguous cash-IN transaction codes. IG keeps these
+// codes in English (only deals are localised). WITH is deliberately absent: IG
+// overloads it for BOTH real withdrawals AND charges (funding/interest/
+// commission), and the one field that might split them — cashTransaction — is
+// false on every IG line, a real DEPO "Virement bancaire" included, so it
+// cannot. WITH is split by description instead (see isIGWithdrawal).
+var igDepositCodes = map[string]bool{
+	"DEPO":   true,
+	"CASHIN": true,
 }
+
+// igTransferHints are substrings that mark a WITH line as a genuine capital
+// transfer (a withdrawal) rather than a charge. This is the one place IG's
+// language localisation leaks into classification — unavoidable, since no
+// stable field distinguishes a WITH-withdrawal from a WITH-charge. Charge
+// descriptions seen on real accounts (Charge/financement/COMM/intérêt/funding/
+// commission/interest) match none of these; a demo cannot withdraw, so this
+// only bites on live accounts, and a miss under-states return rather than
+// inflating it.
+var igTransferHints = []string{"virement", "transfer", "retrait", "withdraw"}
 
 type igSession struct {
 	token string
@@ -768,22 +777,35 @@ func (i *IG) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, err
 	return trades, nil
 }
 
-// isIGCapitalMovement reports whether a ledger line is a genuine deposit or
-// withdrawal of client funds. A DEPO/CASHIN/WITH code alone is not enough: IG
-// reuses WITH for charges (funding, commission) that carry cashTransaction=false
-// — real capital always carries cashTransaction=true.
+// isIGWithdrawal reports whether a WITH line is a real capital transfer out
+// rather than a charge. cashTransaction cannot tell them apart (it is false for
+// both), so the description is the only signal — see igTransferHints.
+func isIGWithdrawal(t IGRawTransaction) bool {
+	if !strings.EqualFold(strings.TrimSpace(t.TransactionType), "WITH") {
+		return false
+	}
+	d := strings.ToLower(t.InstrumentName)
+	for _, hint := range igTransferHints {
+		if strings.Contains(d, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+// isIGCapitalMovement reports whether a ledger line moves client capital: a
+// DEPO/CASHIN deposit, or a WITH the description marks as a transfer out.
 func isIGCapitalMovement(t IGRawTransaction) bool {
-	_, isCashCode := igCashflowSign[strings.ToUpper(strings.TrimSpace(t.TransactionType))]
-	return isCashCode && t.CashTransaction
+	if igDepositCodes[strings.ToUpper(strings.TrimSpace(t.TransactionType))] {
+		return true
+	}
+	return isIGWithdrawal(t)
 }
 
 // isIGTradeLine reports whether a ledger line is a dealt trade, whose P&L is
-// already returned by GetTrades. A trade carries a parseable deal size and is
-// never a cash transaction; charges write size="-", which does not parse.
+// already returned by GetTrades. A trade carries a parseable deal size; capital
+// and charge lines write size="-", which does not parse.
 func isIGTradeLine(t IGRawTransaction) bool {
-	if t.CashTransaction {
-		return false
-	}
 	_, err := ParseIGDecimal(t.Size)
 	return err == nil
 }
@@ -800,8 +822,8 @@ func isIGTradeLine(t IGRawTransaction) bool {
 // A cost line is whatever is neither a capital movement nor a dealt trade.
 // Classifying by exclusion rather than by an allowlist of fee codes is
 // deliberate — IG's fee codes are undocumented, and it books charges under the
-// capital code WITH with cashTransaction=false as readily as under a bespoke
-// fee code, so an allowlist would drop them in silence.
+// withdrawal code WITH as readily as under a bespoke fee code, so an allowlist
+// would drop them in silence.
 //
 // symbols is ignored: IG's rows carry their own instrument and are not scoped
 // to the swap symbols a crypto venue would want.
@@ -815,9 +837,8 @@ func (i *IG) GetFundingFees(ctx context.Context, _ []string, since time.Time) ([
 	for _, t := range txs {
 		// A cost or income line is whatever is neither a real capital movement
 		// (GetCashflows books those) nor a dealt trade (GetTrades books its
-		// P&L). IG books charges under two shapes — an unknown fee code marked
-		// a cash transaction, and the capital code WITH marked
-		// cashTransaction=false — and exclusion catches both.
+		// P&L). IG books charges under two shapes — a bespoke fee code, and the
+		// withdrawal code WITH — and exclusion catches both.
 		if isIGCapitalMovement(t) || isIGTradeLine(t) {
 			continue
 		}
@@ -847,9 +868,13 @@ func (i *IG) GetFundingFees(ctx context.Context, _ []string, since time.Time) ([
 }
 
 // GetCashflows returns deposits and withdrawals from the transaction ledger.
-// The amount's sign comes from the transaction code rather than the reported
-// figure, so a withdrawal booked as a negative profitAndLoss and one booked as
-// a positive figure both land as a withdrawal.
+// The sign comes from the classification rather than the reported figure, so a
+// withdrawal booked as a negative profitAndLoss and one booked as a positive
+// figure both land as a withdrawal.
+//
+// Charges IG books under the WITH code (funding, interest, commission) are NOT
+// capital and are excluded here — counting them as withdrawals would hide the
+// cost from TWR. They surface through GetFundingFees instead.
 func (i *IG) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
 	txs, err := i.fetchTransactions(ctx, since, time.Now().UTC())
 	if err != nil {
@@ -858,13 +883,12 @@ func (i *IG) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, er
 
 	flows := make([]*Cashflow, 0)
 	for _, t := range txs {
-		sign, known := igCashflowSign[strings.ToUpper(strings.TrimSpace(t.TransactionType))]
-		// A cash-movement code is real capital only when IG flags it a cash
-		// transaction. IG also books charges (funding, commission, interest)
-		// under WITH with cashTransaction=false; counting those as withdrawals
-		// hides the cost from TWR — the phantom-cashflow failure, inverted.
-		if !known || !t.CashTransaction {
+		if !isIGCapitalMovement(t) {
 			continue
+		}
+		sign := 1.0
+		if !igDepositCodes[strings.ToUpper(strings.TrimSpace(t.TransactionType))] {
+			sign = -1 // a WITH the description marks as a transfer out
 		}
 
 		// The code already told us this row moves capital, so failing to read its

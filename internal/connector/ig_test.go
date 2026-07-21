@@ -449,8 +449,10 @@ func TestIGSelectAccount(t *testing.T) {
 	}
 }
 
-// Interest and dividend lines are cash transactions but are P&L, not capital.
-// Booking one as a deposit produces a phantom inflow that craters TWR.
+// Deposits are classified by code (DEPO/CASHIN). WITH is shared by real
+// transfers and charges, so it is split on the description — cashTransaction is
+// false on every IG line and cannot. Interest/dividend/charge lines are P&L, not
+// capital: booking one as a flow produces a phantom movement that craters TWR.
 func TestIGGetCashflowsClassifiesByTransactionCode(t *testing.T) {
 	ig := newIGTest(t, false, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -460,12 +462,13 @@ func TestIGGetCashflowsClassifiesByTransactionCode(t *testing.T) {
 			fmt.Fprint(w, igTestAccountsJSON)
 		case "/history/transactions":
 			fmt.Fprint(w, `{"transactions":[
-				{"transactionType":"DEPO","cashTransaction":true,"profitAndLoss":"E1000.00","currency":"EUR","dateUtc":"2026-07-01T10:00:00"},
-				{"transactionType":"WITH","cashTransaction":true,"profitAndLoss":"E-500.00","currency":"EUR","dateUtc":"2026-07-02T10:00:00"},
-				{"transactionType":"WITH","cashTransaction":true,"profitAndLoss":"E500.00","currency":"EUR","dateUtc":"2026-07-03T10:00:00"},
-				{"transactionType":"CASHIN","cashTransaction":true,"profitAndLoss":"E250.00","currency":"EUR","dateUtc":"2026-07-04T10:00:00"},
-				{"transactionType":"DIVIDEND","cashTransaction":true,"profitAndLoss":"E10.00","currency":"EUR","dateUtc":"2026-07-05T10:00:00"},
-				{"transactionType":"INTEREST","cashTransaction":true,"profitAndLoss":"E3.00","currency":"EUR","dateUtc":"2026-07-06T10:00:00"},
+				{"transactionType":"DEPO","cashTransaction":false,"instrumentName":"Virement bancaire","profitAndLoss":"E1000.00","currency":"EUR","dateUtc":"2026-07-01T10:00:00"},
+				{"transactionType":"WITH","cashTransaction":false,"instrumentName":"Virement bancaire","profitAndLoss":"E-500.00","currency":"EUR","dateUtc":"2026-07-02T10:00:00"},
+				{"transactionType":"WITH","cashTransaction":false,"instrumentName":"Virement bancaire","profitAndLoss":"E500.00","currency":"EUR","dateUtc":"2026-07-03T10:00:00"},
+				{"transactionType":"CASHIN","cashTransaction":false,"instrumentName":"Virement bancaire","profitAndLoss":"E250.00","currency":"EUR","dateUtc":"2026-07-04T10:00:00"},
+				{"transactionType":"WITH","cashTransaction":false,"instrumentName":"Charge administrative journalière","profitAndLoss":"E-9.00","currency":"EUR","dateUtc":"2026-07-05T09:00:00"},
+				{"transactionType":"DIVIDEND","cashTransaction":false,"profitAndLoss":"E10.00","currency":"EUR","dateUtc":"2026-07-05T10:00:00"},
+				{"transactionType":"INTEREST","cashTransaction":false,"profitAndLoss":"E3.00","currency":"EUR","dateUtc":"2026-07-06T10:00:00"},
 				{"transactionType":"DEAL","cashTransaction":false,"profitAndLoss":"E42.00","currency":"EUR","dateUtc":"2026-07-07T10:00:00"}
 			],"metaData":{"pageData":{"totalPages":1}}}`)
 		}
