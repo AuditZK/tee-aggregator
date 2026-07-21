@@ -1701,6 +1701,7 @@ func buildHistoricalSnapshots(
 			Volume:          h.TotalVolume,
 			Trades:          h.TotalTrades,
 			TradingFees:     h.TotalFees,
+			FundingFees:     h.FundingFees,
 			LongTrades:      h.LongTrades,
 			ShortTrades:     h.ShortTrades,
 			LongVolume:      h.LongVolume,
