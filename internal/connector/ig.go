@@ -768,6 +768,26 @@ func (i *IG) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, err
 	return trades, nil
 }
 
+// isIGCapitalMovement reports whether a ledger line is a genuine deposit or
+// withdrawal of client funds. A DEPO/CASHIN/WITH code alone is not enough: IG
+// reuses WITH for charges (funding, commission) that carry cashTransaction=false
+// — real capital always carries cashTransaction=true.
+func isIGCapitalMovement(t IGRawTransaction) bool {
+	_, isCashCode := igCashflowSign[strings.ToUpper(strings.TrimSpace(t.TransactionType))]
+	return isCashCode && t.CashTransaction
+}
+
+// isIGTradeLine reports whether a ledger line is a dealt trade, whose P&L is
+// already returned by GetTrades. A trade carries a parseable deal size and is
+// never a cash transaction; charges write size="-", which does not parse.
+func isIGTradeLine(t IGRawTransaction) bool {
+	if t.CashTransaction {
+		return false
+	}
+	_, err := ParseIGDecimal(t.Size)
+	return err == nil
+}
+
 // GetFundingFees returns the ledger's cost and income lines: overnight
 // funding, commission, interest, dividends.
 //
@@ -777,11 +797,11 @@ func (i *IG) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, err
 // what the deal did and says nothing about what holding it cost. Without this
 // they vanish entirely: equity falls and nothing records why.
 //
-// Any cash line that is NOT a capital movement is such a line. Classifying by
-// exclusion rather than by an allowlist of fee codes is deliberate — IG's fee
-// code strings are not documented and a code we failed to anticipate would
-// otherwise be dropped in silence, which is the failure this method exists to
-// end.
+// A cost line is whatever is neither a capital movement nor a dealt trade.
+// Classifying by exclusion rather than by an allowlist of fee codes is
+// deliberate — IG's fee codes are undocumented, and it books charges under the
+// capital code WITH with cashTransaction=false as readily as under a bespoke
+// fee code, so an allowlist would drop them in silence.
 //
 // symbols is ignored: IG's rows carry their own instrument and are not scoped
 // to the swap symbols a crypto venue would want.
@@ -793,10 +813,12 @@ func (i *IG) GetFundingFees(ctx context.Context, _ []string, since time.Time) ([
 
 	fees := make([]*FundingFee, 0)
 	for _, t := range txs {
-		if !t.CashTransaction {
-			continue
-		}
-		if _, isCapital := igCashflowSign[strings.ToUpper(strings.TrimSpace(t.TransactionType))]; isCapital {
+		// A cost or income line is whatever is neither a real capital movement
+		// (GetCashflows books those) nor a dealt trade (GetTrades books its
+		// P&L). IG books charges under two shapes — an unknown fee code marked
+		// a cash transaction, and the capital code WITH marked
+		// cashTransaction=false — and exclusion catches both.
+		if isIGCapitalMovement(t) || isIGTradeLine(t) {
 			continue
 		}
 
@@ -837,7 +859,11 @@ func (i *IG) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, er
 	flows := make([]*Cashflow, 0)
 	for _, t := range txs {
 		sign, known := igCashflowSign[strings.ToUpper(strings.TrimSpace(t.TransactionType))]
-		if !known {
+		// A cash-movement code is real capital only when IG flags it a cash
+		// transaction. IG also books charges (funding, commission, interest)
+		// under WITH with cashTransaction=false; counting those as withdrawals
+		// hides the cost from TWR — the phantom-cashflow failure, inverted.
+		if !known || !t.CashTransaction {
 			continue
 		}
 

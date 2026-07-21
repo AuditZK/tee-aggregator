@@ -158,6 +158,23 @@ func igCash(kind string, day int, pnl string) map[string]any {
 	}
 }
 
+// igCharge is a cost IG books under a capital code but does NOT flag a cash
+// transaction — the shape the live-demo probe found: WITH, cashTransaction=false,
+// size="-". Classifying by code alone read these as withdrawals.
+func igCharge(code string, day int, pnl string) map[string]any {
+	return map[string]any{
+		"transactionType": code,
+		"cashTransaction": false,
+		"reference":       code + "c" + strconv.Itoa(day),
+		"size":            "-",
+		"openLevel":       "-",
+		"closeLevel":      "0",
+		"profitAndLoss":   pnl,
+		"currency":        "EUR",
+		"dateUtc":         fmt.Sprintf("2026-07-%02dT11:00:00", day),
+	}
+}
+
 func newIGFake(t *testing.T, f *igFakeServer) *IG {
 	t.Helper()
 	f.t = t
@@ -419,6 +436,53 @@ func TestIGEndToEndFundingAndCostsAreReported(t *testing.T) {
 	}
 	if len(trades) != 1 {
 		t.Fatalf("got %d trades, want 1: %+v", len(trades), trades)
+	}
+}
+
+// The live-demo probe found IG books funding and commission under the WITH
+// code — the withdrawal code — with cashTransaction=false. Classifying by code
+// alone read them as capital withdrawals, which is TWR-neutral and hid the
+// cost, overstating performance. They must land as funding fees, never as
+// cashflows.
+func TestIGEndToEndChargesUnderWithdrawalCodeAreCostsNotCapital(t *testing.T) {
+	fake := &igFakeServer{ledger: []map[string]any{
+		igCash("DEPO", 1, "E5000.00"),  // real capital in (cashTransaction=true)
+		igCharge("WITH", 2, "E-3.91"),  // daily interest, booked as WITH
+		igCharge("WITH", 3, "E-11.83"), // commission, booked as WITH
+		igCash("WITH", 4, "E-1000.00"), // real withdrawal (cashTransaction=true)
+	}}
+	ig := newIGFake(t, fake)
+	ctx := context.Background()
+	start := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+
+	flows, err := ig.GetCashflows(ctx, start)
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	if len(flows) != 2 {
+		t.Fatalf("got %d cashflows, want 2 (WITH charges must not count as withdrawals): %+v", len(flows), flows)
+	}
+	var capital float64
+	for _, f := range flows {
+		capital += f.Amount
+	}
+	if diff := capital - 4000.0; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("net capital = %v, want 4000 (5000 in − 1000 out, charges excluded)", capital)
+	}
+
+	fees, err := ig.GetFundingFees(ctx, nil, start)
+	if err != nil {
+		t.Fatalf("GetFundingFees: %v", err)
+	}
+	if len(fees) != 2 {
+		t.Fatalf("got %d funding fees, want 2 (the two WITH charges): %+v", len(fees), fees)
+	}
+	var cost float64
+	for _, f := range fees {
+		cost += f.Amount
+	}
+	if diff := cost - -15.74; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("net charge = %v, want -15.74 (−3.91 − 11.83)", cost)
 	}
 }
 
