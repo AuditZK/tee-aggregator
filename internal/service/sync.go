@@ -70,6 +70,27 @@ func reconstructsEverySync(exchange string) bool {
 	return e == "ibkr" || e == "ctrader"
 }
 
+// balanceReconciledExchanges lists exchanges whose live snapshots derive
+// capital flows from the settled-balance residual rather than trusting the
+// broker's cashflow report alone (see doc/plan-balance-reconciled-cashflow.md).
+// An exchange belongs here only once its ledger is proven complete — realized
+// P&L + charges reconcile to ~0 residual over an account's life (the
+// cmd/ig-probe gate) — otherwise an under-reported fee would surface as a
+// phantom withdrawal. IG earns it: its demo top-ups appear in NO transaction
+// endpoint, so only the balance reveals them. Add others one at a time, each
+// after its own reconciliation check.
+var balanceReconciledExchanges = []string{"ig"}
+
+func isBalanceReconciled(exchange string) bool {
+	e := strings.ToLower(exchange)
+	for _, x := range balanceReconciledExchanges {
+		if x == e {
+			return true
+		}
+	}
+	return false
+}
+
 // everySyncReconstructSince returns the lookback for an every-sync
 // reconstruction. IBKR re-emits its full Flex window cheaply (zero = full);
 // cTrader's walk is expensive (paginated deals + weekly cash-flow chunks), so
@@ -540,13 +561,13 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 
 	// 5a. Fetch funding fees (always if supported — funding applies to all open
 	// positions, not just those traded today)
+	var fundingCharges float64
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
 		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, activityStart); err == nil {
-			totalFunding := 0.0
 			for _, f := range fees {
-				totalFunding += f.Amount
+				fundingCharges += f.Amount
 			}
-			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = totalFunding
+			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = fundingCharges
 		}
 	}
 
@@ -600,6 +621,11 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		m.equity = balance.Equity
 		m.availableMargin = balance.Available
 	}
+
+	// 6b. Balance-reconciled capital flow: for eligible exchanges the settled
+	// balance overrides the broker's cashflow report, catching hidden deposits
+	// (doc/plan-balance-reconciled-cashflow.md). No-op for everyone else.
+	deposits, withdrawals = s.reconcileCapitalFlow(ctx, connMeta, startOfDay, trades, balance.Equity, balance.UnrealizedPnL, fundingCharges, deposits, withdrawals)
 
 	// 8. Inception-deposit convention (UX-001). When this is the very first
 	// snapshot we write for the connection AND the connector didn't already
@@ -983,13 +1009,13 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 
 	breakdown := s.aggregateTrades(trades)
 
+	var fundingCharges float64
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
 		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, activityStart); err == nil {
-			total := 0.0
 			for _, f := range fees {
-				total += f.Amount
+				fundingCharges += f.Amount
 			}
-			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = total
+			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = fundingCharges
 		}
 	}
 
@@ -1031,6 +1057,10 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		m.equity = balance.Equity
 		m.availableMargin = balance.Available
 	}
+
+	// Balance-reconciled capital flow: same override as the non-atomic path
+	// (doc/plan-balance-reconciled-cashflow.md). No-op for ineligible exchanges.
+	deposits, withdrawals = s.reconcileCapitalFlow(ctx, connMeta, startOfDay, trades, balance.Equity, balance.UnrealizedPnL, fundingCharges, deposits, withdrawals)
 
 	// Inception-deposit convention (UX-001): see the non-atomic path above
 	// for the full rationale. Both call sites need the same fallback,
@@ -1157,6 +1187,56 @@ func (s *SyncService) recordSyncStatus(ctx context.Context, conn *repository.Exc
 			zap.Error(err),
 		)
 	}
+}
+
+// reconcileCapitalFlow returns the snapshot's deposits/withdrawals. For eligible
+// exchanges it replaces the broker-reported figures with balance-reconciled
+// ones: the settled balance is truth, and any change the ledger (realized P&L +
+// charges) and the reported flow do not explain is a hidden capital movement —
+// the failure a demo top-up that appears in no transaction endpoint would
+// otherwise cause. See doc/plan-balance-reconciled-cashflow.md. Falls back to
+// the reported figures when the exchange is not eligible, no prior snapshot
+// exists (first sync — inception-deposit handles that), or the lookup fails.
+func (s *SyncService) reconcileCapitalFlow(
+	ctx context.Context,
+	connMeta *repository.ExchangeConnection,
+	before time.Time,
+	trades []*connector.Trade,
+	equity, unrealizedPnL, fundingCharges, reportedDeposits, reportedWithdrawals float64,
+) (deposits, withdrawals float64) {
+	if !isBalanceReconciled(connMeta.Exchange) {
+		return reportedDeposits, reportedWithdrawals
+	}
+	prev, err := s.snapshotRepo.GetLatestByUserExchangeLabelBefore(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, before)
+	if err != nil || prev == nil {
+		return reportedDeposits, reportedWithdrawals
+	}
+
+	var realizedPnL float64
+	for _, tr := range trades {
+		realizedPnL += tr.RealizedPnL
+	}
+	dep, wd := InferCapitalFlow(
+		ReconInputs{SettledBalance: prev.RealizedBalance},
+		ReconInputs{
+			SettledBalance: equity - unrealizedPnL,
+			RealizedPnL:    realizedPnL,
+			Charges:        fundingCharges,
+			ReportedFlow:   reportedDeposits - reportedWithdrawals,
+		},
+		reconThreshold(equity),
+	)
+	if dep != reportedDeposits || wd != reportedWithdrawals {
+		s.logger.Info("capital flow reconciled from balance",
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Float64("reported_deposits", reportedDeposits),
+			zap.Float64("reported_withdrawals", reportedWithdrawals),
+			zap.Float64("reconciled_deposits", dep),
+			zap.Float64("reconciled_withdrawals", wd),
+		)
+	}
+	return dep, wd
 }
 
 // enrichBreakdownWithBalances populates equity and available_margin per market
