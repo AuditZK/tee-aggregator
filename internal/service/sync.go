@@ -1324,7 +1324,14 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 // The rebuilt rows upsert over the connect-day live snapshot, which also
 // retires that day's UX-001 inception deposit (deposits recomputed from the
 // on-chain + universal-transfer ledger instead of deposits=equity).
-var externalRebuilderExchanges = []string{"hyperliquid", "bitget", "binance"}
+//
+// okx: same absolute family — unified-account bills carry balance-after per
+// currency (statement-is-truth, EndEquityOverride ignored), so the midnight
+// pass is the idempotent re-walk that finalizes, as with bitget. A key
+// IP-locked to the enclave egress reaches OKX from the rebuilder host only
+// through the rebuilder's OKX_EGRESS_PROXY tunnel; without it the rebuild fails
+// 50110 and never finalizes.
+var externalRebuilderExchanges = []string{"hyperliquid", "bitget", "binance", "okx"}
 
 // maxRebuildRetryDays bounds how long the midnight recalibration keeps retrying
 // a consenting connection that never finalizes (SEC-08): past this many days
