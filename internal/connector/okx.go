@@ -228,12 +228,16 @@ func (o *OKX) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, er
 		}
 
 		trades = append(trades, &Trade{
-			ID:          t.TradeId,
-			Symbol:      t.InstId,
-			Side:        t.Side,
-			Price:       price,
-			Quantity:    qty,
-			Fee:         fee,
+			ID:       t.TradeId,
+			Symbol:   t.InstId,
+			Side:     t.Side,
+			Price:    price,
+			Quantity: qty,
+			// OKX signs fee from the account's viewpoint — negative when
+			// charged, positive on a rebate — while every other connector (and
+			// the aggregation summing Trade.Fee) books a cost as positive.
+			// Passed through raw, a live day's fees summed NEGATIVE.
+			Fee:         -fee,
 			FeeCurrency: t.FeeCcy,
 			Timestamp:   time.UnixMilli(ts),
 			MarketType:  marketType,
