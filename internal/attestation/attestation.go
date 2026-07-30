@@ -338,39 +338,59 @@ func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*Se
 	}
 
 	// Step 2: Fetch and verify VCEK certificates
-	vcekVerified := s.fetchAndCacheVCEK(ctx, reportPath, certsDir)
+	vcekVerified, vcekFromCache := s.fetchAndCacheVCEK(ctx, reportPath, certsDir)
 
 	// Step 3: Verify attestation. Try VCEK first; fall back to VLEK for cloud
 	// providers (e.g. GCP) that issue per-VM VLEKs instead of chip-specific VCEKs.
 	if vcekVerified {
-		verifyCmd := exec.CommandContext(ctx, snpguestPath, "verify", "attestation", certsDir, reportPath)
-		if verifyOut, err := verifyCmd.CombinedOutput(); err != nil {
-			s.logger.Warn("snpguest VCEK verify failed, trying VLEK fallback",
-				zap.String("output", string(verifyOut)))
+		if s.verifyReport(ctx, certsDir, reportPath, "VCEK") {
+			// LOG-NOISE-002: success path is debug-level. Periodic
+			// re-attestation (every 10 min) was emitting an INFO line
+			// per cycle, which adds up to a steady drip in the
+			// dashboard. Failures still surface as Warn. The initial
+			// post-boot verification is still observable via the
+			// "report signer bound to SEV-SNP attestation" INFO line
+			// in main.go.
+			s.logger.Debug("snpguest VCEK verification successful")
+		} else {
 			vcekVerified = false
+
+			// ATT-001: a CACHED VEK that no longer verifies is the signature of
+			// a host migration. The VCEK is bound to (chip ID, TCB), and a GCP
+			// maintenance reboot can land this VM on a different physical chip
+			// — snpguest then reports every TCB field as matching and still
+			// fails with "VEK did NOT sign the Attestation Report!", which
+			// reads like a TCB problem when it is an identity problem.
+			//
+			// Without purging, the cache TTL keeps the wrong certificate alive
+			// and enforceProductionAttestation refuses to start for as long as
+			// it lasts. Drop it and refetch from AMD KDS once, which is exactly
+			// the manual recovery this replaces.
+			if vcekFromCache {
+				s.invalidateVEKCache("cached VEK no longer signs the attestation report (host migration?)")
+				// Clear certsDir so the stale chain can't intermix with the new one.
+				os.RemoveAll(certsDir)
+				os.MkdirAll(certsDir, 0700)
+
+				if refetched, _ := s.fetchAndCacheVCEK(ctx, reportPath, certsDir); refetched {
+					if s.verifyReport(ctx, certsDir, reportPath, "VCEK") {
+						s.logger.Info("attestation recovered: refetched the VEK from AMD KDS after the cached one failed")
+						vcekVerified = true
+					}
+				}
+			}
+		}
+
+		if !vcekVerified {
 			// Clear certsDir so the VCEK and VLEK chains don't intermix.
 			os.RemoveAll(certsDir)
 			os.MkdirAll(certsDir, 0700)
 			if s.fetchVLEKCerts(ctx, reportPath, certsDir) {
-				verifyCmd2 := exec.CommandContext(ctx, snpguestPath, "verify", "attestation", certsDir, reportPath)
-				if verifyOut2, err2 := verifyCmd2.CombinedOutput(); err2 != nil {
-					s.logger.Warn("snpguest VLEK verify failed",
-						zap.String("output", string(verifyOut2)))
-				} else {
-					// LOG-NOISE-002: success is debug-level (runs every 10 min).
+				if s.verifyReport(ctx, certsDir, reportPath, "VLEK") {
 					s.logger.Debug("snpguest VLEK verification successful")
 					vcekVerified = true
 				}
 			}
-		} else {
-			// LOG-NOISE-002: success path is debug-level. Periodic
-			// re-attestation (every 10 min) was emitting an INFO line
-			// per cycle, which adds up to a steady drip in the
-			// dashboard. Failures still surface as Warn above. The
-			// initial post-boot verification is still observable via
-			// the "report signer bound to SEV-SNP attestation" INFO
-			// line in main.go.
-			s.logger.Debug("snpguest VCEK verification successful")
 		}
 	}
 
@@ -489,7 +509,62 @@ func parseSnpguestReport(output string, report *SevSnpReport) {
 	flush()
 }
 
-func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir string) bool {
+// verifyReport runs `snpguest verify attestation` against the chain sitting in
+// certsDir. kind is only used for logging ("VCEK" / "VLEK").
+func (s *Service) verifyReport(ctx context.Context, certsDir, reportPath, kind string) bool {
+	cmd := exec.CommandContext(ctx, s.snpguestPath, "verify", "attestation", certsDir, reportPath)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return true
+	}
+	s.logger.Warn("snpguest verify failed",
+		zap.String("endorsement_key", kind),
+		zap.String("output", string(out)),
+		zap.Error(err),
+	)
+	return false
+}
+
+// invalidateVEKCache moves the cached endorsement-key material aside so the
+// next fetch goes to AMD KDS instead of re-reading a certificate that no longer
+// verifies.
+//
+// Moved rather than deleted: a stale VCEK is the evidence needed to confirm a
+// host migration (its HWID, OID 1.3.6.1.4.1.3704.1.4, differs from the report's
+// Chip ID). A single `.stale` slot per file keeps that available for diagnosis
+// without growing without bound. The ASK is deliberately left alone — it is the
+// AMD intermediate, valid across chips.
+func (s *Service) invalidateVEKCache(reason string) {
+	for _, name := range []string{vcekPEMFile, vlekPEMFile} {
+		path := filepath.Join(s.vcekCacheDir, name)
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		stale := path + ".stale"
+		_ = os.Remove(stale)
+		if err := os.Rename(path, stale); err != nil {
+			// Renaming failed — remove outright rather than leave the bad cert
+			// in place, since leaving it is what causes the repeated outage.
+			if rmErr := os.Remove(path); rmErr != nil {
+				s.logger.Error("could not invalidate cached endorsement key — attestation will keep failing until it is removed by hand",
+					zap.String("path", path),
+					zap.Error(rmErr),
+				)
+				continue
+			}
+		}
+		s.logger.Warn("invalidated cached endorsement key",
+			zap.String("path", path),
+			zap.String("reason", reason),
+		)
+	}
+}
+
+// fetchAndCacheVCEK puts a usable endorsement-key chain in certsDir. It reports
+// whether that succeeded, and whether the chain came from the local cache — the
+// caller needs the latter to know that a verification failure is worth retrying
+// against a freshly fetched certificate.
+func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir string) (ok bool, fromCache bool) {
 	// Check VCEK cache first.
 	vcekPath := filepath.Join(s.vcekCacheDir, vcekPEMFile)
 	if info, err := os.Stat(vcekPath); err == nil {
@@ -500,7 +575,7 @@ func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir st
 					zap.String("src", vcekPath),
 					zap.Error(err),
 				)
-				return false
+				return false, false
 			}
 			caPath := filepath.Join(s.vcekCacheDir, askPEMFile)
 			if _, err := os.Stat(caPath); err == nil {
@@ -509,10 +584,10 @@ func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir st
 						zap.String("src", caPath),
 						zap.Error(err),
 					)
-					return false
+					return false, false
 				}
 			}
-			return true
+			return true, true
 		}
 	}
 
@@ -525,7 +600,7 @@ func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir st
 			if _, err := os.Stat(caPath); err == nil {
 				_ = copyFile(caPath, filepath.Join(certsDir, askPEMFile))
 			}
-			return true
+			return true, true
 		}
 	}
 
@@ -538,14 +613,14 @@ func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir st
 	}
 
 	if s.snpguestPath == "" {
-		return false
+		return false, false
 	}
 
 	// Fetch from AMD KDS via snpguest (TS parity: fetch vcek pem + ca pem)
 	cmd := exec.CommandContext(ctx, s.snpguestPath, "fetch", "vcek", "pem", certsDir, reportPath)
 	if err := cmd.Run(); err != nil {
 		s.logger.Warn("failed to fetch VCEK certificate", zap.Error(err))
-		return false
+		return false, false
 	}
 
 	caCmd := exec.CommandContext(ctx, s.snpguestPath, "fetch", "ca", "pem", certsDir,
@@ -570,7 +645,7 @@ func (s *Service) fetchAndCacheVCEK(ctx context.Context, reportPath, certsDir st
 		}
 	}
 
-	return true
+	return true, false
 }
 
 // fetchVLEKCerts fetches the VLEK (Virtual Machine Launch Endorsement Key) and
