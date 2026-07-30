@@ -9,6 +9,12 @@ services:
       # PlatformUnattestedDev and every signed report would carry attested=false.
       dockerfile: Dockerfile.production
     container_name: enclave_go_prod
+    # OPS-004: the enclave must survive a host reboot. GCP reboots this
+    # confidential VM for maintenance, and with no policy here Docker defaults
+    # to "no" — the enclave then stays down until someone notices.
+    # `unless-stopped` restarts it after a reboot but still honours a deliberate
+    # `docker stop` during maintenance. Keep in sync with compose.prod.KEEP.
+    restart: unless-stopped
     # OPS-01: still root because /dev/sev-guest is mode 0600 root:root on the
     # host — a non-root container user cannot open it without a host-side udev
     # rule giving the device a readable group. To go non-root: add such a rule
