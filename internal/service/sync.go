@@ -30,6 +30,62 @@ const (
 	sourceInEnclave         = "in-enclave"
 )
 
+// dayWindow restricts which reconstructed days persistHistoricalSnapshots is
+// allowed to write. The zero value means "no restriction" — every day the
+// provider or rebuilder returned is upserted, which is what the connect-time
+// and midnight-recalibration paths want.
+//
+// A bounded window exists for gap repair (OPS-004): when a sync interruption
+// leaves holes in an otherwise-correct timeline, a full reconstruct would
+// upsert the provider's ENTIRE walk — which can span months — over days that
+// were already correct. Restricting the write to the missing days repairs the
+// hole without rewriting known-good history.
+type dayWindow struct {
+	from time.Time // inclusive, UTC midnight; zero = unbounded
+	to   time.Time // inclusive, UTC midnight; zero = unbounded
+}
+
+func (w dayWindow) isSet() bool { return !w.from.IsZero() || !w.to.IsZero() }
+
+// reconstructOpts carries the knobs the gap-repair entrypoints need. The zero
+// value is the historical behaviour: full window, real write.
+type reconstructOpts struct {
+	window dayWindow
+	// dryRun runs the whole reconstruct — including the rebuilder round-trip,
+	// which for non-ZK exchanges still egresses credentials (SEC-ZK-001) — but
+	// logs the resulting days instead of upserting them. Exists because some
+	// rebuilder walks are RELATIVE (anchored on current equity), so splicing a
+	// few rebuilt days between existing live snapshots can land on a different
+	// calibration basis than its neighbours. Inspect, then write.
+	dryRun bool
+}
+
+// contains reports whether dayKey (a UTC midnight) falls inside the window.
+func (w dayWindow) contains(dayKey time.Time) bool {
+	if !w.from.IsZero() && dayKey.Before(w.from) {
+		return false
+	}
+	if !w.to.IsZero() && dayKey.After(w.to) {
+		return false
+	}
+	return true
+}
+
+// filter keeps only the snapshots whose day falls inside the window.
+func (w dayWindow) filter(hs []*connector.HistoricalSnapshot) []*connector.HistoricalSnapshot {
+	if !w.isSet() {
+		return hs
+	}
+	out := make([]*connector.HistoricalSnapshot, 0, len(hs))
+	for _, h := range hs {
+		dayKey := time.Date(h.Date.Year(), h.Date.Month(), h.Date.Day(), 0, 0, 0, 0, time.UTC)
+		if w.contains(dayKey) {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 // SANITY-001 collapse guard: exchange backends can answer 200-with-zeros
 // during their daily settlement window (observed: Binance fapi at 00:00 UTC
 // read both futures-balance endpoints as empty with NO error — invisible to
@@ -496,7 +552,7 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		// boundary deposit double-count. Gated INSIDE the HistoricalSnapshotProvider
 		// type assertion, so live-only exchanges (HL/MEXC/Lighter) are unaffected.
 		if reconstructsEverySync(connMeta.Exchange) {
-			s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange))
+			s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange), reconstructOpts{})
 		}
 	}
 
@@ -955,7 +1011,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		// boundary deposit double-count. Gated INSIDE the HistoricalSnapshotProvider
 		// type assertion, so live-only exchanges (HL/MEXC/Lighter) are unaffected.
 		if reconstructsEverySync(connMeta.Exchange) {
-			s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange))
+			s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange), reconstructOpts{})
 		}
 	}
 
@@ -1265,6 +1321,31 @@ func (s *SyncService) enrichBreakdownWithBalances(agg *aggregatedBreakdown, bala
 // syncConnection (Flex returns the full window cheaply and can carry
 // retroactive corrections).
 func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, exchange, label string) {
+	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{})
+}
+
+// ReconstructHistoryRange backfills ONLY the days in [from, to] (inclusive,
+// UTC midnights). Same routing and same credential handling as
+// ReconstructHistoryOnConnect — the only difference is that days outside the
+// window are discarded before the upsert, so existing snapshots on either
+// side are left untouched.
+//
+// This is the gap-repair entrypoint (OPS-004): use it when a sync outage left
+// holes in an otherwise-correct timeline. A zero from/to degrades to the full
+// reconstruct, so callers that mean "only these days" must pass both.
+// dryRun performs the full reconstruct but logs the resulting days instead of
+// writing them — use it before committing a splice into an existing timeline.
+func (s *SyncService) ReconstructHistoryRange(ctx context.Context, userUID, exchange, label string, from, to time.Time, dryRun bool) {
+	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{
+		window: dayWindow{
+			from: time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC),
+			to:   time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, time.UTC),
+		},
+		dryRun: dryRun,
+	})
+}
+
+func (s *SyncService) reconstructHistoryFor(ctx context.Context, userUID, exchange, label string, opts reconstructOpts) {
 	connMeta, err := s.connSvc.GetActiveConnectionByLabel(ctx, userUID, exchange, label)
 	if err != nil {
 		s.logger.Error("history backfill: connection lookup failed",
@@ -1294,7 +1375,7 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 		)
 		return
 	}
-	s.reconstructHistory(ctx, connMeta, conn, creds)
+	s.reconstructHistory(ctx, connMeta, conn, creds, opts)
 }
 
 // reconstructHistory routes a freshly built connection to its history
@@ -1305,13 +1386,13 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 // (SEC-ZK-001). Split from ReconstructHistoryOnConnect so this routing —
 // the decision that governs whether credentials leave the enclave — is
 // unit-testable without a DB-backed ConnectionService.
-func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, creds *Credentials) {
+func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, creds *Credentials, opts reconstructOpts) {
 	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
 		// IBKR (and any future ZK-native provider) keeps the in-enclave path:
 		// signed by the report chain, stays inside the SEV-SNP perimeter.
 		// since=zero => full backfill (connect time + admin reconstruct); the
 		// every-sync path uses a bounded window.
-		s.syncFromHistoricalProvider(ctx, connMeta, hsp, time.Time{})
+		s.syncFromHistoricalProvider(ctx, connMeta, hsp, time.Time{}, opts)
 		s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
 		return
 	}
@@ -1383,7 +1464,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 	)
 
 	firstSync := s.isFirstSync(ctx, connMeta)
-	s.persistHistoricalSnapshots(ctx, connMeta, res.Snapshots, firstSync, sourceExternalRebuilder)
+	s.persistHistoricalSnapshots(ctx, connMeta, res.Snapshots, firstSync, sourceExternalRebuilder, opts)
 	s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
 }
 
@@ -1581,7 +1662,7 @@ func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.Excha
 	// failure leaves rebuild_finalized_at NULL so the connection retries on the
 	// next tick (bounded by maxRebuildRetryDays) instead of being silently
 	// marked done with no recalibrated history written.
-	if err := s.persistHistoricalSnapshots(ctx, conn, res.Snapshots, false, sourceExternalRebuilder); err != nil {
+	if err := s.persistHistoricalSnapshots(ctx, conn, res.Snapshots, false, sourceExternalRebuilder, reconstructOpts{}); err != nil {
 		return fmt.Errorf("persist recalibrated snapshots: %w", err)
 	}
 
@@ -1612,7 +1693,7 @@ func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.Excha
 // their Flex query (e.g. 30d → 365d) sees the new earlier days flow into
 // the DB on the next sync — we log "history reconstruction detected" the
 // first time we see Flex go further back than what we already have.
-func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.HistoricalSnapshotProvider, since time.Time) {
+func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.HistoricalSnapshotProvider, since time.Time, opts reconstructOpts) {
 	firstSync := s.isFirstSync(ctx, connMeta)
 	if firstSync {
 		s.logger.Info("history backfill — first sync",
@@ -1638,7 +1719,7 @@ func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *
 		return
 	}
 
-	s.persistHistoricalSnapshots(ctx, connMeta, historicalSnapshots, firstSync, sourceInEnclave)
+	s.persistHistoricalSnapshots(ctx, connMeta, historicalSnapshots, firstSync, sourceInEnclave, opts)
 }
 
 // persistHistoricalSnapshots is the upsert loop shared between the
@@ -1651,10 +1732,36 @@ func (s *SyncService) persistHistoricalSnapshots(
 	historicalSnapshots []*connector.HistoricalSnapshot,
 	firstSync bool,
 	source string,
+	opts reconstructOpts,
 ) error {
 	// Today is owned by the live branch — never reconstruct it.
 	now := time.Now().UTC()
 	todayKey := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+
+	// Gap repair: drop everything outside the requested days BEFORE anything
+	// else, so the expansion log, the inception rule and the upsert all see
+	// only the days we intend to write.
+	if opts.window.isSet() {
+		before := len(historicalSnapshots)
+		historicalSnapshots = opts.window.filter(historicalSnapshots)
+		s.logger.Info("history reconstruction restricted to a day window",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Time("window_from", opts.window.from),
+			zap.Time("window_to", opts.window.to),
+			zap.Int("days_returned", before),
+			zap.Int("days_kept", len(historicalSnapshots)),
+		)
+		if len(historicalSnapshots) == 0 {
+			s.logger.Warn("history reconstruction: provider returned nothing inside the window — nothing written",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+			)
+			return nil
+		}
+	}
 
 	s.logHistoryExpansion(ctx, connMeta, historicalSnapshots, firstSync)
 
@@ -1663,7 +1770,40 @@ func (s *SyncService) persistHistoricalSnapshots(
 		return nil
 	}
 
-	s.applyInceptionDeposit(ctx, connMeta, snapshots)
+	// A bounded repair window cannot be the account's inception by
+	// construction — it targets days surrounded by existing history. Skipping
+	// keeps UX-001 from stamping the window's first day as starting capital,
+	// which would book the whole account as a deposit on that day.
+	if !opts.window.isSet() {
+		s.applyInceptionDeposit(ctx, connMeta, snapshots)
+	}
+
+	// Dry run: everything above already happened (including, for non-ZK
+	// exchanges, the rebuilder round-trip) — we just stop short of the write
+	// and log what WOULD have been persisted so it can be compared against the
+	// live snapshots bracketing the gap.
+	if opts.dryRun {
+		for _, sn := range snapshots {
+			s.logger.Info("history reconstruction DRY RUN — would upsert",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.String("day", sn.Timestamp.Format("2006-01-02")),
+				zap.Float64("total_equity", sn.TotalEquity),
+				zap.Float64("realized_balance", sn.RealizedBalance),
+				zap.Float64("deposits", sn.Deposits),
+				zap.Float64("withdrawals", sn.Withdrawals),
+				zap.Int("total_trades", sn.TotalTrades),
+			)
+		}
+		s.logger.Info("history reconstruction DRY RUN — nothing written",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Int("days", len(snapshots)),
+		)
+		return nil
+	}
 
 	// ENG-002: write the whole reconstructed series in ONE transaction. The
 	// previous per-row Upsert loop left a silent hole in the timeline when a

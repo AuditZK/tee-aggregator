@@ -230,6 +230,13 @@ func (s *Server) handleAdminSyncNow(w http.ResponseWriter, r *http.Request) {
 // gained HistoricalSnapshotProvider support (cTrader) — gets backfilled.
 //
 // Usage: POST /api/v1/admin/reconstruct?user_uid=X&exchange=ctrader&label=Y
+//
+// Optional from=YYYY-MM-DD&to=YYYY-MM-DD restricts the write to those days
+// (inclusive) — the gap-repair mode (OPS-004). Without it the reconstruct
+// upserts the provider's whole window, which for the external rebuilder means
+// rewriting up to 90 days of already-correct live snapshots. Both bounds are
+// required together; passing only one is rejected rather than silently
+// widening to a full reconstruct.
 func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
@@ -258,6 +265,36 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	fromStr, toStr := q.Get("from"), q.Get("to")
+	if (fromStr == "") != (toStr == "") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from and to must be provided together"})
+		return
+	}
+	var from, to time.Time
+	if fromStr != "" {
+		var err error
+		if from, err = time.Parse("2006-01-02", fromStr); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from must be YYYY-MM-DD"})
+			return
+		}
+		if to, err = time.Parse("2006-01-02", toStr); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "to must be YYYY-MM-DD"})
+			return
+		}
+		if to.Before(from) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "to must not precede from"})
+			return
+		}
+	}
+
+	// dry_run only makes sense with an explicit window — it exists to inspect a
+	// splice before committing it.
+	dryRun := q.Get("dry_run") == "1" || q.Get("dry_run") == "true"
+	if dryRun && fromStr == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "dry_run requires from and to"})
+		return
+	}
+
 	if s.handler == nil || s.handler.syncSvc == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
 		return
@@ -267,6 +304,9 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		zap.String("user_uid", userUID),
 		zap.String("exchange", exchange),
 		zap.String("label", label),
+		zap.String("from", fromStr),
+		zap.String("to", toStr),
+		zap.Bool("dry_run", dryRun),
 	)
 	go func() {
 		// Must exceed the rebuilder-client chain (1920s): a binance HF 90-day
@@ -274,9 +314,13 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		// cancelling first aborts it server-side mid-page.
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 		defer cancel()
-		s.handler.syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
+		if fromStr == "" {
+			s.handler.syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
+			return
+		}
+		s.handler.syncSvc.ReconstructHistoryRange(ctx, userUID, exchange, label, from, to, dryRun)
 	}()
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "reconstruction triggered, check logs"})
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "dry_run": dryRun, "message": "reconstruction triggered, check logs"})
 }
 
 // handleAdminDumpCashflows dumps all BALANCE deals for a user/exchange/label since a date.

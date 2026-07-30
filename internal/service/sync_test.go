@@ -688,7 +688,7 @@ func TestReconstructHistory_ZKNativeProviderStaysInEnclave(t *testing.T) {
 	provider := &fakeHistProvider{fakeHistConnector: fakeHistConnector{exchange: "ibkr"}}
 	connMeta := &repository.ExchangeConnection{UserUID: "u1", Exchange: "ibkr", Label: "main"}
 
-	svc.reconstructHistory(context.Background(), connMeta, provider, &Credentials{APIKey: "k", APISecret: "s"})
+	svc.reconstructHistory(context.Background(), connMeta, provider, &Credentials{APIKey: "k", APISecret: "s"}, reconstructOpts{})
 
 	if !provider.called {
 		t.Error("ZK-native provider: in-enclave GetHistoricalSnapshots was never called")
@@ -714,7 +714,7 @@ func TestReconstructHistory_NonProviderWithoutRebuilderIsNoop(t *testing.T) {
 			conn := &fakeHistConnector{exchange: "hyperliquid"}
 			connMeta := &repository.ExchangeConnection{UserUID: "u1", Exchange: "hyperliquid", Label: "main"}
 			// Must return cleanly — no panic, no dispatch.
-			svc.reconstructHistory(context.Background(), connMeta, conn, &Credentials{APIKey: "wallet"})
+			svc.reconstructHistory(context.Background(), connMeta, conn, &Credentials{APIKey: "wallet"}, reconstructOpts{})
 		})
 	}
 }
@@ -740,7 +740,7 @@ func TestReconstructHistory_NonProviderDispatchesToRebuilder(t *testing.T) {
 	connMeta := &repository.ExchangeConnection{UserUID: "u1", Exchange: "hyperliquid", Label: "main"}
 
 	svc.reconstructHistory(context.Background(), connMeta, conn,
-		&Credentials{APIKey: "0xWALLET", APISecret: "secret-xyz", Passphrase: "pp"})
+		&Credentials{APIKey: "0xWALLET", APISecret: "secret-xyz", Passphrase: "pp"}, reconstructOpts{})
 
 	if gotToken != "internal-token-0123456789" {
 		t.Errorf("X-Internal-Token not propagated to rebuilder: got %q", gotToken)
@@ -772,7 +772,7 @@ func TestReconstructHistory_UnsupportedExchangeNeverReachesRebuilder(t *testing.
 	connMeta := &repository.ExchangeConnection{UserUID: "u1", Exchange: "kraken", Label: "main"}
 
 	svc.reconstructHistory(context.Background(), connMeta, conn,
-		&Credentials{APIKey: "k", APISecret: "s", Passphrase: "pp"})
+		&Credentials{APIKey: "k", APISecret: "s", Passphrase: "pp"}, reconstructOpts{})
 
 	if hits != 0 {
 		t.Fatalf("rebuilder received %d request(s) for an unsupported exchange — credentials left the enclave for a guaranteed 400", hits)
@@ -828,5 +828,49 @@ func TestBuildHistoricalSnapshots_AllMarketTypes(t *testing.T) {
 	if b.Global.LongVolume != 1000 || b.Global.ShortVolume != 234 {
 		t.Errorf("long/short volume not propagated to global: long=%f short=%f",
 			b.Global.LongVolume, b.Global.ShortVolume)
+	}
+}
+
+// OPS-004 gap repair: a bounded dayWindow must keep ONLY the requested days.
+// Without this the reconstruct upserts the provider's whole walk — which can
+// span months — over live snapshots that were already correct.
+func TestDayWindow_FilterKeepsOnlyRequestedDays(t *testing.T) {
+	day := func(d int) time.Time { return time.Date(2026, 7, d, 0, 0, 0, 0, time.UTC) }
+	// Providers hand back timestamps at arbitrary times of day, not midnight —
+	// the filter must compare on the day key, not the raw instant.
+	series := []*connector.HistoricalSnapshot{
+		{Date: time.Date(2026, 7, 24, 23, 59, 0, 0, time.UTC)},
+		{Date: day(25)},
+		{Date: time.Date(2026, 7, 26, 13, 5, 0, 0, time.UTC)},
+		{Date: day(27)},
+		{Date: time.Date(2026, 7, 28, 0, 0, 1, 0, time.UTC)},
+		{Date: day(29)},
+	}
+
+	got := dayWindow{from: day(26), to: day(28)}.filter(series)
+
+	if len(got) != 3 {
+		t.Fatalf("window 26–28 kept %d days, want 3", len(got))
+	}
+	for i, want := range []int{26, 27, 28} {
+		if got[i].Date.Day() != want {
+			t.Errorf("kept[%d] is day %d, want %d", i, got[i].Date.Day(), want)
+		}
+	}
+}
+
+// The zero dayWindow is the connect-time / midnight-recalibration contract:
+// it must stay a full reconstruct, never silently narrow.
+func TestDayWindow_ZeroValueKeepsEverything(t *testing.T) {
+	series := []*connector.HistoricalSnapshot{
+		{Date: time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC)},
+		{Date: time.Date(2026, 7, 26, 0, 0, 0, 0, time.UTC)},
+	}
+	var w dayWindow
+	if w.isSet() {
+		t.Fatal("zero dayWindow reports isSet()")
+	}
+	if got := w.filter(series); len(got) != len(series) {
+		t.Errorf("zero window kept %d of %d days, want all", len(got), len(series))
 	}
 }
