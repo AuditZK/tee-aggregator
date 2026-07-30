@@ -30,6 +30,91 @@ const (
 	sourceInEnclave         = "in-enclave"
 )
 
+const (
+	// defaultActivityWindow is the classic lookback for trades, cashflows and
+	// funding fees: the 24h ending at the snapshot boundary. It stays the floor
+	// — activityWindowStart only ever widens past it, never narrows.
+	defaultActivityWindow = 24 * time.Hour
+
+	// maxActivityLookback caps how far back a catch-up sync may reach. Several
+	// connectors reject or heavily paginate very wide ranges, so a connection
+	// dormant for a year must not ask for a year of trades in one call. Days
+	// older than this stay unobserved — they are already lost to the gap that
+	// created them.
+	maxActivityLookback = 30 * 24 * time.Hour
+)
+
+// activityWindowStart returns the instant from which this sync pulls trades,
+// cashflows and funding fees.
+//
+// This used to be a fixed `startOfDay - 24h`, which silently assumed the
+// previous sync ran yesterday. Whenever a sync is missed — host reboot, outage,
+// a rate-limited connector — the intervening days were never queried and their
+// cashflows were lost for good. That is not merely missing detail: TWR computes
+// adjustedEquity as `equity - deposits + withdrawals`, so a deposit nobody
+// fetched is indistinguishable from trading profit, and an unfetched withdrawal
+// reads as a loss. The equity curve absorbs the error permanently.
+//
+// Anchoring on the connection's last snapshot makes the window span exactly the
+// unobserved period. Two deliberate bounds:
+//
+//   - Never NARROWER than defaultActivityWindow. A snapshot written mid-day (a
+//     manual re-sync) must not shrink the window and drop activity the previous
+//     snapshot never accounted for.
+//   - Never WIDER than maxActivityLookback, so a long-dormant connection cannot
+//     issue an unbounded history request.
+//
+// Trade-off worth knowing: after a gap, several days of trades land on the
+// catch-up snapshot, inflating its trade count and volume. That is the right
+// call — those trades were previously dropped entirely, and the cashflows they
+// come with are what keep the return series honest.
+func (s *SyncService) activityWindowStart(ctx context.Context, connMeta *repository.ExchangeConnection, startOfDay time.Time) time.Time {
+	var last time.Time
+	if s.snapshotRepo != nil && connMeta != nil {
+		// A failed lookup deliberately degrades to the classic window rather
+		// than reaching back blindly, so a flaky DB cannot turn every sync into
+		// a month-wide history request.
+		if latest, err := s.snapshotRepo.GetLatestByUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label); err == nil && latest != nil {
+			last = latest.Timestamp.UTC()
+		}
+	}
+
+	start, widened, clamped := resolveActivityWindow(startOfDay, last)
+	switch {
+	case clamped:
+		s.logger.Warn("activity window clamped — connection unsynced longer than the lookback cap",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Time("last_snapshot", last),
+			zap.Duration("cap", maxActivityLookback),
+		)
+	case widened:
+		s.logger.Info("activity window widened to cover a sync gap",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Time("last_snapshot", last),
+			zap.Duration("window", startOfDay.Sub(start)),
+		)
+	}
+	return start
+}
+
+// resolveActivityWindow is the policy behind activityWindowStart, split out as
+// a pure function so the clamping rules are testable without a DB. A zero
+// lastSnapshot means "no history known".
+func resolveActivityWindow(startOfDay, lastSnapshot time.Time) (start time.Time, widened, clamped bool) {
+	fallback := startOfDay.Add(-defaultActivityWindow)
+	if lastSnapshot.IsZero() || !lastSnapshot.Before(fallback) {
+		return fallback, false, false
+	}
+	if floor := startOfDay.Add(-maxActivityLookback); lastSnapshot.Before(floor) {
+		return floor, true, true
+	}
+	return lastSnapshot, true, false
+}
+
 // dayWindow restricts which reconstructed days persistHistoricalSnapshots is
 // allowed to write. The zero value means "no restriction" — every day the
 // provider or rebuilder returned is upserted, which is what the connect-time
@@ -569,14 +654,16 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		return result
 	}
 
-	// 4. Get trades for the 24h window ending at the snapshot boundary.
-	// startOfDay is the snapshot timestamp (today 00:00 UTC). The sync runs
-	// at that moment, so we need to look BACK one day to attribute the last
-	// 24h of trades/cashflows to this snapshot — otherwise GetTrades runs
-	// with a zero-length window and returns nothing.
+	// 4. Get trades for the window ending at the snapshot boundary. startOfDay
+	// is the snapshot timestamp (today 00:00 UTC) and the sync runs at that
+	// moment, so we must look BACK to attribute trades/cashflows to this
+	// snapshot — otherwise GetTrades runs with a zero-length window and returns
+	// nothing. Normally that is the last 24h; after a missed sync it stretches
+	// to the previous snapshot so the gap's cashflows are not lost (see
+	// activityWindowStart).
 	now := time.Now().UTC()
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	activityStart := startOfDay.Add(-24 * time.Hour)
+	activityStart := s.activityWindowStart(ctx, connMeta, startOfDay)
 
 	// 4a. Per-market trade fetching if supported; otherwise fallback to flat GetTrades
 	var trades []*connector.Trade
@@ -1023,12 +1110,13 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	}
 	s.logger.Info("balance fetched", zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.Duration("elapsed", time.Since(start)))
 
-	// Same 24h-window semantics as syncConnection above: the snapshot lands
-	// at startOfDay (today 00:00 UTC), so we pull trades/cashflows from the
-	// preceding 24h window.
+	// Same window semantics as syncConnection above: the snapshot lands at
+	// startOfDay (today 00:00 UTC), so we pull trades/cashflows from the
+	// preceding window — 24h normally, stretched back to the last snapshot
+	// when a sync was missed (see activityWindowStart).
 	now := time.Now().UTC()
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	activityStart := startOfDay.Add(-24 * time.Hour)
+	activityStart := s.activityWindowStart(ctx, connMeta, startOfDay)
 
 	var trades []*connector.Trade
 	var swapSymbols []string

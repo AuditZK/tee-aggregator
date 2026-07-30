@@ -874,3 +874,83 @@ func TestDayWindow_ZeroValueKeepsEverything(t *testing.T) {
 		t.Errorf("zero window kept %d of %d days, want all", len(got), len(series))
 	}
 }
+
+// The activity window used to be a fixed 24h, so a missed sync silently
+// dropped the intervening cashflows — and TWR reads an unfetched deposit as
+// trading profit. These lock the widening rules.
+func TestResolveActivityWindow(t *testing.T) {
+	startOfDay := time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC)
+	day := func(d int) time.Time { return time.Date(2026, 7, d, 0, 0, 0, 0, time.UTC) }
+
+	cases := []struct {
+		name        string
+		last        time.Time
+		wantStart   time.Time
+		wantWidened bool
+		wantClamped bool
+	}{
+		{
+			name:      "no history keeps the classic 24h window",
+			last:      time.Time{},
+			wantStart: day(28),
+		},
+		{
+			name:      "yesterday's snapshot is the classic 24h window",
+			last:      day(28),
+			wantStart: day(28),
+		},
+		{
+			// The outage shape this fix exists for: last snapshot on the 25th,
+			// sync resumes on the 29th. The window must cover all four days.
+			name:        "a multi-day gap widens back to the last snapshot",
+			last:        day(25),
+			wantStart:   day(25),
+			wantWidened: true,
+		},
+		{
+			// A manual mid-day re-sync must not shrink the window below 24h:
+			// the previous snapshot never accounted for that activity.
+			name:      "a snapshot newer than 24h ago never narrows the window",
+			last:      time.Date(2026, 7, 28, 13, 0, 0, 0, time.UTC),
+			wantStart: day(28),
+		},
+		{
+			name:        "a long-dormant connection is clamped to the cap",
+			last:        day(1).AddDate(0, -6, 0),
+			wantStart:   startOfDay.Add(-maxActivityLookback),
+			wantWidened: true,
+			wantClamped: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			start, widened, clamped := resolveActivityWindow(startOfDay, tc.last)
+			if !start.Equal(tc.wantStart) {
+				t.Errorf("start = %s, want %s", start.Format(time.RFC3339), tc.wantStart.Format(time.RFC3339))
+			}
+			if widened != tc.wantWidened {
+				t.Errorf("widened = %v, want %v", widened, tc.wantWidened)
+			}
+			if clamped != tc.wantClamped {
+				t.Errorf("clamped = %v, want %v", clamped, tc.wantClamped)
+			}
+			if start.After(startOfDay) {
+				t.Errorf("window start %s is after the snapshot boundary", start.Format(time.RFC3339))
+			}
+		})
+	}
+}
+
+// A nil snapshot repo (and a nil connection) must not panic — it degrades to
+// the classic window, which is what a first sync and a dev stack both want.
+func TestActivityWindowStart_NoRepoDegradesToClassicWindow(t *testing.T) {
+	svc := &SyncService{logger: zap.NewNop()}
+	startOfDay := time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC)
+
+	got := svc.activityWindowStart(context.Background(), nil, startOfDay)
+
+	if want := startOfDay.Add(-defaultActivityWindow); !got.Equal(want) {
+		t.Errorf("start = %s, want %s", got.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
