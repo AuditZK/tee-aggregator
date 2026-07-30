@@ -26,6 +26,20 @@ vendor/
 .env
 .env.*
 .env.local
+# `.env.*` does not match a name with no dot after "env" — widen it.
+.env*
+
+# Host-provisioned material. Never produced by the build; supplied per
+# deployment and mounted read-only into the container.
+#
+# NO trailing slash on purpose: this path is a symlink in a normal working
+# tree, and a `foo/` pattern matches real directories only — a symlink slips
+# straight through it.
+certs
+
+# Local backups of configs and binaries. They routinely carry host-specific
+# values.
+*.bak
 
 # Local AI assistant configuration (never commit, never push)
 .agents/
