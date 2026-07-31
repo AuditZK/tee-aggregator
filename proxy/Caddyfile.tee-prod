@@ -1,0 +1,84 @@
+# Caddy sidecar for tee-aggregator.
+#
+# Path-based routing only — no header injection. The Go upstream
+# (REST server on 3060 and log-stream server on 50062) emits its own
+# CORS headers and standard security headers. Adding them again here
+# produces duplicated header values which browsers reject.
+#
+# Routes:
+#   /api/*           → REST server         (enclave_go_prod:3060)
+#   /errors/stream   → log-stream SSE      (enclave_go_prod:50062, no buffering)
+#   /logs/stream     → log-stream SSE      (enclave_go_prod:50062, no buffering)
+#   everything else  → log-stream HTTP     (enclave_go_prod:50062)
+#
+# Required env vars: ENCLAVE_DOMAIN, DASHBOARD_ORIGIN (kept for reference), ACME_EMAIL
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$ENCLAVE_DOMAIN} {
+	# OBS-005: without this block Caddy logs ONLY errors — there is no access
+	# log at all. During an incident that silence is indistinguishable from
+	# "no traffic reaching the proxy", and a healthy enclave reads as an
+	# unreachable one. Successful requests must leave a trace too.
+	#
+	# The filter encoder strips credential-bearing headers before they hit
+	# disk. This proxy fronts a TEE: an access log that captured Authorization
+	# or a session cookie would put outside the enclave exactly what the
+	# enclave exists to protect. Add any new auth header to this list.
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>X-Api-Key delete
+				request>headers>X-Internal-Token delete
+				request>headers>Set-Cookie delete
+			}
+		}
+	}
+
+	# Don't compress SSE — chunks need to flush immediately.
+	@notsse {
+		not path /errors/stream /logs/stream
+	}
+	encode @notsse zstd gzip
+
+	# REST API → REST server (port 3060). REST handles its own CORS.
+	@rest path /api/*
+	handle @rest {
+		reverse_proxy enclave_go_prod:3060 {
+			transport http {
+				tls
+				tls_insecure_skip_verify
+			}
+			header_up X-Forwarded-Proto https
+		}
+	}
+
+	# SSE → log-stream (port 50062), flush per chunk, force HTTP/1.1.
+	@sse path /errors/stream /logs/stream
+	handle @sse {
+		reverse_proxy enclave_go_prod:50062 {
+			transport http {
+				tls
+				tls_insecure_skip_verify
+			}
+			flush_interval -1
+			header_up X-Forwarded-Proto https
+		}
+	}
+
+	# Everything else → log-stream (/health, /errors/groups, /errors/stats,
+	# /logs, /attestation, /attestation/info, /logs/clear).
+	reverse_proxy enclave_go_prod:50062 {
+		transport http {
+			tls
+			tls_insecure_skip_verify
+		}
+		header_up X-Forwarded-Proto https
+	}
+}
