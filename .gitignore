@@ -63,6 +63,10 @@ Thumbs.db
 doc/AUDIT_PROMPT.md
 doc/AUDIT_PROMPT.en.md
 doc/audit/
+doc/support-audit-securite.md
+# Internal planning / ops notes — local only (already covered by *.md, listed
+# for intent and to survive any future whitelist).
+doc/plan-balance-reconciled-cashflow.md
 
 # Internal docs — only the public-facing markdown files are tracked.
 # Anything else (dev setup, ops runbooks, migration notes) stays local.
