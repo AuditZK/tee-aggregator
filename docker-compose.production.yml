@@ -127,7 +127,13 @@ services:
     devices:
       - /dev/sev-guest:/dev/sev-guest
     volumes:
-      - /usr/local/bin/snpguest:/usr/local/bin/snpguest:ro
+      # OPS-007: NO host bind-mount of snpguest here — the image bundles its
+      # own pinned binary (see Dockerfile.production). The old mount silently
+      # shadowed the image's copy with whatever the host happened to have, and
+      # on a host missing the file Docker substitutes an empty DIRECTORY at
+      # that path, breaking attestation entirely. One source of truth: the
+      # image. The host's /usr/local/bin/snpguest remains useful for manual
+      # diagnostics only.
       - enclave_vcek_cache:/var/cache/enclave/certs:rw
       - ./certs:/etc/enclave:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
