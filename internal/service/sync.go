@@ -249,6 +249,9 @@ type SyncService struct {
 	connSvc      *ConnectionService
 	snapshotRepo *repository.SnapshotRepo
 	syncStatus   *repository.SyncStatusRepo
+	// rateLimitLog optionally journals throttle events (Flex 1018, stale-
+	// statement skips) to sync_rate_limit_logs. Nil = log-only, no persistence.
+	rateLimitLog *repository.SyncRateLimitLogRepo
 	factory      *connector.Factory
 	connCache    *cache.ConnectorCache
 	logger       *zap.Logger
@@ -282,6 +285,29 @@ func NewSyncService(
 		factory:      connector.NewFactory(),
 		connCache:    connCache,
 		logger:       logger,
+	}
+}
+
+// SetRateLimitLogRepo configures optional rate-limit journaling. Nil-safe:
+// without it, throttle events are logged but not persisted.
+func (s *SyncService) SetRateLimitLogRepo(repo *repository.SyncRateLimitLogRepo) {
+	s.rateLimitLog = repo
+}
+
+// recordRateLimitHit journals one throttle event (Flex 1018 race loss or
+// stale-statement skip) to sync_rate_limit_logs. Best-effort: a failed insert
+// only warns, it never blocks the sync path.
+func (s *SyncService) recordRateLimitHit(ctx context.Context, conn *repository.ExchangeConnection) {
+	if s.rateLimitLog == nil || conn == nil {
+		return
+	}
+	if err := s.rateLimitLog.RecordHit(ctx, conn.UserUID, conn.Exchange, conn.Label, time.Now().UTC()); err != nil {
+		s.logger.Warn("failed to journal rate-limit hit",
+			zap.String("user_uid", conn.UserUID),
+			zap.String("exchange", conn.Exchange),
+			zap.String("label", conn.Label),
+			zap.Error(err),
+		)
 	}
 }
 
@@ -357,6 +383,14 @@ type SyncResult struct {
 	SnapshotEquity    float64   `json:"snapshot_equity"`
 	SnapshotTimestamp time.Time `json:"snapshot_timestamp"`
 	Error             string    `json:"error,omitempty"`
+
+	// Skipped marks a sync that intentionally wrote nothing because the
+	// broker's freshest statement predates the last trading day — stamping it
+	// with today's date would fabricate a phantom snapshot (audit 2026-08-01).
+	// The gap is honest: a deferred retry re-syncs once the statement window
+	// clears, and the nightly reconstruction fills the day regardless.
+	Skipped    bool   `json:"skipped,omitempty"`
+	SkipReason string `json:"skip_reason,omitempty"`
 
 	// snapshot is the built snapshot for atomic batch saves (not serialized).
 	snapshot *repository.Snapshot
@@ -663,6 +697,24 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	// activityWindowStart).
 	now := time.Now().UTC()
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+
+	// 4-pre. Freshness guard — same rationale and recovery as the guard in
+	// buildConnectionSnapshot (root fix, audit 2026-08-01). The deferred
+	// recordSyncStatus above persists the skip as status "skipped_stale".
+	if reason := staleBalanceSkipReason(conn, startOfDay); reason != "" {
+		result.Skipped = true
+		result.SkipReason = reason
+		s.logger.Warn("skipping live snapshot: stale statement",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.String("reason", reason),
+		)
+		s.recordRateLimitHit(ctx, connMeta)
+		s.scheduleDeferredRetry(connMeta, rateLimitRetryDelay)
+		return result
+	}
+
 	activityStart := s.activityWindowStart(ctx, connMeta, startOfDay)
 
 	// 4a. Per-market trade fetching if supported; otherwise fallback to flat GetTrades
@@ -812,6 +864,10 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	result.SnapshotEquity = balance.Equity
 	result.SnapshotTimestamp = startOfDay
 
+	// Safety net (AUDIT_HL_DAILY_GAIN_BUG.md): flag implausible daily moves
+	// before they land in metrics. Detection only, the write still happens.
+	s.warnOnAberrantDailyMove(ctx, snapshot)
+
 	// Save snapshot individually (non-atomic path, used by manual sync)
 	if err := s.snapshotRepo.Upsert(ctx, snapshot); err != nil {
 		result.Error = fmt.Sprintf("save snapshot: %v", err)
@@ -941,9 +997,11 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		}
 	}
 
-	// Phase 4: Record sync status for all
+	// Phase 4: Record sync status for all. Skipped results (stale statement)
+	// carry no snapshot but must still surface as "skipped_stale" — silence is
+	// what hid the phantom-snapshot defect.
 	for _, r := range results {
-		if r.snapshot != nil {
+		if r.snapshot != nil || r.Skipped {
 			conn := findConnection(connections, r.Exchange, r.Label)
 			if conn != nil {
 				s.recordSyncStatus(ctx, conn, r, now)
@@ -961,6 +1019,7 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 	for _, r := range results {
 		if isRateLimitError(r.Error) {
 			if conn := findConnection(connections, r.Exchange, r.Label); conn != nil {
+				s.recordRateLimitHit(ctx, conn)
 				s.scheduleDeferredRetry(conn, rateLimitRetryDelay)
 			}
 		}
@@ -979,6 +1038,83 @@ const rateLimitRetryDelay = 6 * time.Hour
 // are NOT treated as rate limits — they clear in seconds, not hours.
 func isRateLimitError(errStr string) bool {
 	return strings.Contains(errStr, "1018") || strings.Contains(errStr, "Too many requests")
+}
+
+// lastExpectedStatementDate returns the most recent weekday (UTC) strictly
+// before startOfDay — the newest statement date a daily-reporting broker can
+// possibly have when the sync runs at startOfDay. Saturday, Sunday and Monday
+// all expect Friday: over a weekend nothing trades, so a statement ending
+// Friday is fully fresh and its close is the honest carry-forward value.
+// Holidays are not modelled; the guard then skips one extra day, which the
+// nightly reconstruction fills — a conservative, self-healing miss.
+func lastExpectedStatementDate(startOfDay time.Time) time.Time {
+	d := startOfDay.AddDate(0, 0, -1)
+	for d.Weekday() == time.Saturday || d.Weekday() == time.Sunday {
+		d = d.AddDate(0, 0, -1)
+	}
+	return d
+}
+
+// staleBalanceSkipReason returns a non-empty human-readable reason when conn's
+// last GetBalance figure is too old to be stamped with startOfDay's date.
+// Connectors that don't report freshness (everything except statement-based
+// brokers) and statements without a parsable date fail open: empty reason.
+//
+// This is the root fix for the phantom-snapshot defect (audit 2026-08-01): the
+// midnight sync used to write the statement's two-day-old equity under today's
+// date; on weekend dates the backfill never revisits the row, so the stale
+// value became a permanent fake ±N% zigzag in every derived metric.
+func staleBalanceSkipReason(conn connector.Connector, startOfDay time.Time) string {
+	fp, ok := conn.(connector.BalanceFreshnessProvider)
+	if !ok {
+		return ""
+	}
+	asOf := fp.BalanceAsOf()
+	if asOf.IsZero() {
+		return ""
+	}
+	expected := lastExpectedStatementDate(startOfDay)
+	if asOf.Before(expected) {
+		return fmt.Sprintf("stale statement: balance as of %s, need >= %s to stamp %s",
+			asOf.Format("2006-01-02"), expected.Format("2006-01-02"), startOfDay.Format("2006-01-02"))
+	}
+	return ""
+}
+
+// warnOnAberrantDailyMove logs a WARN when a live snapshot implies a
+// flow-adjusted daily move beyond ±50% versus the previous stored snapshot —
+// the safety net recommended by AUDIT_HL_DAILY_GAIN_BUG.md (May 2026) that
+// would have caught the phantom-snapshot defect a year earlier. Detection
+// only: the snapshot is still written, an operator investigates.
+func (s *SyncService) warnOnAberrantDailyMove(ctx context.Context, snap *repository.Snapshot) {
+	if snap == nil || s.snapshotRepo == nil {
+		return
+	}
+	prev, err := s.snapshotRepo.GetLatestByUserExchangeLabelBefore(ctx, snap.UserUID, snap.Exchange, snap.Label, snap.Timestamp)
+	if err != nil || prev == nil || prev.TotalEquity <= 0 {
+		return
+	}
+	base := prev.TotalEquity
+	if snap.Deposits > 0 {
+		base += snap.Deposits
+	}
+	if base <= 0 {
+		return
+	}
+	move := (snap.TotalEquity - prev.TotalEquity - (snap.Deposits - snap.Withdrawals)) / base
+	if move > 0.5 || move < -0.5 {
+		s.logger.Warn("aberrant daily move on live snapshot (flow-adjusted > 50%)",
+			zap.String("user_uid", snap.UserUID),
+			zap.String("exchange", snap.Exchange),
+			zap.String("label", snap.Label),
+			zap.Time("day", snap.Timestamp),
+			zap.Float64("move_pct", move*100),
+			zap.Float64("prev_equity", prev.TotalEquity),
+			zap.Float64("new_equity", snap.TotalEquity),
+			zap.Float64("deposits", snap.Deposits),
+			zap.Float64("withdrawals", snap.Withdrawals),
+		)
+	}
 }
 
 // scheduleDeferredRetry re-syncs a single connection once, after delay, to
@@ -1116,6 +1252,26 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	// when a sync was missed (see activityWindowStart).
 	now := time.Now().UTC()
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+
+	// Freshness guard (root fix, audit 2026-08-01): refuse to stamp a stale
+	// statement figure with today's date — that fabricated the J−2 phantom
+	// snapshots. Writing nothing is honest (the reconstruction fills the day),
+	// and the deferred retry picks up the fresh statement the same day, the
+	// same recovery already used for the shared-token 1018 race.
+	if reason := staleBalanceSkipReason(conn, startOfDay); reason != "" {
+		result.Skipped = true
+		result.SkipReason = reason
+		s.logger.Warn("skipping live snapshot: stale statement",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.String("reason", reason),
+		)
+		s.recordRateLimitHit(ctx, connMeta)
+		s.scheduleDeferredRetry(connMeta, rateLimitRetryDelay)
+		return result
+	}
+
 	activityStart := s.activityWindowStart(ctx, connMeta, startOfDay)
 
 	var trades []*connector.Trade
@@ -1237,6 +1393,10 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	result.SnapshotEquity = balance.Equity
 	result.SnapshotTimestamp = startOfDay
 
+	// Safety net (AUDIT_HL_DAILY_GAIN_BUG.md): flag implausible daily moves
+	// before they land in metrics. Detection only, the write still happens.
+	s.warnOnAberrantDailyMove(ctx, result.snapshot)
+
 	return result
 }
 
@@ -1309,7 +1469,15 @@ func (s *SyncService) recordSyncStatus(ctx context.Context, conn *repository.Exc
 	}
 
 	status := "error"
-	if result.Success {
+	errMsg := result.Error
+	switch {
+	case result.Skipped:
+		// Surfaced as its own status (not "completed") so a stale-statement
+		// skip is visible in sync_statuses instead of the silent success that
+		// hid the phantom-snapshot defect for months.
+		status = "skipped_stale"
+		errMsg = result.SkipReason
+	case result.Success:
 		status = "completed"
 	}
 
@@ -1320,7 +1488,7 @@ func (s *SyncService) recordSyncStatus(ctx context.Context, conn *repository.Exc
 		LastSyncTime: &lastAttempt,
 		Status:       status,
 		TotalTrades:  result.TradeCount,
-		ErrorMessage: result.Error,
+		ErrorMessage: errMsg,
 	}
 
 	if err := s.syncStatus.Upsert(ctx, record); err != nil {

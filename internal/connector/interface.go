@@ -97,6 +97,20 @@ type BalanceByMarketFetcher interface {
 	GetBalanceByMarket(ctx context.Context) ([]*MarketBalance, error)
 }
 
+// BalanceFreshnessProvider is implemented by statement-based connectors (IBKR
+// Flex) whose GetBalance can only return the newest figure present in an
+// already-generated statement — data that lags real time by one to two days.
+// The sync layer uses it to refuse to stamp a stale figure with today's date:
+// stamped stale, the value replays the equity of two days earlier under a new
+// date and, on non-trading days, is never corrected by the backfill (the
+// "phantom snapshot" defect, audit 2026-08-01).
+type BalanceFreshnessProvider interface {
+	// BalanceAsOf returns the statement date of the equity returned by the
+	// last GetBalance call, or the zero time when the statement carried no
+	// usable date (callers must then fail open).
+	BalanceAsOf() time.Time
+}
+
 // FundingFee represents a single funding fee payment on a perpetual/swap position.
 type FundingFee struct {
 	Amount    float64   `json:"amount"`

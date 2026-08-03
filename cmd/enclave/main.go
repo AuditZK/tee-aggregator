@@ -308,6 +308,10 @@ func main() {
 		if syncStatusRepo != nil {
 			syncSvc.SetSyncStatusRepo(syncStatusRepo)
 		}
+		// Journal throttle events (Flex 1018 races, stale-statement skips) to
+		// sync_rate_limit_logs — the table existed since migration 007 but
+		// nothing ever wrote to it (audit 2026-08-01).
+		syncSvc.SetRateLimitLogRepo(repository.NewSyncRateLimitLogRepo(pool))
 		// SEC-ZK-001: wire the (optional, NON-ZK) external history-rebuilder-service
 		// client. When configured, non-IBKR exchanges (Hyperliquid, …) get
 		// their historical equity rebuilt out-of-perimeter on connect; IBKR

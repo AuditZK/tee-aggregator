@@ -48,6 +48,10 @@ type IBKR struct {
 	// Cached from last GetBalance call (avoids extra Flex requests)
 	cachedBreakdown []*MarketBalance
 	cachedIsPaper   *bool
+	// cachedBalanceAsOf is the reportDate of the summary the last GetBalance
+	// call returned — the real age of the figure, which can lag today by two
+	// days (Flex statements generate after close). Zero when no date parsed.
+	cachedBalanceAsOf time.Time
 }
 
 // NewIBKR creates a new IBKR connector
@@ -328,6 +332,7 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 				AccountID           string `xml:"accountId,attr"`
 				EquitySummaryInBase struct {
 					EquitySummaryByReportDateInBase []struct {
+						ReportDate           string `xml:"reportDate,attr"`
 						Currency             string `xml:"currency,attr"`
 						Total                string `xml:"total,attr"`
 						Cash                 string `xml:"cash,attr"`
@@ -353,11 +358,19 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 	}
 
 	summaries := flex.FlexStatements.FlexStatement.EquitySummaryInBase.EquitySummaryByReportDateInBase
+	i.cachedBalanceAsOf = time.Time{}
 	if len(summaries) == 0 {
 		return &Balance{Currency: "USD"}, nil
 	}
 
 	summary := summaries[len(summaries)-1] // Latest
+	// Freshness: record the statement date of the figure we are about to
+	// return. "Latest" here means latest IN THE STATEMENT — at midnight UTC
+	// that is typically two days old, and the sync layer must know it
+	// (BalanceFreshnessProvider) before stamping the value with today's date.
+	if d, err := time.Parse("20060102", summary.ReportDate); err == nil {
+		i.cachedBalanceAsOf = d
+	}
 	// Flex reports "in base currency" — the account's denomination, not always USD.
 	currency := summary.Currency
 	if currency == "" {
@@ -416,6 +429,13 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 		UnrealizedPnL: unrealized,
 		Currency:      currency,
 	}, nil
+}
+
+// BalanceAsOf implements BalanceFreshnessProvider: the reportDate of the
+// summary the last GetBalance call returned. Zero when GetBalance has not run
+// or the statement carried no parsable date (fail open).
+func (i *IBKR) BalanceAsOf() time.Time {
+	return i.cachedBalanceAsOf
 }
 
 // GetBalanceByMarket returns per-asset-class equity breakdown from IBKR Flex.
