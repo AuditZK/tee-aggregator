@@ -347,7 +347,28 @@ func main() {
 		// Trigger historical snapshot backfill on connection creation. For IBKR
 		// the rebuild runs in-enclave (ZK-native); for other exchanges the
 		// hook delegates to the external rebuilder when configured.
-		connSvc.SetPostCreateHook(syncSvc.ReconstructHistoryOnConnect)
+		//
+		// Then take the FIRST live snapshot right away instead of leaving the
+		// account without a today-row and without a sync_statuses entry until
+		// the next 00:00 pass — a user who signed up at 08:33 stayed frozen on
+		// yesterday's rebuilt history all day, with empty status columns in
+		// the admin (cold-start incident, 2026-08-04). The sync pipeline also
+		// writes the sync_statuses row the dashboards display. Failures only
+		// warn: the daily scheduler picks the connection up at midnight
+		// regardless. Connections created with rebuild_history=false skip the
+		// whole hook and keep waiting for the daily pass (frontend only sends
+		// false for mt5).
+		connSvc.SetPostCreateHook(func(ctx context.Context, userUID, exchange, label string) {
+			syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
+			if r := syncSvc.SyncConnectionScheduledByLabel(ctx, userUID, exchange, label); r != nil && r.Error != "" {
+				logger.Warn("first live sync after connect failed; daily pass will retry",
+					zap.String("user_uid", userUID),
+					zap.String("exchange", exchange),
+					zap.String("label", label),
+					zap.String("error", r.Error),
+				)
+			}
+		})
 		metricsSvc = service.NewMetricsService(snapshotRepo)
 	}
 
