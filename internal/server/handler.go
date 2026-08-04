@@ -472,6 +472,19 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		// Credential-test failures are the CALLER's problem, not the server's:
+		// surface them as 400 with the real reason, mirroring the gRPC error
+		// mapping (grpc/server.go). The generic 500 hid "your API key is
+		// invalid" behind "failed to create connection", which sent a user
+		// into a retry loop on 2026-08-04 (regenerating keys, hitting rate
+		// limits) instead of fixing the key once.
+		if strings.Contains(err.Error(), "invalid credentials") {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"success": false,
+				"error":   "invalid credentials",
+			})
+			return
+		}
 		h.logger.Error("create connection from E2E failed", zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"success": false,
@@ -622,6 +635,15 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 				"success":  true,
 				"user_uid": userUID,
 				"error":    service.ExistingConnectionNoopMessage,
+			})
+			return
+		}
+		// Same caller-error mapping as the E2E path above: an invalid API key
+		// is a 400 with the real reason, not a generic 500.
+		if strings.Contains(err.Error(), "invalid credentials") {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"success": false,
+				"error":   "invalid credentials",
 			})
 			return
 		}
