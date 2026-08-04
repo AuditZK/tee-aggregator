@@ -36,6 +36,15 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -o /enclave \
     ./cmd/enclave
 
+# Admin tools, operator-run via docker exec (see cmd/admin-*). Shipped in the
+# image so incident response never needs to copy unreviewed binaries into the
+# running TEE container — the 2026-08-04 cold-start incident had to wait for
+# the daily pass for lack of an in-image sync trigger.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-w -s" \
+    -o /admin-recover-snapshot ./cmd/admin-recover-snapshot \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-w -s" \
+    -o /admin-dump-breakdown ./cmd/admin-dump-breakdown
+
 # Runtime stage.
 FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
@@ -60,6 +69,8 @@ RUN /usr/local/bin/snpguest --version
 
 # Copy Go binary
 COPY --from=builder /enclave /app/enclave
+COPY --from=builder /admin-recover-snapshot /app/admin-recover-snapshot
+COPY --from=builder /admin-dump-breakdown /app/admin-dump-breakdown
 
 # Copy migrations
 COPY --from=builder /app/migrations /app/migrations
