@@ -168,6 +168,59 @@ func repairWeekends(exchange string, apply bool) {
 	fmt.Printf("updated: %d rows\n", tag.RowsAffected())
 }
 
+// dumpSyncStatusEnum prints the members of the legacy Postgres enum backing
+// sync_statuses.status (SyncStatusEnum — absent from every current Prisma
+// schema, a leftover DB type) plus the actual column type. Read-only; used to
+// decide how to persist the "skipped_stale" status without breaking readers.
+func dumpSyncStatusEnum() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, databaseURL())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	rows, err := pool.Query(ctx, `
+		SELECT t.typname, e.enumlabel
+		FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid
+		WHERE t.typname ILIKE '%syncstatus%'
+		ORDER BY t.typname, e.enumsortorder`)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "enum query: %v\n", err)
+		os.Exit(1)
+	}
+	for rows.Next() {
+		var typ, label string
+		if err := rows.Scan(&typ, &label); err != nil {
+			fmt.Fprintf(os.Stderr, "scan: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("enum\t%s\t%s\n", typ, label)
+	}
+	rows.Close()
+
+	rows, err = pool.Query(ctx, `
+		SELECT column_name, data_type, udt_name
+		FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'sync_statuses'
+		ORDER BY ordinal_position`)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "columns query: %v\n", err)
+		os.Exit(1)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var col, dt, udt string
+		if err := rows.Scan(&col, &dt, &udt); err != nil {
+			fmt.Fprintf(os.Stderr, "scan: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("col\t%s\t%s\t%s\n", col, dt, udt)
+	}
+}
+
 // listTables prints the public tables of the connected database — read-only,
 // used to locate where (if anywhere) per-trade rows with symbols live.
 func listTables() {
@@ -212,6 +265,10 @@ func main() {
 	}
 	if *mode == "repair-weekends" {
 		repairWeekends(*exchange, *apply)
+		return
+	}
+	if *mode == "sync-status-enum" {
+		dumpSyncStatusEnum()
 		return
 	}
 

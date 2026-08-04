@@ -1472,11 +1472,17 @@ func (s *SyncService) recordSyncStatus(ctx context.Context, conn *repository.Exc
 	errMsg := result.Error
 	switch {
 	case result.Skipped:
-		// Surfaced as its own status (not "completed") so a stale-statement
-		// skip is visible in sync_statuses instead of the silent success that
-		// hid the phantom-snapshot defect for months.
-		status = "skipped_stale"
-		errMsg = result.SkipReason
+		// Surfaced as non-"completed" so a stale-statement skip is visible in
+		// sync_statuses instead of the silent success that hid the
+		// phantom-snapshot defect for months. The column is backed by the
+		// legacy Postgres enum SyncStatusEnum (pending|syncing|completed|error
+		// — absent from every current Prisma schema but still constraining the
+		// column), so a literal 'skipped_stale' is rejected (22P02, observed
+		// on the 2026-08-04 first run). 'pending' is the honest member: the
+		// day's fresh statement is not available yet and a retry is armed.
+		// The machine-readable marker lives in errorMessage.
+		status = "pending"
+		errMsg = "skipped_stale: " + result.SkipReason
 	case result.Success:
 		status = "completed"
 	}
