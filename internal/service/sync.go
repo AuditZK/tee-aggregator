@@ -1688,9 +1688,23 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 		)
 		return
 	}
+	// Anchor: the freshest live row when one exists (the connect hook runs the
+	// first live sync before this dispatch). The MTM-walk rebuilders calibrate
+	// their curve on it exactly as the midnight pass does; the absolute-
+	// statement family (binance, bitget, …) never calibrates on it but uses it
+	// as the anchor-gate witness — a rebuilt tail that contradicts it (net of
+	// flows) is refused instead of persisted. Zero when no row exists yet:
+	// the rebuilder falls back to its own live valuation, as before.
+	var endEquity float64
+	if s.snapshotRepo != nil {
+		if latest, lerr := s.snapshotRepo.GetLatestByUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label); lerr == nil && latest != nil {
+			endEquity = latest.TotalEquity
+		}
+	}
 	s.logger.Info("history backfill: dispatching to external rebuilder",
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
+		zap.Float64("end_equity_anchor", endEquity),
 	)
 	res, err := s.rebuilder.Rebuild(ctx, rebuilderclient.RebuildRequest{
 		UserUID:  connMeta.UserUID,
@@ -1705,6 +1719,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 			APISecret:     creds.APISecret,
 			Passphrase:    creds.Passphrase,
 		},
+		EndEquityOverride: endEquity,
 	})
 	// LOG-CREDS-001: drop the local reference promptly. Best-effort — Go
 	// strings are immutable so the original heap allocation may live until

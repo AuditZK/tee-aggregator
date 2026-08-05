@@ -359,7 +359,13 @@ func main() {
 		// whole hook and keep waiting for the daily pass (frontend only sends
 		// false for mt5).
 		connSvc.SetPostCreateHook(func(ctx context.Context, userUID, exchange, label string) {
-			syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
+			// Live sync FIRST: the row it writes is the equity anchor the
+			// rebuild dispatch reads (EndEquityOverride) — without it the
+			// walk-family rebuilders calibrate on their own wallet valuation
+			// and the anchor gate has no witness (2026-08-04: a mispriced
+			// walk published a 93k account at 3k because connect-time
+			// rebuilds carried no anchor). Sync failure degrades to the old
+			// anchorless behavior, never blocks the backfill.
 			if r := syncSvc.SyncConnectionScheduledByLabel(ctx, userUID, exchange, label); r != nil && r.Error != "" {
 				logger.Warn("first live sync after connect failed; daily pass will retry",
 					zap.String("user_uid", userUID),
@@ -368,6 +374,7 @@ func main() {
 					zap.String("error", r.Error),
 				)
 			}
+			syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
 		})
 		metricsSvc = service.NewMetricsService(snapshotRepo)
 	}
