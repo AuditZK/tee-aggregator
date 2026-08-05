@@ -288,6 +288,57 @@ func clearRebuildOptin(userUID, exchange, label string, apply bool) {
 	fmt.Printf("cleared: %d row\n", tag.RowsAffected())
 }
 
+// setDeposit writes a deposits value on ONE snapshot row — the admin remedy
+// for a funding event Binance records in no queryable ledger. 2026-08-05 case:
+// the MARGIN accountSnapshots jump ~+50k between Jul 9 and Jul 10 with flat
+// spot statements and zero rows across every flow ledger the rebuilder reads
+// (on-chain deposits/withdrawals, 14 universal-transfer types, sub-account
+// transfers, Simple Earn flexible+locked, RWUSD, Binance Pay). The money
+// provably entered (statement delta); only its trace is missing, so analytics
+// would read the day as +161% performance. The amount is the operator's
+// judgment — use the exact statement delta so the day flow-adjusts to ~0.
+// Dry-run by default. NOTE: any future rebuild upsert overwrites this value.
+func setDeposit(userUID, exchange, label, date string, amount float64, apply bool) {
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		fmt.Fprintf(os.Stderr, "bad -from: %v\n", err)
+		os.Exit(2)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, databaseURL())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	var equity, dep float64
+	var ts time.Time
+	err = pool.QueryRow(ctx, `
+		SELECT timestamp, "totalEquity", deposits FROM snapshot_data
+		WHERE "userUid"=$1 AND exchange=$2 AND label=$3 AND timestamp::date=$4::date`,
+		userUID, exchange, label, date).Scan(&ts, &equity, &dep)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "row lookup: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("row %s %s|%s: equity=%.2f deposits=%.2f -> deposits=%.2f\n",
+		ts.Format("2006-01-02"), exchange, label, equity, dep, amount)
+	if !apply {
+		fmt.Println("dry-run only — re-run with -apply to write")
+		return
+	}
+	tag, err := pool.Exec(ctx, `
+		UPDATE snapshot_data SET deposits=$5, "updatedAt"=now()
+		WHERE "userUid"=$1 AND exchange=$2 AND label=$3 AND timestamp::date=$4::date`,
+		userUID, exchange, label, date, amount)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "update: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("written: %d row\n", tag.RowsAffected())
+}
+
 // purgeHistory deletes every snapshot row of one connection strictly BEFORE
 // the cutoff date. Built for the 2026-08-04 case: a binance rebuild produced a
 // 90-day history whose level is ~29x below the live account value (partial
@@ -455,9 +506,10 @@ func main() {
 	exchange := flag.String("exchange", "ibkr", "exchange filter")
 	from := flag.String("from", "", "inclusive start date YYYY-MM-DD (required)")
 	to := flag.String("to", "", "exclusive end date YYYY-MM-DD (required)")
-	mode := flag.String("mode", "breakdown", "breakdown | tables | repair-weekends | sync-status-enum | latest-users | purge-history")
-	label := flag.String("label", "", "connection label (purge-history)")
-	apply := flag.Bool("apply", false, "repair-weekends/purge-history: actually write; default is dry-run")
+	mode := flag.String("mode", "breakdown", "breakdown | tables | repair-weekends | sync-status-enum | latest-users | purge-history | set-deposit")
+	label := flag.String("label", "", "connection label (purge-history, set-deposit)")
+	amount := flag.Float64("amount", 0, "set-deposit: deposit USD value to write on the row")
+	apply := flag.Bool("apply", false, "repair-weekends/purge-history/set-deposit: actually write; default is dry-run")
 	flag.Parse()
 
 	if *mode == "tables" {
@@ -490,6 +542,14 @@ func main() {
 			os.Exit(2)
 		}
 		purgeHistory(*userUID, *exchange, *label, *to, *apply)
+		return
+	}
+	if *mode == "set-deposit" {
+		if *userUID == "" || *label == "" || *from == "" || *amount == 0 {
+			fmt.Fprintln(os.Stderr, "set-deposit requires -user-uid, -exchange, -label, -from (row date) and -amount")
+			os.Exit(2)
+		}
+		setDeposit(*userUID, *exchange, *label, *from, *amount, *apply)
 		return
 	}
 
