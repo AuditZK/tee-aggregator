@@ -384,6 +384,13 @@ type SyncResult struct {
 	SnapshotTimestamp time.Time `json:"snapshot_timestamp"`
 	Error             string    `json:"error,omitempty"`
 
+	// CapabilityWarnings carries key-scope gaps the connector discovered
+	// while fetching the balance (connector.CapabilityWarner) — recorded in
+	// sync_statuses.errorMessage under a "warning:" prefix with status still
+	// "completed", mirrored to the frontend so the user is asked to widen
+	// the key instead of silently publishing a partial equity.
+	CapabilityWarnings []string `json:"capability_warnings,omitempty"`
+
 	// Skipped marks a sync that intentionally wrote nothing because the
 	// broker's freshest statement predates the last trading day — stamping it
 	// with today's date would fabricate a phantom snapshot (audit 2026-08-01).
@@ -790,6 +797,21 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 			s.logger.Debug("cashflow fetch failed (non-critical)",
 				zap.String("exchange", connMeta.Exchange),
 				zap.Error(err),
+			)
+		}
+	}
+
+	// 6bis. Key-scope gaps discovered during the balance fetch — forwarded
+	// through the sync status so the frontend can ask the user to widen the
+	// key (see connector.CapabilityWarner).
+	if cw, ok := conn.(connector.CapabilityWarner); ok {
+		if warns := cw.CapabilityWarnings(); len(warns) > 0 {
+			result.CapabilityWarnings = warns
+			s.logger.Warn("connector reported capability gaps",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.Strings("warnings", warns),
 			)
 		}
 	}
@@ -1485,6 +1507,14 @@ func (s *SyncService) recordSyncStatus(ctx context.Context, conn *repository.Exc
 		errMsg = "skipped_stale: " + result.SkipReason
 	case result.Success:
 		status = "completed"
+		// A successful sync can still carry key-scope warnings — recorded in
+		// errorMessage under a stable machine-readable prefix ("warning:")
+		// so the analytics mirror and the frontend can key off it without a
+		// schema change; status stays "completed" (the sync DID succeed on
+		// what the key covers).
+		if errMsg == "" && len(result.CapabilityWarnings) > 0 {
+			errMsg = "warning: " + strings.Join(result.CapabilityWarnings, ",")
+		}
 	}
 
 	record := &repository.SyncStatus{

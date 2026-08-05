@@ -111,6 +111,22 @@ type BalanceFreshnessProvider interface {
 	BalanceAsOf() time.Time
 }
 
+// CapabilityWarner is implemented by connectors that can discover, during a
+// balance fetch, that the stored API key cannot read part of the account —
+// e.g. a Binance key without the Futures scope answering -2015 on every fapi
+// endpoint while spot/margin read fine. The sync layer forwards the warnings
+// into sync_statuses (errorMessage, "warning:" prefix, status stays
+// completed) so the frontend can ask the user to widen the key instead of
+// silently publishing a partial equity (2026-08-05: a UM wallet moving ±15k
+// stayed invisible for a month; the live equity overstated the account by
+// the wallet's debt).
+type CapabilityWarner interface {
+	// CapabilityWarnings returns machine-readable markers (e.g.
+	// "futures_permission_missing") discovered by the LAST GetBalance call;
+	// empty when the key covers everything the connector tried to read.
+	CapabilityWarnings() []string
+}
+
 // FundingFee represents a single funding fee payment on a perpetual/swap position.
 type FundingFee struct {
 	Amount    float64   `json:"amount"`

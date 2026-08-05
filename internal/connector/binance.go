@@ -30,6 +30,11 @@ type Binance struct {
 	// GetBalance, served by GetBalanceByMarket without extra API calls (the
 	// midnight herd already rate-limits fapi; same pattern as IBKR).
 	cachedBreakdown []*MarketBalance
+	// capabilityWarnings carries key-scope gaps discovered by the last
+	// GetBalance (CapabilityWarner) — e.g. -2015 on every fapi endpoint
+	// while sapi reads fine means the key lacks the Futures scope and the
+	// UM wallet is invisible.
+	capabilityWarnings []string
 }
 
 // NewBinance creates a new Binance connector
@@ -130,12 +135,21 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	// silently dropping a wallet persisted snapshots $16k-$20k short, and a
 	// failed sync is a retry while a wrong snapshot is a lie on the curve.
 	var futures *Balance
+	b.capabilityWarnings = nil
 	if fut, ferr := b.getFuturesBalance(ctx); ferr == nil && fut != nil {
 		total.Equity += fut.Equity
 		total.UnrealizedPnL += fut.UnrealizedPnL
 		futures = fut
 	} else if errors.Is(ferr, ErrTransient) {
 		return nil, fmt.Errorf("futures balance: %w", ferr)
+	} else if ferr != nil && (strings.Contains(ferr.Error(), "-2015") || strings.Contains(ferr.Error(), "Invalid API-key")) {
+		// Permission-style refusal on the futures scope while the spot read
+		// above succeeded with the same key: the UM wallet may hold value
+		// (or debt) we cannot see. Not fatal — the sync proceeds on what the
+		// key does cover — but surfaced so the frontend can ask the user to
+		// tick "Enable Futures" on the key (2026-08-05: an invisible UM
+		// wallet moved ±15k and overstated the live equity by its debt).
+		b.capabilityWarnings = append(b.capabilityWarnings, "futures_permission_missing")
 	}
 
 	if eq, cerr := b.getCoinMFuturesEquity(ctx, priceMap); cerr == nil {
@@ -190,6 +204,12 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 // no additional API calls (the midnight herd already rate-limits fapi).
 func (b *Binance) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
 	return b.cachedBreakdown, nil
+}
+
+// CapabilityWarnings implements CapabilityWarner with the key-scope gaps
+// discovered by the last GetBalance call.
+func (b *Binance) CapabilityWarnings() []string {
+	return b.capabilityWarnings
 }
 
 func (b *Binance) getSpotBalance(ctx context.Context, priceMap map[string]float64) (*Balance, error) {
