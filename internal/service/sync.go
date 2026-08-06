@@ -1268,6 +1268,22 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	}
 	s.logger.Info("balance fetched", zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.Duration("elapsed", time.Since(start)))
 
+	// Key-scope gaps discovered during the balance fetch — same hook as
+	// syncConnection (the scheduler goes through THIS function, which is
+	// where the midnight herd actually detects a key that cannot read part
+	// of the account; see connector.CapabilityWarner).
+	if cw, ok := conn.(connector.CapabilityWarner); ok {
+		if warns := cw.CapabilityWarnings(); len(warns) > 0 {
+			result.CapabilityWarnings = warns
+			s.logger.Warn("connector reported capability gaps",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.Strings("warnings", warns),
+			)
+		}
+	}
+
 	// Same window semantics as syncConnection above: the snapshot lands at
 	// startOfDay (today 00:00 UTC), so we pull trades/cashflows from the
 	// preceding window — 24h normally, stretched back to the last snapshot
