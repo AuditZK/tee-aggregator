@@ -27,6 +27,19 @@ func NewBybit(creds *Credentials) *Bybit {
 	}
 }
 
+// NewBybitWithClient creates a Bybit connector using the provided HTTP client.
+// Used to route through the egress proxy: api.bybit.com sits behind CloudFront
+// with a country block that returns 403 to the enclave's region (verified
+// 2026-08-08) — reached directly, every call fails before authentication and
+// used to be misreported as bad credentials.
+func NewBybitWithClient(creds *Credentials, client *http.Client) *Bybit {
+	return &Bybit{
+		apiKey:    creds.APIKey,
+		apiSecret: creds.APISecret,
+		client:    client,
+	}
+}
+
 func (b *Bybit) Exchange() string {
 	return "bybit"
 }

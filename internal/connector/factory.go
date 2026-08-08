@@ -43,6 +43,11 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 		}
 		return NewBinance(creds), nil
 	case "bybit":
+		// Same geo-block family as Binance: CloudFront country-blocks the
+		// enclave's region (403 before auth). Proxy when configured.
+		if f.proxyCfg.ShouldProxy("bybit") {
+			return NewBybitWithClient(creds, f.proxyCfg.NewClient("bybit")), nil
+		}
 		return NewBybit(creds), nil
 	case "okx":
 		return NewOKX(creds), nil
