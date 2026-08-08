@@ -149,6 +149,12 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 					zap.Error(err),
 				)
 			}
+		} else if connector.IsIPRestriction(err) {
+			// Not a credential failure: the venue accepted the key and refused
+			// the source address. Saying "invalid credentials" here sends the
+			// holder off to regenerate a key that was never the problem, and
+			// the replacement fails identically.
+			return fmt.Errorf("%w: %w", connector.ErrIPRestricted, err)
 		} else {
 			return fmt.Errorf("invalid credentials: %w", err)
 		}
