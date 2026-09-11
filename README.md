@@ -202,10 +202,10 @@ Critical dependencies (included in TCB audit scope):
 | Module | Version | Purpose |
 |--------|---------|---------|
 | `github.com/jackc/pgx/v5` | 5.9.x | PostgreSQL driver (parameterized queries) |
-| `google.golang.org/grpc` | 1.79.x | gRPC implementation |
+| `google.golang.org/grpc` | 1.83.x | gRPC implementation |
 | `google.golang.org/protobuf` | 1.36.x | Protobuf runtime |
 | `go.uber.org/zap` | 1.26.x | Structured logging (redaction core) |
-| `golang.org/x/crypto` | 0.50.x | HKDF / ECIES primitives |
+| `golang.org/x/crypto` | 0.57.x | HKDF / ECIES primitives |
 
 JWT (HS256) and ECDSA-P256 report signing use the Go standard library only — no third-party JWT or crypto dependency. Total direct dependencies: 9 modules (`go.sum` pins exact hashes for all transitive deps).
 
