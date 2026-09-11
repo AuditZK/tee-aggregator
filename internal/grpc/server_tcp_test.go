@@ -3,6 +3,8 @@ package grpc
 import (
 	"context"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -137,5 +139,89 @@ func TestProcessSyncJob_TCPServiceUnavailableReturnsPayloadError(t *testing.T) {
 	}
 	if resp.Error == "" {
 		t.Fatalf("expected non-empty payload error when sync service unavailable")
+	}
+}
+
+const streamCapWait = 10 * time.Second
+
+func TestServer_ConcurrentStreamsCapped(t *testing.T) {
+	const calls = grpcMaxConcurrentStreams + 6
+
+	srv := NewServer(zap.NewNop(), Services{}, ServerOptions{})
+
+	var inFlight atomic.Int32
+	var once sync.Once
+	gate := make(chan struct{})
+	release := func() { once.Do(func() { close(gate) }) }
+
+	opts := append(srv.serverOptions(nil), gogrpc.ChainUnaryInterceptor(
+		func(ctx context.Context, req any, info *gogrpc.UnaryServerInfo, handler gogrpc.UnaryHandler) (any, error) {
+			inFlight.Add(1)
+			defer inFlight.Add(-1)
+			<-gate
+			return handler(ctx, req)
+		},
+	))
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on random tcp port: %v", err)
+	}
+	grpcServer := gogrpc.NewServer(opts...)
+	pb.RegisterEnclaveServiceServer(grpcServer, srv)
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+
+	conn, err := gogrpc.NewClient(
+		lis.Addr().String(),
+		gogrpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		grpcServer.Stop()
+		t.Fatalf("dial tcp grpc server: %v", err)
+	}
+
+	defer func() {
+		_ = conn.Close()
+		grpcServer.Stop()
+	}()
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*streamCapWait)
+	defer cancel()
+
+	client := pb.NewEnclaveServiceClient(conn)
+	errs := make(chan error, calls)
+	for range calls {
+		go func() {
+			_, err := client.HealthCheck(ctx, &pb.HealthCheckRequest{})
+			errs <- err
+		}()
+	}
+
+	deadline := time.Now().Add(streamCapWait)
+	for inFlight.Load() < grpcMaxConcurrentStreams {
+		if time.Now().After(deadline) {
+			t.Fatalf("handlers in flight = %d, want %d", inFlight.Load(), grpcMaxConcurrentStreams)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if got := inFlight.Load(); got != grpcMaxConcurrentStreams {
+		t.Fatalf("handlers in flight = %d, want %d", got, grpcMaxConcurrentStreams)
+	}
+
+	release()
+	for i := range calls {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("HealthCheck() error = %v", err)
+			}
+		case <-time.After(streamCapWait):
+			t.Fatalf("only %d of %d calls returned", i, calls)
+		}
 	}
 }
