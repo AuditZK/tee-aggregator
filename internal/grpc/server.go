@@ -43,6 +43,10 @@ const msgDatabaseNotConfigured = "database not configured"
 // enclave memory cheaply.
 const grpcMaxRecvMsgSize = 256 << 10
 
+// GRPC-002: grpc-go leaves streams per connection unlimited. A conforming
+// client queues past the cap instead of failing.
+const grpcMaxConcurrentStreams = 64
+
 // Server implements the protobuf EnclaveService.
 type Server struct {
 	pb.UnimplementedEnclaveServiceServer
@@ -125,20 +129,7 @@ func (s *Server) Start(port int, tlsConfig *tls.Config) error {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 
-	serverOpts := []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(s.authInterceptor, s.loggingInterceptor),
-		// GRPC-001: cap inbound message size at 256 KiB. The largest
-		// legitimate payload is the SignedReportRequest (a few date / flag
-		// fields) — REST applies a 64 KiB MaxBytesReader on the same
-		// surface; we leave a wider margin here for the metric / snapshot
-		// responses that flow back over the same gRPC connections.
-		grpc.MaxRecvMsgSize(grpcMaxRecvMsgSize),
-	}
-	if tlsConfig != nil {
-		serverOpts = append(serverOpts, grpc.Creds(credentials.NewTLS(tlsConfig)))
-	}
-
-	s.grpcServer = grpc.NewServer(serverOpts...)
+	s.grpcServer = grpc.NewServer(s.serverOptions(tlsConfig)...)
 	pb.RegisterEnclaveServiceServer(s.grpcServer, s)
 	// Reflection exposes the full service schema to anyone who can reach the
 	// port. Gate it on !production so dev/test tooling (grpcurl, Postman)
@@ -157,6 +148,23 @@ func (s *Server) Start(port int, tlsConfig *tls.Config) error {
 		zap.Bool("reflection", !s.isProduction()),
 	)
 	return s.grpcServer.Serve(lis)
+}
+
+func (s *Server) serverOptions(tlsConfig *tls.Config) []grpc.ServerOption {
+	opts := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(s.authInterceptor, s.loggingInterceptor),
+		// GRPC-001: cap inbound message size at 256 KiB. The largest
+		// legitimate payload is the SignedReportRequest (a few date / flag
+		// fields) — REST applies a 64 KiB MaxBytesReader on the same
+		// surface; we leave a wider margin here for the metric / snapshot
+		// responses that flow back over the same gRPC connections.
+		grpc.MaxRecvMsgSize(grpcMaxRecvMsgSize),
+		grpc.MaxConcurrentStreams(grpcMaxConcurrentStreams),
+	}
+	if tlsConfig != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConfig)))
+	}
+	return opts
 }
 
 // Stop gracefully stops the server.
