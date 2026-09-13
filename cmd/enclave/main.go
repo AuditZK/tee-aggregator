@@ -113,7 +113,7 @@ func main() {
 	defer logger.Sync()
 
 	logger.Info("starting enclave worker",
-		zap.String("version", "1.0.0-go"),
+		zap.String("version", "1.1.0-go"),
 		zap.String("env", cfg.Env),
 	)
 
