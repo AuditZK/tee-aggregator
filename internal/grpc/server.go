@@ -28,7 +28,7 @@ import (
 
 var startTime = time.Now()
 
-const version = "1.1.1-go"
+const version = "1.1.2-go"
 const genericInternalError = "Internal server error"
 
 // msgDatabaseNotConfigured is the canonical error string returned when an
@@ -811,6 +811,7 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 		ReportHash:         report.ReportHash,
 		EnclaveVersion:     report.EnclaveVersion,
 		EnclaveMode:        currentEnclaveMode(),
+		AnnualizationDays:  int32(report.AnnualizationDays),
 	}
 	resp.ExchangeDetails = mapExchangeDetails(report.ExchangeDetails, report.Exchanges)
 
