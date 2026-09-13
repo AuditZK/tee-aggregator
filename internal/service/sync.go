@@ -2502,8 +2502,14 @@ const reproductionTolerance = 0.001
 func contradictedDay(rebuilt, existing []*repository.Snapshot) (*repository.Snapshot, float64, bool) {
 	measured := make(map[time.Time]float64, len(existing))
 	for _, e := range existing {
-		if e.IsHistorical {
-			continue // reconstructed too — nothing independent to check against
+		if e.IsHistorical || e.FromExternalRebuilder {
+			// Reconstructed too — nothing independent to check against. The
+			// external rebuilder's rows carry from_external_rebuilder rather
+			// than is_historical; holding a fresh reconstruction to them
+			// rejected every rebuild that changed its own method (2026-09-13:
+			// the first mark-to-market pass on a bybit history was thrown out
+			// against the realized-only pass of the same morning).
+			continue
 		}
 		if e.TotalEquity <= 0 {
 			// A live row at zero is far more often a degenerate sync than a

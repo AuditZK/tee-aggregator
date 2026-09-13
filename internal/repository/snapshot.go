@@ -462,14 +462,23 @@ func (r *SnapshotRepo) getByUserAndDateRange(ctx context.Context, userUID string
 }
 
 func (r *SnapshotRepo) getByUserAndDateRangeTS(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
-	query := `
+	// The origin column exists on the TS schema too (migration 015 applied
+	// by hand on prod); without it every stored row reads as measured, and
+	// the reproduction gate then holds a fresh reconstruction to the rows
+	// the previous reconstruction wrote.
+	hasOrigin := r.hasFromExternalRebuilderColumn(ctx)
+	originCol := ""
+	if hasOrigin {
+		originCol = snapshotFromExternalRebuilderCol
+	}
+	query := fmt.Sprintf(`
 		SELECT id, "userUid", exchange, label, timestamp,
 			"totalEquity", "realizedBalance", "unrealizedPnL",
 			deposits, withdrawals,
-			breakdown_by_market, "createdAt"
+			breakdown_by_market, "createdAt"%s
 		FROM snapshot_data
 		WHERE "userUid" = $1 AND timestamp >= $2 AND timestamp <= $3
-		ORDER BY timestamp`
+		ORDER BY timestamp`, originCol)
 
 	rows, err := r.pool.Query(ctx, query, userUID, start, end)
 	if err != nil {
@@ -477,7 +486,7 @@ func (r *SnapshotRepo) getByUserAndDateRangeTS(ctx context.Context, userUID stri
 	}
 	defer rows.Close()
 
-	return r.scanSnapshotsTS(rows)
+	return r.scanSnapshotsTSOrigin(rows, hasOrigin)
 }
 
 // GetLatestByUser returns the most recent snapshot for a user
@@ -1087,18 +1096,28 @@ func (r *SnapshotRepo) scanSnapshots(rows pgx.Rows, hasLabel, hasHist bool) ([]*
 // rows predating the global aggregate), the totals fall back to zero, which
 // matches TS behaviour for those same rows.
 func (r *SnapshotRepo) scanSnapshotsTS(rows pgx.Rows) ([]*Snapshot, error) {
+	return r.scanSnapshotsTSOrigin(rows, false)
+}
+
+// scanSnapshotsTSOrigin scans the TS column list, plus from_external_rebuilder
+// as the last column when the query selected it.
+func (r *SnapshotRepo) scanSnapshotsTSOrigin(rows pgx.Rows, withOrigin bool) ([]*Snapshot, error) {
 	var snapshots []*Snapshot
 
 	for rows.Next() {
 		var s Snapshot
 		var breakdownJSON []byte
 
-		err := rows.Scan(
+		dest := []any{
 			&s.ID, &s.UserUID, &s.Exchange, &s.Label, &s.Timestamp,
 			&s.TotalEquity, &s.RealizedBalance, &s.UnrealizedPnL,
 			&s.Deposits, &s.Withdrawals,
 			&breakdownJSON, &s.CreatedAt,
-		)
+		}
+		if withOrigin {
+			dest = append(dest, &s.FromExternalRebuilder)
+		}
+		err := rows.Scan(dest...)
 		if err != nil {
 			return nil, err
 		}

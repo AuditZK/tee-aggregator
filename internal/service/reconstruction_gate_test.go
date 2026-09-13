@@ -136,3 +136,18 @@ func TestContradictedDay_FundedDayWitnessesAgainstAZeroRebuild(t *testing.T) {
 		t.Fatal("a reconstruction wiping a funded day to zero was accepted")
 	}
 }
+
+// The external rebuilder's rows carry from_external_rebuilder, not
+// is_historical. They are reconstructions too: a fresh pass that changes its
+// own method (mark-to-market where the previous pass published realized only)
+// must not be held to them. Measured 2026-09-13 on a bybit history: the first
+// per-leg pass was rejected against the realized-only pass of the same morning.
+func TestContradictedDay_IgnoresRowsTheExternalRebuilderWrote(t *testing.T) {
+	previous := &repository.Snapshot{Timestamp: day(2026, time.June, 20), TotalEquity: 11115.84, FromExternalRebuilder: true}
+	existing := []*repository.Snapshot{previous}
+	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.June, 20), 10862.86)}
+
+	if _, _, bad := contradictedDay(rebuilt, existing); bad {
+		t.Fatal("a reconstruction was held to a day the previous reconstruction wrote")
+	}
+}
