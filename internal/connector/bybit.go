@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -16,6 +17,10 @@ type Bybit struct {
 	apiKey    string
 	apiSecret string
 	client    *http.Client
+	baseURL   string
+
+	mu               sync.Mutex
+	cashflowWarnings []string
 }
 
 // NewBybit creates a new Bybit connector
@@ -24,6 +29,7 @@ func NewBybit(creds *Credentials) *Bybit {
 		apiKey:    creds.APIKey,
 		apiSecret: creds.APISecret,
 		client:    &http.Client{Timeout: 30 * time.Second},
+		baseURL:   bybitAPI,
 	}
 }
 
@@ -37,6 +43,7 @@ func NewBybitWithClient(creds *Credentials, client *http.Client) *Bybit {
 		apiKey:    creds.APIKey,
 		apiSecret: creds.APISecret,
 		client:    client,
+		baseURL:   bybitAPI,
 	}
 }
 
@@ -53,7 +60,7 @@ func (b *Bybit) doRequest(ctx context.Context, method, path, params string) ([]b
 		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 		signature := b.sign(timestamp, params)
 
-		url := bybitAPI + path
+		url := b.baseURL + path
 		if params != "" {
 			url += "?" + params
 		}
