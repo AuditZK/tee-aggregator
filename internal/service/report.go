@@ -410,7 +410,10 @@ func (s *ReportService) cacheReport(ctx context.Context, req *GenerateReportRequ
 // equity curve, the period start and the data-point count on a flat zero
 // line months before the first return. The series starts on the first day
 // whose equity across connections reaches minTWRBaseUSD, or that carries a
-// cash flow (the account's real inception). Interior runs are kept: an
+// cash flow of at least that much (the account's real inception). The flow
+// must be material: a rebuilt history books its first row's equity as an
+// inception deposit, so a dust first day carries a $0.0000969 "deposit"
+// that would otherwise pin the series on it. Interior runs are kept: an
 // account that blew up to dust and was refunded has a history, and the TWR
 // guards score those days. Snapshots must be sorted by timestamp.
 func dropLeadingDustDays(snapshots []*repository.Snapshot) []*repository.Snapshot {
@@ -424,7 +427,7 @@ func dropLeadingDustDays(snapshots []*repository.Snapshot) []*repository.Snapsho
 			flows += math.Abs(snapshots[j].Deposits) + math.Abs(snapshots[j].Withdrawals)
 			j++
 		}
-		if equity >= minTWRBaseUSD || flows > 0 {
+		if equity >= minTWRBaseUSD || flows >= minTWRBaseUSD {
 			break
 		}
 		i = j

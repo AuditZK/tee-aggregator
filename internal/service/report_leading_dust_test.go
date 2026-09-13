@@ -50,16 +50,18 @@ func TestDropLeadingDustDays_SumsConnectionsPerDay(t *testing.T) {
 	}
 }
 
-// A cash flow marks the account's real inception even if the close is dust.
-func TestDropLeadingDustDays_CashFlowIsInception(t *testing.T) {
+// A material cash flow marks the account's real inception even if the close
+// is still small; a dust inception deposit (a rebuilt first row booking its
+// own $0.0000969 as a deposit) does not.
+func TestDropLeadingDustDays_MaterialCashFlowIsInception(t *testing.T) {
 	snaps := []*repository.Snapshot{
-		dustDay("2026-01-01", "a", 0.0001, 0),
-		dustDay("2026-01-02", "a", 0.5, 0.5),
-		dustDay("2026-01-03", "a", 200, 199.5),
+		dustDay("2026-01-01", "a", 0.0000969, 0.0000969),
+		dustDay("2026-01-02", "a", 0.9, 5),
+		dustDay("2026-01-03", "a", 200, 199),
 	}
 	kept := dropLeadingDustDays(snaps)
 	if len(kept) != 2 || kept[0].Timestamp.Format("2006-01-02") != "2026-01-02" {
-		t.Fatalf("want the series to start on the deposit day, got %d from %v", len(kept), kept[0].Timestamp)
+		t.Fatalf("want the series to start on the material deposit day, got %d from %v", len(kept), kept[0].Timestamp)
 	}
 }
 
