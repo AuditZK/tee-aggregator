@@ -57,15 +57,18 @@ func (r *SignedReportRepo) Create(ctx context.Context, report *SignedReportRecor
 	).Scan(&report.ID)
 }
 
-// GetCached retrieves a cached report by user + period + benchmark
-func (r *SignedReportRepo) GetCached(ctx context.Context, userUID string, startDate, endDate time.Time, benchmark string) (*SignedReportRecord, error) {
+// GetCached retrieves a cached report by user + period + benchmark, produced
+// by the given enclave version. Reports signed by an older engine stay in
+// the table (they remain verifiable) but are never re-served: a metric fix
+// must not keep echoing the pre-fix numbers for a cached period.
+func (r *SignedReportRepo) GetCached(ctx context.Context, userUID string, startDate, endDate time.Time, benchmark, enclaveVersion string) (*SignedReportRecord, error) {
 	query := `
 		SELECT id, report_id, user_uid, start_date, end_date, benchmark, report_data, signature, report_hash, enclave_version, created_at
 		FROM signed_reports
-		WHERE user_uid = $1 AND start_date = $2 AND end_date = $3 AND benchmark = $4`
+		WHERE user_uid = $1 AND start_date = $2 AND end_date = $3 AND benchmark = $4 AND enclave_version = $5`
 
 	var report SignedReportRecord
-	err := r.pool.QueryRow(ctx, query, userUID, startDate, endDate, benchmark).Scan(
+	err := r.pool.QueryRow(ctx, query, userUID, startDate, endDate, benchmark, enclaveVersion).Scan(
 		&report.ID, &report.ReportID, &report.UserUID, &report.StartDate, &report.EndDate,
 		&report.Benchmark, &report.ReportData, &report.Signature, &report.ReportHash,
 		&report.EnclaveVersion, &report.CreatedAt,

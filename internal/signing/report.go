@@ -22,7 +22,7 @@ import (
 
 const (
 	SignatureAlgorithm = "ECDSA-P256-SHA256"
-	EnclaveVersion     = "1.0.0-go"
+	EnclaveVersion     = "1.1.0-go"
 	// PayloadVersion bumps whenever the signed payload shape changes.
 	// 1.0 = original (metrics + returns only)
 	// 1.1 = adds enclaveAttestation {measurement, reportData, platform, attested}

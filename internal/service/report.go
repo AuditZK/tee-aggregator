@@ -17,6 +17,16 @@ import (
 
 const tradingDaysPerYear = 252
 
+// Daily TWR scoring guards, mirrored from the analytics daily aggregation
+// (MIN_TWR_BASE_USD / FLOW_DOMINANCE_RATIO) so signed reports and the
+// dashboard score the same days the same way. A day whose base is below
+// minTWRBaseUSD, or whose gross cash flows exceed flowDominanceRatio × base,
+// is not scored (0%).
+const (
+	minTWRBaseUSD      = 1.0
+	flowDominanceRatio = 10.0
+)
+
 // ReportService generates signed performance reports.
 type ReportService struct {
 	metricsSvc       *MetricsService
@@ -331,7 +341,7 @@ func (s *ReportService) checkReportCache(ctx context.Context, req *GenerateRepor
 		return nil
 	}
 
-	cached, err := s.signedReportRepo.GetCached(ctx, req.UserUID, req.StartDate, req.EndDate, req.Benchmark)
+	cached, err := s.signedReportRepo.GetCached(ctx, req.UserUID, req.StartDate, req.EndDate, req.Benchmark, signing.EnclaveVersion)
 	if err != nil {
 		if !errors.Is(err, repository.ErrNotFound) && s.logger != nil {
 			s.logger.Warn("report cache lookup failed", zap.Error(err))
@@ -463,6 +473,9 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 
 		// Calculate current total, handling new exchanges as virtual deposits
 		totalCurrentEquity := 0.0
+		closeEquity := 0.0
+		dayDeposits := 0.0
+		dayWithdrawals := 0.0
 		virtualDeposits := 0.0
 
 		for ex, lastEq := range knownExchanges {
@@ -470,10 +483,14 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 				// Exchange has data today
 				adjustedEquity := snap.TotalEquity - snap.Deposits + snap.Withdrawals
 				totalCurrentEquity += adjustedEquity
+				closeEquity += snap.TotalEquity
+				dayDeposits += math.Abs(snap.Deposits)
+				dayWithdrawals += math.Abs(snap.Withdrawals)
 				knownExchanges[ex] = snap.TotalEquity
 			} else {
 				// Forward-fill: use last known equity
 				totalCurrentEquity += lastEq
+				closeEquity += lastEq
 			}
 		}
 
@@ -482,16 +499,35 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 			if _, known := knownExchanges[ex]; !known {
 				// New connection - treat as virtual deposit.
 				virtualDeposits += snap.TotalEquity
+				closeEquity += snap.TotalEquity
 				knownExchanges[ex] = snap.TotalEquity
 			}
 		}
 
 		// TWR: adjust denominator for virtual deposits
 		adjustedPrev := totalPrevEquity + virtualDeposits
+		netFlow := dayDeposits - dayWithdrawals
 
+		// Same scoring rules as the analytics daily aggregation, so a signed
+		// report and the dashboard agree on every day:
+		//   - a net inflow that accounts for the whole close is an account
+		//     (re)start, not a return — baseline reset, 0%;
+		//   - a base below minTWRBaseUSD, or gross flows dwarfing the base,
+		//     cannot attribute performance at daily granularity — 0%. A
+		//     stablecoin-dust base ($0.0001) followed by the first funding
+		//     otherwise scores the funding day at +10^8 %;
+		//   - otherwise Modified Dietz: money deposited during the day was at
+		//     risk that day, so it belongs in the base. The open-only base
+		//     turns "deposit 67 onto 201 and blow the lot" into -133%, which
+		//     pins the compounded series at -100% forever.
 		var dayReturn float64
-		if adjustedPrev > 0 {
-			dayReturn = (totalCurrentEquity + virtualDeposits - adjustedPrev) / adjustedPrev
+		switch {
+		case netFlow > 0 && netFlow >= closeEquity:
+			dayReturn = 0
+		case adjustedPrev >= minTWRBaseUSD && dayDeposits+dayWithdrawals <= flowDominanceRatio*adjustedPrev:
+			dayReturn = (totalCurrentEquity + virtualDeposits - adjustedPrev) / (adjustedPrev + dayDeposits)
+		default:
+			dayReturn = 0
 		}
 
 		cumulativeReturn = (1+cumulativeReturn)*(1+dayReturn) - 1
