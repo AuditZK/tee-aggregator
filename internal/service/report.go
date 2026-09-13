@@ -327,6 +327,22 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 
 const dateFormat = "2006-01-02"
 
+// cacheIsFresh reports whether a report signed at cachedAt still describes the
+// snapshots it was computed from. The cache key is the period, not the data:
+// a rebuild that rewrites the history under a signed period leaves the cached
+// report serving numbers the snapshots no longer support, forever. Until this
+// gate existed the only way out was to bump signing.EnclaveVersion, which
+// invalidates every user's cache to fix one user's period.
+//
+// A zero latestSnapshotChange means the schema carries no write stamp to read;
+// there is nothing to compare, so the cache is served as before.
+func cacheIsFresh(cachedAt, latestSnapshotChange time.Time) bool {
+	if latestSnapshotChange.IsZero() {
+		return true
+	}
+	return !latestSnapshotChange.After(cachedAt)
+}
+
 // checkReportCache looks for a cached report matching user + dates + benchmark.
 func (s *ReportService) checkReportCache(ctx context.Context, req *GenerateReportRequest) *signing.SignedReport {
 	if s.signedReportRepo == nil {
@@ -348,6 +364,23 @@ func (s *ReportService) checkReportCache(ctx context.Context, req *GenerateRepor
 			s.logger.Warn("report cache lookup failed", zap.Error(err))
 		}
 		return nil
+	}
+
+	if s.snapshotRepo != nil {
+		latestChange, err := s.snapshotRepo.GetLatestSnapshotChange(ctx, req.UserUID, req.StartDate, req.EndDate)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("snapshot freshness lookup failed", zap.Error(err))
+			}
+			return nil
+		}
+		if !cacheIsFresh(cached.CreatedAt, latestChange) {
+			if s.logger != nil {
+				s.logger.Info("signed report cache bypassed: snapshots changed since it was signed",
+					zap.String("user_uid", req.UserUID))
+			}
+			return nil
+		}
 	}
 
 	var report signing.SignedReport

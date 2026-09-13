@@ -170,6 +170,7 @@ type SnapshotRepo struct {
 	hasIsHistoricalCol          bool // Go schema only; TS Prisma never has it
 	hasFromExternalRebuilderCol bool // Go schema only (migration 015)
 	isTSSchema                  bool // true = TS Prisma camelCase columns
+	changeStampExpr             string
 }
 
 // NewSnapshotRepo creates a new snapshot repository
@@ -355,6 +356,75 @@ func (r *SnapshotRepo) GetExternalRebuilderDays(ctx context.Context, userUID str
 		out[time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)] = struct{}{}
 	}
 	return out, rows.Err()
+}
+
+// GetLatestSnapshotChange returns the most recent moment at which one of the
+// user's snapshots dated in [start, end] was written. A zero time means the
+// window holds no snapshot, or the schema carries no write stamp to read —
+// callers must treat it as "unknown", not as "never written".
+//
+// A signed report is cached against the period it covers, never against the
+// rows it was computed from. A history rebuild rewrites those rows under it
+// (a Bybit history moving from realized-only to mark-to-market took a period
+// from 54% to 43.7% total return, and its max drawdown from 5.5% to 9.9%),
+// and the cache then keeps serving numbers the data no longer supports. This
+// is the stamp the report cache compares against to notice that.
+//
+// The Go schema has no updated_at and its snapshot upsert leaves created_at
+// alone on conflict, so there this dates each row's first write: a rebuild
+// that overwrites rows in place is invisible. The TS schema, which production
+// runs, refreshes "updatedAt" on every upsert and has no such hole.
+func (r *SnapshotRepo) GetLatestSnapshotChange(ctx context.Context, userUID string, start, end time.Time) (time.Time, error) {
+	r.hasLabelColumn(ctx) // primes capabilitiesLoaded
+	r.capMu.Lock()
+	stamp := r.changeStampExpr
+	isTS := r.isTSSchema
+	r.capMu.Unlock()
+
+	if stamp == "" {
+		return time.Time{}, nil
+	}
+
+	userCol := "user_uid"
+	if isTS {
+		userCol = `"userUid"`
+	}
+
+	query := fmt.Sprintf(`
+		SELECT MAX(%s)
+		FROM snapshot_data
+		WHERE %s = $1 AND timestamp >= $2 AND timestamp <= $3`, stamp, userCol)
+
+	var latest *time.Time
+	if err := r.pool.QueryRow(ctx, query, userUID, start, end).Scan(&latest); err != nil {
+		return time.Time{}, fmt.Errorf("read latest snapshot change: %w", err)
+	}
+	if latest == nil {
+		return time.Time{}, nil
+	}
+	return latest.UTC(), nil
+}
+
+// snapshotChangeStampExpr builds the SQL expression dating a snapshot row's
+// last write, for whichever of the two stamp columns the schema actually has.
+// Empty means the schema carries neither. The COALESCE covers rows written
+// before a nullable "updatedAt" was populated; the stamp never runs backwards
+// because every writer sets both to the same instant on insert.
+func snapshotChangeStampExpr(isTS, hasUpdated, hasCreated bool) string {
+	updated, created := "updated_at", "created_at"
+	if isTS {
+		updated, created = `"updatedAt"`, `"createdAt"`
+	}
+	switch {
+	case hasUpdated && hasCreated:
+		return "COALESCE(" + updated + ", " + created + ")"
+	case hasUpdated:
+		return updated
+	case hasCreated:
+		return created
+	default:
+		return ""
+	}
 }
 
 // ErrOriginUnavailable is returned when an operation needs to tell rebuilt
@@ -1193,6 +1263,14 @@ func (r *SnapshotRepo) hasLabelColumn(ctx context.Context) bool {
 			r.hasFromExternalRebuilderCol = originExists
 		}
 	}
+
+	updatedName, createdName := "updated_at", "created_at"
+	if tsSchema {
+		updatedName, createdName = "updatedAt", "createdAt"
+	}
+	updatedExists, _ := r.columnExists(ctx, "snapshot_data", updatedName)
+	createdExists, _ := r.columnExists(ctx, "snapshot_data", createdName)
+	r.changeStampExpr = snapshotChangeStampExpr(tsSchema, updatedExists, createdExists)
 
 	r.capabilitiesLoaded = true
 	return r.hasLabelCol
