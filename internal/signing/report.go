@@ -22,7 +22,22 @@ import (
 
 const (
 	SignatureAlgorithm = "ECDSA-P256-SHA256"
-	EnclaveVersion     = "1.1.1-go"
+	EnclaveVersion     = "1.1.2-go"
+
+	// AnnualizationDays is the one year length every annualised figure the
+	// enclave produces is computed on: volatility, Sharpe, Sortino and the
+	// annualized return in internal/service/metrics.go, and the benchmark
+	// comparisons (alpha, tracking error, information ratio) in
+	// internal/service/benchmark.go. Snapshots are taken 7/7, so every
+	// observation is a calendar day and a year is 365 of them — the same
+	// basis as the analytics service, or the signed report and the dashboard
+	// would disagree on every ratio. An equity-market 252-day year describes
+	// a market that closes at weekends; this data has no weekends.
+	//
+	// Reports carry it as annualization_days so a reader never has to guess
+	// which convention produced the numbers in front of them.
+	AnnualizationDays = 365
+
 	// PayloadVersion bumps whenever the signed payload shape changes.
 	// 1.0 = original (metrics + returns only)
 	// 1.1 = adds enclaveAttestation {measurement, reportData, platform, attested}
@@ -350,6 +365,12 @@ type SignedReport struct {
 	PeriodStart string `json:"period_start"`
 	PeriodEnd   string `json:"period_end"`
 
+	// AnnualizationDays is the year length behind every annualised figure
+	// below and in benchmark_metrics (see the package constant). Stated
+	// rather than assumed: report-service passes it through so the reader of
+	// a Sharpe or an alpha knows the basis it was computed on.
+	AnnualizationDays int `json:"annualization_days"`
+
 	// Metrics
 	TotalReturn      float64 `json:"total_return"`
 	AnnualizedReturn float64 `json:"annualized_return"`
@@ -408,6 +429,7 @@ func (s *ReportSigner) Sign(input *ReportInput) (*SignedReport, error) {
 		GeneratedAt:        formatISO8601(time.Now().UTC()),
 		PeriodStart:        formatISO8601(input.PeriodStart),
 		PeriodEnd:          formatISO8601(input.PeriodEnd),
+		AnnualizationDays:  AnnualizationDays,
 		TotalReturn:        input.TotalReturn,
 		AnnualizedReturn:   input.AnnualizedReturn,
 		Annualized:         input.Annualized,

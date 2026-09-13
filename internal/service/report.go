@@ -15,8 +15,6 @@ import (
 	"go.uber.org/zap"
 )
 
-const tradingDaysPerYear = 252
-
 // Daily TWR scoring guards, mirrored from the analytics daily aggregation
 // (MIN_TWR_BASE_USD / FLOW_DOMINANCE_RATIO) so signed reports and the
 // dashboard score the same days the same way. A day whose base is below

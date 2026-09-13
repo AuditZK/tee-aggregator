@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/trackrecord/enclave/internal/repository"
+	"github.com/trackrecord/enclave/internal/signing"
 )
 
 // PerformanceMetrics holds calculated performance metrics
@@ -50,7 +51,13 @@ type PerformanceMetrics struct {
 // Every daily figure here is a calendar-day observation (snapshots are taken
 // 7/7), so a year is 365 of them — the same basis as the analytics service,
 // or the signed report and the dashboard would disagree on every ratio.
-const daysPerYear = 365.0
+//
+// There is exactly one definition of that year length in the enclave,
+// signing.AnnualizationDays, and the signed report declares it to its reader
+// as annualization_days. Everything that annualises — this file and the
+// benchmark comparisons in benchmark.go — scales by it, so the report can
+// never print a Sharpe on one year and an alpha on another.
+const daysPerYear = float64(signing.AnnualizationDays)
 
 // MetricsService calculates performance metrics from snapshots
 type MetricsService struct {

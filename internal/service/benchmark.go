@@ -118,9 +118,16 @@ func (s *BenchmarkService) CalculateFromSeries(portfolioReturns, benchReturns []
 		beta = covPB / varB
 	}
 
+	// Every annualisation below scales by daysPerYear (365), the basis the
+	// rest of the enclave uses and the one the signed report declares as
+	// annualization_days. Alpha, tracking error and the information ratio
+	// used to run on a 252-day equity-market year while the volatility and
+	// Sharpe printed beside them ran on 365, which made the two halves of a
+	// Pro report incomparable.
+
 	// Alpha (annualized) = annualized(P) - Beta * annualized(B)
-	annP := pMean * tradingDaysPerYear
-	annB := bMean * tradingDaysPerYear
+	annP := pMean * daysPerYear
+	annB := bMean * daysPerYear
 	alpha := annP - beta*annB
 
 	// Tracking Error = StdDev(P - B) annualized
@@ -128,14 +135,14 @@ func (s *BenchmarkService) CalculateFromSeries(portfolioReturns, benchReturns []
 	for i := 0; i < n; i++ {
 		excessReturns[i] = pReturns[i] - bReturns[i]
 	}
-	te := stddev(excessReturns) * math.Sqrt(tradingDaysPerYear)
+	te := stddev(excessReturns) * math.Sqrt(daysPerYear)
 
-	// Information Ratio = Mean(excess) / StdDev(excess) * sqrt(252).
-	// (Equivalent to Mean(excess)*sqrt(252) / StdDev(excess)*sqrt(252) with
-	// the two sqrt(252) factors cancelled.)
+	// Information Ratio = Mean(excess) / StdDev(excess) * sqrt(365).
+	// (Equivalent to Mean(excess)*sqrt(365) / StdDev(excess)*sqrt(365) with
+	// the two sqrt(365) factors cancelled.)
 	ir := 0.0
 	if te > 0 {
-		ir = mean(excessReturns) / stddev(excessReturns) * math.Sqrt(tradingDaysPerYear)
+		ir = mean(excessReturns) / stddev(excessReturns) * math.Sqrt(daysPerYear)
 	}
 
 	// Correlation = Cov(P, B) / (StdDev(P) * StdDev(B))

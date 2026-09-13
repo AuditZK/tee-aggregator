@@ -308,6 +308,13 @@ message SignedReportResponse {
   // the audited source code. Empty string when the enclave runs in
   // non-SEV-SNP (dev) mode.
   string measurement = 83;
+
+  // Year length every annualised figure in this response was computed on:
+  // annualized_return, volatility, sharpe_ratio, sortino_ratio, alpha,
+  // tracking_error and information_ratio. 365 — snapshots are taken 7/7, so
+  // every observation is a calendar day. Stated rather than assumed, so a
+  // consumer never has to guess between a 365-day and a 252-day year.
+  int32 annualization_days = 91;
 }
 
 // Exchange info with KYC and paper status

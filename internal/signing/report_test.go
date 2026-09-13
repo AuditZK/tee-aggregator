@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -400,5 +401,47 @@ func TestVerify_NoAlgorithmConfusion(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("Verify must return a decode error, not nil")
+	}
+}
+
+// A reader of a signed report must be able to tell which year length produced
+// its Sharpe, its volatility and its alpha, instead of inferring one. The
+// enclave annualises on 365 calendar days (snapshots are taken 7/7) and says
+// so in the serialized report, under the exact key report-service reads.
+func TestSign_SerializedReportCarriesAnnualizationDays(t *testing.T) {
+	if AnnualizationDays != 365 {
+		t.Fatalf("AnnualizationDays = %d, want 365 calendar days", AnnualizationDays)
+	}
+
+	report, err := MustNewReportSignerGenerate().Sign(&ReportInput{
+		UserUID:     "user_abc1234567890",
+		ReportName:  "Basis Report",
+		PeriodStart: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		PeriodEnd:   time.Date(2025, 12, 31, 0, 0, 0, 0, time.UTC),
+		TotalReturn: 0.25,
+		DataPoints:  365,
+	})
+	if err != nil {
+		t.Fatalf("Sign() error = %v", err)
+	}
+
+	if report.AnnualizationDays != 365 {
+		t.Fatalf("report.AnnualizationDays = %d, want 365", report.AnnualizationDays)
+	}
+
+	raw, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal report: %v", err)
+	}
+	got, ok := decoded["annualization_days"]
+	if !ok {
+		t.Fatalf("serialized report has no annualization_days key: %s", raw)
+	}
+	if n, isNum := got.(float64); !isNum || n != 365 {
+		t.Fatalf("annualization_days = %v, want 365", got)
 	}
 }
