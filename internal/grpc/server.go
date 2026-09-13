@@ -28,7 +28,7 @@ import (
 
 var startTime = time.Now()
 
-const version = "1.1.0-go"
+const version = "1.1.1-go"
 const genericInternalError = "Internal server error"
 
 // msgDatabaseNotConfigured is the canonical error string returned when an
