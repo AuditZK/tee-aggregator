@@ -431,3 +431,122 @@ func TestRenamedReportFailsVerification(t *testing.T) {
 		t.Fatal("a renamed report still verified — reportName is outside the signature")
 	}
 }
+
+// TestAnnualizationDaysInPayload pins the PayloadVersion-gated behaviour of
+// metrics.annualizationDays. Same contract as riskFreeRate at 1.4:
+//
+//   - Pre-1.7 reports carry no annualizationDays in the signed metrics block,
+//     so VerifyReport on already-issued reports still reproduces their hash.
+//   - 1.7+ reports always emit the key, so a verifier can read the year
+//     length that produced the ratios instead of assuming one.
+func TestAnnualizationDaysInPayload(t *testing.T) {
+	cases := []struct {
+		name           string
+		payloadVersion string
+		wantKey        bool
+	}{
+		{name: "legacy_1.6", payloadVersion: "1.6", wantKey: false},
+		{name: "current_1.7", payloadVersion: "1.7", wantKey: true},
+		{name: "empty_version_treated_as_legacy", payloadVersion: "", wantKey: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			report := &SignedReport{PayloadVersion: tc.payloadVersion, AnnualizationDays: AnnualizationDays}
+			payload := buildFinancialPayload(report)
+			metrics := payload["metrics"].(map[string]any)
+			days, hasKey := metrics["annualizationDays"]
+			if hasKey != tc.wantKey {
+				t.Errorf("payloadVersion=%q: annualizationDays present=%v, want=%v", tc.payloadVersion, hasKey, tc.wantKey)
+			}
+			if tc.wantKey && days != 365 {
+				t.Errorf("annualizationDays = %v, want 365", days)
+			}
+		})
+	}
+}
+
+// TestAnnualizationDaysSignAndVerifyRoundtrip pins the signature invariant
+// for 1.7 reports. Relabelling the basis rescales every signed ratio by
+// sqrt(365/252) ~= 1.2 without changing a single number on the page, so it
+// must invalidate the signature.
+func TestAnnualizationDaysSignAndVerifyRoundtrip(t *testing.T) {
+	signer := MustNewReportSignerGenerate()
+	report, err := signer.Sign(&ReportInput{
+		UserUID:      "u",
+		ReportName:   "r",
+		PeriodStart:  time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		PeriodEnd:    time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC),
+		DataPoints:   2,
+		BaseCurrency: "USD",
+		SharpeRatio:  1.1,
+		Volatility:   0.22,
+		BenchmarkMetrics: &BenchmarkMetrics{
+			BenchmarkName: "SPY", Alpha: 0.05, Beta: 1.1,
+			InformationRatio: 0.8, TrackingError: 0.04, Correlation: 0.9,
+		},
+	})
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if report.PayloadVersion != "1.7" {
+		t.Fatalf("new reports must be issued at payload 1.7, got %q", report.PayloadVersion)
+	}
+	if report.AnnualizationDays != 365 {
+		t.Fatalf("annualization_days = %d, want 365", report.AnnualizationDays)
+	}
+
+	ok, err := VerifyReport(report)
+	if err != nil || !ok {
+		t.Fatalf("verify untampered 1.7 report: ok=%v err=%v", ok, err)
+	}
+
+	// Tamper: relabel the basis as the 252-day equity-market year.
+	report.AnnualizationDays = 252
+	ok, err = VerifyReport(report)
+	if err != nil {
+		t.Fatalf("verify tampered report errored unexpectedly: %v", err)
+	}
+	if ok {
+		t.Fatal("a report whose declared annualization basis was swapped to 252 still verified")
+	}
+}
+
+// legacyReport16JSON is a report actually issued at PayloadVersion 1.6,
+// captured before annualizationDays entered the signed payload. It carries no
+// annualization_days key at all, exactly like every report already stored in
+// signed_reports. The bytes are frozen: if the pre-1.7 canonical shape ever
+// drifts, this stops verifying and the reports in the database go with it.
+const legacyReport16JSON = `{"report_id":"92418d52-7a78-49dd-ba01-526ea5e538d8","user_uid":"user_legacy_16","report_name":"Legacy 1.6 report","generated_at":"2026-09-13T20:12:05.891Z","period_start":"2025-01-01T00:00:00.000Z","period_end":"2025-12-31T00:00:00.000Z","total_return":0.42,"annualized_return":0.31,"annualized":true,"period_days":364,"sharpe_ratio":1.5,"sortino_ratio":2.1,"calmar_ratio":0.9,"max_drawdown":-0.18,"volatility":0.22,"win_rate":0.6,"profit_factor":1.8,"data_points":3,"base_currency":"USD","benchmark":"SPY","risk_free_rate":2.5,"exchanges":["binance","ibkr"],"exchange_details":[{"name":"binance","kyc_level":"basic","is_paper":false},{"name":"ibkr","kyc_level":"advanced","is_paper":false}],"daily_returns":[{"date":"2025-01-02","net_return":0.01,"benchmark_return":0.004,"outperformance":0.006,"cumulative_return":0.01,"nav":101,"verifiability_class":"live"},{"date":"2025-01-03","net_return":-0.005,"benchmark_return":0.001,"outperformance":-0.006,"cumulative_return":0.005,"nav":100.5,"verifiability_class":"rebuilder-service"}],"monthly_returns":[{"date":"2025-01","net_return":0.05,"benchmark_return":0.02,"outperformance":0.03,"aum":100.5}],"risk_metrics":{"var_95":-0.02,"var_99":-0.04,"expected_shortfall":-0.05,"skewness":-0.3,"kurtosis":3.5},"drawdown_data":{"current_drawdown":-0.05,"max_drawdown_duration":12,"periods":[{"start_date":"2025-02-10","end_date":"2025-02-22","depth":-0.18,"duration":12,"recovered":true}]},"benchmark_metrics":{"benchmark_name":"SPY","benchmark_return":0.1,"alpha":0.05,"beta":1.1,"information_ratio":0.8,"tracking_error":0.04,"correlation":0.9},"enclave_attestation":{"measurement":"9f1c2b","report_data":"deadbeef","platform":"sev-snp","attested":true,"report_data_bound_to_request":true,"vcek_verified":true},"signature":"MEUCIQDS8asS5gEq8xf+EO5Wzzyxl0Ik5+G6d/dwlm50T7ILjwIgcGNhtEOCCYOKzlCFsQ9ha9qLXdOpjZkdIOtnXZZwLeI=","public_key":"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEdwV6CVHxHqMWXzcKTH4BX/4pp8Ru+5DmXnQbmsYHXAJZvxm9W/F4xKgA+6q2jXllTRAzUbmuNpLjpgKNUzYfOA==","signature_algorithm":"ECDSA-P256-SHA256","report_hash":"8683a6700b004253ac9f6aa26b9b7b780a853859f12747e2a0366d0a7d1b1efe","enclave_version":"1.1.2-go","payload_version":"1.6"}`
+
+// A report issued at 1.6 must keep verifying byte-for-byte after 1.7 adds a
+// field to the payload — that is the entire point of the legacy gate.
+func TestLegacy16ReportStillVerifiesUnderPayload17(t *testing.T) {
+	var report SignedReport
+	if err := json.Unmarshal([]byte(legacyReport16JSON), &report); err != nil {
+		t.Fatalf("unmarshal legacy fixture: %v", err)
+	}
+	if report.PayloadVersion != "1.6" {
+		t.Fatalf("fixture payload_version = %q, want 1.6", report.PayloadVersion)
+	}
+	// A pre-1.7 report has no basis field, so it decodes to the zero value.
+	// The gate must ignore it rather than sign a 0 into the payload.
+	if report.AnnualizationDays != 0 {
+		t.Fatalf("legacy fixture carries annualization_days = %d, want it absent", report.AnnualizationDays)
+	}
+
+	ok, err := VerifyReport(&report)
+	if err != nil {
+		t.Fatalf("verify legacy 1.6 report: %v", err)
+	}
+	if !ok {
+		t.Fatal("a report issued at payload 1.6 no longer verifies — the 1.7 gate does not reproduce the old canonical shape")
+	}
+
+	// And the gate is keyed on the report's own version, not on the package
+	// constant: the legacy report's payload must still omit the key.
+	metrics := buildFinancialPayload(&report)["metrics"].(map[string]any)
+	if _, present := metrics["annualizationDays"]; present {
+		t.Fatal("the 1.6 canonical payload gained an annualizationDays key")
+	}
+}
