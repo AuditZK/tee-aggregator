@@ -178,6 +178,7 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 	})
 
 	// 2. Convert to daily returns (TWR with multi-exchange support)
+	snapshots = dropLeadingDustDays(snapshots)
 	dailyReturns := convertSnapshotsToDailyReturns(snapshots)
 
 	// 2b. Enrich daily returns with the benchmark series (same decimal unit
@@ -399,6 +400,39 @@ func (s *ReportService) cacheReport(ctx context.Context, req *GenerateReportRequ
 			s.logger.Warn("report cache store failed", zap.Error(err))
 		}
 	}
+}
+
+// dropLeadingDustDays removes the run of days that precede the first
+// material equity. A history rebuilder that carries today's balances
+// backwards projects a stablecoin-dust residue ($0.0000969) over every day
+// before the account was funded; those days hold no capital, no trades and
+// no flows, and nothing can be measured on them. Keeping them anchors the
+// equity curve, the period start and the data-point count on a flat zero
+// line months before the first return. The series starts on the first day
+// whose equity across connections reaches minTWRBaseUSD, or that carries a
+// cash flow of at least that much (the account's real inception). The flow
+// must be material: a rebuilt history books its first row's equity as an
+// inception deposit, so a dust first day carries a $0.0000969 "deposit"
+// that would otherwise pin the series on it. Interior runs are kept: an
+// account that blew up to dust and was refunded has a history, and the TWR
+// guards score those days. Snapshots must be sorted by timestamp.
+func dropLeadingDustDays(snapshots []*repository.Snapshot) []*repository.Snapshot {
+	i := 0
+	for i < len(snapshots) {
+		day := snapshots[i].Timestamp.Format("2006-01-02")
+		equity, flows := 0.0, 0.0
+		j := i
+		for j < len(snapshots) && snapshots[j].Timestamp.Format("2006-01-02") == day {
+			equity += snapshots[j].TotalEquity
+			flows += math.Abs(snapshots[j].Deposits) + math.Abs(snapshots[j].Withdrawals)
+			j++
+		}
+		if equity >= minTWRBaseUSD || flows >= minTWRBaseUSD {
+			break
+		}
+		i = j
+	}
+	return snapshots[i:]
 }
 
 // convertSnapshotsToDailyReturns implements TWR with multi-connection support.
