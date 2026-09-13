@@ -116,6 +116,7 @@ func (s *MetricsService) calculateFromSnapshots(snapshots []*repository.Snapshot
 	})
 
 	// Use report-aligned TWR conversion to handle multi-exchange snapshots.
+	snapshots = dropLeadingDustDays(snapshots)
 	dailyReturns := convertSnapshotsToDailyReturns(snapshots)
 	if len(dailyReturns) == 0 {
 		return nil, errors.New("insufficient data: need at least 2 daily data points")
