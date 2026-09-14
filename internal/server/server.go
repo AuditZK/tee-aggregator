@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/trackrecord/enclave/internal/auth"
 	"github.com/trackrecord/enclave/internal/config"
+	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/service"
 	"github.com/trackrecord/enclave/internal/validation"
 	"go.uber.org/zap"
 )
@@ -40,6 +43,11 @@ type Server struct {
 	// jwtExpectedIssuer pins the `iss` claim on inbound JWTs when non-empty
 	// (AUTH-002 follow-up). Mirrors the gRPC interceptor.
 	jwtExpectedIssuer string
+
+	// probeSvc overrides the balance prober used by the admin probe endpoint.
+	// Nil in production, where the endpoint goes through the sync service that
+	// already holds the DEK; set by tests, which have no enclave to unwrap.
+	probeSvc balanceProbeRunner
 
 	// handoffHandler, when non-nil, exposes the B2 handoff endpoint
 	// at POST /api/v1/admin/handoff. Successor enclaves use this to
@@ -127,6 +135,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/admin/sync-now", s.localhostOnly(s.handleAdminSyncNow))
 	mux.HandleFunc("/api/v1/admin/cashflows", s.localhostOnly(s.handleAdminDumpCashflows))
 	mux.HandleFunc("/api/v1/admin/reconstruct", s.localhostOnly(s.handleAdminReconstruct))
+	mux.HandleFunc("/api/v1/admin/balance-probe", s.localhostOnly(s.handleAdminBalanceProbe))
 
 	// B2 handoff: deliberately NOT gated by localhostOnly because the
 	// successor enclave runs in a different container with a non-loopback
@@ -391,6 +400,111 @@ func (s *Server) handleAdminDumpCashflows(w http.ResponseWriter, r *http.Request
 		"cashflows": cashflows,
 		"warnings":  warnings,
 	})
+}
+
+// balanceProbeRunner is the slice of the sync service the balance probe needs.
+// An interface rather than the concrete service so the handler can be
+// exercised without a DEK-unwrapped enclave behind it.
+type balanceProbeRunner interface {
+	ProbeBalance(ctx context.Context, userUID, exchange, label string) (*connector.BalanceProbe, error)
+}
+
+// log returns the server's logger, or a no-op one when the server was built
+// without it. Keeps the probe handler usable from a test that wires nothing
+// but the prober.
+func (s *Server) log() *zap.Logger {
+	if s.logger == nil {
+		return zap.NewNop()
+	}
+	return s.logger
+}
+
+// sanitizeErr is the handler's production error scrubber, nil-safe for a
+// server that has no handler attached.
+func (s *Server) sanitizeErr(err error) string {
+	if s.handler == nil {
+		return genericInternalError
+	}
+	return s.handler.sanitizeErr(err)
+}
+
+func (s *Server) balanceProber() balanceProbeRunner {
+	if s.probeSvc != nil {
+		return s.probeSvc
+	}
+	if s.handler == nil || s.handler.syncSvc == nil {
+		return nil
+	}
+	return s.handler.syncSvc
+}
+
+// handleAdminBalanceProbe answers with the venue's own balance payload beside
+// the Balance this enclave derives from it, for one connection.
+//
+// Usage: POST /api/v1/admin/balance-probe?user_uid=X&exchange=okx&label=Y
+//
+// It exists to settle a free-margin figure against a real customer account
+// without anyone handling that account's credentials: the credentials are
+// decrypted in here exactly as a sync decrypts them, one balance call goes out,
+// and both sides of the comparison come back in the HTTP response. Nothing is
+// persisted, and the amounts are deliberately absent from the logs — the
+// response goes to a loopback caller, a log file goes everywhere a log file
+// goes. A connector with no BalanceProber answers 501 rather than an empty
+// result that would read like an empty account.
+func (s *Server) handleAdminBalanceProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+
+	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	prober := s.balanceProber()
+	if prober == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	probe, err := prober.ProbeBalance(r.Context(), userUID, exchange, label)
+	if err != nil {
+		if errors.Is(err, service.ErrBalanceProbeUnsupported) {
+			writeJSON(w, http.StatusNotImplemented, map[string]any{
+				"error":    "connector does not expose a balance probe",
+				"exchange": exchange,
+			})
+			return
+		}
+		s.log().Error("balance probe failed",
+			zap.String("exchange", exchange),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+
+	// One line, no amounts: the figures are the whole point of the call and
+	// they belong in the answer to the loopback caller, not in a log.
+	s.log().Info("balance probe served", zap.String("exchange", exchange))
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "probe": probe})
 }
 
 // jwtRequired verifies an HS256 bearer token on REST handlers (SEC-002).

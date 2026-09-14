@@ -98,6 +98,47 @@ type BalanceByMarketFetcher interface {
 	GetBalanceByMarket(ctx context.Context) ([]*MarketBalance, error)
 }
 
+// BalanceProbe is one venue balance payload shown as it arrived, next to the
+// Balance the connector derived from it. It exists so a free-margin figure can
+// be checked against a real account without anybody reading the account's
+// credentials or its trades: every amount is a verbatim string from the venue,
+// the derived side says which field pair produced it, and nothing here is
+// persisted or logged. Served only to a loopback caller
+// (POST /api/v1/admin/balance-probe).
+type BalanceProbe struct {
+	Exchange string `json:"exchange"`
+
+	// AccountMode is the venue's own name for the account's margin mode, when
+	// the connector could read it; empty when it could not.
+	AccountMode string `json:"account_mode,omitempty"`
+
+	// MarginBasis names the fields Available was computed from, in the venue's
+	// own field names — e.g. "account.adjEq - account.imr". This is the answer
+	// the probe exists to give: which reading of the payload is in force.
+	MarginBasis string `json:"margin_basis"`
+
+	// Account holds the account-level fields verbatim, Currencies the
+	// per-currency lines. Strings, not floats: an inapplicable field is "" at
+	// the venue and must not arrive here as a zero.
+	Account    map[string]string   `json:"account"`
+	Currencies []map[string]string `json:"currencies"`
+
+	// Derived is what GetBalance returns from this very payload.
+	Derived *Balance `json:"derived"`
+
+	// Notes carry anything degraded about the probe itself (a mode lookup that
+	// failed, say) rather than about the account.
+	Notes []string `json:"notes,omitempty"`
+}
+
+// BalanceProber is implemented by connectors that can show their work: the
+// venue's raw balance payload alongside the Balance they computed from it.
+// A connector that does not implement it answers the admin probe with 501
+// rather than a wrong-looking empty result.
+type BalanceProber interface {
+	ProbeBalance(ctx context.Context) (*BalanceProbe, error)
+}
+
 // BalanceFreshnessProvider is implemented by statement-based connectors (IBKR
 // Flex) whose GetBalance can only return the newest figure present in an
 // already-generated statement — data that lags real time by one to two days.

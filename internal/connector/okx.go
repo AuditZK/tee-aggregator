@@ -55,6 +55,12 @@ type OKX struct {
 	hosts []string // candidate API domains; collapses to one once a key is recognised
 
 	cashflowWarnings []string // markers from the last GetCashflows, guarded by mu
+
+	// acctLv caches GET /api/v5/account/config's account mode for the life of
+	// the connector. Only the probe reads it — the balance path infers the mode
+	// from which fields OKX left empty and spends no request on it.
+	acctLv        string
+	acctLvFetched bool
 }
 
 // NewOKX creates a new OKX connector
