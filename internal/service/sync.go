@@ -3073,6 +3073,45 @@ func (s *SyncService) DumpCashflows(
 	return flows, warnings, nil
 }
 
+// ErrBalanceProbeUnsupported is returned when the connection's connector has
+// no BalanceProber. The admin endpoint turns it into a 501 so "this venue was
+// never wired for probing" cannot be misread as "this account has no balance".
+var ErrBalanceProbeUnsupported = errors.New("connector does not implement balance probing")
+
+// ProbeBalance decrypts the connection's credentials the way a sync does,
+// asks the venue for its balance once, and returns that payload verbatim
+// beside the Balance the connector derived from it.
+//
+// It exists because a free-margin figure that looks wrong on the dashboard
+// cannot be settled from the outside: the raw fields never leave the enclave,
+// and re-reading them by hand would mean handling the customer's API key. The
+// caller is the loopback-only admin endpoint; nothing here is persisted and
+// the amounts are not logged.
+func (s *SyncService) ProbeBalance(
+	ctx context.Context,
+	userUID, exchange, label string,
+) (*connector.BalanceProbe, error) {
+	if s.connSvc == nil {
+		return nil, fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build connector: %w", err)
+	}
+
+	prober, ok := conn.(connector.BalanceProber)
+	if !ok {
+		return nil, fmt.Errorf("%s: %w", exchange, ErrBalanceProbeUnsupported)
+	}
+	return prober.ProbeBalance(ctx)
+}
+
 // DumpRawCashflows returns the broker's unfiltered balance-operation ledger for
 // a user, every operationType preserved. Diagnostic for balance jumps that the
 // deposit/withdraw filter (op 0/1) can't explain — a demo reset that surfaces

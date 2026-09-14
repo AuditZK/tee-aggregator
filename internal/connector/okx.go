@@ -55,6 +55,12 @@ type OKX struct {
 	hosts []string // candidate API domains; collapses to one once a key is recognised
 
 	cashflowWarnings []string // markers from the last GetCashflows, guarded by mu
+
+	// acctLv caches GET /api/v5/account/config's account mode for the life of
+	// the connector. Only the probe reads it — the balance path infers the mode
+	// from which fields OKX left empty and spends no request on it.
+	acctLv        string
+	acctLvFetched bool
 }
 
 // NewOKX creates a new OKX connector
@@ -198,51 +204,236 @@ func (o *OKX) TestConnection(ctx context.Context) error {
 	return err
 }
 
-func (o *OKX) GetBalance(ctx context.Context) (*Balance, error) {
+// okxBalanceResponse is GET /api/v5/account/balance. Every figure is kept as
+// the raw string OKX sent, because the emptiness of a field is data: OKX
+// documents that `"" will be returned for inapplicable fields under the current
+// account level`, which is what lets okxReadMargin tell the account modes apart
+// without a second request.
+type okxBalanceResponse struct {
+	Data []okxAccountBalance `json:"data"`
+}
+
+// okxAccountBalance is one account-level entry of the balance response.
+type okxAccountBalance struct {
+	UTime    string               `json:"uTime"`
+	TotalEq  string               `json:"totalEq"`
+	IsoEq    string               `json:"isoEq"`
+	AdjEq    string               `json:"adjEq"`
+	AvailEq  string               `json:"availEq"`
+	OrdFroz  string               `json:"ordFroz"`
+	IMR      string               `json:"imr"`
+	MMR      string               `json:"mmr"`
+	MgnRatio string               `json:"mgnRatio"`
+	UPL      string               `json:"upl"`
+	Details  []okxCurrencyBalance `json:"details"`
+}
+
+// okxCurrencyBalance is one currency line of the balance response.
+type okxCurrencyBalance struct {
+	Ccy       string `json:"ccy"`
+	Eq        string `json:"eq"`
+	EqUsd     string `json:"eqUsd"`
+	CashBal   string `json:"cashBal"`
+	AvailBal  string `json:"availBal"`
+	AvailEq   string `json:"availEq"`
+	FrozenBal string `json:"frozenBal"`
+	IsoEq     string `json:"isoEq"`
+	UPL       string `json:"upl"`
+	IMR       string `json:"imr"`
+	MMR       string `json:"mmr"`
+}
+
+// OKX account modes, and which field carries free margin in each.
+//
+// acctLv comes from GET /api/v5/account/config — 1 Spot mode, 2 Futures mode
+// (the old single-currency margin), 3 Multi-currency margin, 4 Portfolio
+// margin. The balance endpoint does not repeat it, but it does not need to:
+// "Distribution of applicable fields under each account level" in the v5 docs
+// maps every field to the modes it exists in, and the same page states that
+// `"" will be returned for inapplicable fields under the current account
+// level`. The mode is therefore readable off the payload itself.
+//
+//	field                acctLv 1   acctLv 2   acctLv 3   acctLv 4
+//	                     spot       futures    multi-ccy  portfolio
+//	totalEq              yes        yes        yes        yes
+//	adjEq                yes        —          yes        yes
+//	imr                  yes        —          yes        yes
+//	upl        (account) —          —          yes        yes
+//	availEq    (account) —          —          yes        yes
+//	> availEq  (per ccy) —          yes        yes        yes
+//	> upl      (per ccy) —          yes        yes        yes
+//	> availBal (per ccy) yes        yes        yes        yes
+//
+// Free margin, per mode:
+//
+//   - acctLv 3 / 4 — adjEq − imr, both already in USD. adjEq is "the net fiat
+//     value of the assets in the account that can provide margins for spot,
+//     expiry futures, perpetual futures and options under the cross-margin
+//     mode"; imr is "the sum of initial margins of all open positions and
+//     pending orders under cross-margin mode". imr already covers resting
+//     orders, so ordFroz must not be subtracted on top of it. OKX checks an
+//     order against exactly this pair: "the order didn't pass delta
+//     verification because if the order were to succeed, the change in adjEq
+//     would be smaller than the change in IMR".
+//   - acctLv 2 — Σ per-currency availEq, "available equity of currency", priced
+//     into USD. The account-level USD trio does not exist in this mode.
+//   - acctLv 1 — Σ per-currency availBal. A spot account carries no cross
+//     position, so the balance not locked by a resting order IS the free
+//     margin, and free == equity on an account with nothing on the book is the
+//     correct answer rather than a bug.
+//
+// Unrealized P&L follows the same split: account-level upl (USD, "unrealized
+// PnL across all open cross-margin positions at the account level") in modes
+// 3/4, Σ per-currency upl priced into USD otherwise. Per-currency upl can read
+// 0 on an account whose account-level upl does not, which is why the two are
+// not interchangeable.
+//
+// What this must never go back to: Σ availBal in modes 2/3/4. availBal is
+// "available balance of currency" — the balance not locked by ORDERS. It does
+// not deduct the margin held by open cross positions, so on a margin account
+// it sums to the entire equity. Live proof, 2026-09-11: an OKX account running
+// a short options straddle against a perpetual hedge reported 22 077 free out
+// of 22 077 equity, and every OKX row written between 2026-08-31 and 2026-09-14
+// had free margin exactly equal to equity.
+const (
+	okxBasisAdjEqMinusIMR = "account.adjEq - account.imr"
+	okxBasisSumAvailEq    = "sum(details.availEq * usd_rate)"
+	okxBasisSumAvailBal   = "sum(details.availBal * usd_rate)"
+
+	okxModeCrossUSD = "multi-currency or portfolio margin (acctLv 3/4)"
+	okxModeFutures  = "futures / single-currency margin (acctLv 2)"
+	okxModeSpot     = "spot (acctLv 1)"
+)
+
+// okxMarginReading is what one balance payload says about free margin, plus
+// the field pair it was read from — the probe endpoint reports both so an
+// operator can see which branch fired on a real account.
+type okxMarginReading struct {
+	Available  float64
+	Unrealized float64
+	Basis      string
+	Mode       string
+}
+
+// okxReadMargin picks the margin-aware fields for the mode the payload is in.
+// See the table above for the mapping and the doc quotes behind it.
+func okxReadMargin(account okxAccountBalance) okxMarginReading {
+	// Modes 3 and 4. Account-level upl is the discriminator: it is the one of
+	// the three that OKX leaves empty in spot mode, which otherwise also
+	// carries adjEq and imr (spot borrowing) and would take this branch and
+	// report its haircut-discounted collateral value as free cash.
+	if account.AdjEq != "" && account.IMR != "" && account.UPL != "" {
+		adjEq, okAdjEq := okxFloat(account.AdjEq)
+		imr, okIMR := okxFloat(account.IMR)
+		if okAdjEq && okIMR {
+			upl, _ := okxFloat(account.UPL)
+			free := adjEq - imr
+			if free < 0 {
+				// imr above adjEq means the account is past its initial-margin
+				// budget. There is no margin free, not a negative amount of it.
+				free = 0
+			}
+			return okxMarginReading{
+				Available:  free,
+				Unrealized: upl,
+				Basis:      okxBasisAdjEqMinusIMR,
+				Mode:       okxModeCrossUSD,
+			}
+		}
+	}
+
+	var sumAvailEq, sumAvailBal, sumUPL float64
+	haveAvailEq := false
+	for _, d := range account.Details {
+		rate := okxUSDRate(d.Eq, d.EqUsd)
+		if v, ok := okxFloat(d.AvailEq); ok {
+			sumAvailEq += v * rate
+			haveAvailEq = true
+		}
+		if v, ok := okxFloat(d.AvailBal); ok {
+			sumAvailBal += v * rate
+		}
+		if v, ok := okxFloat(d.UPL); ok {
+			sumUPL += v * rate
+		}
+	}
+
+	// Mode 2: availEq is the per-currency figure that already has position
+	// margin taken out of it.
+	if haveAvailEq {
+		return okxMarginReading{
+			Available:  sumAvailEq,
+			Unrealized: sumUPL,
+			Basis:      okxBasisSumAvailEq,
+			Mode:       okxModeFutures,
+		}
+	}
+
+	// Mode 1, and the last resort for any payload that carries neither of the
+	// margin-aware sets — a spot balance is all availBal has ever measured
+	// correctly.
+	return okxMarginReading{
+		Available:  sumAvailBal,
+		Unrealized: sumUPL,
+		Basis:      okxBasisSumAvailBal,
+		Mode:       okxModeSpot,
+	}
+}
+
+// okxFloat parses one OKX numeric string. A field that does not apply to the
+// account's mode comes back as "", and that must not read as a measured zero:
+// the bool is what the mode detection keys off.
+func okxFloat(s string) (float64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// fetchAccountBalance returns the first (and only) account entry of the
+// balance response, or nil when OKX answered with no account at all.
+func (o *OKX) fetchAccountBalance(ctx context.Context) (*okxAccountBalance, error) {
 	body, err := o.doRequest(ctx, "GET", "/api/v5/account/balance")
 	if err != nil {
 		return nil, err
 	}
 
-	var resp struct {
-		Data []struct {
-			TotalEq string `json:"totalEq"`
-			IsoEq   string `json:"isoEq"`
-			AdjEq   string `json:"adjEq"`
-			Details []struct {
-				Ccy      string `json:"ccy"`
-				Eq       string `json:"eq"`
-				EqUsd    string `json:"eqUsd"`
-				AvailBal string `json:"availBal"`
-				UPL      string `json:"upl"`
-			} `json:"details"`
-		} `json:"data"`
-	}
-
+	var resp okxBalanceResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
-
 	if len(resp.Data) == 0 {
+		return nil, nil
+	}
+	return &resp.Data[0], nil
+}
+
+func (o *OKX) GetBalance(ctx context.Context) (*Balance, error) {
+	account, err := o.fetchAccountBalance(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if account == nil {
 		return &Balance{Currency: "USDT"}, nil
 	}
 
-	account := resp.Data[0]
+	// Equity stays totalEq — total account assets in USD, the one field every
+	// mode fills in. adjEq is a collateral valuation, not the account's worth,
+	// and swapping it in here would move the equity curve of every OKX user.
 	equity, _ := strconv.ParseFloat(account.TotalEq, 64)
+	reading := okxReadMargin(*account)
 
-	var available, unrealized float64
-	for _, d := range account.Details {
-		rate := okxUSDRate(d.Eq, d.EqUsd)
-		availBal, _ := strconv.ParseFloat(d.AvailBal, 64)
-		upl, _ := strconv.ParseFloat(d.UPL, 64)
-		available += availBal * rate
-		unrealized += upl * rate
-	}
-
+	// The "free margin never exceeds equity" invariant is held one layer up,
+	// in service.clampAvailableMargin, so it applies to every venue and to the
+	// reconstruction path as well as this one.
 	return &Balance{
-		Available:     available,
+		Available:     reading.Available,
 		Equity:        equity,
-		UnrealizedPnL: unrealized,
+		UnrealizedPnL: reading.Unrealized,
 		Currency:      "USDT",
 	}, nil
 }
