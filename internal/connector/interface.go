@@ -76,8 +76,17 @@ type CashflowFetcher interface {
 type RawBalanceOp struct {
 	OperationType int       `json:"operationType"`
 	Delta         float64   `json:"delta"`        // signed change to the balance
-	BalanceAfter  float64   `json:"balanceAfter"` // account balance after the operation
+	BalanceAfter  float64   `json:"balanceAfter"` // account balance after the operation; 0 on venues whose ledger carries no running balance
 	Timestamp     time.Time `json:"timestamp"`
+	// Label carries the venue's own type name where it is not numeric, so a
+	// ledger entry can be read without a code table.
+	Label    string `json:"label,omitempty"`
+	Currency string `json:"currency,omitempty"`
+	Symbol   string `json:"symbol,omitempty"`
+	// PositionValue is the market value an entry moves without moving cash.
+	// A position transfer is invisible in Delta by construction, and that is
+	// exactly the entry worth seeing.
+	PositionValue float64 `json:"positionValue,omitempty"`
 }
 
 // RawCashflowFetcher optionally exposes the unfiltered balance-operation ledger.

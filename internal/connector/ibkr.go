@@ -652,6 +652,105 @@ func (i *IBKR) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, 
 	return i.parseCashflowsFromReport(report, since)
 }
 
+// GetRawCashflowEntries returns every CashTransaction and every Transfer the
+// statement carries, the ones GetCashflows drops included. A position
+// transferred in from another broker moves no cash, so the filtered view
+// cannot tell it from a trading gain: the market value lands in equity and
+// scores as performance. This is the view that separates the two.
+func (i *IBKR) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error) {
+	report, err := i.fetchFlexReport(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return parseRawLedgerFromReport(report, since)
+}
+
+func parseRawLedgerFromReport(report []byte, since time.Time) ([]RawBalanceOp, error) {
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				CashTransactions struct {
+					CashTransaction []struct {
+						Type     string `xml:"type,attr"`
+						Amount   string `xml:"amount,attr"`
+						Currency string `xml:"currency,attr"`
+						Symbol   string `xml:"symbol,attr"`
+						DateTime string `xml:"dateTime,attr"`
+					} `xml:"CashTransaction"`
+				} `xml:"CashTransactions"`
+				Transfers struct {
+					Transfer []struct {
+						Type           string `xml:"type,attr"`
+						Direction      string `xml:"direction,attr"`
+						CashTransfer   string `xml:"cashTransfer,attr"`
+						PositionAmount string `xml:"positionAmount,attr"`
+						Quantity       string `xml:"quantity,attr"`
+						AssetCategory  string `xml:"assetCategory,attr"`
+						Symbol         string `xml:"symbol,attr"`
+						Currency       string `xml:"currency,attr"`
+						DateTime       string `xml:"dateTime,attr"`
+						Date           string `xml:"date,attr"`
+					} `xml:"Transfer"`
+				} `xml:"Transfers"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return nil, fmt.Errorf("parse flex raw ledger: %w", err)
+	}
+
+	stmt := flex.FlexStatements.FlexStatement
+	ops := make([]RawBalanceOp, 0, len(stmt.CashTransactions.CashTransaction)+len(stmt.Transfers.Transfer))
+
+	for _, tx := range stmt.CashTransactions.CashTransaction {
+		ts, ok := parseFlexTimestamp(tx.DateTime)
+		if !ok || ts.Before(since) {
+			continue
+		}
+		amount, _ := strconv.ParseFloat(tx.Amount, 64)
+		ops = append(ops, RawBalanceOp{
+			Label:     "cash:" + tx.Type,
+			Delta:     amount,
+			Currency:  tx.Currency,
+			Symbol:    tx.Symbol,
+			Timestamp: ts,
+		})
+	}
+
+	for _, tr := range stmt.Transfers.Transfer {
+		raw := tr.DateTime
+		if raw == "" {
+			raw = tr.Date
+		}
+		ts, ok := parseFlexTimestamp(raw)
+		if !ok || ts.Before(since) {
+			continue
+		}
+		cash, _ := strconv.ParseFloat(tr.CashTransfer, 64)
+		posAmount, _ := strconv.ParseFloat(tr.PositionAmount, 64)
+		label := "transfer:" + tr.Type
+		if tr.Direction != "" {
+			label += "/" + tr.Direction
+		}
+		if tr.AssetCategory != "" {
+			label += "/" + tr.AssetCategory
+		}
+		ops = append(ops, RawBalanceOp{
+			Label:         label,
+			Delta:         cash,
+			PositionValue: posAmount,
+			Currency:      tr.Currency,
+			Symbol:        tr.Symbol,
+			Timestamp:     ts,
+		})
+	}
+
+	sort.Slice(ops, func(a, b int) bool { return ops[a].Timestamp.Before(ops[b].Timestamp) })
+	return ops, nil
+}
+
 // flexCapitalTypes are the CashTransaction types that move money across the
 // account boundary. Both spellings of the umbrella type are real: current
 // Flex statements write "Deposits & Withdrawals" (ampersand), older ones
