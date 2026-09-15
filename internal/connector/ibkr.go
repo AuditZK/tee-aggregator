@@ -665,6 +665,17 @@ func (i *IBKR) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]Ra
 	return parseRawLedgerFromReport(report, since)
 }
 
+// GetRawStatement returns the Flex XML as IBKR sent it. The token is scrubbed
+// in case it was echoed back (CONN-002); nothing else is filtered, because a
+// filter is exactly what this is for.
+func (i *IBKR) GetRawStatement(ctx context.Context) ([]byte, string, error) {
+	report, err := i.fetchFlexReport(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return []byte(scrubSecret(string(report), i.token)), "application/xml", nil
+}
+
 func parseRawLedgerFromReport(report []byte, since time.Time) ([]RawBalanceOp, error) {
 	var flex struct {
 		XMLName        xml.Name `xml:"FlexQueryResponse"`

@@ -3144,6 +3144,36 @@ func (s *SyncService) DumpRawCashflows(
 	return rawFetcher.GetRawCashflowEntries(ctx, since)
 }
 
+// ErrRawStatementUnsupported is returned when the connection's connector has
+// no statement document to hand over.
+var ErrRawStatementUnsupported = errors.New("connector does not expose a raw statement")
+
+// DumpRawStatement returns the venue's own statement document for one
+// connection, whole. On a venue that rations statements (IBKR: roughly one
+// Flex request per token per six hours, refusals counted), taking the document
+// once is what stops every further question from costing another wait.
+func (s *SyncService) DumpRawStatement(ctx context.Context, userUID, exchange, label string) ([]byte, string, error) {
+	if s.connSvc == nil {
+		return nil, "", fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, "", fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, "", fmt.Errorf("build connector: %w", err)
+	}
+
+	provider, ok := conn.(connector.RawStatementProvider)
+	if !ok {
+		return nil, "", fmt.Errorf("%s: %w", exchange, ErrRawStatementUnsupported)
+	}
+	return provider.GetRawStatement(ctx)
+}
+
 // ExchangeMetadataRefresh reports what one connection's metadata probe stored.
 type ExchangeMetadataRefresh struct {
 	Exchange string `json:"exchange"`

@@ -94,6 +94,17 @@ type RawCashflowFetcher interface {
 	GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error)
 }
 
+// RawStatementProvider optionally exposes the venue's own statement document,
+// whole and unparsed. It exists for venues that ration statements: IBKR allows
+// roughly one Flex request per token per six hours and counts refusals, so a
+// question the parsed views cannot answer costs another six-hour wait. Taking
+// the document once makes every later question free. Secrets are scrubbed by
+// the implementation; the caller still holds live account data and must keep
+// it inside the enclave.
+type RawStatementProvider interface {
+	GetRawStatement(ctx context.Context) (document []byte, contentType string, err error)
+}
+
 // MarketBalance holds equity data for a specific market type.
 type MarketBalance struct {
 	MarketType      string  `json:"market_type"`

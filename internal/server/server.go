@@ -137,6 +137,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/admin/reconstruct", s.localhostOnly(s.handleAdminReconstruct))
 	mux.HandleFunc("/api/v1/admin/balance-probe", s.localhostOnly(s.handleAdminBalanceProbe))
 	mux.HandleFunc("/api/v1/admin/refresh-metadata", s.localhostOnly(s.handleAdminRefreshMetadata))
+	mux.HandleFunc("/api/v1/admin/raw-statement", s.localhostOnly(s.handleAdminRawStatement))
 
 	// B2 handoff: deliberately NOT gated by localhostOnly because the
 	// successor enclave runs in a different container with a non-loopback
@@ -584,6 +585,78 @@ func (s *Server) handleAdminRefreshMetadata(w http.ResponseWriter, r *http.Reque
 		"failed":       failed,
 		"connections":  results,
 	})
+}
+
+// handleAdminRawStatement hands back the venue's own statement document for one
+// connection, unparsed.
+//
+// Usage: GET /api/v1/admin/raw-statement?user_uid=X&exchange=ibkr&label=Y
+//
+// It exists because IBKR rations Flex statements to roughly one per token per
+// six hours and counts refusals, so a question our parsed views cannot answer
+// costs another six-hour wait. Taking the document once makes every later
+// question free. The response carries live account data and goes to a loopback
+// caller only; it is deliberately absent from the logs, which record that a
+// dump was served and its size, never its content.
+func (s *Server) handleAdminRawStatement(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "GET only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+
+	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	doc, contentType, err := s.handler.syncSvc.DumpRawStatement(r.Context(), userUID, exchange, label)
+	if err != nil {
+		if errors.Is(err, service.ErrRawStatementUnsupported) {
+			writeJSON(w, http.StatusNotImplemented, map[string]any{
+				"error":    "connector does not expose a raw statement",
+				"exchange": exchange,
+			})
+			return
+		}
+		s.log().Error("raw statement dump failed",
+			zap.String("exchange", exchange),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+
+	s.log().Info("raw statement served",
+		zap.String("exchange", exchange),
+		zap.Int("bytes", len(doc)),
+	)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(doc)
 }
 
 // jwtRequired verifies an HS256 bearer token on REST handlers (SEC-002).
