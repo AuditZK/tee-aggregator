@@ -697,6 +697,14 @@ func (r *ConnectionRepo) GetExchangeDetailsByUser(ctx context.Context, userUID s
 	return details, rows.Err()
 }
 
+// updateConnectionMetadataQuery builds the UPDATE shared by UpdateKYCLevel and
+// UpdateIsPaper. Pure so the schema-aware column naming can be pinned by a
+// test: prod runs the TS Prisma schema, where these columns are camelCase and
+// a hardcoded snake_case name updates nothing.
+func updateConnectionMetadataQuery(valueCol, updatedAtCol string) string {
+	return `UPDATE exchange_connections SET ` + valueCol + ` = $1, ` + updatedAtCol + ` = $2 WHERE id = $3`
+}
+
 // UpdateKYCLevel updates kyc_level metadata for a connection.
 // It no-ops when the column is not present.
 func (r *ConnectionRepo) UpdateKYCLevel(ctx context.Context, connectionID, kycLevel string) error {
@@ -709,14 +717,13 @@ func (r *ConnectionRepo) UpdateKYCLevel(ctx context.Context, connectionID, kycLe
 		return nil
 	}
 
-	query := `UPDATE exchange_connections SET kyc_level = $1, updated_at = $2 WHERE id = $3`
-	_, err := r.pool.Exec(ctx, query, strings.TrimSpace(kycLevel), time.Now().UTC(), connectionID)
+	query := updateConnectionMetadataQuery(r.qcol("kyc_level"), r.qcol("updated_at"))
+	tag, err := r.pool.Exec(ctx, query, strings.TrimSpace(kycLevel), time.Now().UTC(), connectionID)
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "42703" {
-			return nil
-		}
-		return err
+		return fmt.Errorf("update kyc level: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
 	}
 
 	return nil
@@ -734,14 +741,13 @@ func (r *ConnectionRepo) UpdateIsPaper(ctx context.Context, connectionID string,
 		return nil
 	}
 
-	query := `UPDATE exchange_connections SET is_paper = $1, updated_at = $2 WHERE id = $3`
-	_, err := r.pool.Exec(ctx, query, isPaper, time.Now().UTC(), connectionID)
+	query := updateConnectionMetadataQuery(r.qcol("is_paper"), r.qcol("updated_at"))
+	tag, err := r.pool.Exec(ctx, query, isPaper, time.Now().UTC(), connectionID)
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "42703" {
-			return nil
-		}
-		return err
+		return fmt.Errorf("update is paper: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
 	}
 
 	return nil
@@ -849,7 +855,7 @@ func (r *ConnectionRepo) GetByUserExchangeLabel(ctx context.Context, userUID, ex
 
 // Deactivate soft-deletes a connection
 func (r *ConnectionRepo) Deactivate(ctx context.Context, id string) error {
-	query := `UPDATE exchange_connections SET is_active = false, updated_at = $1 WHERE id = $2`
+	query := `UPDATE exchange_connections SET ` + r.qcol("is_active") + ` = false, ` + r.qcol("updated_at") + ` = $1 WHERE id = $2`
 	_, err := r.pool.Exec(ctx, query, time.Now().UTC(), id)
 	return err
 }

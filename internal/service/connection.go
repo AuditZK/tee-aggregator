@@ -13,6 +13,7 @@ import (
 	"github.com/trackrecord/enclave/internal/encryption"
 	"github.com/trackrecord/enclave/internal/repository"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 var ErrConnectionAlreadyExists = errors.New("connection already exists")
@@ -301,7 +302,7 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 	// TS parity: capture exchange metadata (KYC level + paper/live status)
 	// after successful connection creation; failures are non-blocking.
 	// Reuse testConn — it already has cached state from TestConnection (e.g. IBKR paper detection).
-	s.captureExchangeMetadata(ctx, conn.ID, testConn)
+	s.CaptureExchangeMetadata(ctx, conn.ID, testConn)
 
 	// DetectIsPaper runs inside the call above and can refresh too, AFTER the
 	// row was written. Catch that last rotation as well (E-H4).
@@ -428,7 +429,7 @@ func (s *ConnectionService) reauthorizeOAuthConnection(
 
 	// The account behind the authorization can have changed (live vs demo);
 	// re-read the metadata rather than keeping the old row's.
-	s.captureExchangeMetadata(ctx, existing.ID, testConn)
+	s.CaptureExchangeMetadata(ctx, existing.ID, testConn)
 
 	if s.logger != nil {
 		s.logger.Info("OAuth connection re-authorized",
@@ -494,26 +495,72 @@ func effectiveOAuthCredentials(conn connector.Connector, fallbackAccess, fallbac
 	return access, refresh
 }
 
-func (s *ConnectionService) captureExchangeMetadata(ctx context.Context, connectionID string, exchangeConn connector.Connector) {
+// MetadataCapture is the outcome of one metadata probe. PaperProbed
+// distinguishes a stored "live" from a connector that has no paper detector at
+// all — both leave IsPaper false, and reading the second as the first is what
+// lets a demo account pass for a funded one.
+type MetadataCapture struct {
+	KYCLevel    string
+	IsPaper     bool
+	PaperProbed bool
+	Err         error
+}
+
+// CaptureExchangeMetadata reads paper/live and KYC status from the broker and
+// stores it against the connection. The two probes are independent, so a
+// non-nil Err can accompany a value stored by the other one. A failed store is
+// logged at Error rather than dropped: the report's paper badge reads this
+// column, so losing the write silently presents a demo account as a funded one.
+func (s *ConnectionService) CaptureExchangeMetadata(ctx context.Context, connectionID string, exchangeConn connector.Connector) MetadataCapture {
+	var out MetadataCapture
 	if s.repo == nil || strings.TrimSpace(connectionID) == "" || exchangeConn == nil {
-		return
+		return out
 	}
+
+	var failures []error
 
 	if fetcher, ok := exchangeConn.(connector.KYCLevelFetcher); ok {
 		kycLevel, err := fetcher.FetchKYCLevel(ctx)
-		if err == nil {
-			if normalized := normalizeKYCLevel(kycLevel); normalized != "" {
-				_ = s.repo.UpdateKYCLevel(ctx, connectionID, normalized)
+		if err != nil {
+			s.logMetadataIssue(zapcore.WarnLevel, "kyc level not read from broker", connectionID, exchangeConn, err)
+			failures = append(failures, fmt.Errorf("read kyc level: %w", err))
+		} else if normalized := normalizeKYCLevel(kycLevel); normalized != "" {
+			if err := s.repo.UpdateKYCLevel(ctx, connectionID, normalized); err != nil {
+				s.logMetadataIssue(zapcore.ErrorLevel, "kyc level detected but not stored", connectionID, exchangeConn, err)
+				failures = append(failures, fmt.Errorf("store kyc level: %w", err))
+			} else {
+				out.KYCLevel = normalized
 			}
 		}
 	}
 
 	if detector, ok := exchangeConn.(connector.PaperAccountDetector); ok {
 		isPaper, err := detector.DetectIsPaper(ctx)
-		if err == nil {
-			_ = s.repo.UpdateIsPaper(ctx, connectionID, isPaper)
+		if err != nil {
+			s.logMetadataIssue(zapcore.WarnLevel, "paper/live status not read from broker", connectionID, exchangeConn, err)
+			failures = append(failures, fmt.Errorf("detect paper account: %w", err))
+		} else if err := s.repo.UpdateIsPaper(ctx, connectionID, isPaper); err != nil {
+			s.logMetadataIssue(zapcore.ErrorLevel, "paper/live status detected but not stored", connectionID, exchangeConn, err)
+			failures = append(failures, fmt.Errorf("store paper account: %w", err))
+		} else {
+			out.IsPaper = isPaper
+			out.PaperProbed = true
 		}
 	}
+
+	out.Err = errors.Join(failures...)
+	return out
+}
+
+func (s *ConnectionService) logMetadataIssue(level zapcore.Level, msg, connectionID string, exchangeConn connector.Connector, err error) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.Log(level, msg,
+		zap.String("connection_id", connectionID),
+		zap.String("exchange", exchangeConn.Exchange()),
+		zap.Error(err),
+	)
 }
 
 // GetDecryptedCredentials retrieves and decrypts credentials for a connection

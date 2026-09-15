@@ -3144,6 +3144,74 @@ func (s *SyncService) DumpRawCashflows(
 	return rawFetcher.GetRawCashflowEntries(ctx, since)
 }
 
+// ExchangeMetadataRefresh reports what one connection's metadata probe stored.
+type ExchangeMetadataRefresh struct {
+	Exchange string `json:"exchange"`
+	Label    string `json:"label,omitempty"`
+	KYCLevel string `json:"kyc_level,omitempty"`
+	IsPaper  bool   `json:"is_paper"`
+	// PaperProbed false means the broker was never asked — the connector has no
+	// paper detector, or the probe failed. IsPaper is then meaningless.
+	PaperProbed bool `json:"paper_probed"`
+	// Err is raw; the egress layer sanitizes it into Error.
+	Err   error  `json:"-"`
+	Error string `json:"error,omitempty"`
+}
+
+// RefreshExchangeMetadata re-probes paper/live and KYC status for a user's
+// active connections and stores the result. Detection otherwise runs only at
+// connect time, so a connection created before its connector gained a probe —
+// or one whose stored flags never took — keeps whatever its row was created
+// with, and false is indistinguishable from never-written.
+//
+// exchange and label narrow the pass; empty means every active connection.
+func (s *SyncService) RefreshExchangeMetadata(ctx context.Context, userUID, exchange, label string) ([]*ExchangeMetadataRefresh, error) {
+	if s.connSvc == nil {
+		return nil, fmt.Errorf("connection service not configured")
+	}
+
+	conns, err := s.connSvc.GetActiveConnections(ctx, userUID)
+	if err != nil {
+		return nil, fmt.Errorf("list connections: %w", err)
+	}
+
+	wantExchange := strings.ToLower(strings.TrimSpace(exchange))
+	wantLabel := strings.TrimSpace(label)
+
+	out := make([]*ExchangeMetadataRefresh, 0, len(conns))
+	for _, c := range conns {
+		if wantExchange != "" && strings.ToLower(c.Exchange) != wantExchange {
+			continue
+		}
+		if wantLabel != "" && c.Label != wantLabel {
+			continue
+		}
+
+		item := &ExchangeMetadataRefresh{Exchange: c.Exchange, Label: c.Label}
+		out = append(out, item)
+
+		creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, c.Exchange, c.Label)
+		if err != nil {
+			item.Err = err
+			continue
+		}
+
+		conn, err := s.getOrCreateConnector(strings.ToLower(c.Exchange), userUID, c.Label, creds)
+		if err != nil {
+			item.Err = err
+			continue
+		}
+
+		captured := s.connSvc.CaptureExchangeMetadata(ctx, c.ID, conn)
+		item.KYCLevel = captured.KYCLevel
+		item.IsPaper = captured.IsPaper
+		item.PaperProbed = captured.PaperProbed
+		item.Err = captured.Err
+	}
+
+	return out, nil
+}
+
 func appendUnique(slice []string, s string) []string {
 	for _, v := range slice {
 		if v == s {

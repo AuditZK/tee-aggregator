@@ -136,6 +136,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/admin/cashflows", s.localhostOnly(s.handleAdminDumpCashflows))
 	mux.HandleFunc("/api/v1/admin/reconstruct", s.localhostOnly(s.handleAdminReconstruct))
 	mux.HandleFunc("/api/v1/admin/balance-probe", s.localhostOnly(s.handleAdminBalanceProbe))
+	mux.HandleFunc("/api/v1/admin/refresh-metadata", s.localhostOnly(s.handleAdminRefreshMetadata))
 
 	// B2 handoff: deliberately NOT gated by localhostOnly because the
 	// successor enclave runs in a different container with a non-loopback
@@ -505,6 +506,84 @@ func (s *Server) handleAdminBalanceProbe(w http.ResponseWriter, r *http.Request)
 	// they belong in the answer to the loopback caller, not in a log.
 	s.log().Info("balance probe served", zap.String("exchange", exchange))
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "probe": probe})
+}
+
+// handleAdminRefreshMetadata re-probes paper/live and KYC status for a user's
+// existing connections. Capture runs at connect time only, so a connection
+// predating its connector's probe keeps the flags its row was created with —
+// and a stored false is indistinguishable from never-written.
+//
+// Usage: POST /api/v1/admin/refresh-metadata?user_uid=X[&exchange=ibkr][&label=Y]
+//
+// Each connection costs one broker round trip, so narrow with exchange/label
+// when re-probing a single account.
+func (s *Server) handleAdminRefreshMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+
+	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
+	// exchange and label are optional here — they narrow the pass rather than
+	// address one connection — but are validated when present.
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if exchange != "" {
+		if err := validation.ValidateExchange(exchange); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	results, err := s.handler.syncSvc.RefreshExchangeMetadata(r.Context(), userUID, exchange, label)
+	if err != nil {
+		s.log().Error("refresh exchange metadata failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+
+	probed, failed := 0, 0
+	for _, item := range results {
+		if item.Err != nil {
+			failed++
+			s.log().Error("exchange metadata not refreshed",
+				zap.String("user_uid", userUID),
+				zap.String("exchange", item.Exchange),
+				zap.String("label", item.Label),
+				zap.Error(item.Err),
+			)
+			item.Error = s.sanitizeErr(item.Err)
+		}
+		if item.PaperProbed {
+			probed++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":      true,
+		"count":        len(results),
+		"paper_probed": probed,
+		"failed":       failed,
+		"connections":  results,
+	})
 }
 
 // jwtRequired verifies an HS256 bearer token on REST handlers (SEC-002).
