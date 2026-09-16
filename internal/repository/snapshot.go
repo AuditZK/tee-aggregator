@@ -461,12 +461,20 @@ func (r *SnapshotRepo) DeleteExternalRebuilderHistory(ctx context.Context, userU
 // each week ended on a two-day plateau that never happened.
 //
 // Scoped three ways, all unconditional. Only rebuilt rows, so the live branch
-// is untouchable. Only inside [min(keep), max(keep)], so days the caller did
-// not reconstruct — a bounded repair window, or history older than this run —
-// are left alone. And never a day present in keep. A caller whose source is the
-// enclave itself must not use this: its rows carry the same origin flag as live
-// ones, and there is no way to tell them apart.
-func (r *SnapshotRepo) PruneRebuiltDaysOutside(ctx context.Context, userUID, exchange, label string, keep []time.Time) (int64, error) {
+// is untouchable. Only inside [from, max(keep)], and never a day present in
+// keep. A caller whose source is the enclave itself must not use this: its rows
+// carry the same origin flag as live ones, and there is no way to tell them
+// apart.
+//
+// from is the caller's, not derived from keep, because the two reconstruction
+// modes need different floors. A bounded repair passes its window start, so the
+// history around the window is untouched. A full run passes the zero time: its
+// output IS the connection's whole rebuilt history, and deriving the floor from
+// keep instead leaves anything the run no longer reaches — a row the previous
+// keying put a day earlier than anything the new one emits, say, which is
+// exactly the residue that survived the Alpaca correction and double-counted a
+// funding day.
+func (r *SnapshotRepo) PruneRebuiltDaysOutside(ctx context.Context, userUID, exchange, label string, from time.Time, keep []time.Time) (int64, error) {
 	if len(keep) == 0 {
 		return 0, nil
 	}
@@ -474,7 +482,7 @@ func (r *SnapshotRepo) PruneRebuiltDaysOutside(ctx context.Context, userUID, exc
 		return 0, ErrOriginUnavailable
 	}
 
-	where, args := prunedRebuiltScope(r.isTSSchema, r.hasLabelColumn(ctx), userUID, exchange, label, keep)
+	where, args := prunedRebuiltScope(r.isTSSchema, r.hasLabelColumn(ctx), userUID, exchange, label, from, keep)
 	tag, err := r.pool.Exec(ctx, "DELETE FROM snapshot_data WHERE "+where, args...)
 	if err != nil {
 		return 0, fmt.Errorf("prune rebuilt snapshots: %w", err)
@@ -485,24 +493,22 @@ func (r *SnapshotRepo) PruneRebuiltDaysOutside(ctx context.Context, userUID, exc
 // prunedRebuiltScope builds the predicate for PruneRebuiltDaysOutside. Pure so
 // the three guards can be regression-tested without a live DB: dropping any one
 // of them turns a tidy-up into data loss.
-func prunedRebuiltScope(isTS, hasLabel bool, userUID, exchange, label string, keep []time.Time) (string, []any) {
+func prunedRebuiltScope(isTS, hasLabel bool, userUID, exchange, label string, from time.Time, keep []time.Time) (string, []any) {
 	userCol := "user_uid"
 	if isTS {
 		userCol = `"userUid"`
 	}
 
-	from, to := keep[0], keep[0]
+	to := keep[0].UTC()
 	days := make([]time.Time, 0, len(keep))
 	for _, d := range keep {
 		u := d.UTC()
-		if u.Before(from) {
-			from = u
-		}
 		if u.After(to) {
 			to = u
 		}
 		days = append(days, u)
 	}
+	from = from.UTC()
 
 	args := []any{userUID, exchange}
 	clause := userCol + " = $1 AND exchange = $2"

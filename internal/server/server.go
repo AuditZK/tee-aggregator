@@ -320,6 +320,29 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		zap.String("to", toStr),
 		zap.Bool("dry_run", dryRun),
 	)
+	// A dry run answers the caller rather than the log: logredact masks every
+	// money field, on purpose, so the days would arrive empty. Synchronous for
+	// the same reason — there is nothing to come back for later.
+	if dryRun {
+		ctx, cancel := context.WithTimeout(r.Context(), 45*time.Minute)
+		defer cancel()
+		days := s.handler.syncSvc.DryRunReconstructRange(ctx, userUID, exchange, label, from, to)
+		rows := make([]map[string]any, 0, len(days))
+		for _, d := range days {
+			rows = append(rows, map[string]any{
+				"day":              d.Timestamp.Format("2006-01-02"),
+				"total_equity":     d.TotalEquity,
+				"realized_balance": d.RealizedBalance,
+				"deposits":         d.Deposits,
+				"withdrawals":      d.Withdrawals,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true, "dry_run": true, "count": len(rows), "days": rows,
+		})
+		return
+	}
+
 	go func() {
 		// Must exceed the rebuilder-client chain (1920s): a binance HF 90-day
 		// income paging rebuild runs up to ~25 min, and this context

@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -147,6 +147,12 @@ type reconstructOpts struct {
 	// few rebuilt days between existing live snapshots can land on a different
 	// calibration basis than its neighbours. Inspect, then write.
 	dryRun bool
+	// collect receives the days a dry run would have written. The log lines
+	// cannot carry them: logredact masks every money field, on purpose, so a
+	// diagnostic that reports through the log reports nothing. The days go to
+	// the loopback caller that asked for them instead, the same channel the
+	// raw-statement dump uses and for the same reason.
+	collect func([]*repository.Snapshot)
 }
 
 // contains reports whether dayKey (a UTC midnight) falls inside the window.
@@ -1765,6 +1771,23 @@ func (s *SyncService) ReconstructHistoryRange(ctx context.Context, userUID, exch
 	})
 }
 
+// DryRunReconstructRange runs a reconstruction without writing and hands back
+// the days it would have persisted, so they can be compared against what is
+// already stored. Synchronous, unlike ReconstructHistoryRange: the caller is
+// waiting for the answer, not for confirmation that work started.
+func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, exchange, label string, from, to time.Time) []*repository.Snapshot {
+	var out []*repository.Snapshot
+	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{
+		window: dayWindow{
+			from: time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC),
+			to:   time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, time.UTC),
+		},
+		dryRun:  true,
+		collect: func(sn []*repository.Snapshot) { out = sn },
+	})
+	return out
+}
+
 func (s *SyncService) reconstructHistoryFor(ctx context.Context, userUID, exchange, label string, opts reconstructOpts) {
 	connMeta, err := s.connSvc.GetActiveConnectionByLabel(ctx, userUID, exchange, label)
 	if err != nil {
@@ -2349,18 +2372,32 @@ func (s *SyncService) persistHistoricalSnapshots(
 			}
 		}
 		if day, measured, bad := contradictedDay(snapshots, mine); bad {
-			s.logger.Error("history reconstruction rejected — contradicts a measured day",
-				zap.String("user_uid", connMeta.UserUID),
-				zap.String("exchange", connMeta.Exchange),
-				zap.String("label", connMeta.Label),
-				zap.String("source", source),
-				zap.String("day", day.Timestamp.Format("2006-01-02")),
-				zap.Float64("rebuilt_equity", day.TotalEquity),
-				zap.Float64("measured_equity", measured),
-				zap.Int("days_discarded", len(snapshots)),
-				zap.String("hint", "the reconstruction did not reproduce a day the live sync measured; nothing was written"),
-			)
-			return fmt.Errorf("reconstruction contradicts the measured equity on %s", day.Timestamp.Format("2006-01-02"))
+			// A dry run exists to inspect a disagreement, so returning here
+			// silenced the dump in exactly the case worth dumping: the
+			// operator saw one rejected day and never the series around it.
+			if opts.dryRun {
+				s.logger.Warn("history reconstruction DRY RUN — contradicts a measured day (series follows)",
+					zap.String("user_uid", connMeta.UserUID),
+					zap.String("exchange", connMeta.Exchange),
+					zap.String("label", connMeta.Label),
+					zap.String("day", day.Timestamp.Format("2006-01-02")),
+					zap.Float64("rebuilt_equity", day.TotalEquity),
+					zap.Float64("measured_equity", measured),
+				)
+			} else {
+				s.logger.Error("history reconstruction rejected — contradicts a measured day",
+					zap.String("user_uid", connMeta.UserUID),
+					zap.String("exchange", connMeta.Exchange),
+					zap.String("label", connMeta.Label),
+					zap.String("source", source),
+					zap.String("day", day.Timestamp.Format("2006-01-02")),
+					zap.Float64("rebuilt_equity", day.TotalEquity),
+					zap.Float64("measured_equity", measured),
+					zap.Int("days_discarded", len(snapshots)),
+					zap.String("hint", "the reconstruction did not reproduce a day the live sync measured; nothing was written"),
+				)
+				return fmt.Errorf("reconstruction contradicts the measured equity on %s", day.Timestamp.Format("2006-01-02"))
+			}
 		}
 	}
 
@@ -2369,6 +2406,9 @@ func (s *SyncService) persistHistoricalSnapshots(
 	// and log what WOULD have been persisted so it can be compared against the
 	// live snapshots bracketing the gap.
 	if opts.dryRun {
+		if opts.collect != nil {
+			opts.collect(snapshots)
+		}
 		for _, sn := range snapshots {
 			s.logger.Info("history reconstruction DRY RUN — would upsert",
 				zap.String("user_uid", connMeta.UserUID),
@@ -2424,7 +2464,13 @@ func (s *SyncService) persistHistoricalSnapshots(
 		for _, sn := range snapshots {
 			keep = append(keep, sn.Timestamp)
 		}
-		switch pruned, perr := s.snapshotRepo.PruneRebuiltDaysOutside(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, keep); {
+		// A full run owns the connection's whole rebuilt history, so its floor
+		// is the beginning of time; a bounded repair owns only its window.
+		pruneFrom := time.Time{}
+		if opts.window.isSet() {
+			pruneFrom = opts.window.from
+		}
+		switch pruned, perr := s.snapshotRepo.PruneRebuiltDaysOutside(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, pruneFrom, keep); {
 		case perr != nil && !errors.Is(perr, repository.ErrOriginUnavailable):
 			// The series that matters is written; a stale day left behind is
 			// worth a warning, not a failed reconstruction.
