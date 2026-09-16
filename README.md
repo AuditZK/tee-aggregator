@@ -333,7 +333,7 @@ cd tee-aggregator
 git rev-parse HEAD            # the commit you are verifying
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-  -trimpath -buildvcs=false -ldflags="-w -s" \
+  -trimpath -buildvcs=false -ldflags="-w -s -buildid=" \
   -o enclave ./cmd/enclave
 
 sha256sum enclave
@@ -346,11 +346,15 @@ from them matches no commit anyone can check out, and its hash proves nothing.
 The toolchain is pinned by `go.mod` (`go 1.26.6`); the `go` command fetches
 that exact version if the machine has another. The production image builds
 inside `golang:1.26.6-alpine`, pinned by digest, with the same command
-(`Dockerfile.production`). The host OS does not matter. `-trimpath` removes
-build paths and `-buildvcs=false` removes git stamps, the two things that let
-identical source produce different bytes: the image builds from a context
-without `.git`, and on a checkout one stray untracked file flips
-`vcs.modified` and with it the hash.
+(`Dockerfile.production`). The host OS does not matter, but three things
+could still make identical source produce different bytes, and the build
+removes each. `-trimpath` drops build-host paths. `-buildvcs=false` drops git
+stamps, which the image (built from a context without `.git`) would lack and
+which one stray untracked file flips on a checkout. `-buildid=` drops the
+linker's build ID, a hash of the build's inputs rather than of its output,
+which a CRLF checkout on Windows changed while the compiled code stayed
+byte-identical; `.gitattributes` pins every text file to LF for the same
+reason, so a checkout has the same bytes on every platform.
 
 ### Compare with production
 

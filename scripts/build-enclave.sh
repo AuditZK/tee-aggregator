@@ -2,11 +2,14 @@
 # build-enclave.sh — the one build of the enclave binary, used for production
 # deploys and by anyone checking that production runs what main says.
 #
-# Two flags make the result depend on the source and not on the machine:
+# Three flags make the result depend on the source and not on the machine:
 #   -trimpath        no build-host paths in the binary
 #   -buildvcs=false  no git stamps; the production image builds from a context
 #                    without .git, and on a checkout a single untracked file
 #                    flips vcs.modified and changes the hash of identical code
+#   -buildid=        no linker build ID; it hashes the build's INPUTS, not its
+#                    output, and a CRLF checkout changed it while the compiled
+#                    code stayed byte-identical (.gitattributes pins LF too)
 # go.mod pins the toolchain, so `go` fetches that exact version wherever this
 # runs, and the host OS does not matter for a linux/amd64 target.
 #
@@ -33,7 +36,7 @@ if [[ "$allow_dirty" == false ]] && [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-  -trimpath -buildvcs=false -ldflags="-w -s" \
+  -trimpath -buildvcs=false -ldflags="-w -s -buildid=" \
   -o enclave_linux ./cmd/enclave/
 
 suffix=""

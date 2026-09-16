@@ -33,7 +33,7 @@ COPY . .
 # build from this context (which has no .git) hash the same.
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -trimpath -buildvcs=false \
-    -ldflags="-w -s" \
+    -ldflags="-w -s -buildid=" \
     -o /enclave \
     ./cmd/enclave
 
@@ -41,11 +41,11 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 # image so incident response never needs to copy unreviewed binaries into the
 # running TEE container — the 2026-08-04 cold-start incident had to wait for
 # the daily pass for lack of an in-image sync trigger.
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-w -s" \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-w -s -buildid=" \
     -o /admin-recover-snapshot ./cmd/admin-recover-snapshot \
- && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-w -s" \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-w -s -buildid=" \
     -o /admin-dump-breakdown ./cmd/admin-dump-breakdown \
- && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-w -s" \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-w -s -buildid=" \
     -o /admin-probe ./cmd/admin-probe
 
 # Runtime stage.
