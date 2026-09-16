@@ -88,3 +88,76 @@ func TestAggregateFlexTradesByDate_CountsContractValue(t *testing.T) {
 		t.Fatalf("total volume: got %v, want %v", got, want)
 	}
 }
+
+// Every Flex query built from our setup guide before 2026-09-16 omits the
+// Multiplier field, so the statement of an existing customer carries no
+// attribute at all. Waiting for each of them to edit their query would leave
+// the figure wrong for as long as they never do.
+func TestParseTradesFromReport_OptionWithoutTheAttribute(t *testing.T) {
+	report := []byte(`<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement>
+      <Trades>
+        <Trade tradeID="1" symbol="TESTX 260731C00255000" buySell="SELL"
+               tradePrice="2" quantity="-498"
+               ibCommission="-269.27" currency="USD" dateTime="20260730;095413"
+               assetCategory="OPT" fifoPnlRealized="48692.44" />
+        <Trade tradeID="2" symbol="TESTZ" buySell="BUY"
+               tradePrice="4200" quantity="3"
+               ibCommission="-6" currency="USD" dateTime="20260730;100000"
+               assetCategory="FUT" fifoPnlRealized="0" />
+      </Trades>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>`)
+
+	i := &IBKR{}
+	trades, err := i.parseTradesFromReport(report,
+		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// 498 contracts of premium at 2, which is 99,600 of cash and not 996.
+	if got, want := trades[0].Notional(), 99600.0; got != want {
+		t.Fatalf("option without the attribute: got %v, want %v", got, want)
+	}
+
+	// A future is anything from 20 to 1000 and there is nothing to read it
+	// off, so it keeps the value it had rather than inheriting the option's.
+	if trades[1].Multiplier != 0 {
+		t.Fatalf("future must not be given a guessed multiplier, got %v", trades[1].Multiplier)
+	}
+	if got, want := trades[1].Notional(), 12600.0; got != want {
+		t.Fatalf("future notional: got %v, want %v", got, want)
+	}
+}
+
+// A statement that does carry the attribute wins over the default, which is
+// what an option adjusted by a corporate action depends on.
+func TestParseTradesFromReport_AdjustedOptionKeepsItsOwnMultiplier(t *testing.T) {
+	report := []byte(`<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement>
+      <Trades>
+        <Trade tradeID="1" symbol="TESTX1 260731C00100000" buySell="BUY"
+               tradePrice="3" quantity="10" multiplier="110"
+               ibCommission="-1" currency="USD" dateTime="20260730;095413"
+               assetCategory="OPT" fifoPnlRealized="0" />
+      </Trades>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>`)
+
+	i := &IBKR{}
+	trades, err := i.parseTradesFromReport(report,
+		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got, want := trades[0].Notional(), 3300.0; got != want {
+		t.Fatalf("adjusted option: got %v, want %v", got, want)
+	}
+}

@@ -1237,6 +1237,15 @@ func (i *IBKR) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, e
 	return i.parseTradesFromReport(report, start, end)
 }
 
+// flexDefaultOptionMultiplier stands in when a statement carries no Multiplier
+// attribute, which is every query built from our setup guide before it started
+// asking for the field. Listed equity and index options are 100 across the
+// board; a contract adjusted by a corporate action is not, and a future is
+// anything from 20 to 1000, which is why only options get a default. Being
+// wrong on the occasional adjusted contract beats being wrong on all of them,
+// and a statement that does carry the attribute always wins over this.
+const flexDefaultOptionMultiplier = 100
+
 func (i *IBKR) parseTradesFromReport(report []byte, start, end time.Time) ([]*Trade, error) {
 	var flex struct {
 		XMLName        xml.Name `xml:"FlexQueryResponse"`
@@ -1291,6 +1300,9 @@ func (i *IBKR) parseTradesFromReport(report []byte, start, end time.Time) ([]*Tr
 		// Absent unless the Flex query selects the Multiplier field, and
 		// absent on every cash instrument. Left at zero it means one.
 		multiplier, _ := strconv.ParseFloat(t.Multiplier, 64)
+		if multiplier <= 0 && t.AssetCategory == "OPT" {
+			multiplier = flexDefaultOptionMultiplier
+		}
 
 		side := "buy"
 		if t.BuySell == "SELL" {
