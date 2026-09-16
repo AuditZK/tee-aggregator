@@ -191,6 +191,7 @@ type IBKR struct {
 	// account's denomination is not a statement-shape problem it should be
 	// allowed to erase.
 	currencyWarning string
+	accountCurrency string
 
 	// Cached from last GetBalance call (avoids extra Flex requests)
 	cachedBreakdown []*MarketBalance
@@ -623,20 +624,20 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 	}
 	// Flex reports "in base currency" — the account's denomination, not always
 	// USD. Nothing downstream converts, so a EUR account's figures travel as
-	// EUR under a USD label unless somebody is told. A French PEA cannot be
-	// anything but EUR, and a statement whose query omits the Currency field
-	// leaves this empty, which is indistinguishable from a dollar account:
-	// warn on that too rather than treat silence as a dollar.
-	currency := summary.Currency
+	// EUR under a USD label unless somebody reads this.
+	currency, inferred := accountCurrency(summary.Currency, report)
 	switch {
 	case currency == "":
 		i.currencyWarning = "ibkr_account_currency_unknown"
 		currency = "USD"
+	case currency != "USD" && inferred:
+		i.currencyWarning = "ibkr_account_currency_" + strings.ToLower(currency) + "_inferred"
 	case currency != "USD":
 		i.currencyWarning = "ibkr_account_currency_" + strings.ToLower(currency)
 	default:
 		i.currencyWarning = ""
 	}
+	i.accountCurrency = currency
 	total, _ := strconv.ParseFloat(summary.Total, 64)
 	cash, _ := strconv.ParseFloat(summary.Cash, 64)
 	unrealized, _ := strconv.ParseFloat(summary.UnrealizedPnL, 64)
@@ -1255,6 +1256,78 @@ func (i *IBKR) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, e
 	}
 
 	return i.parseTradesFromReport(report, start, end)
+}
+
+// accountCurrency answers what the figures in a statement are denominated in,
+// and whether that had to be inferred.
+//
+// The Currency field of Equity Summary is the answer when a query selects it.
+// Ours did not ask for it until 2026-09-16, so an existing account's statement
+// is simply silent, and silence has been read as dollars: two accounts of one
+// customer, a French PEA and its CTO, have been served in dollars since June
+// 2025 while a PEA cannot hold anything but euros.
+//
+// The statement still knows. Money crossing the account boundary is recorded
+// in the currency the account is funded in, so when every deposit, withdrawal
+// and transfer in the report agrees on one currency, that is the denomination.
+// Disagreement means a multi-currency account, which this cannot resolve and
+// does not try to.
+func accountCurrency(declared string, report []byte) (ccy string, inferred bool) {
+	if declared != "" {
+		return declared, false
+	}
+
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				CashTransactions struct {
+					CashTransaction []struct {
+						Type     string `xml:"type,attr"`
+						Currency string `xml:"currency,attr"`
+					} `xml:"CashTransaction"`
+				} `xml:"CashTransactions"`
+				Transfers struct {
+					Transfer []struct {
+						CashTransfer string `xml:"cashTransfer,attr"`
+						Currency     string `xml:"currency,attr"`
+					} `xml:"Transfer"`
+				} `xml:"Transfers"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return "", false
+	}
+
+	stmt := flex.FlexStatements.FlexStatement
+	seen := ""
+	for _, tx := range stmt.CashTransactions.CashTransaction {
+		if !flexCapitalTypes[tx.Type] {
+			continue
+		}
+		if tx.Currency == "" {
+			continue
+		}
+		if seen != "" && seen != tx.Currency {
+			return "", false
+		}
+		seen = tx.Currency
+	}
+	for _, tr := range stmt.Transfers.Transfer {
+		cash, _ := strconv.ParseFloat(tr.CashTransfer, 64)
+		if cash == 0 || tr.Currency == "" {
+			continue
+		}
+		if seen != "" && seen != tr.Currency {
+			return "", false
+		}
+		seen = tr.Currency
+	}
+	if seen == "" {
+		return "", false
+	}
+	return seen, true
 }
 
 // flexDefaultOptionMultiplier stands in when a statement carries no Multiplier

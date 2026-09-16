@@ -85,3 +85,118 @@ func TestCapabilityWarnings_CurrencySurvivesACashflowParse(t *testing.T) {
 		t.Fatalf("currency warning lost after a cashflow parse: %v", i.CapabilityWarnings())
 	}
 }
+
+// A query built from our guide before 2026-09-16 does not select the Currency
+// field, so an existing customer's statement is silent about it. The money
+// that crossed the account boundary is not: it is recorded in the currency the
+// account is funded in.
+func TestAccountCurrency_InferredFromTheMoneyThatMoved(t *testing.T) {
+	report := []byte(`<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement>
+      <EquitySummaryInBase>
+        <EquitySummaryByReportDateInBase reportDate="20260915" total="10000" cash="10000" />
+      </EquitySummaryInBase>
+      <CashTransactions>
+        <CashTransaction type="Deposits/Withdrawals" amount="5000" currency="EUR" dateTime="20260601;120000"/>
+        <CashTransaction type="Broker Interest Received" amount="3" currency="EUR" dateTime="20260701;120000"/>
+        <CashTransaction type="Deposits/Withdrawals" amount="2000" currency="EUR" dateTime="20260801;120000"/>
+      </CashTransactions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>`)
+
+	i := &IBKR{}
+	bal, err := i.parseBalanceFromReport(report)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if bal.Currency != "EUR" {
+		t.Fatalf("currency: got %q, want EUR", bal.Currency)
+	}
+	if got := i.CapabilityWarnings(); len(got) != 1 || got[0] != "ibkr_account_currency_eur_inferred" {
+		t.Fatalf("warnings: got %v, want [ibkr_account_currency_eur_inferred]", got)
+	}
+}
+
+// An account funded in more than one currency cannot be reduced to one, and
+// guessing would be worse than saying so.
+func TestAccountCurrency_MixedFundingStaysUnknown(t *testing.T) {
+	report := []byte(`<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement>
+      <EquitySummaryInBase>
+        <EquitySummaryByReportDateInBase reportDate="20260915" total="10000" cash="10000" />
+      </EquitySummaryInBase>
+      <CashTransactions>
+        <CashTransaction type="Deposits/Withdrawals" amount="5000" currency="EUR" dateTime="20260601;120000"/>
+        <CashTransaction type="Deposits/Withdrawals" amount="2000" currency="USD" dateTime="20260801;120000"/>
+      </CashTransactions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>`)
+
+	i := &IBKR{}
+	if _, err := i.parseBalanceFromReport(report); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := i.CapabilityWarnings(); len(got) != 1 || got[0] != "ibkr_account_currency_unknown" {
+		t.Fatalf("warnings: got %v, want [ibkr_account_currency_unknown]", got)
+	}
+}
+
+// Income and charges are booked in the currency of the instrument that paid
+// them, so a dividend in dollars on a euro account must not decide the
+// denomination. Only capital crossing the boundary counts.
+func TestAccountCurrency_IncomeDoesNotDecideTheDenomination(t *testing.T) {
+	report := []byte(`<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement>
+      <EquitySummaryInBase>
+        <EquitySummaryByReportDateInBase reportDate="20260915" total="10000" cash="10000" />
+      </EquitySummaryInBase>
+      <CashTransactions>
+        <CashTransaction type="Deposits/Withdrawals" amount="5000" currency="EUR" dateTime="20260601;120000"/>
+        <CashTransaction type="Dividends" amount="12" currency="USD" dateTime="20260701;120000"/>
+      </CashTransactions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>`)
+
+	i := &IBKR{}
+	bal, err := i.parseBalanceFromReport(report)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if bal.Currency != "EUR" {
+		t.Fatalf("currency: got %q, want EUR", bal.Currency)
+	}
+}
+
+// A declared currency is the answer; nothing is inferred over it.
+func TestAccountCurrency_DeclaredWinsOverTheInference(t *testing.T) {
+	report := []byte(`<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement>
+      <EquitySummaryInBase>
+        <EquitySummaryByReportDateInBase reportDate="20260915" currency="USD" total="10000" cash="10000" />
+      </EquitySummaryInBase>
+      <CashTransactions>
+        <CashTransaction type="Deposits/Withdrawals" amount="5000" currency="EUR" dateTime="20260601;120000"/>
+      </CashTransactions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>`)
+
+	i := &IBKR{}
+	bal, err := i.parseBalanceFromReport(report)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if bal.Currency != "USD" {
+		t.Fatalf("currency: got %q, want the declared USD", bal.Currency)
+	}
+	if got := i.CapabilityWarnings(); len(got) != 0 {
+		t.Fatalf("warnings: got %v, want none", got)
+	}
+}
