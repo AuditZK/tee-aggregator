@@ -3003,7 +3003,7 @@ func (s *SyncService) aggregateTrades(trades []*connector.Trade) *aggregatedBrea
 	agg := &aggregatedBreakdown{}
 
 	for _, t := range trades {
-		volume := t.Price * t.Quantity
+		volume := t.Notional()
 		ma := &agg.spot
 
 		switch t.MarketType {

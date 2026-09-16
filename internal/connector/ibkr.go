@@ -1003,7 +1003,7 @@ func aggregateFlexTradesByDate(trades []*Trade) map[string]flexDayTrades {
 		dateKey := t.Timestamp.Format("20060102")
 		entry := byDate[dateKey]
 		entry.count++
-		notional := t.Price * t.Quantity
+		notional := t.Notional()
 		entry.volume += notional
 		entry.fees += t.Fee
 		if t.Side == "sell" {
@@ -1158,6 +1158,7 @@ func (i *IBKR) parseTradesFromReport(report []byte, start, end time.Time) ([]*Tr
 						Currency        string `xml:"currency,attr"`
 						DateTime        string `xml:"dateTime,attr"`
 						AssetCategory   string `xml:"assetCategory,attr"`
+						Multiplier      string `xml:"multiplier,attr"`
 						FifoPnlRealized string `xml:"fifoPnlRealized,attr"`
 					} `xml:"Trade"`
 				} `xml:"Trades"`
@@ -1192,6 +1193,9 @@ func (i *IBKR) parseTradesFromReport(report []byte, start, end time.Time) ([]*Tr
 			fee = -fee
 		}
 		pnl, _ := strconv.ParseFloat(t.FifoPnlRealized, 64)
+		// Absent unless the Flex query selects the Multiplier field, and
+		// absent on every cash instrument. Left at zero it means one.
+		multiplier, _ := strconv.ParseFloat(t.Multiplier, 64)
 
 		side := "buy"
 		if t.BuySell == "SELL" {
@@ -1216,6 +1220,7 @@ func (i *IBKR) parseTradesFromReport(report []byte, start, end time.Time) ([]*Tr
 			Side:        side,
 			Price:       price,
 			Quantity:    qty,
+			Multiplier:  multiplier,
 			Fee:         fee,
 			FeeCurrency: t.Currency,
 			RealizedPnL: pnl,

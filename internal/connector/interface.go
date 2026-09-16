@@ -372,16 +372,32 @@ type Position struct {
 
 // Trade represents a single trade (memory only)
 type Trade struct {
-	ID          string    `json:"id"`
-	Symbol      string    `json:"symbol"`
-	Side        string    `json:"side"` // "buy" or "sell"
-	Price       float64   `json:"price"`
-	Quantity    float64   `json:"quantity"`
+	ID       string  `json:"id"`
+	Symbol   string  `json:"symbol"`
+	Side     string  `json:"side"` // "buy" or "sell"
+	Price    float64 `json:"price"`
+	Quantity float64 `json:"quantity"`
+	// Underlying units per unit of Quantity, for a venue that counts
+	// contracts while quoting the price per underlying unit: 100 on an
+	// equity option, 50 on an ES future. Zero means Quantity is already in
+	// the price's unit, which is every spot venue and every connector not
+	// yet taught its own contract sizes.
+	Multiplier  float64   `json:"multiplier,omitempty"`
 	Fee         float64   `json:"fee"`
 	FeeCurrency string    `json:"fee_currency"`
 	RealizedPnL float64   `json:"realized_pnl"`
 	Timestamp   time.Time `json:"timestamp"`
 	MarketType  string    `json:"market_type"` // "spot", "stocks", "swap", "futures", "options"
+}
+
+// Notional is the value traded, in the currency Price is quoted in. Reading
+// Price * Quantity off a contract undercounts it by the multiplier, which put
+// a day of $2,030,051 in equity options on the dashboard as $20,300.
+func (t *Trade) Notional() float64 {
+	if t.Multiplier > 0 {
+		return t.Price * t.Quantity * t.Multiplier
+	}
+	return t.Price * t.Quantity
 }
 
 // Credentials holds decrypted API credentials
