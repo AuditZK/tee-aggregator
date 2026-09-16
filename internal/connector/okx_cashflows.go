@@ -53,17 +53,24 @@ func (o *OKX) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, e
 		return nil, fmt.Errorf("fetch okx bills: %w", err)
 	}
 
-	// One public all-tickers call prices every non-stable transfer currency;
-	// skipped entirely when the window moved only stables. A transport
-	// failure degrades to stables-only rather than dropping the whole window:
-	// a missed USDT transfer books as fabricated performance, which is the
-	// defect this file exists to close.
-	prices, priced := o.spotUSDPrices(ctx, okxNonStableTransferCcys(bills))
+	// The second wallet. A move between the two is not a crossing, and a
+	// deposit on its way through is visible only from this side.
+	funding, err := o.fundingBills(ctx, since, now)
+	if err != nil {
+		o.noteCashflowWarning("okx_funding_ledger_unreadable")
+	}
+
+	// One public all-tickers call prices every non-stable currency either
+	// ledger moved; skipped entirely when the window moved only stables. A
+	// transport failure degrades to stables-only rather than dropping the
+	// whole window: a missed USDT transfer books as fabricated performance,
+	// which is the defect this file exists to close.
+	prices, priced := o.spotUSDPrices(ctx, okxNonStableTransferCcys(bills, funding))
 	if !priced {
 		o.noteCashflowWarning("okx_spot_pricing_unavailable")
 	}
 
-	flows, warnings := okxClassifyCashflows(bills, prices)
+	flows, warnings := okxClassifyCashflows(bills, funding, prices)
 	for _, w := range warnings {
 		o.noteCashflowWarning(w)
 	}
@@ -79,16 +86,22 @@ func (o *OKX) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, e
 // already absorbs. Any OTHER type that moves balance surfaces as a warning
 // and must be classified deliberately, not absorbed — the rebuilder's
 // ledger-histogram doctrine, applied live.
-func okxClassifyCashflows(bills []okxBill, prices map[string]float64) ([]*Cashflow, []string) {
+func okxClassifyCashflows(bills, funding []okxBill, prices map[string]float64) ([]*Cashflow, []string) {
 	warnings := map[string]bool{}
 	var flows []*Cashflow
+	internal := pairInternalTransfers(bills, funding)
 
-	for _, b := range bills {
+	for i, b := range bills {
 		if b.BalChg == 0 {
 			continue
 		}
 		switch b.Type {
 		case "1":
+			// Paired with a funding leg: one move between two wallets that are
+			// both inside, and the holding stays valued on the other side.
+			if internal[i] {
+				continue
+			}
 			usd, ok := okxValueUSD(b.Ccy, math.Abs(b.BalChg), prices)
 			if !ok {
 				warnings["okx_transfer_unpriced:"+b.Ccy] = true
@@ -103,6 +116,25 @@ func okxClassifyCashflows(bills []okxBill, prices map[string]float64) ([]*Cashfl
 			warnings["okx_bill_unclassified:"+b.Type+"/"+b.SubType] = true
 		}
 	}
+
+	// The funding ledger names its own counterpart, so it needs no pairing:
+	// 130/131 is the trading account either way, and its trading twin may fall
+	// outside the window. Everything else there crossed OKX itself.
+	for _, b := range funding {
+		if b.BalChg == 0 || fundingInternalTypes[b.Type] {
+			continue
+		}
+		usd, ok := okxValueUSD(b.Ccy, math.Abs(b.BalChg), prices)
+		if !ok {
+			warnings["okx_funding_unpriced:"+b.Ccy] = true
+			continue
+		}
+		if b.BalChg < 0 {
+			usd = -usd
+		}
+		flows = append(flows, &Cashflow{Amount: usd, Currency: b.Ccy, Timestamp: b.T})
+	}
+	sort.Slice(flows, func(i, j int) bool { return flows[i].Timestamp.Before(flows[j].Timestamp) })
 
 	keys := make([]string, 0, len(warnings))
 	for k := range warnings {
@@ -122,15 +154,29 @@ func okxValueUSD(ccy string, qty float64, prices map[string]float64) (float64, b
 	return 0, false
 }
 
-func okxNonStableTransferCcys(bills []okxBill) []string {
+// okxNonStableTransferCcys lists what the one public tickers call has to
+// price. The funding ledger contributes every type it carries, not just
+// transfers: its deposits and sub-account moves are crossings in their own
+// right, and an unpriced crossing is the phantom-performance defect.
+func okxNonStableTransferCcys(bills, funding []okxBill) []string {
 	seen := map[string]bool{}
 	var ccys []string
-	for _, b := range bills {
-		if b.Type != "1" || b.BalChg == 0 || okxStableCoins[b.Ccy] || seen[b.Ccy] {
-			continue
+	add := func(ccy string) {
+		if okxStableCoins[ccy] || seen[ccy] {
+			return
 		}
-		seen[b.Ccy] = true
-		ccys = append(ccys, b.Ccy)
+		seen[ccy] = true
+		ccys = append(ccys, ccy)
+	}
+	for _, b := range bills {
+		if b.Type == "1" && b.BalChg != 0 {
+			add(b.Ccy)
+		}
+	}
+	for _, b := range funding {
+		if b.BalChg != 0 {
+			add(b.Ccy)
+		}
 	}
 	return ccys
 }

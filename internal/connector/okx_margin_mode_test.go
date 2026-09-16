@@ -200,17 +200,19 @@ const okxBodyPortfolioMargin = `{"code":"0","data":[{` +
 	`{"ccy":"USDC","eq":"3021.10","eqUsd":"3021.10","cashBal":"3021.10","availBal":"3021.10","availEq":"3021.10","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""}` +
 	`]}]}`
 
-// GetBalance must stay a single request. The mode is readable off the fields
-// OKX left empty, so paying for /account/config on every sync of every OKX
-// account would buy nothing.
-func TestOKXGetBalance_SpendsOneRequest(t *testing.T) {
+// One request per wallet, and not one more. The perimeter covers the trading
+// and the funding account, and OKX states them on separate endpoints, so the
+// second call buys a number that would otherwise be missing. The account mode
+// does not: it is readable off the fields OKX left empty, and paying for
+// /account/config on every sync of every OKX account would buy nothing.
+func TestOKXGetBalance_SpendsOneRequestPerWallet(t *testing.T) {
 	region := newOKXFakeRegion(t, http.StatusOK, okxBodyPortfolioMargin)
 	okx := newOKXAcross(region)
 
 	if _, err := okx.GetBalance(context.Background()); err != nil {
 		t.Fatalf("GetBalance: %v", err)
 	}
-	if got := region.requests(); got != 1 {
-		t.Fatalf("GetBalance made %d requests, want 1", got)
+	if got := region.requests(); got != 2 {
+		t.Fatalf("GetBalance made %d requests, want 2 (one per wallet)", got)
 	}
 }

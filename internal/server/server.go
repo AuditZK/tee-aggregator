@@ -138,6 +138,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/admin/balance-probe", s.localhostOnly(s.handleAdminBalanceProbe))
 	mux.HandleFunc("/api/v1/admin/refresh-metadata", s.localhostOnly(s.handleAdminRefreshMetadata))
 	mux.HandleFunc("/api/v1/admin/raw-statement", s.localhostOnly(s.handleAdminRawStatement))
+	mux.HandleFunc("/api/v1/admin/funding-probe", s.localhostOnly(s.handleAdminFundingProbe))
 
 	// B2 handoff: deliberately NOT gated by localhostOnly because the
 	// successor enclave runs in a different container with a non-loopback
@@ -680,6 +681,87 @@ func (s *Server) handleAdminRawStatement(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(doc)
+}
+
+// handleAdminFundingProbe answers with the wallet the tracked perimeter leaves
+// out, for one connection.
+//
+// Usage: GET /api/v1/admin/funding-probe?user_uid=X&exchange=okx&label=Y&from=2026-09-01
+//
+// A transfer out of the trading account is indistinguishable, from inside the
+// perimeter, between money parked in the customer's other wallet and money
+// that left the venue. The two lead to opposite readings of the same day — one
+// is performance, the other is capital — and only the venue can settle it. The
+// rows come back verbatim rather than classified: the published type tables
+// for this ledger disagree with each other, and a classifier written from the
+// wrong one would be wrong silently. The response carries live account data
+// and goes to a loopback caller only; the log records that a probe was served
+// and how many rows, never their content.
+func (s *Server) handleAdminFundingProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "GET only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+
+	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	since := time.Now().UTC().AddDate(0, 0, -90)
+	if fromStr := q.Get("from"); fromStr != "" {
+		parsed, err := time.Parse("2006-01-02", fromStr)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from must be YYYY-MM-DD"})
+			return
+		}
+		since = parsed
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	probe, err := s.handler.syncSvc.ProbeFunding(r.Context(), userUID, exchange, label, since)
+	if err != nil {
+		if errors.Is(err, service.ErrFundingProbeUnsupported) {
+			writeJSON(w, http.StatusNotImplemented, map[string]any{
+				"error":    "connector does not expose a funding probe",
+				"exchange": exchange,
+			})
+			return
+		}
+		s.log().Error("funding probe failed",
+			zap.String("exchange", exchange),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+
+	s.log().Info("funding probe served",
+		zap.String("exchange", exchange),
+		zap.Int("balances", len(probe.Balances)),
+		zap.Int("bills", len(probe.Bills)),
+	)
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "funding": probe})
 }
 
 // jwtRequired verifies an HS256 bearer token on REST handlers (SEC-002).

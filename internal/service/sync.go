@@ -3188,6 +3188,44 @@ func (s *SyncService) ProbeBalance(
 	return prober.ProbeBalance(ctx)
 }
 
+// ErrFundingProbeUnsupported is returned when the connection's connector has
+// no FundingProber, which for most venues means there is no second wallet to
+// read rather than a missing feature.
+var ErrFundingProbeUnsupported = errors.New("connector does not implement funding probing")
+
+// ProbeFunding reports the wallet that sits outside the tracked perimeter.
+//
+// A transfer out of the trading account is booked as a withdrawal and its
+// return as a deposit, so a round trip turns whatever the holding did in
+// between into capital. Telling that apart from a real exit needs the other
+// wallet's ledger, which only this enclave can read. Nothing is persisted and
+// the rows are not logged.
+func (s *SyncService) ProbeFunding(
+	ctx context.Context,
+	userUID, exchange, label string,
+	since time.Time,
+) (*connector.FundingProbe, error) {
+	if s.connSvc == nil {
+		return nil, fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build connector: %w", err)
+	}
+
+	prober, ok := conn.(connector.FundingProber)
+	if !ok {
+		return nil, fmt.Errorf("%s: %w", exchange, ErrFundingProbeUnsupported)
+	}
+	return prober.ProbeFunding(ctx, since)
+}
+
 // DumpRawCashflows returns the broker's unfiltered balance-operation ledger for
 // a user, every operationType preserved. Diagnostic for balance jumps that the
 // deposit/withdraw filter (op 0/1) can't explain — a demo reset that surfaces

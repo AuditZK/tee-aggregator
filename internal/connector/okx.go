@@ -427,6 +427,16 @@ func (o *OKX) GetBalance(ctx context.Context) (*Balance, error) {
 	equity, _ := strconv.ParseFloat(account.TotalEq, 64)
 	reading := okxReadMargin(*account)
 
+	// totalEq is the trading wallet alone. The funding wallet is inside the
+	// perimeter too, so its value belongs in equity — without it, coins parked
+	// there read as an account that emptied itself. A key not permitted to see
+	// it degrades to the trading wallet rather than reporting a hole.
+	if funding, err := o.fundingEquityUSD(ctx); err != nil {
+		o.noteCashflowWarning("okx_funding_balance_unreadable")
+	} else {
+		equity += funding
+	}
+
 	// The "free margin never exceeds equity" invariant is held one layer up,
 	// in service.clampAvailableMargin, so it applies to every venue and to the
 	// reconstruction path as well as this one.

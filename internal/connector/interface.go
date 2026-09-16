@@ -159,6 +159,14 @@ type BalanceProber interface {
 	ProbeBalance(ctx context.Context) (*BalanceProbe, error)
 }
 
+// FundingProber is implemented by connectors whose venue keeps a second wallet
+// outside the tracked perimeter. It reports that wallet's balances and ledger
+// verbatim, so a transfer that left the perimeter can be told apart from money
+// that left the venue.
+type FundingProber interface {
+	ProbeFunding(ctx context.Context, since time.Time) (*FundingProbe, error)
+}
+
 // BalanceFreshnessProvider is implemented by statement-based connectors (IBKR
 // Flex) whose GetBalance can only return the newest figure present in an
 // already-generated statement — data that lags real time by one to two days.

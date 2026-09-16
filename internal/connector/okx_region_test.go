@@ -77,8 +77,9 @@ func TestOKXRegionProbePinsTheDomainThatKnowsTheKey(t *testing.T) {
 	if bal.Equity != 1234.5 || bal.Available != 1000 {
 		t.Fatalf("balance = %+v, want equity 1234.5 / available 1000", bal)
 	}
-	if global.requests() != 1 || eea.requests() != 2 || us.requests() != 0 {
-		t.Fatalf("pin broken: global=%d eea=%d us=%d, want 1/2/0",
+	// Two more on the pinned region, one per wallet, and none anywhere else.
+	if global.requests() != 1 || eea.requests() != 3 || us.requests() != 0 {
+		t.Fatalf("pin broken: global=%d eea=%d us=%d, want 1/3/0",
 			global.requests(), eea.requests(), us.requests())
 	}
 }
