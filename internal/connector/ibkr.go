@@ -38,32 +38,55 @@ var (
 	// what the token gate below is for.
 	flexSingleflight singleflight.Group
 
-	// flexTokenLastReq records the last time each Flex TOKEN went to the
-	// network. IBKR's 1018 rate limit is per token, but the cache and
-	// singleflight above are keyed token:queryID — so a user with two
-	// accounts on one token (CTO+PEA, two query IDs) raced both requests
-	// into IBKR within the same millisecond, every midnight, and the loser
-	// burned a second request on its follow-up GetBalance for good measure.
-	// The gate makes the loser fail locally, instantly and typed, without
-	// spending IBKR's budget; the sync layer's deferred retry (6h) then
-	// picks it up long after the cooldown.
-	flexTokenLastReq   = make(map[string]time.Time)
-	flexTokenLastReqMu sync.Mutex
+	// flexTokenStates paces each Flex TOKEN. IBKR's 1018 rate limit is per
+	// token, but the cache and singleflight above are keyed token:queryID, so
+	// a user with two accounts on one token (CTO+PEA, two query IDs) raced
+	// both requests into IBKR within the same millisecond, every midnight, and
+	// the loser burned a second request on its follow-up GetBalance for good
+	// measure. The gate makes the loser fail locally, instantly and typed,
+	// without spending IBKR's budget; the sync layer's deferred retry (6h)
+	// then picks it up long after the cooldown.
+	//
+	// Process-local: a restart forgets the back-off and the day's budget, so
+	// recreating the container is itself a way to spend IBKR's patience.
+	flexTokenStates  = make(map[string]*flexTokenState)
+	flexTokenStateMu sync.Mutex
 )
+
+// flexTokenState is what one token has spent and how long it must now wait.
+type flexTokenState struct {
+	lastReq     time.Time
+	failures    int    // consecutive, drives the back-off
+	budgetDay   string // UTC date budgetSpent is counted on
+	budgetSpent int
+	lockedUntil time.Time
+}
 
 const flexReportCacheTTL = 5 * time.Minute
 
-// flexTokenCooldown paces requests on one Flex token. IBKR documents the
-// limit with error 1018: one request per second, ten per minute, per token.
-// This was 3h, read off an observation rather than the documentation, and the
-// observation was a misreading: the refusals that suggested it are 1001, which
-// IBKR defines as transient and answers with "please try again shortly". A
-// three-hour gate turns that invitation into a day of silence, and it denied
-// the enclave its own scheduled sync. One minute keeps the guard this exists
-// for — two connections on one token racing into IBKR in the same millisecond,
-// where the loser spends a request for nothing — with ten times the headroom
-// the documented limit asks for.
+// flexTokenCooldown paces requests on one Flex token after a SUCCESS. IBKR
+// documents the limit with error 1018: one request per second, ten per minute,
+// per token. One minute keeps the guard this exists for, two connections on
+// one token racing into IBKR in the same millisecond where the loser spends a
+// request for nothing, with ten times the headroom the documented limit asks
+// for.
 const flexTokenCooldown = time.Minute
+
+// A failure is not paced the same way, because IBKR counts FAILURES and not
+// just requests. On 2026-09-15 a token answering 1001 ("could not be generated
+// at this time, please try again shortly") was asked nine times in forty
+// minutes and came back 1025, "too many failed attempts, please review your
+// configuration", a code in no published IBKR table, which took a customer's
+// account off the air the day after he subscribed. Taking IBKR's invitation to
+// retry shortly at face value is what spent his credit.
+//
+// So the wait doubles after each consecutive failure, and the day has a hard
+// budget of them. Once spent, the token waits for the next UTC day, where the
+// scheduled midnight sync picks it up with a fresh one.
+const (
+	flexTokenMaxBackoff    = 2 * time.Hour
+	flexTokenDailyFailures = 6
+)
 
 // flexStaleReuseWindow is how long a statement already fetched may still be
 // served once the gate denies a fresh request. It is deliberately not the
@@ -83,15 +106,71 @@ var ErrFlexTokenBusy = fmt.Errorf("%w: shared flex token cooling down", ErrTrans
 // claims it when allowed. The claim is taken BEFORE the request is sent and
 // kept even if the request then fails: a failed send still spent IBKR-side
 // budget, and holding the claim is what stops the same sync cycle from
-// spending a second one.
-func claimFlexToken(token string, now time.Time) (lastUse time.Time, ok bool) {
-	flexTokenLastReqMu.Lock()
-	defer flexTokenLastReqMu.Unlock()
-	if last, used := flexTokenLastReq[token]; used && now.Sub(last) < flexTokenCooldown {
-		return last, false
+// spending a second one. A denial says when the token reopens.
+func claimFlexToken(token string, now time.Time) (retryAt time.Time, ok bool) {
+	flexTokenStateMu.Lock()
+	defer flexTokenStateMu.Unlock()
+
+	st := flexTokenStates[token]
+	if st == nil {
+		st = &flexTokenState{}
+		flexTokenStates[token] = st
 	}
-	flexTokenLastReq[token] = now
+	if day := now.UTC().Format("2006-01-02"); st.budgetDay != day {
+		st.budgetDay = day
+		st.budgetSpent = 0
+	}
+
+	if now.Before(st.lockedUntil) {
+		return st.lockedUntil, false
+	}
+	if st.budgetSpent >= flexTokenDailyFailures {
+		return nextUTCDay(now), false
+	}
+	if wait := flexTokenWait(st.failures); !st.lastReq.IsZero() && now.Sub(st.lastReq) < wait {
+		return st.lastReq.Add(wait), false
+	}
+
+	st.lastReq = now
 	return time.Time{}, true
+}
+
+func flexTokenWait(failures int) time.Duration {
+	wait := flexTokenCooldown
+	for n := 0; n < failures; n++ {
+		if wait >= flexTokenMaxBackoff {
+			return flexTokenMaxBackoff
+		}
+		wait *= 2
+	}
+	return wait
+}
+
+// noteFlexOutcome closes the attempt claimFlexToken opened. A success clears
+// the back-off; a failure widens it, spends one of the day's attempts, and on
+// 1025 stops asking until tomorrow.
+func noteFlexOutcome(token string, now time.Time, err error) {
+	flexTokenStateMu.Lock()
+	defer flexTokenStateMu.Unlock()
+
+	st := flexTokenStates[token]
+	if st == nil {
+		return
+	}
+	if err == nil {
+		st.failures = 0
+		return
+	}
+	st.failures++
+	st.budgetSpent++
+	if errors.Is(err, ErrFlexConfigLocked) {
+		st.lockedUntil = nextUTCDay(now)
+	}
+}
+
+func nextUTCDay(now time.Time) time.Time {
+	t := now.UTC()
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour)
 }
 
 // IBKR implements Connector for Interactive Brokers via Flex Query
@@ -156,7 +235,7 @@ func (i *IBKR) fetchFlexReport(ctx context.Context) ([]byte, error) {
 		}
 		flexReportCacheMu.Unlock()
 
-		if last, ok := claimFlexToken(i.token, time.Now()); !ok {
+		if retryAt, ok := claimFlexToken(i.token, time.Now()); !ok {
 			// Our own report from earlier in this window is still usable —
 			// a slow sync whose 5-minute cache lapsed mid-cycle, or an admin
 			// re-parse after a deploy, keeps working on the same-day XML.
@@ -167,20 +246,21 @@ func (i *IBKR) fetchFlexReport(ctx context.Context) ([]byte, error) {
 				return xml, nil
 			}
 			flexReportCacheMu.Unlock()
-			return nil, fmt.Errorf("%w (in use %s ago; retry after ~%s UTC)",
-				ErrFlexTokenBusy,
-				time.Since(last).Round(time.Second),
-				last.Add(flexTokenCooldown).UTC().Format("15:04"))
+			return nil, fmt.Errorf("%w (retry after ~%s UTC)",
+				ErrFlexTokenBusy, retryAt.UTC().Format("Jan 2 15:04"))
 		}
 
 		refCode, err := i.requestFlexReport(ctx)
 		if err != nil {
+			noteFlexOutcome(i.token, time.Now(), err)
 			return nil, err
 		}
 		report, err := i.getFlexReport(ctx, refCode)
 		if err != nil {
+			noteFlexOutcome(i.token, time.Now(), err)
 			return nil, err
 		}
+		noteFlexOutcome(i.token, time.Now(), nil)
 
 		flexReportCacheMu.Lock()
 		flexReportCache[key] = &flexReportEntry{xml: report, fetchedAt: time.Now()}
@@ -308,6 +388,9 @@ func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
 		if result.ErrorCode == flexIPRestrictionCode {
 			return "", fmt.Errorf("%w: %w", ErrIPRestricted, base)
 		}
+		if result.ErrorCode == flexRepeatedFailureCode {
+			return "", fmt.Errorf("%w: %w", ErrFlexConfigLocked, base)
+		}
 		if isTransientFlexErrorCode(result.ErrorCode) {
 			return "", fmt.Errorf("%w: %w", ErrTransient, base)
 		}
@@ -361,6 +444,18 @@ var transientFlexErrorCodes = map[string]struct{}{
 // the holder to replace a working token, and the replacement fails the same
 // way.
 const flexIPRestrictionCode = "1013"
+
+// flexRepeatedFailureCode is IBKR's "Too many failed attempts. Please review
+// your configuration." It appears in no published error table and is not a
+// rate limit: it is what a token earns by being asked again and again while it
+// answers 1001. Nothing local clears it, so the only useful response is to
+// stop asking.
+const flexRepeatedFailureCode = "1025"
+
+// ErrFlexConfigLocked marks that code. It wraps ErrTransient so the sync layer
+// records a pending retry instead of telling the holder their credentials are
+// bad, which they are not.
+var ErrFlexConfigLocked = fmt.Errorf("%w: flex token locked after repeated failures", ErrTransient)
 
 func isTransientFlexErrorCode(code string) bool {
 	_, ok := transientFlexErrorCodes[code]
