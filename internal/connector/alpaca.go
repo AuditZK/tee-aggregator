@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -284,12 +285,69 @@ func (a *Alpaca) CapabilityWarnings() []string {
 	return a.capabilityWarnings
 }
 
+// GetRawCashflowEntries returns every activity the account has, whatever its
+// type, with the venue's own label attached.
+//
+// GetCashflows above asks for the four types that move capital, which is what
+// a sync needs and all it should book. It is not what a question needs: an
+// account whose equity jumped on a day with no deposit leaves nothing behind
+// to look at, and the answer — a fill, an option assignment, a dividend, a
+// journal — lives in the types the filter drops. Asking without a filter is
+// the difference between deducing an account's activity from its equity and
+// reading it.
+func (a *Alpaca) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error) {
+	var ops []RawBalanceOp
+	_, err := a.fetchActivities(ctx, since, nil, func(act alpacaActivity) *Cashflow {
+		ts, ok := alpacaActivityTime(act)
+		if !ok {
+			return nil
+		}
+		label := act.ActivityType
+		if act.Side != "" {
+			label += "/" + act.Side
+		}
+		amount, _ := strconv.ParseFloat(act.NetAmount, 64)
+		notional := 0.0
+		if qty, price := parseAlpacaFloat(act.Qty), parseAlpacaFloat(act.Price); qty != 0 && price != 0 {
+			notional = qty * price
+		}
+		ops = append(ops, RawBalanceOp{
+			Label:         label,
+			Delta:         amount,
+			PositionValue: notional,
+			Currency:      "USD",
+			Symbol:        act.Symbol,
+			Timestamp:     ts,
+		})
+		// The walk's own return value is unused here: every activity is kept,
+		// and keeping them is this collector's job.
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(ops, func(i, j int) bool { return ops[i].Timestamp.Before(ops[j].Timestamp) })
+	return ops, nil
+}
+
+func parseAlpacaFloat(s string) float64 {
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
 type alpacaActivity struct {
 	ID              string `json:"id"`
 	ActivityType    string `json:"activity_type"`
 	Date            string `json:"date"`
 	TransactionTime string `json:"transaction_time"`
 	NetAmount       string `json:"net_amount"`
+	Symbol          string `json:"symbol"`
+	Side            string `json:"side"`
+	Qty             string `json:"qty"`
+	Price           string `json:"price"`
 }
 
 func alpacaActivityTime(act alpacaActivity) (time.Time, bool) {
@@ -320,8 +378,11 @@ func (a *Alpaca) fetchActivities(
 	)
 
 	for page := 0; page < alpacaActivityMaxPages; page++ {
-		path := fmt.Sprintf("/v2/account/activities?activity_types=%s&after=%s&page_size=100",
-			strings.Join(types, ","), url.QueryEscape(since.UTC().Format(time.RFC3339)))
+		path := fmt.Sprintf("/v2/account/activities?after=%s&page_size=100",
+			url.QueryEscape(since.UTC().Format(time.RFC3339)))
+		if len(types) > 0 {
+			path += "&activity_types=" + strings.Join(types, ",")
+		}
 		if pageToken != "" {
 			path += "&page_token=" + url.QueryEscape(pageToken)
 		}

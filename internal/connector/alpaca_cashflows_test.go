@@ -156,3 +156,80 @@ func TestAlpacaGetCashflows_IgnoresUnparseableEntries(t *testing.T) {
 		t.Fatalf("only the well-formed entry should survive: %+v", flows)
 	}
 }
+
+// The filtered view exists to book capital; this one exists to answer a
+// question, so it must keep what the filter drops — a fill, an option
+// assignment, a dividend. An account's activity read instead of deduced.
+func TestAlpacaGetRawCashflowEntries_KeepsEveryType(t *testing.T) {
+	var sawFilter bool
+	a := newAlpacaTestConnector(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("activity_types") != "" {
+			sawFilter = true
+		}
+		if r.URL.Query().Get("page_token") != "" {
+			w.Write([]byte(`[]`))
+			return
+		}
+		w.Write([]byte(`[
+			{"id":"r1","activity_type":"FILL","symbol":"AAPL","side":"buy","qty":"10","price":"190.5","transaction_time":"2026-08-05T13:34:00Z"},
+			{"id":"r2","activity_type":"CSD","date":"2026-08-03","net_amount":"73879.27"},
+			{"id":"r3","activity_type":"DIV","symbol":"MSFT","date":"2026-08-06","net_amount":"12.40"},
+			{"id":"r4","activity_type":"OPASN","symbol":"SPY240816C00500000","date":"2026-08-16","net_amount":"0"}
+		]`))
+	})
+
+	ops, err := a.GetRawCashflowEntries(context.Background(), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("GetRawCashflowEntries: %v", err)
+	}
+	if sawFilter {
+		t.Error("the raw ledger asked for a type filter — the dropped types are the point")
+	}
+	if len(ops) != 4 {
+		t.Fatalf("got %d entries, want 4 — a type was filtered out: %+v", len(ops), ops)
+	}
+
+	byLabel := map[string]RawBalanceOp{}
+	for _, op := range ops {
+		byLabel[op.Label] = op
+	}
+	fill, ok := byLabel["FILL/buy"]
+	if !ok {
+		t.Fatalf("the fill is absent or unlabelled: %+v", ops)
+	}
+	if fill.PositionValue != 1905 {
+		t.Errorf("fill notional = %v, want 1905 (10 x 190.5)", fill.PositionValue)
+	}
+	if fill.Symbol != "AAPL" {
+		t.Errorf("fill symbol = %q, want AAPL", fill.Symbol)
+	}
+	for _, want := range []string{"CSD", "DIV", "OPASN"} {
+		if _, ok := byLabel[want]; !ok {
+			t.Errorf("%s dropped — this view keeps every type", want)
+		}
+	}
+
+	for i := 1; i < len(ops); i++ {
+		if ops[i].Timestamp.Before(ops[i-1].Timestamp) {
+			t.Fatalf("entries are not chronological: %v then %v", ops[i-1].Timestamp, ops[i].Timestamp)
+		}
+	}
+}
+
+// The capital view must keep its filter: booking a dividend as a deposit would
+// erase the very return it represents.
+func TestAlpacaGetCashflows_StillAsksForCapitalTypesOnly(t *testing.T) {
+	var seen string
+	a := newAlpacaTestConnector(t, func(w http.ResponseWriter, r *http.Request) {
+		if q := r.URL.Query().Get("activity_types"); q != "" && seen == "" {
+			seen = q
+		}
+		w.Write([]byte(`[]`))
+	})
+	if _, err := a.GetCashflows(context.Background(), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	if seen != "CSD,CSW,JNLC,ACATC" {
+		t.Errorf("capital filter = %q, want CSD,CSW,JNLC,ACATC", seen)
+	}
+}
