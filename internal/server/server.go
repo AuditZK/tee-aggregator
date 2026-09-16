@@ -325,6 +325,7 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 	// money field, on purpose, so the days would arrive empty. Synchronous for
 	// the same reason — there is nothing to come back for later.
 	if dryRun {
+		extendWriteDeadline(w, 45*time.Minute)
 		ctx, cancel := context.WithTimeout(r.Context(), 45*time.Minute)
 		defer cancel()
 		days := s.handler.syncSvc.DryRunReconstructRange(ctx, userUID, exchange, label, from, to)
@@ -654,6 +655,7 @@ func (s *Server) handleAdminRawStatement(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	extendWriteDeadline(w, 10*time.Minute)
 	doc, contentType, err := s.handler.syncSvc.DumpRawStatement(r.Context(), userUID, exchange, label)
 	if err != nil {
 		if errors.Is(err, service.ErrRawStatementUnsupported) {
@@ -739,6 +741,7 @@ func (s *Server) handleAdminFundingProbe(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	extendWriteDeadline(w, 10*time.Minute)
 	probe, err := s.handler.syncSvc.ProbeFunding(r.Context(), userUID, exchange, label, since)
 	if err != nil {
 		if errors.Is(err, service.ErrFundingProbeUnsupported) {
@@ -762,6 +765,26 @@ func (s *Server) handleAdminFundingProbe(w http.ResponseWriter, r *http.Request)
 		zap.Int("bills", len(probe.Bills)),
 	)
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "funding": probe})
+}
+
+// extendWriteDeadline lifts the server-wide 60s WriteTimeout for one request.
+//
+// A few loopback admin handlers answer only after work that outlives it: a
+// reconstruction walks a venue's whole ledger, and one OKX account with 13,952
+// bills takes three minutes. The server closed the connection at sixty
+// seconds, so the answer never arrived — and the caller, seeing a dropped
+// connection rather than a refusal, retried, which started the three minutes
+// again. A loop that hammered the venue and could not terminate.
+//
+// Only the handlers that own a long unit of work call this; the deadline for
+// every other endpoint stays where it is.
+func extendWriteDeadline(w http.ResponseWriter, d time.Duration) {
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d)); err != nil {
+		// A ResponseWriter that cannot carry a deadline degrades to the
+		// server-wide one: the request may still time out, which is what
+		// happened before this existed.
+		return
+	}
 }
 
 // jwtRequired verifies an HS256 bearer token on REST handlers (SEC-002).
