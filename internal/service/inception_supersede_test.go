@@ -19,8 +19,8 @@ func snap(ts time.Time, equity, deposits float64) *repository.Snapshot {
 // the live sync first (it writes the equity anchor the rebuild dispatch needs),
 // so the connection's first snapshot is TODAY, carrying an inception deposit
 // worth the whole balance. The reconstruction then lands 79 earlier days and
-// stamps the real inception underneath. Avi's Bybit account came out reporting
-// ~22k of capital against ~12k ever deposited, halving his return.
+// stamps the real inception underneath. One Bybit account came out reporting
+// close to twice the capital ever deposited, halving its return.
 func TestSupersededConnectStamp_ClearsTheConnectTimeStamp(t *testing.T) {
 	live := snap(day(2026, time.August, 26), 10093.99, 10093.99)
 	got := supersededConnectStamp([]*repository.Snapshot{live}, day(2026, time.June, 8))
@@ -154,7 +154,7 @@ func TestResolveInception_OlderHistoryDisablesBoth(t *testing.T) {
 	}
 }
 
-// The defect Sylvain's OKX account exposed on 2026-08-30. The rebuild opened
+// The defect one OKX account exposed on 2026-08-30. The rebuild opened
 // on zero-equity padding, so the earliest day of the batch carried no equity;
 // the rule bailed on it and never reached the clearing, leaving the whole
 // balance booked as a deposit on connection day. Whichever end the padding is

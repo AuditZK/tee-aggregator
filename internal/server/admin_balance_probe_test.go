@@ -98,11 +98,11 @@ func TestHandleAdminBalanceProbe_ServesTheFiguresAndLogsNone(t *testing.T) {
 	prober := &fakeProber{probe: okxProbeFromVenue(t)}
 	s, logs := observedServer(prober)
 
-	rec := postProbe(s, "user_uid=user_abc1234567890&exchange=okx&label=RAVCA_UW")
+	rec := postProbe(s, "user_uid=user_abc1234567890&exchange=okx&label=acct-2")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200: %s", rec.Code, rec.Body.String())
 	}
-	if prober.gotUser != "user_abc1234567890" || prober.gotExchange != "okx" || prober.gotLabel != "RAVCA_UW" {
+	if prober.gotUser != "user_abc1234567890" || prober.gotExchange != "okx" || prober.gotLabel != "acct-2" {
 		t.Fatalf("probe called with (%q, %q, %q)", prober.gotUser, prober.gotExchange, prober.gotLabel)
 	}
 
@@ -130,7 +130,7 @@ func TestHandleAdminBalanceProbe_ServesTheFiguresAndLogsNone(t *testing.T) {
 	if len(entries) != 1 || entries[0].Message != "balance probe served" {
 		t.Fatalf("log entries = %v, want exactly one \"balance probe served\"", entries)
 	}
-	for _, amount := range []string{"22077", "21880", "1214", "97.34", "3021", "RAVCA_UW", "user_abc1234567890"} {
+	for _, amount := range []string{"22077", "21880", "1214", "97.34", "3021", "acct-2", "user_abc1234567890"} {
 		if strings.Contains(fmt.Sprint(entries[0].ContextMap()), amount) ||
 			strings.Contains(entries[0].Message, amount) {
 			t.Errorf("log line leaks %q: %v %v", amount, entries[0].Message, entries[0].ContextMap())

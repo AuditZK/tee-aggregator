@@ -6,9 +6,9 @@ import (
 )
 
 // An IBKR contract is quoted per underlying unit and traded in contracts, so
-// Price * Quantity is the value divided by the multiplier. A customer's
-// options round trip of 2,030,051 reached the dashboard as 20,300, which read
-// as 72 trades producing 578,062 of profit out of nothing.
+// Price * Quantity is the value divided by the multiplier. One customer's
+// options day reached the dashboard at one hundredth of its size, and read as
+// a handful of trades producing a large profit out of nothing.
 func TestParseTradesFromReport_ContractMultiplier(t *testing.T) {
 	report := []byte(`<FlexQueryResponse>
   <FlexStatements>
@@ -99,9 +99,9 @@ func TestParseTradesFromReport_OptionWithoutTheAttribute(t *testing.T) {
     <FlexStatement>
       <Trades>
         <Trade tradeID="1" symbol="TESTX 260731C00255000" buySell="SELL"
-               tradePrice="2" quantity="-498"
-               ibCommission="-269.27" currency="USD" dateTime="20260730;095413"
-               assetCategory="OPT" fifoPnlRealized="48692.44" />
+               tradePrice="1.5" quantity="-250"
+               ibCommission="-120" currency="USD" dateTime="20260730;101500"
+               assetCategory="OPT" fifoPnlRealized="1234.5" />
         <Trade tradeID="2" symbol="TESTZ" buySell="BUY"
                tradePrice="4200" quantity="3"
                ibCommission="-6" currency="USD" dateTime="20260730;100000"
@@ -119,8 +119,8 @@ func TestParseTradesFromReport_OptionWithoutTheAttribute(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 
-	// 498 contracts of premium at 2, which is 99,600 of cash and not 996.
-	if got, want := trades[0].Notional(), 99600.0; got != want {
+	// 250 contracts at 1.5 are 37,500 of premium, not 375.
+	if got, want := trades[0].Notional(), 37500.0; got != want {
 		t.Fatalf("option without the attribute: got %v, want %v", got, want)
 	}
 

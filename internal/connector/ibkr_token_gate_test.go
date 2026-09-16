@@ -78,9 +78,9 @@ func TestErrFlexTokenBusy_IsTransientAndMatchesRateLimitPredicate(t *testing.T) 
 }
 
 // What follows pins the 2026-09-15 incident: nine attempts in forty minutes on
-// a token answering 1001 earned error 1025 and took a paying customer's
-// account off the air the day after he subscribed. IBKR counts failures, so a
-// failure must cost more than the next minute.
+// a token answering 1001 earned error 1025 and took a customer's account off
+// the air until the lock lifted. IBKR counts failures, so a failure must cost
+// more than the next minute.
 
 func TestClaimFlexToken_WaitDoublesAfterEachFailure(t *testing.T) {
 	token := "gate-test-token-D"
@@ -161,7 +161,7 @@ func TestClaimFlexToken_DailyFailureBudgetStopsTheDay(t *testing.T) {
 
 func TestNoteFlexOutcome_RepeatedFailureCodeStopsUntilTomorrow(t *testing.T) {
 	token := "gate-test-token-G"
-	at := time.Date(2026, 9, 16, 0, 57, 0, 0, time.UTC)
+	at := time.Date(2026, 9, 16, 1, 0, 0, 0, time.UTC)
 
 	if _, ok := claimFlexToken(token, at); !ok {
 		t.Fatal("first claim must be granted")

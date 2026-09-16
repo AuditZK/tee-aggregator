@@ -116,7 +116,7 @@ func TestPrunedRebuiltScope_FloorStopsAtTheRebuildsHorizon(t *testing.T) {
 		time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC),
 	}
 
-	_, args := prunedRebuiltScope(true, true, "user-1", "okx", "RAVCA_UW", horizon, keep)
+	_, args := prunedRebuiltScope(true, true, "user-1", "okx", "acct-2", horizon, keep)
 
 	from := args[3].(time.Time)
 	if !from.Equal(horizon) {

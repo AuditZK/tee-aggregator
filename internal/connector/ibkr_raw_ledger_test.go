@@ -78,7 +78,7 @@ func TestParseRawLedgerFromReport_HonoursSince(t *testing.T) {
     <FlexStatement accountId="U1234567">
       <CashTransactions>
         <CashTransaction type="Deposits &amp; Withdrawals" amount="100" currency="USD" dateTime="20260715;120000"/>
-        <CashTransaction type="Deposits &amp; Withdrawals" amount="649000" currency="USD" dateTime="20260727;120000"/>
+        <CashTransaction type="Deposits &amp; Withdrawals" amount="125000" currency="USD" dateTime="20260724;120000"/>
       </CashTransactions>
     </FlexStatement>
   </FlexStatements>
@@ -88,7 +88,7 @@ func TestParseRawLedgerFromReport_HonoursSince(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if len(ops) != 1 || ops[0].Delta != 649000 {
+	if len(ops) != 1 || ops[0].Delta != 125000 {
 		t.Fatalf("since filter ignored: %+v", ops)
 	}
 }

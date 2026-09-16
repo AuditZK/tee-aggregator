@@ -77,8 +77,8 @@ const flexTokenCooldown = time.Minute
 // at this time, please try again shortly") was asked nine times in forty
 // minutes and came back 1025, "too many failed attempts, please review your
 // configuration", a code in no published IBKR table, which took a customer's
-// account off the air the day after he subscribed. Taking IBKR's invitation to
-// retry shortly at face value is what spent his credit.
+// account off the air until the lock lifted. Taking IBKR's invitation to retry
+// shortly at face value is what spent the token's credit.
 //
 // So the wait doubles after each consecutive failure, and the day has a hard
 // budget of them. Once spent, the token waits for the next UTC day, where the

@@ -12,7 +12,7 @@ import (
 // ORDERS. In every account mode above spot it does not deduct the margin held
 // by open cross positions, so it sums to the account's whole equity. Between
 // 2026-08-31 and 2026-09-14 every live OKX snapshot carried free margin exactly
-// equal to equity, including an account (77b398e9 / RAVCA_UW, 2026-09-11) whose
+// equal to equity, including an account (seen 2026-09-11) whose
 // short options straddle and perpetual hedge were showing an unrealized loss at
 // the time — an account that cannot, by construction, have all of its equity
 // free.

@@ -10,7 +10,7 @@
 // Usage (inside the enclave container, which has DATABASE_URL in its env):
 //
 //	docker exec enclave_go_prod /tmp/admin-dump-breakdown \
-//	    -user-uid="e8c9c56a-d9fd-5ec2-973e-f217beca81fe" \
+//	    -user-uid="00000000-0000-5000-8000-000000000000" \
 //	    -exchange="ibkr" \
 //	    -from="2026-07-28" -to="2026-08-01"
 package main

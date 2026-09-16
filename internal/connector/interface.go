@@ -392,7 +392,7 @@ type Trade struct {
 
 // Notional is the value traded, in the currency Price is quoted in. Reading
 // Price * Quantity off a contract undercounts it by the multiplier, which put
-// a day of $2,030,051 in equity options on the dashboard as $20,300.
+// a day of equity options on the dashboard at one hundredth of its size.
 func (t *Trade) Notional() float64 {
 	if t.Multiplier > 0 {
 		return t.Price * t.Quantity * t.Multiplier
