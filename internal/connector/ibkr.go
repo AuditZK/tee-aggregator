@@ -53,9 +53,25 @@ var (
 
 const flexReportCacheTTL = 5 * time.Minute
 
-// flexTokenCooldown is the observed span of IBKR's per-token Flex limit
-// (~1 request per token per 3h).
-const flexTokenCooldown = 3 * time.Hour
+// flexTokenCooldown paces requests on one Flex token. IBKR documents the
+// limit with error 1018: one request per second, ten per minute, per token.
+// This was 3h, read off an observation rather than the documentation, and the
+// observation was a misreading: the refusals that suggested it are 1001, which
+// IBKR defines as transient and answers with "please try again shortly". A
+// three-hour gate turns that invitation into a day of silence, and it denied
+// the enclave its own scheduled sync. One minute keeps the guard this exists
+// for — two connections on one token racing into IBKR in the same millisecond,
+// where the loser spends a request for nothing — with ten times the headroom
+// the documented limit asks for.
+const flexTokenCooldown = time.Minute
+
+// flexStaleReuseWindow is how long a statement already fetched may still be
+// served once the gate denies a fresh request. It is deliberately not the
+// cooldown: pacing the network and deciding when a document goes stale are
+// different questions, and tying them together meant shortening one silently
+// shortened the other. IBKR statements carry a full period, so a copy a few
+// hours old answers every question the fresh one would.
+const flexStaleReuseWindow = 3 * time.Hour
 
 // ErrFlexTokenBusy is returned instead of a network call when the shared
 // Flex token was used too recently. It wraps ErrTransient (this is pacing,
@@ -145,7 +161,7 @@ func (i *IBKR) fetchFlexReport(ctx context.Context) ([]byte, error) {
 			// a slow sync whose 5-minute cache lapsed mid-cycle, or an admin
 			// re-parse after a deploy, keeps working on the same-day XML.
 			flexReportCacheMu.Lock()
-			if entry, ok2 := flexReportCache[key]; ok2 && time.Since(entry.fetchedAt) < flexTokenCooldown {
+			if entry, ok2 := flexReportCache[key]; ok2 && time.Since(entry.fetchedAt) < flexStaleReuseWindow {
 				xml := entry.xml
 				flexReportCacheMu.Unlock()
 				return xml, nil
@@ -191,7 +207,7 @@ const flexReportCacheMaxEntries = 256
 // order and use order coincide.
 func evictFlexReportCache(now time.Time) {
 	for key, entry := range flexReportCache {
-		if now.Sub(entry.fetchedAt) >= flexTokenCooldown {
+		if now.Sub(entry.fetchedAt) >= flexStaleReuseWindow {
 			delete(flexReportCache, key)
 		}
 	}
@@ -289,6 +305,9 @@ func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
 
 	if result.Status != "Success" {
 		base := fmt.Errorf("flex request failed: %s - %s", result.ErrorCode, result.ErrorMessage)
+		if result.ErrorCode == flexIPRestrictionCode {
+			return "", fmt.Errorf("%w: %w", ErrIPRestricted, base)
+		}
 		if isTransientFlexErrorCode(result.ErrorCode) {
 			return "", fmt.Errorf("%w: %w", ErrTransient, base)
 		}
@@ -298,28 +317,50 @@ func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
 	return result.ReferenceCode, nil
 }
 
-// transientFlexErrorCodes lists IBKR Flex error codes that indicate temporary
-// upstream conditions (busy report generator, rate limit, service hiccup) and
-// NOT credential failures. See IBKR Flex Web Service docs.
+// transientFlexErrorCodes lists the IBKR Flex error codes worth retrying.
+// Descriptions are IBKR's own, from the Flex Web Service v3 error table; an
+// earlier version of this list paraphrased them from memory and got four
+// wrong, which sent 1014 and 1011 into endless retries and told users their
+// token was bad when a P/L figure was simply not computed yet.
 //
 //	1001 - Statement could not be generated at this time. Please try again shortly.
-//	1005 - Currently not available.
-//	1011 - Service unavailable.
-//	1014 - Statement generation failed.
-//	1018 - Too many requests (rate limit).
-//	1019 - Statement is busy generating.
+//	1004 - Statement is incomplete at this time. Please try again shortly.
+//	1005 - Settlement data is not ready at this time. Please try again shortly.
+//	1006 - FIFO P/L data is not ready at this time. Please try again shortly.
+//	1007 - MTM P/L data is not ready at this time. Please try again shortly.
+//	1008 - MTM and FIFO P/L data is not ready at this time. Please try again shortly.
+//	1009 - The server is under heavy load. Statement could not be generated at this time.
+//	1019 - Statement generation in progress. Please try again shortly.
+//	1021 - Statement could not be retrieved at this time. Please try again shortly.
 //
-// Codes like 1008 (bad token), 1012 (token expired), 1013 (invalid query ID),
-// 1015 (bad request) and 1020 (invalid request) are NOT transient — they mean
-// the credentials/parameters are wrong and must be fixed by the user.
+// 1018 (too many requests: one per second, ten per minute per token) is
+// transient too, but it is paced by claimFlexToken rather than retried blind.
+//
+// Deliberately absent, because the account or its configuration must change
+// first: 1003 (statement not available), 1010 (legacy query unsupported),
+// 1011 (service account inactive), 1012 (token expired), 1014 (query invalid),
+// 1015 (token invalid), 1016 (account invalid), 1017 (reference code invalid),
+// 1020 (invalid request). 1013 is an IP restriction and is neither — it is
+// classified as such upstream so the holder is not sent to regenerate a token
+// that was never the problem.
 var transientFlexErrorCodes = map[string]struct{}{
 	"1001": {},
+	"1004": {},
 	"1005": {},
-	"1011": {},
-	"1014": {},
+	"1006": {},
+	"1007": {},
+	"1008": {},
+	"1009": {},
 	"1018": {},
 	"1019": {},
+	"1021": {},
 }
+
+// flexIPRestrictionCode is IBKR's "IP restriction": the token is valid and the
+// source address is not allowed. Routing it through the credential path sends
+// the holder to replace a working token, and the replacement fails the same
+// way.
+const flexIPRestrictionCode = "1013"
 
 func isTransientFlexErrorCode(code string) bool {
 	_, ok := transientFlexErrorCodes[code]
