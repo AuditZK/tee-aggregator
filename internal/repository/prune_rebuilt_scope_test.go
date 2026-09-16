@@ -103,3 +103,34 @@ func TestPrunedRebuiltScope_FullRunReachesBelowItsOwnOutput(t *testing.T) {
 		t.Errorf("range ends %v, want the latest kept day %v", to, keep[1])
 	}
 }
+
+// A venue that rations its ledger hands back only what it still serves. OKX
+// keeps ninety days, so a rebuild run today says nothing about a day from four
+// months ago — and a floor at the beginning of time would read that silence as
+// a correction and delete it. Truncating a customer's record to the venue's
+// retention, on every reconstruction, with nothing able to bring it back.
+func TestPrunedRebuiltScope_FloorStopsAtTheRebuildsHorizon(t *testing.T) {
+	horizon := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
+	keep := []time.Time{
+		time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC),
+	}
+
+	_, args := prunedRebuiltScope(true, true, "user-1", "okx", "RAVCA_UW", horizon, keep)
+
+	from := args[3].(time.Time)
+	if !from.Equal(horizon) {
+		t.Fatalf("floor is %v, want the rebuild's horizon %v", from, horizon)
+	}
+	// The days the rebuild could not reach sit below the floor and survive.
+	older := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	if !older.Before(from) {
+		t.Fatalf("a day at %v is inside a scope floored at %v", older, from)
+	}
+	// Everything the rebuild DID examine and no longer produces still goes:
+	// 06-19 sits above the floor and outside the keep list.
+	stale := time.Date(2026, 6, 19, 0, 0, 0, 0, time.UTC)
+	if stale.Before(from) || stale.After(args[4].(time.Time)) {
+		t.Fatalf("a stale day at %v escaped the scope %v..%v", stale, from, args[4])
+	}
+}

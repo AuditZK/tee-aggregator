@@ -153,6 +153,12 @@ type reconstructOpts struct {
 	// the loopback caller that asked for them instead, the same channel the
 	// raw-statement dump uses and for the same reason.
 	collect func([]*repository.Snapshot)
+	// coveredFrom is the earliest instant the rebuild that produced these days
+	// could see. It is the floor of the prune: a stored day above it that the
+	// rebuild no longer produces is stale and goes, one below it was never
+	// examined and stays. Zero means the rebuilder stated no horizon, and the
+	// prune falls back to owning the whole rebuilt history.
+	coveredFrom time.Time
 }
 
 // contains reports whether dayKey (a UTC midnight) falls inside the window.
@@ -1924,6 +1930,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 		zap.Int64("rebuild_duration_ms", res.DurationMs),
 	)
 
+	opts.coveredFrom = res.CoveredFrom
 	firstSync := s.isFirstSync(ctx, connMeta)
 	s.persistHistoricalSnapshots(ctx, connMeta, res.Snapshots, firstSync, sourceExternalRebuilder, opts)
 	s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
@@ -2200,7 +2207,7 @@ func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.Excha
 	// failure leaves rebuild_finalized_at NULL so the connection retries on the
 	// next tick (bounded by maxRebuildRetryDays) instead of being silently
 	// marked done with no recalibrated history written.
-	if err := s.persistHistoricalSnapshots(ctx, conn, res.Snapshots, false, sourceExternalRebuilder, reconstructOpts{}); err != nil {
+	if err := s.persistHistoricalSnapshots(ctx, conn, res.Snapshots, false, sourceExternalRebuilder, reconstructOpts{coveredFrom: res.CoveredFrom}); err != nil {
 		return fmt.Errorf("persist recalibrated snapshots: %w", err)
 	}
 
@@ -2464,9 +2471,13 @@ func (s *SyncService) persistHistoricalSnapshots(
 		for _, sn := range snapshots {
 			keep = append(keep, sn.Timestamp)
 		}
-		// A full run owns the connection's whole rebuilt history, so its floor
-		// is the beginning of time; a bounded repair owns only its window.
-		pruneFrom := time.Time{}
+		// A bounded repair owns only its window. A full run owns everything the
+		// rebuild could actually see — not the beginning of time: the venue
+		// rations its ledger, and a day older than the rebuild's horizon was
+		// never examined. Deleting those would truncate a customer's record to
+		// the venue's retention on every reconstruction, and nothing could
+		// bring them back.
+		pruneFrom := opts.coveredFrom
 		if opts.window.isSet() {
 			pruneFrom = opts.window.from
 		}

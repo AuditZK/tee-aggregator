@@ -63,10 +63,11 @@ type RebuildRequest struct {
 // the caller receives []*connector.HistoricalSnapshot, which already has
 // the canonical in-enclave field naming.
 type rebuildResponse struct {
-	Exchange   string                  `json:"exchange"`
-	Count      int                     `json:"count"`
-	DurationMs int64                   `json:"durationMs"`
-	Snapshots  []rebuildSnapshotOnWire `json:"snapshots"`
+	Exchange    string                  `json:"exchange"`
+	Count       int                     `json:"count"`
+	DurationMs  int64                   `json:"durationMs"`
+	Snapshots   []rebuildSnapshotOnWire `json:"snapshots"`
+	CoveredFrom time.Time               `json:"coveredFrom"`
 }
 
 // rebuildSnapshotOnWire mirrors the rebuilder's HistoricalSnapshot JSON
@@ -101,6 +102,12 @@ type marketBalanceOnWire struct {
 type RebuildResult struct {
 	Snapshots  []*connector.HistoricalSnapshot
 	DurationMs int64
+
+	// CoveredFrom is the earliest instant the rebuild could see. Venues ration
+	// their ledgers, so a stored day older than this was never examined: its
+	// absence from Snapshots is silence, not a correction, and pruning it would
+	// destroy history nothing can rebuild. Zero when the rebuilder said nothing.
+	CoveredFrom time.Time
 }
 
 // Client is a thin HTTP client. The pointed-at service runs on a separate
@@ -198,8 +205,9 @@ func (c *Client) Rebuild(ctx context.Context, req RebuildRequest) (*RebuildResul
 	}
 
 	return &RebuildResult{
-		Snapshots:  mapWireSnapshots(out.Snapshots),
-		DurationMs: out.DurationMs,
+		Snapshots:   mapWireSnapshots(out.Snapshots),
+		DurationMs:  out.DurationMs,
+		CoveredFrom: out.CoveredFrom.UTC(),
 	}, nil
 }
 
