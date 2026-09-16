@@ -321,50 +321,59 @@ Please **do not** open public GitHub issues for security vulnerabilities.
 
 ### Purpose
 
-Reproducible builds allow verification that the production binary matches the audited source, preventing "trusting trust" attacks.
+Anyone can check that the enclave in production runs the source on `main`
+without taking the operator's word for it: build the commit, hash the result,
+ask the running enclave for its own hash.
 
-### Build Process
+### Build
 
 ```bash
-# Clone repository
-git clone https://github.com/AuditZK/zero-knowledge-aggregator-go.git
-cd zero-knowledge-aggregator-go
+git clone https://github.com/AuditZK/tee-aggregator.git
+cd tee-aggregator
+git rev-parse HEAD            # the commit you are verifying
 
-# Checkout specific version
-git checkout v1.0.0
-
-# Verify commit hash
-git rev-parse HEAD
-# Expected: <COMMIT_HASH> (published on release page)
-
-# Build (identical flags to production Dockerfile)
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-  -trimpath \
-  -ldflags="-w -s" \
-  -o enclave \
-  ./cmd/enclave
+  -trimpath -buildvcs=false -ldflags="-w -s" \
+  -o enclave ./cmd/enclave
 
-# Calculate binary hash
 sha256sum enclave
-# Expected: <BINARY_HASH> (published on release page)
 ```
 
-### Build Environment
+`scripts/build-enclave.sh` runs exactly this and is what production is built
+with. It refuses a tree with uncommitted or untracked files: a binary built
+from them matches no commit anyone can check out, and its hash proves nothing.
 
-For bit-for-bit reproducibility:
-- **Go**: 1.26.3 (exact version pinned in `go.mod`)
-- **OS**: Ubuntu 22.04 LTS
-- **Architecture**: x86_64 (linux/amd64)
-- **CGO**: disabled (`CGO_ENABLED=0`)
-- **Flags**: `-trimpath -ldflags="-w -s"` (strip debug info, deterministic paths)
+The toolchain is pinned by `go.mod` (`go 1.26.6`); the `go` command fetches
+that exact version if the machine has another. The production image builds
+inside `golang:1.26.6-alpine`, pinned by digest, with the same command
+(`Dockerfile.production`). The host OS does not matter. `-trimpath` removes
+build paths and `-buildvcs=false` removes git stamps, the two things that let
+identical source produce different bytes: the image builds from a context
+without `.git`, and on a checkout one stray untracked file flips
+`vcs.modified` and with it the hash.
 
-### Attestation (Production Only)
+### Compare with production
 
-In production on AMD SEV-SNP:
+```bash
+curl -s https://enclave.auditzk.com/api/v1/attestation | jq -r .binarySha256
+```
 
-1. Enclave generates attestation report containing binary hash (SHA-256), VM measurement, SEV-SNP firmware version
-2. API Gateway verifies attestation before connecting via mTLS
-3. Attestation report independently verifiable by auditors
+must print the hash from the build above.
+
+### What the hardware attests, and what it does not
+
+- `attestation.measurement` is the SEV-SNP launch measurement of the VM image
+  (firmware, kernel, initrd), signed by the AMD PSP; `vcekVerified` says the
+  certificate chain checked out. Replacing `/app/enclave` does not change it:
+  the application binary lives on the VM's disk, outside the measured image.
+- `binarySha256` is SHA-256 of the running executable, computed by the
+  enclave process at boot and served over a TLS certificate that is itself
+  bound into the attestation report (`tlsBinding`). It is self-reported, not
+  covered by the PSP signature.
+
+The measurement tells you which VM you are talking to; the binary hash tells
+you which build of this repository it runs, and that second claim is only as
+strong as the first plus the deployment chain in this repository.
 
 ## API Specification
 

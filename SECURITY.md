@@ -710,16 +710,18 @@ On each tick, `executeDailySync` syncs every user via
 **For Independent Auditors:**
 
 ```bash
-# 1. Verify source code matches deployed binary
-git clone https://github.com/AuditZK/zero-knowledge-aggregator-go.git
-cd zero-knowledge-aggregator-go
-git checkout v1.0.0
-go build -trimpath -ldflags="-w -s" -o enclave ./cmd/enclave
-sha256sum enclave  # Compare with published hash
+# 1. Verify the deployed binary is a build of main
+git clone https://github.com/AuditZK/tee-aggregator.git
+cd tee-aggregator
+scripts/build-enclave.sh          # prints the commit and the sha256
+curl -s https://enclave.auditzk.com/api/v1/attestation | jq -r .binarySha256
+# The two hashes must match. README, "Reproducible Builds", says what the
+# hardware measurement covers and what the binary hash does not.
 
 # 2. Check attestation report
-curl -X POST https://enclave.auditzk.com/api/v1/attestation
-# Verify measurement matches build hash
+curl -s https://enclave.auditzk.com/api/v1/attestation
+# attestation.verified and attestation.vcekVerified must be true. The
+# measurement is the VM image, not the application binary.
 
 # 3. Review sync status logs (database query)
 SELECT "userUid", exchange, "lastSyncTime", status

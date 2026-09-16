@@ -1,13 +1,17 @@
 # Dockerfile.patch — fast Go-only update, no snpguest rebuild.
 #
-# Cross-compile on dev:
-#   GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-w -s" -o enclave_linux ./cmd/enclave/
+# Build on dev, from a clean tree of the commit being deployed:
+#   scripts/build-enclave.sh          # -> enclave_linux, prints commit + sha256
 #
 # Build + deploy on the VPS:
+#   chmod +x enclave_linux            # BEFORE the build, or the container boots down
 #   docker build -f Dockerfile.patch -t tee-aggregator-enclave:latest .
 #   docker compose -f docker-compose.production.yml up -d --force-recreate enclave
+#   curl -s https://enclave.auditzk.com/api/v1/attestation | jq -r .binarySha256
 #
 # Requires enclave_linux to be present in the build context (repo root).
 # The snpguest binary and all other layers are inherited from the existing image.
+# The admin tools in /app are NOT rebuilt by this path; they date from the last
+# full Dockerfile.production build.
 FROM tee-aggregator-enclave:latest
 COPY enclave_linux /app/enclave

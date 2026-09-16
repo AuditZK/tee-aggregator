@@ -281,6 +281,9 @@ func (h *Handler) GetAttestation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
+		// Outside the attestation object on purpose: the PSP signs the VM
+		// measurement, not this. See README, "Reproducible Builds".
+		"binarySha256": executableSHA256(),
 		"attestation": map[string]any{
 			"verified":                 verified,
 			"sevSnpEnabled":            sevSnpEnabled,
