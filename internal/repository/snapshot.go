@@ -452,6 +452,72 @@ func (r *SnapshotRepo) DeleteExternalRebuilderHistory(ctx context.Context, userU
 	return tag.RowsAffected(), nil
 }
 
+// PruneRebuiltDaysOutside removes the rebuilt rows a fresh reconstruction no
+// longer produces, inside the span it just wrote. A reconstruction upserts, so
+// a day it stops emitting survives under the new series: harmless while a fix
+// only changes values, and not harmless at all when a fix moves dates. Alpaca's
+// stamping correction moved every close back one calendar day, and the Saturday
+// rows the old keying had invented stayed behind carrying Friday's equity, so
+// each week ended on a two-day plateau that never happened.
+//
+// Scoped three ways, all unconditional. Only rebuilt rows, so the live branch
+// is untouchable. Only inside [min(keep), max(keep)], so days the caller did
+// not reconstruct — a bounded repair window, or history older than this run —
+// are left alone. And never a day present in keep. A caller whose source is the
+// enclave itself must not use this: its rows carry the same origin flag as live
+// ones, and there is no way to tell them apart.
+func (r *SnapshotRepo) PruneRebuiltDaysOutside(ctx context.Context, userUID, exchange, label string, keep []time.Time) (int64, error) {
+	if len(keep) == 0 {
+		return 0, nil
+	}
+	if !r.hasFromExternalRebuilderColumn(ctx) {
+		return 0, ErrOriginUnavailable
+	}
+
+	where, args := prunedRebuiltScope(r.isTSSchema, r.hasLabelColumn(ctx), userUID, exchange, label, keep)
+	tag, err := r.pool.Exec(ctx, "DELETE FROM snapshot_data WHERE "+where, args...)
+	if err != nil {
+		return 0, fmt.Errorf("prune rebuilt snapshots: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// prunedRebuiltScope builds the predicate for PruneRebuiltDaysOutside. Pure so
+// the three guards can be regression-tested without a live DB: dropping any one
+// of them turns a tidy-up into data loss.
+func prunedRebuiltScope(isTS, hasLabel bool, userUID, exchange, label string, keep []time.Time) (string, []any) {
+	userCol := "user_uid"
+	if isTS {
+		userCol = `"userUid"`
+	}
+
+	from, to := keep[0], keep[0]
+	days := make([]time.Time, 0, len(keep))
+	for _, d := range keep {
+		u := d.UTC()
+		if u.Before(from) {
+			from = u
+		}
+		if u.After(to) {
+			to = u
+		}
+		days = append(days, u)
+	}
+
+	args := []any{userUID, exchange}
+	clause := userCol + " = $1 AND exchange = $2"
+	if hasLabel {
+		clause += " AND label = $3"
+		args = append(args, label)
+	}
+	args = append(args, from, to, days)
+	n := len(args)
+	return fmt.Sprintf(
+		"%s AND from_external_rebuilder = TRUE AND timestamp >= $%d AND timestamp <= $%d AND timestamp <> ALL($%d)",
+		clause, n-2, n-1, n,
+	), args
+}
+
 // rebuiltHistoryScope builds the predicate isolating one connection's
 // out-of-perimeter rebuilt rows, up to but excluding `before`.
 //

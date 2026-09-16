@@ -2414,6 +2414,36 @@ func (s *SyncService) persistHistoricalSnapshots(
 		return err
 	}
 
+	// A reconstruction that moves dates leaves its own previous output behind:
+	// the upsert rewrites the days it still emits and cannot know about the
+	// ones it stopped emitting. Only the external rebuilder's rows can be
+	// pruned — an in-enclave rebuild writes the same origin flag as the live
+	// branch, so there is nothing to tell them apart by.
+	if source == sourceExternalRebuilder {
+		keep := make([]time.Time, 0, len(snapshots))
+		for _, sn := range snapshots {
+			keep = append(keep, sn.Timestamp)
+		}
+		switch pruned, perr := s.snapshotRepo.PruneRebuiltDaysOutside(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, keep); {
+		case perr != nil && !errors.Is(perr, repository.ErrOriginUnavailable):
+			// The series that matters is written; a stale day left behind is
+			// worth a warning, not a failed reconstruction.
+			s.logger.Warn("history reconstruction: stale rebuilt days not pruned",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.Error(perr),
+			)
+		case perr == nil && pruned > 0:
+			s.logger.Info("history reconstruction pruned days it no longer produces",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.Int64("days_pruned", pruned),
+			)
+		}
+	}
+
 	s.logger.Info("history reconstruction completed",
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
