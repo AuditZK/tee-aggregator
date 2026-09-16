@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,11 @@ type Alpaca struct {
 	apiSecret string
 	client    *http.Client
 	baseURL   string
+
+	// capabilityWarnings carries what the last cashflow read found that it
+	// could not book as capital — securities crossing the account boundary
+	// with no cash leg.
+	capabilityWarnings []string
 }
 
 // NewAlpaca creates a new Alpaca connector
@@ -215,8 +221,131 @@ func (a *Alpaca) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade,
 	return trades, nil
 }
 
-// GetCashflows returns deposits/withdrawals. Alpaca does not expose
-// capital flows via API, so this always returns empty (TS parity).
-func (a *Alpaca) GetCashflows(_ context.Context, _ time.Time) ([]*Cashflow, error) {
-	return nil, nil
+// alpacaCapitalActivityTypes are the non-trade activities that move money
+// across the account boundary: cash deposit, cash withdrawal, a cash journal
+// between two Alpaca accounts, and the cash leg of an ACATS transfer.
+var alpacaCapitalActivityTypes = []string{"CSD", "CSW", "JNLC", "ACATC"}
+
+// alpacaSecurityTransferTypes move holdings with no cash leg. Their market
+// value arrives through the positions and lands in equity, where nothing
+// distinguishes it from a gain — the same channel that let an IBKR account
+// book an incoming portfolio as performance. They carry no amount to book as
+// a cashflow, so they are reported rather than dropped.
+var alpacaSecurityTransferTypes = []string{"ACATS", "JNLS"}
+
+// alpacaActivityMaxPages bounds the walk. At 100 entries per page this covers
+// 10k activities, far past any real funding history, and stops a paging bug or
+// a hostile page_token from looping forever.
+const alpacaActivityMaxPages = 100
+
+// GetCashflows returns deposits and withdrawals from the account activity
+// ledger.
+//
+// This used to return nothing at all, on the belief that Alpaca exposed no
+// capital flows. It does, under /v2/account/activities, and the cost of the
+// mistake was total: every deposit reaching a live-synced Alpaca account
+// raised the equity with no recorded inflow, and the step read as a gain.
+func (a *Alpaca) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
+	flows, err := a.fetchActivities(ctx, since, alpacaCapitalActivityTypes, func(act alpacaActivity) *Cashflow {
+		amount, err := strconv.ParseFloat(act.NetAmount, 64)
+		if err != nil || amount == 0 {
+			return nil
+		}
+		ts, ok := alpacaActivityTime(act)
+		if !ok {
+			return nil
+		}
+		return &Cashflow{Amount: amount, Currency: "USD", Timestamp: ts}
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	a.noteSecurityTransfers(ctx, since)
+	return flows, nil
+}
+
+// noteSecurityTransfers records that holdings crossed the account boundary
+// without cash. Failure to read them is not failure to read the cashflows, so
+// it leaves the warning unset rather than the deposits unreturned.
+func (a *Alpaca) noteSecurityTransfers(ctx context.Context, since time.Time) {
+	a.capabilityWarnings = nil
+	transfers, err := a.fetchActivities(ctx, since, alpacaSecurityTransferTypes, func(act alpacaActivity) *Cashflow {
+		return &Cashflow{}
+	})
+	if err != nil || len(transfers) == 0 {
+		return
+	}
+	a.capabilityWarnings = append(a.capabilityWarnings,
+		fmt.Sprintf("security_transfer_not_capital:%d", len(transfers)))
+}
+
+func (a *Alpaca) CapabilityWarnings() []string {
+	return a.capabilityWarnings
+}
+
+type alpacaActivity struct {
+	ID              string `json:"id"`
+	ActivityType    string `json:"activity_type"`
+	Date            string `json:"date"`
+	TransactionTime string `json:"transaction_time"`
+	NetAmount       string `json:"net_amount"`
+}
+
+func alpacaActivityTime(act alpacaActivity) (time.Time, bool) {
+	if act.TransactionTime != "" {
+		if ts, err := time.Parse(time.RFC3339, act.TransactionTime); err == nil {
+			return ts.UTC(), true
+		}
+	}
+	if act.Date != "" {
+		if ts, err := time.Parse("2006-01-02", act.Date); err == nil {
+			return ts.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
+// fetchActivities walks the activity ledger for the given types, following
+// page_token until the venue stops returning entries.
+func (a *Alpaca) fetchActivities(
+	ctx context.Context,
+	since time.Time,
+	types []string,
+	convert func(alpacaActivity) *Cashflow,
+) ([]*Cashflow, error) {
+	var (
+		out       []*Cashflow
+		pageToken string
+	)
+
+	for page := 0; page < alpacaActivityMaxPages; page++ {
+		path := fmt.Sprintf("/v2/account/activities?activity_types=%s&after=%s&page_size=100",
+			strings.Join(types, ","), url.QueryEscape(since.UTC().Format(time.RFC3339)))
+		if pageToken != "" {
+			path += "&page_token=" + url.QueryEscape(pageToken)
+		}
+
+		body, err := a.doRequest(ctx, a.baseURL, path)
+		if err != nil {
+			return nil, fmt.Errorf("fetch account activities: %w", err)
+		}
+
+		var batch []alpacaActivity
+		if err := json.Unmarshal(body, &batch); err != nil {
+			return nil, fmt.Errorf("parse account activities: %w", err)
+		}
+		if len(batch) == 0 {
+			return out, nil
+		}
+
+		for _, act := range batch {
+			if cf := convert(act); cf != nil {
+				out = append(out, cf)
+			}
+		}
+		pageToken = batch[len(batch)-1].ID
+	}
+
+	return out, nil
 }
