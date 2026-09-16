@@ -186,6 +186,12 @@ type IBKR struct {
 	// number on screen silently stopped being the account.
 	capabilityWarnings []string
 
+	// currencyWarning is kept apart from capabilityWarnings because
+	// GetCashflows rebuilds that slice from scratch on every call, and the
+	// account's denomination is not a statement-shape problem it should be
+	// allowed to erase.
+	currencyWarning string
+
 	// Cached from last GetBalance call (avoids extra Flex requests)
 	cachedBreakdown []*MarketBalance
 	cachedIsPaper   *bool
@@ -615,10 +621,21 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 	if d, err := time.Parse("20060102", summary.ReportDate); err == nil {
 		i.cachedBalanceAsOf = d
 	}
-	// Flex reports "in base currency" — the account's denomination, not always USD.
+	// Flex reports "in base currency" — the account's denomination, not always
+	// USD. Nothing downstream converts, so a EUR account's figures travel as
+	// EUR under a USD label unless somebody is told. A French PEA cannot be
+	// anything but EUR, and a statement whose query omits the Currency field
+	// leaves this empty, which is indistinguishable from a dollar account:
+	// warn on that too rather than treat silence as a dollar.
 	currency := summary.Currency
-	if currency == "" {
+	switch {
+	case currency == "":
+		i.currencyWarning = "ibkr_account_currency_unknown"
 		currency = "USD"
+	case currency != "USD":
+		i.currencyWarning = "ibkr_account_currency_" + strings.ToLower(currency)
+	default:
+		i.currencyWarning = ""
 	}
 	total, _ := strconv.ParseFloat(summary.Total, 64)
 	cash, _ := strconv.ParseFloat(summary.Cash, 64)
@@ -945,7 +962,10 @@ func parseFlexTimestamp(v string) (time.Time, bool) {
 // CapabilityWarnings implements CapabilityWarner with the statement-shape
 // gaps found by the last Flex parse.
 func (i *IBKR) CapabilityWarnings() []string {
-	return i.capabilityWarnings
+	if i.currencyWarning == "" {
+		return i.capabilityWarnings
+	}
+	return append(append([]string{}, i.capabilityWarnings...), i.currencyWarning)
 }
 
 func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, error) {
