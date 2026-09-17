@@ -1143,12 +1143,25 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 // token-level window with margin; 6h was chosen after 3h proved too tight.
 const rateLimitRetryDelay = 6 * time.Hour
 
-// isRateLimitError reports whether a sync result error is the IBKR Flex
-// token-level rate limit (1018). Other transient Flex codes (1001/1019 "busy")
-// are NOT treated as rate limits — they clear in seconds, not hours.
+// isRateLimitError reports whether a sync result error is one the same day can
+// still recover from: IBKR's token-level rate limit (1018), the local token
+// gate, or a statement IBKR declined to generate.
+//
+// That last one used to be excluded, on the grounds that 1001 and its siblings
+// "clear in seconds, not hours". They do, in the middle of a trading day. The
+// daily pass runs at 00:00 UTC, which is the middle of IBKR's own end-of-day
+// processing, and a refusal there lasts through it. Excluded, the connection
+// skipped the 6h retry that recovers every other IBKR account and waited a
+// full day for the next pass, which landed in the same window and refused
+// again: one account repeated that for three nights while its statements were
+// being served normally in the afternoon.
+//
+// The match is the connector's own judgement, not a second list of codes here:
+// it wraps exactly the refusals it considers transient in ErrTransient.
 func isRateLimitError(errStr string) bool {
 	return strings.Contains(errStr, "1018") || strings.Contains(errStr, "Too many requests") ||
-		strings.Contains(errStr, "shared flex token cooling down")
+		strings.Contains(errStr, "shared flex token cooling down") ||
+		strings.Contains(errStr, connector.ErrTransient.Error()+": flex request failed:")
 }
 
 // lastExpectedStatementDate returns the most recent weekday (UTC) strictly
