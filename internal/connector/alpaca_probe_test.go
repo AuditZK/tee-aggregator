@@ -2,8 +2,10 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -86,4 +88,61 @@ func TestAlpacaProbeBalance_UnrealizedIsShownWithItsPositions(t *testing.T) {
 
 func TestAlpaca_ImplementsBalanceProber(t *testing.T) {
 	var _ BalanceProber = (*Alpaca)(nil)
+}
+
+// Alpaca answers a rejected key with 401 {"message": "unauthorized."} and
+// nothing else, the same body whether the key was revoked, belongs to the
+// other environment, or the account is closed. The probe separates the one
+// case whose fix differs by asking the other host.
+func TestAlpacaExplainAuthFailure_WrongEnvironmentIsNamedAsSuch(t *testing.T) {
+	accepting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ACTIVE","cash":"10","equity":"10"}`))
+	}))
+	defer accepting.Close()
+
+	a := &Alpaca{apiKey: "k", apiSecret: "s", baseURL: alpacaLiveAPI, client: accepting.Client()}
+	err := a.explainAuthFailure(context.Background(),
+		errors.New("alpaca API error: HTTP 401: {\"message\": \"unauthorized.\"}"),
+		accepting.URL, "paper")
+
+	if err == nil || !strings.Contains(err.Error(), "belongs to the paper environment") {
+		t.Fatalf("error must name the environment, got: %v", err)
+	}
+}
+
+// Refused on both hosts is the other answer, and the one that sends the holder
+// to look at their keys.
+func TestAlpacaExplainAuthFailure_RefusedEverywhereReadsAsRevoked(t *testing.T) {
+	deny := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message": "unauthorized."}`))
+	}))
+	defer deny.Close()
+
+	a := &Alpaca{apiKey: "k", apiSecret: "s", baseURL: alpacaLiveAPI, client: deny.Client()}
+	err := a.explainAuthFailure(context.Background(),
+		errors.New("alpaca API error: HTTP 401: unauthorized"), deny.URL, "paper")
+
+	if err == nil || !strings.Contains(err.Error(), "revoked or the account closed") {
+		t.Fatalf("error must state that both hosts refused, got: %v", err)
+	}
+}
+
+// A failure that is not an authentication one travels unchanged: dressing a
+// timeout up as a credential problem sends the holder to rotate a working key.
+func TestAlpacaExplainAuthFailure_OtherFailuresAreNotReinterpreted(t *testing.T) {
+	a := &Alpaca{baseURL: alpacaLiveAPI}
+	original := errors.New("alpaca API error: HTTP 503: service unavailable")
+	if got := a.explainAuthFailure(context.Background(), original, alpacaPaperAPI, "paper"); got != original {
+		t.Fatalf("a non-401 must pass through untouched, got: %v", got)
+	}
+}
+
+func TestAlpacaOtherEnvironment_FlipsBothWays(t *testing.T) {
+	if url, name := alpacaOtherEnvironment(alpacaLiveAPI); url != alpacaPaperAPI || name != "paper" {
+		t.Fatalf("live should flip to paper, got %s/%s", url, name)
+	}
+	if url, name := alpacaOtherEnvironment(alpacaPaperAPI); url != alpacaLiveAPI || name != "live" {
+		t.Fatalf("paper should flip to live, got %s/%s", url, name)
+	}
 }

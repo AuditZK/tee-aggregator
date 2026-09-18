@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // ProbeBalance returns Alpaca's own account payload next to the Balance
@@ -16,7 +17,8 @@ import (
 func (a *Alpaca) ProbeBalance(ctx context.Context) (*BalanceProbe, error) {
 	body, err := a.doRequest(ctx, a.baseURL, "/v2/account")
 	if err != nil {
-		return nil, err
+		otherURL, otherName := alpacaOtherEnvironment(a.baseURL)
+		return nil, a.explainAuthFailure(ctx, err, otherURL, otherName)
 	}
 
 	var raw map[string]any
@@ -77,4 +79,42 @@ func (a *Alpaca) ProbeBalance(ctx context.Context) (*BalanceProbe, error) {
 		Currency:      "USD",
 	}
 	return probe, nil
+}
+
+// explainAuthFailure turns Alpaca's answer to a rejected key into something an
+// operator can act on. Alpaca replies 401 {"message": "unauthorized."} and
+// nothing else, the same body whether the key was revoked, belongs to the
+// other environment, or the account is closed.
+//
+// One of those is worth separating, because the fix differs: the environment
+// is chosen from the key's prefix, so a key that no longer matches its prefix
+// is sent to the wrong host and refused for a reason unrelated to its
+// validity. Asking the other host settles it. The probe does this; a sync
+// never does, because reading an environment the holder did not configure is
+// a worse failure than a refused read.
+func (a *Alpaca) explainAuthFailure(ctx context.Context, err error, otherURL, otherName string) error {
+	if !strings.Contains(err.Error(), "401") {
+		return err
+	}
+	if _, otherErr := a.doRequest(ctx, otherURL, "/v2/account"); otherErr == nil {
+		return fmt.Errorf("alpaca credentials refused by the %s API and accepted by the %s one: the key belongs to the %s environment and this connection points at the other",
+			alpacaEnvironmentName(a.baseURL), otherName, otherName)
+	}
+	return fmt.Errorf("alpaca credentials refused by both the live and paper APIs: the key is revoked or the account closed, not pointed at the wrong environment")
+}
+
+// alpacaOtherEnvironment names the host a key would reach if its prefix had
+// been read the other way round.
+func alpacaOtherEnvironment(baseURL string) (url, name string) {
+	if baseURL == alpacaPaperAPI {
+		return alpacaLiveAPI, "live"
+	}
+	return alpacaPaperAPI, "paper"
+}
+
+func alpacaEnvironmentName(baseURL string) string {
+	if baseURL == alpacaPaperAPI {
+		return "paper"
+	}
+	return "live"
 }
