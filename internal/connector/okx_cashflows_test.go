@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -57,6 +58,14 @@ func (s *okxBillsServer) pathsHit() []string {
 	return append([]string(nil), s.hits...)
 }
 
+// msAgo dates a fixture relative to the run. Absolute epochs used to work
+// here because nothing checked them against the window the test asked for;
+// GetCashflows now enforces that window itself, so a fixture pinned to a fixed
+// calendar day falls out of "the last 24 hours" as soon as the day passes.
+func msAgo(d time.Duration) string {
+	return strconv.FormatInt(time.Now().Add(-d).UnixMilli(), 10)
+}
+
 func billRow(id, ts, ccy, balChg, typ, subType string) string {
 	return `{"billId":"` + id + `","ts":"` + ts + `","ccy":"` + ccy + `","balChg":"` + balChg + `","type":"` + typ + `","subType":"` + subType + `"}`
 }
@@ -72,10 +81,10 @@ const (
 func TestOKXGetCashflows_TransfersInAndOut(t *testing.T) {
 	s := newOKXBillsServer(t, map[string]string{
 		okxBillsPath: `{"code":"0","data":[` +
-			billRow("b1", "1787788800000", "USDT", "500", "1", "11") + `,` +
-			billRow("b2", "1787792400000", "USDT", "-120.5", "1", "12") + `,` +
-			billRow("b3", "1787796000000", "USDT", "3.2", "2", "1") + `,` +
-			billRow("b4", "1787799600000", "USDT", "-0.8", "8", "173") +
+			billRow("b1", msAgo(5*time.Hour), "USDT", "500", "1", "11") + `,` +
+			billRow("b2", msAgo(4*time.Hour), "USDT", "-120.5", "1", "12") + `,` +
+			billRow("b3", msAgo(3*time.Hour), "USDT", "3.2", "2", "1") + `,` +
+			billRow("b4", msAgo(2*time.Hour), "USDT", "-0.8", "8", "173") +
 			`]}`,
 	}, nil)
 
@@ -99,7 +108,7 @@ func TestOKXGetCashflows_TransfersInAndOut(t *testing.T) {
 func TestOKXGetCashflows_NonStableValuedThroughTickers(t *testing.T) {
 	s := newOKXBillsServer(t, map[string]string{
 		okxBillsPath: `{"code":"0","data":[` +
-			billRow("b1", "1787788800000", "BTC", "-0.5", "1", "12") +
+			billRow("b1", msAgo(2*time.Hour), "BTC", "-0.5", "1", "12") +
 			`]}`,
 		okxTickersPath: `{"code":"0","data":[{"instId":"BTC-USDT","last":"50000"}]}`,
 	}, nil)
@@ -157,7 +166,7 @@ func TestOKXPriceInUSD_Precedence(t *testing.T) {
 func TestOKXGetCashflows_StablesOnlySkipTickers(t *testing.T) {
 	s := newOKXBillsServer(t, map[string]string{
 		okxBillsPath: `{"code":"0","data":[` +
-			billRow("b1", "1787788800000", "USDC", "1000", "1", "11") +
+			billRow("b1", msAgo(2*time.Hour), "USDC", "1000", "1", "11") +
 			`]}`,
 	}, nil)
 
@@ -176,7 +185,7 @@ func TestOKXGetCashflows_StablesOnlySkipTickers(t *testing.T) {
 func TestOKXGetCashflows_UnpricedTransferWarnsInsteadOfZero(t *testing.T) {
 	s := newOKXBillsServer(t, map[string]string{
 		okxBillsPath: `{"code":"0","data":[` +
-			billRow("b1", "1787788800000", "RWUSD", "2000", "1", "11") +
+			billRow("b1", msAgo(2*time.Hour), "RWUSD", "2000", "1", "11") +
 			`]}`,
 		okxTickersPath: `{"code":"0","data":[{"instId":"BTC-USDT","last":"50000"}]}`,
 	}, nil)
@@ -200,7 +209,7 @@ func TestOKXGetCashflows_UnpricedTransferWarnsInsteadOfZero(t *testing.T) {
 func TestOKXGetCashflows_UnknownTypeWarns(t *testing.T) {
 	s := newOKXBillsServer(t, map[string]string{
 		okxBillsPath: `{"code":"0","data":[` +
-			billRow("b1", "1787788800000", "USDT", "77", "33", "9") +
+			billRow("b1", msAgo(2*time.Hour), "USDT", "77", "33", "9") +
 			`]}`,
 	}, nil)
 
@@ -235,11 +244,11 @@ func TestOKXGetCashflows_ArchiveOnlyWhenWindowNeedsIt(t *testing.T) {
 
 	past := newOKXBillsServer(t, map[string]string{
 		okxBillsPath: `{"code":"0","data":[` +
-			billRow("dup", "1787788800000", "USDT", "500", "1", "11") +
+			billRow("dup", msAgo(10*24*time.Hour), "USDT", "500", "1", "11") +
 			`]}`,
 		okxArchivePath: `{"code":"0","data":[` +
-			billRow("dup", "1787788800000", "USDT", "500", "1", "11") + `,` +
-			billRow("old", "1786000000000", "USDT", "900", "1", "11") +
+			billRow("dup", msAgo(10*24*time.Hour), "USDT", "500", "1", "11") + `,` +
+			billRow("old", msAgo(15*24*time.Hour), "USDT", "900", "1", "11") +
 			`]}`,
 	}, nil)
 	flows, err := past.connector().GetCashflows(context.Background(), time.Now().Add(-20*24*time.Hour))
@@ -278,7 +287,7 @@ func TestOKXGetCashflows_InBodyErrorIsAnErrorNotAnEmptyLedger(t *testing.T) {
 
 	degraded := newOKXBillsServer(t, map[string]string{
 		okxBillsPath: `{"code":"0","data":[` +
-			billRow("b1", "1787788800000", "USDT", "500", "1", "11") +
+			billRow("b1", msAgo(10*24*time.Hour), "USDT", "500", "1", "11") +
 			`]}`,
 		okxArchivePath: `{"code":"51000","msg":"parameter error","data":[]}`,
 	}, nil)
@@ -311,7 +320,7 @@ func TestOKXGetCashflows_FailurePolicy(t *testing.T) {
 
 	degraded := newOKXBillsServer(t, map[string]string{
 		okxBillsPath: `{"code":"0","data":[` +
-			billRow("b1", "1787788800000", "USDT", "500", "1", "11") +
+			billRow("b1", msAgo(10*24*time.Hour), "USDT", "500", "1", "11") +
 			`]}`,
 	}, map[string]int{okxArchivePath: http.StatusInternalServerError})
 	conn := degraded.connector()
