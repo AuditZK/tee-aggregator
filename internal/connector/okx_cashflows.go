@@ -74,7 +74,34 @@ func (o *OKX) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, e
 	for _, w := range warnings {
 		o.noteCashflowWarning(w)
 	}
-	return flows, nil
+	return okxFlowsSince(flows, since), nil
+}
+
+// okxFlowsSince drops what fell outside the caller's window.
+//
+// The asset-bills endpoints ignore the begin and end we send them: a probe
+// asking for a single day came back with two months of ledger. Believed, that
+// hands a daily sync the account's entire funding history to book as today's
+// deposits and withdrawals, which is what happened to three accounts for two
+// nights running, each reporting its whole lifetime capital as one day's
+// inflow and a daily return near -90%.
+//
+// Classification runs on the full ledgers first, on purpose. Pairing a trading
+// transfer against its funding twin needs both legs present, and a twin
+// trimmed off by the window would turn a move between two wallets into a
+// crossing that never happened.
+func okxFlowsSince(flows []*Cashflow, since time.Time) []*Cashflow {
+	if since.IsZero() {
+		return flows
+	}
+	kept := make([]*Cashflow, 0, len(flows))
+	for _, f := range flows {
+		if f.Timestamp.Before(since) {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return kept
 }
 
 // okxClassifyCashflows is pure so the perimeter rule stays testable without
