@@ -63,6 +63,23 @@ func NewLighter(creds *Credentials) *Lighter {
 
 func (l *Lighter) Exchange() string { return "lighter" }
 
+// lighterHistoryNeedsToken is the capability gap of a wallet-address
+// connection: balance and positions read fine, the trade history does not.
+const lighterHistoryNeedsToken = "lighter_history_needs_ro_token"
+
+// CapabilityWarnings implements CapabilityWarner. A wallet address reads the
+// account's balance and positions but not its fills, so its history can never
+// be rebuilt; the rebuilder refuses the address outright. Said here, on every
+// sync, the gap reaches sync_statuses and the dashboard banner, where the one
+// person who can fix it, by pasting a ro: token, will see it. It used to be a
+// 400 in the enclave's log and a connection recorded as completed.
+func (l *Lighter) CapabilityWarnings() []string {
+	if l.walletAddress == "" {
+		return nil
+	}
+	return []string{lighterHistoryNeedsToken}
+}
+
 // DetectIsPaper mirrors TS behavior: Lighter connector targets mainnet.
 func (l *Lighter) DetectIsPaper(_ context.Context) (bool, error) {
 	return false, nil
