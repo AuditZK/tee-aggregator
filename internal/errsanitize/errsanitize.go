@@ -56,6 +56,12 @@ var categories = []category{
 	// throttle, not a dead authorization, and the reauth patterns below would
 	// otherwise claim it.
 	{"blocked_payload_type", MsgRateLimited},
+	// IBKR Flex pacing, in IBKR's words (1001, 1019) and in ours (the
+	// token gate). Unlisted, the loser of a shared-token race reached the
+	// dashboard as a plain "sync failed", which reads as broken.
+	{"shared flex token cooling down", MsgRateLimited},
+	{"could not be generated at this time", MsgRateLimited},
+	{"statement generation in progress", MsgRateLimited},
 	{"rate limited", MsgRateLimited},
 	{"rate-limited", MsgRateLimited},
 	{"too many requests", MsgRateLimited},

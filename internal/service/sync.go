@@ -14,6 +14,7 @@ import (
 
 	"github.com/trackrecord/enclave/internal/cache"
 	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/errsanitize"
 	"github.com/trackrecord/enclave/internal/rebuilderclient"
 	"github.com/trackrecord/enclave/internal/repository"
 	"go.uber.org/zap"
@@ -420,6 +421,16 @@ type SyncResult struct {
 	SnapshotTimestamp time.Time `json:"snapshot_timestamp"`
 	Error             string    `json:"error,omitempty"`
 
+	// RateLimited is the typed form of "the broker is pacing us, retry
+	// later". Error is sanitized before it is stored (egressSyncError), so
+	// the text no longer carries the connector's own words and the string
+	// predicate that used to arm the deferred retry stopped matching: from
+	// 2026-09-09 the loser of a shared Flex token race was recorded as
+	// "get balance: sync failed" and never retried, and two accounts on one
+	// token took turns having a day. Set from the RAW error at the failure
+	// site, where the words are still there.
+	RateLimited bool `json:"rate_limited,omitempty"`
+
 	// CapabilityWarnings carries key-scope gaps the connector discovered
 	// while fetching the balance (connector.CapabilityWarner) — recorded in
 	// sync_statuses.errorMessage under a "warning:" prefix with status still
@@ -730,6 +741,7 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 	balance, err := s.fetchBalanceWithCollapseGuard(ctx, conn, connMeta)
 	if err != nil {
 		result.Error = egressSyncError("get balance", err)
+		result.RateLimited = isRateLimitError(err.Error())
 		s.logger.Error("sync failed: get balance",
 			zap.String("user_uid", connMeta.UserUID),
 			zap.String("exchange", connMeta.Exchange),
@@ -1110,7 +1122,7 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		// Phase 5 below schedules a deferred retry for exactly this
 		// predicate, so the status can honestly say "pending" rather than
 		// "error" — same contract as the skipped_stale case.
-		if isRateLimitError(r.Error) {
+		if r.rateLimited() {
 			r.RetryArmed = true
 		}
 		conn := findConnection(connections, r.Exchange, r.Label)
@@ -1127,7 +1139,7 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 	// but not a lastSyncTime, so the connection stays "due" — the deferred retry,
 	// or failing that the next daily pass, recovers it.
 	for _, r := range results {
-		if isRateLimitError(r.Error) {
+		if r.rateLimited() {
 			if conn := findConnection(connections, r.Exchange, r.Label); conn != nil {
 				s.recordRateLimitHit(ctx, conn)
 				s.scheduleDeferredRetry(conn, rateLimitRetryDelay)
@@ -1161,7 +1173,15 @@ const rateLimitRetryDelay = 6 * time.Hour
 func isRateLimitError(errStr string) bool {
 	return strings.Contains(errStr, "1018") || strings.Contains(errStr, "Too many requests") ||
 		strings.Contains(errStr, "shared flex token cooling down") ||
-		strings.Contains(errStr, connector.ErrTransient.Error()+": flex request failed:")
+		strings.Contains(errStr, connector.ErrTransient.Error()+": flex request failed:") ||
+		strings.Contains(errStr, errsanitize.MsgRateLimited)
+}
+
+// rateLimited answers for a result whether its failure was pacing rather
+// than breakage, from the typed flag first and the text as a fallback for
+// results built by paths that only carry the text.
+func (r *SyncResult) rateLimited() bool {
+	return r.RateLimited || isRateLimitError(r.Error)
 }
 
 // lastExpectedStatementDate returns the most recent weekday (UTC) strictly
@@ -1365,6 +1385,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	balance, err := s.fetchBalanceWithCollapseGuard(ctx, conn, connMeta)
 	if err != nil {
 		result.Error = egressSyncError("get balance", err)
+		result.RateLimited = isRateLimitError(err.Error())
 		s.logger.Error(classifySyncError("get balance: "+err.Error()), zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.String("step", "get_balance"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return result
 	}
