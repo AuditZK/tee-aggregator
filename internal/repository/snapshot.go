@@ -1022,7 +1022,7 @@ func (r *SnapshotRepo) GetLatestByUserExchangeLabelBefore(ctx context.Context, u
 		return nil, err
 	}
 	defer rows.Close()
-	snapshots, err := r.scanSnapshots(rows, false, hasHist)
+	snapshots, err := r.scanSnapshots(rows, true, hasHist)
 	if err != nil {
 		return nil, err
 	}
