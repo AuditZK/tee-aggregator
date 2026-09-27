@@ -514,50 +514,6 @@ func (s *SyncService) SyncUser(ctx context.Context, userUID string) ([]*SyncResu
 	return results, nil
 }
 
-// SyncUserScheduled synchronizes all exchanges for a user (scheduler path - bypasses manual block)
-func (s *SyncService) SyncUserScheduled(ctx context.Context, userUID string) ([]*SyncResult, error) {
-	return s.SyncUserScheduledDue(ctx, userUID, time.Now().UTC())
-}
-
-// SyncUserScheduledDue synchronizes only connections that are due based on
-// per-connection sync_interval_minutes and last_sync_time (from sync_statuses).
-func (s *SyncService) SyncUserScheduledDue(ctx context.Context, userUID string, now time.Time) ([]*SyncResult, error) {
-	connections, err := s.connSvc.GetActiveConnections(ctx, userUID)
-	if err != nil {
-		return nil, fmt.Errorf(errFmtGetConnections, err)
-	}
-
-	if len(connections) == 0 {
-		return nil, fmt.Errorf(errFmtNoActiveConnections, userUID)
-	}
-
-	var (
-		results []*SyncResult
-		mu      sync.Mutex
-		wg      sync.WaitGroup
-	)
-
-	for _, conn := range connections {
-		if !s.isConnectionDue(ctx, conn, now) {
-			continue
-		}
-
-		wg.Add(1)
-		go func(c *repository.ExchangeConnection) {
-			defer wg.Done()
-
-			result := s.syncConnection(ctx, c)
-
-			mu.Lock()
-			results = append(results, result)
-			mu.Unlock()
-		}(conn)
-	}
-
-	wg.Wait()
-	return results, nil
-}
-
 // SyncExchange synchronizes a single exchange for a user (manual sync).
 // If multiple labels exist for the same exchange, all matching connections are synced.
 // Blocks if a snapshot already exists for this user+exchange+label (anti-cherry-picking).
@@ -628,31 +584,6 @@ func (s *SyncService) SyncConnectionScheduledByLabel(ctx context.Context, userUI
 		}
 	}
 	return s.syncConnection(ctx, conn)
-}
-
-// SyncExchangeScheduled is used by the hourly scheduler - bypasses manual sync block
-func (s *SyncService) SyncExchangeScheduled(ctx context.Context, userUID, exchange string) *SyncResult {
-	connections, err := s.getConnectionsByExchange(ctx, userUID, exchange)
-	if err != nil {
-		return &SyncResult{
-			UserUID:  userUID,
-			Exchange: exchange,
-			Error:    egressSyncError("", err),
-		}
-	}
-	if len(connections) == 0 {
-		return &SyncResult{
-			UserUID:  userUID,
-			Exchange: exchange,
-			Error:    fmt.Sprintf("no active connection for exchange %s", exchange),
-		}
-	}
-
-	results := make([]*SyncResult, 0, len(connections))
-	for _, conn := range connections {
-		results = append(results, s.syncConnection(ctx, conn))
-	}
-	return aggregateSyncResults(userUID, exchange, results)
 }
 
 // isManualSyncAllowed checks if a manual sync is permitted.
@@ -780,37 +711,13 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 
 	activityStart := s.activityWindowStart(ctx, connMeta, startOfDay)
 
-	// 4a. Per-market trade fetching if supported; otherwise fallback to flat GetTrades
+	// 4a. Trades over the activity window; swap symbols feed the funding fetch.
 	var trades []*connector.Trade
 	var swapSymbols []string
-	if pmFetcher, ok := conn.(connector.PerMarketTradeFetcher); ok {
-		if detector, ok2 := conn.(connector.MarketTypeDetector); ok2 {
-			if marketTypes, err := detector.DetectMarketTypes(ctx); err == nil {
-				for _, mt := range marketTypes {
-					mtTrades, err := pmFetcher.GetTradesByMarket(ctx, mt, activityStart)
-					if err != nil {
-						continue
-					}
-					for _, t := range mtTrades {
-						if t.MarketType == "" {
-							t.MarketType = mt
-						}
-						trades = append(trades, t)
-						if mt == connector.MarketSwap {
-							swapSymbols = appendUnique(swapSymbols, t.Symbol)
-						}
-					}
-				}
-			}
-		}
-	}
-	if len(trades) == 0 {
-		trades, _ = conn.GetTrades(ctx, activityStart, now)
-		// Collect swap symbols from fallback trades for funding fee fetch
-		for _, t := range trades {
-			if t.MarketType == connector.MarketSwap {
-				swapSymbols = appendUnique(swapSymbols, t.Symbol)
-			}
+	trades, _ = conn.GetTrades(ctx, activityStart, now)
+	for _, t := range trades {
+		if t.MarketType == connector.MarketSwap {
+			swapSymbols = appendUnique(swapSymbols, t.Symbol)
 		}
 	}
 
@@ -826,14 +733,6 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 				fundingCharges += f.Amount
 			}
 			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = fundingCharges
-		}
-	}
-
-	// 5b. Fetch earn/staking balance if supported
-	if earnFetcher, ok := conn.(connector.EarnBalanceFetcher); ok {
-		if earnEquity, err := earnFetcher.GetEarnBalance(ctx); err == nil && earnEquity > 0 {
-			breakdown.earn.equity = earnEquity
-			balance.Equity += earnEquity // Add to global equity
 		}
 	}
 
@@ -1431,34 +1330,10 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 
 	var trades []*connector.Trade
 	var swapSymbols []string
-	if pmFetcher, ok := conn.(connector.PerMarketTradeFetcher); ok {
-		if detector, ok2 := conn.(connector.MarketTypeDetector); ok2 {
-			if marketTypes, err := detector.DetectMarketTypes(ctx); err == nil {
-				for _, mt := range marketTypes {
-					mtTrades, err := pmFetcher.GetTradesByMarket(ctx, mt, activityStart)
-					if err != nil {
-						continue
-					}
-					for _, t := range mtTrades {
-						if t.MarketType == "" {
-							t.MarketType = mt
-						}
-						trades = append(trades, t)
-						if mt == connector.MarketSwap {
-							swapSymbols = appendUnique(swapSymbols, t.Symbol)
-						}
-					}
-				}
-			}
-		}
-	}
-	if len(trades) == 0 {
-		trades, _ = conn.GetTrades(ctx, activityStart, now)
-		// Collect swap symbols from fallback trades for funding fee fetch
-		for _, t := range trades {
-			if t.MarketType == connector.MarketSwap {
-				swapSymbols = appendUnique(swapSymbols, t.Symbol)
-			}
+	trades, _ = conn.GetTrades(ctx, activityStart, now)
+	for _, t := range trades {
+		if t.MarketType == connector.MarketSwap {
+			swapSymbols = appendUnique(swapSymbols, t.Symbol)
 		}
 	}
 
@@ -1471,13 +1346,6 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 				fundingCharges += f.Amount
 			}
 			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = fundingCharges
-		}
-	}
-
-	if earnFetcher, ok := conn.(connector.EarnBalanceFetcher); ok {
-		if earnEquity, err := earnFetcher.GetEarnBalance(ctx); err == nil && earnEquity > 0 {
-			breakdown.earn.equity = earnEquity
-			balance.Equity += earnEquity
 		}
 	}
 
@@ -3386,7 +3254,6 @@ func (s *SyncService) DumpRawStatement(ctx context.Context, userUID, exchange, l
 type ExchangeMetadataRefresh struct {
 	Exchange string `json:"exchange"`
 	Label    string `json:"label,omitempty"`
-	KYCLevel string `json:"kyc_level,omitempty"`
 	IsPaper  bool   `json:"is_paper"`
 	// PaperProbed false means the broker was never asked — the connector has no
 	// paper detector, or the probe failed. IsPaper is then meaningless.
@@ -3396,7 +3263,7 @@ type ExchangeMetadataRefresh struct {
 	Error string `json:"error,omitempty"`
 }
 
-// RefreshExchangeMetadata re-probes paper/live and KYC status for a user's
+// RefreshExchangeMetadata re-probes paper/live status for a user's
 // active connections and stores the result. Detection otherwise runs only at
 // connect time, so a connection created before its connector gained a probe —
 // or one whose stored flags never took — keeps whatever its row was created
@@ -3441,7 +3308,6 @@ func (s *SyncService) RefreshExchangeMetadata(ctx context.Context, userUID, exch
 		}
 
 		captured := s.connSvc.CaptureExchangeMetadata(ctx, c.ID, conn)
-		item.KYCLevel = captured.KYCLevel
 		item.IsPaper = captured.IsPaper
 		item.PaperProbed = captured.PaperProbed
 		item.Err = captured.Err

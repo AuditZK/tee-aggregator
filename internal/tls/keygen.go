@@ -107,12 +107,6 @@ func (k *KeyGenerator) KeyPEM() []byte {
 	return k.keyPEM
 }
 
-// FingerprintBytes returns the raw SHA-256 hash of the certificate DER.
-func (k *KeyGenerator) FingerprintBytes() []byte {
-	hash := sha256.Sum256(k.certificate.Raw)
-	return hash[:]
-}
-
 // Cleanup wipes the private key from memory.
 func (k *KeyGenerator) Cleanup() {
 	// Zero out key PEM bytes regardless of key source (generated or file-loaded).

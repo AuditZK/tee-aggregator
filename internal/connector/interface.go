@@ -45,12 +45,6 @@ type Connector interface {
 	Exchange() string
 }
 
-// KYCLevelFetcher optionally provides exchange KYC level metadata.
-// Implementations should return empty string when unsupported.
-type KYCLevelFetcher interface {
-	FetchKYCLevel(ctx context.Context) (string, error)
-}
-
 // PaperAccountDetector optionally detects paper/demo account mode.
 type PaperAccountDetector interface {
 	DetectIsPaper(ctx context.Context) (bool, error)
@@ -277,22 +271,6 @@ type FundingFee struct {
 // FundingFeesFetcher optionally provides funding fee history for swap/perpetual markets.
 type FundingFeesFetcher interface {
 	GetFundingFees(ctx context.Context, symbols []string, since time.Time) ([]*FundingFee, error)
-}
-
-// EarnBalanceFetcher optionally provides earn/staking balance.
-type EarnBalanceFetcher interface {
-	GetEarnBalance(ctx context.Context) (float64, error)
-}
-
-// MarketTypeDetector optionally detects which market types an exchange supports.
-// Returns a slice of market type constants (e.g., ["spot", "swap", "futures"]).
-type MarketTypeDetector interface {
-	DetectMarketTypes(ctx context.Context) ([]string, error)
-}
-
-// PerMarketTradeFetcher optionally fetches trades for a specific market type.
-type PerMarketTradeFetcher interface {
-	GetTradesByMarket(ctx context.Context, marketType string, since time.Time) ([]*Trade, error)
 }
 
 // Connectors that hold a long-lived resource — a WebSocket with its read loop

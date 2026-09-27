@@ -697,36 +697,12 @@ func (r *ConnectionRepo) GetExchangeDetailsByUser(ctx context.Context, userUID s
 	return details, rows.Err()
 }
 
-// updateConnectionMetadataQuery builds the UPDATE shared by UpdateKYCLevel and
-// UpdateIsPaper. Pure so the schema-aware column naming can be pinned by a
-// test: prod runs the TS Prisma schema, where these columns are camelCase and
-// a hardcoded snake_case name updates nothing.
+// updateConnectionMetadataQuery builds the UPDATE behind UpdateIsPaper. Pure
+// so the schema-aware column naming can be pinned by a test: prod runs the TS
+// Prisma schema, where these columns are camelCase and a hardcoded snake_case
+// name updates nothing.
 func updateConnectionMetadataQuery(valueCol, updatedAtCol string) string {
 	return `UPDATE exchange_connections SET ` + valueCol + ` = $1, ` + updatedAtCol + ` = $2 WHERE id = $3`
-}
-
-// UpdateKYCLevel updates kyc_level metadata for a connection.
-// It no-ops when the column is not present.
-func (r *ConnectionRepo) UpdateKYCLevel(ctx context.Context, connectionID, kycLevel string) error {
-	if strings.TrimSpace(connectionID) == "" {
-		return nil
-	}
-
-	_, _, _, hasKYCLevel, _ := r.getCapabilityFlags(ctx)
-	if !hasKYCLevel {
-		return nil
-	}
-
-	query := updateConnectionMetadataQuery(r.qcol("kyc_level"), r.qcol("updated_at"))
-	tag, err := r.pool.Exec(ctx, query, strings.TrimSpace(kycLevel), time.Now().UTC(), connectionID)
-	if err != nil {
-		return fmt.Errorf("update kyc level: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-
-	return nil
 }
 
 // UpdateIsPaper updates is_paper metadata for a connection.

@@ -49,13 +49,6 @@ import (
 // the first production deploy. See cmd/release-sign for how to generate it.
 var operatorPubkey = "AAAAC3NzaC1lZDI1NTE5AAAAIPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHO"
 
-// OperatorPubkey returns the configured operator Ed25519 pubkey
-// (ssh-ed25519 wire format, base64-encoded). Reading-only — see the
-// operatorPubkey variable doc for why this is not a constant.
-func OperatorPubkey() string {
-	return operatorPubkey
-}
-
 // AllowlistEntry is one approved binary release.
 type AllowlistEntry struct {
 	// Measurement is the SEV-SNP launch measurement (hex, lowercase) of

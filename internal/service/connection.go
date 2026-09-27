@@ -492,17 +492,15 @@ func effectiveOAuthCredentials(conn connector.Connector, fallbackAccess, fallbac
 // all — both leave IsPaper false, and reading the second as the first is what
 // lets a demo account pass for a funded one.
 type MetadataCapture struct {
-	KYCLevel    string
 	IsPaper     bool
 	PaperProbed bool
 	Err         error
 }
 
-// CaptureExchangeMetadata reads paper/live and KYC status from the broker and
-// stores it against the connection. The two probes are independent, so a
-// non-nil Err can accompany a value stored by the other one. A failed store is
-// logged at Error rather than dropped: the report's paper badge reads this
-// column, so losing the write silently presents a demo account as a funded one.
+// CaptureExchangeMetadata reads paper/live status from the broker and stores it
+// against the connection. A failed store is logged at Error rather than
+// dropped: the report's paper badge reads this column, so losing the write
+// silently presents a demo account as a funded one.
 func (s *ConnectionService) CaptureExchangeMetadata(ctx context.Context, connectionID string, exchangeConn connector.Connector) MetadataCapture {
 	var out MetadataCapture
 	if s.repo == nil || strings.TrimSpace(connectionID) == "" || exchangeConn == nil {
@@ -510,21 +508,6 @@ func (s *ConnectionService) CaptureExchangeMetadata(ctx context.Context, connect
 	}
 
 	var failures []error
-
-	if fetcher, ok := exchangeConn.(connector.KYCLevelFetcher); ok {
-		kycLevel, err := fetcher.FetchKYCLevel(ctx)
-		if err != nil {
-			s.logMetadataIssue(zapcore.WarnLevel, "kyc level not read from broker", connectionID, exchangeConn, err)
-			failures = append(failures, fmt.Errorf("read kyc level: %w", err))
-		} else if normalized := normalizeKYCLevel(kycLevel); normalized != "" {
-			if err := s.repo.UpdateKYCLevel(ctx, connectionID, normalized); err != nil {
-				s.logMetadataIssue(zapcore.ErrorLevel, "kyc level detected but not stored", connectionID, exchangeConn, err)
-				failures = append(failures, fmt.Errorf("store kyc level: %w", err))
-			} else {
-				out.KYCLevel = normalized
-			}
-		}
-	}
 
 	if detector, ok := exchangeConn.(connector.PaperAccountDetector); ok {
 		isPaper, err := detector.DetectIsPaper(ctx)
@@ -755,13 +738,4 @@ func normalizeExchange(exchange string) string {
 		return "binance_futures"
 	}
 	return e
-}
-
-func normalizeKYCLevel(level string) string {
-	switch strings.ToLower(strings.TrimSpace(level)) {
-	case "none", "basic", "intermediate", "advanced":
-		return strings.ToLower(strings.TrimSpace(level))
-	default:
-		return ""
-	}
 }
