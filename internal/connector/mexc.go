@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,7 +21,9 @@ const mexcPathAccount = "/api/v3/account"
 type MEXC struct {
 	base CryptoBase
 
-	// Cached from last GetBalance for GetBalanceByMarket
+	// Cached from last GetBalance for GetBalanceByMarket, guarded by mu: the
+	// instance is shared by every sync of the connection.
+	mu                  sync.Mutex
 	cachedSpotEquity    float64
 	cachedFuturesEquity float64
 	cachedFuturesAvail  float64
@@ -128,10 +131,11 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 		}
 	}
 
-	// Cache for GetBalanceByMarket
+	m.mu.Lock()
 	m.cachedSpotEquity = spotEquity
 	m.cachedFuturesEquity = futuresEquity
 	m.cachedFuturesAvail = futuresAvailable
+	m.mu.Unlock()
 
 	totalEquity := spotEquity + futuresEquity
 	totalAvailable := spotAvailable + futuresAvailable
@@ -146,6 +150,8 @@ func (m *MEXC) GetBalance(ctx context.Context) (*Balance, error) {
 
 // GetBalanceByMarket returns spot and swap equity breakdown (cached from GetBalance).
 func (m *MEXC) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var balances []*MarketBalance
 	if m.cachedSpotEquity > 0 {
 		balances = append(balances, &MarketBalance{

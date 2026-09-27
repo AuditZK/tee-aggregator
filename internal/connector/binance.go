@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +28,10 @@ type Binance struct {
 	apiKey    string
 	apiSecret string
 	client    *http.Client
+	// mu guards the three fields below. GetBalance holds it throughout: the
+	// instance is shared by every sync of the connection for an hour, and two
+	// balance reads must not interleave their appends.
+	mu sync.Mutex
 	// cachedBreakdown carries the per-market split computed by the last
 	// GetBalance, served by GetBalanceByMarket without extra API calls (the
 	// midnight herd already rate-limits fapi; same pattern as IBKR).
@@ -54,7 +60,9 @@ const (
 
 // Coverage implements CoverageReporter.
 func (b *Binance) Coverage() []WalletCoverage {
-	return b.coverage
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.coverage)
 }
 
 // noteWallet grades one wallet from the error its fetch returned. A nil error
@@ -137,6 +145,9 @@ func (b *Binance) TestConnection(ctx context.Context) error {
 }
 
 func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	// One public ticker fetch, shared by every wallet that needs pricing (spot
 	// alts, COIN-M collateral coins, margin BTC valuation). A transient failure
 	// must fail the sync: a margin-heavy account valued without prices would
@@ -265,13 +276,17 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 // GetBalanceByMarket returns the split cached by the last GetBalance call —
 // no additional API calls (the midnight herd already rate-limits fapi).
 func (b *Binance) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
-	return b.cachedBreakdown, nil
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.cachedBreakdown), nil
 }
 
 // CapabilityWarnings implements CapabilityWarner with the key-scope gaps
 // discovered by the last GetBalance call.
 func (b *Binance) CapabilityWarnings() []string {
-	return b.capabilityWarnings
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.capabilityWarnings)
 }
 
 func (b *Binance) getSpotBalance(ctx context.Context, priceMap map[string]float64) (*Balance, error) {
