@@ -56,8 +56,7 @@ func (r *UserRepo) detectSchema(ctx context.Context) bool {
 
 	var exists bool
 	if err := r.pool.QueryRow(ctx, query).Scan(&exists); err != nil {
-		r.schemaLoaded = true
-		r.isTSSchema = false
+		// Retried on the next call rather than latched as the Go schema.
 		return false
 	}
 

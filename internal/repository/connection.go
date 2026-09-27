@@ -917,19 +917,30 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 		return r.hasCredentialsHashCol, r.hasSyncIntervalMinsCol, r.hasExcludeFromReportCol, r.hasKYCLevelCol, r.hasIsPaperCol
 	}
 
+	// A failed probe is retried on the next call rather than latched for the
+	// life of the process as "column absent".
+	probeFailed := false
+	probe := func(column string) bool {
+		exists, err := r.columnExists(ctx, "exchange_connections", column)
+		if err != nil {
+			probeFailed = true
+		}
+		return exists
+	}
+
 	// Detect TS Prisma schema (camelCase) vs Go schema (snake_case)
 	// If "userUid" column exists → TS schema; if "user_uid" → Go schema
-	tsSchema, _ := r.columnExists(ctx, "exchange_connections", "userUid")
+	tsSchema := probe("userUid")
 	r.isTSSchema = tsSchema
 
 	// Check capability columns using the correct naming
-	credHashCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("credentials_hash"))
-	syncIntervalCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("sync_interval_minutes"))
-	excludeFromReportCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("exclude_from_report"))
-	kycLevelCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("kyc_level"))
-	isPaperCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("is_paper"))
-	rebuildFinalizedCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("rebuild_finalized_at"))
-	rebuildRequestedCol, _ := r.columnExists(ctx, "exchange_connections", r.colName("rebuild_requested_at"))
+	credHashCol := probe(r.colName("credentials_hash"))
+	syncIntervalCol := probe(r.colName("sync_interval_minutes"))
+	excludeFromReportCol := probe(r.colName("exclude_from_report"))
+	kycLevelCol := probe(r.colName("kyc_level"))
+	isPaperCol := probe(r.colName("is_paper"))
+	rebuildFinalizedCol := probe(r.colName("rebuild_finalized_at"))
+	rebuildRequestedCol := probe(r.colName("rebuild_requested_at"))
 
 	r.hasCredentialsHashCol = credHashCol
 	r.hasSyncIntervalMinsCol = syncIntervalCol
@@ -938,7 +949,7 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 	r.hasIsPaperCol = isPaperCol
 	r.hasRebuildFinalizedAtCol = rebuildFinalizedCol
 	r.hasRebuildRequestedAtCol = rebuildRequestedCol
-	r.capabilitiesLoaded = true
+	r.capabilitiesLoaded = !probeFailed
 
 	return r.hasCredentialsHashCol, r.hasSyncIntervalMinsCol, r.hasExcludeFromReportCol, r.hasKYCLevelCol, r.hasIsPaperCol
 }
