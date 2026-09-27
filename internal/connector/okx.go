@@ -55,6 +55,7 @@ type OKX struct {
 	hosts []string // candidate API domains; collapses to one once a key is recognised
 
 	cashflowWarnings []string // markers from the last GetCashflows, guarded by mu
+	balanceWarnings  []string // markers from the last GetBalance, guarded by mu
 
 	// acctLv caches GET /api/v5/account/config's account mode for the life of
 	// the connector. Only the probe reads it — the balance path infers the mode
@@ -413,6 +414,7 @@ func (o *OKX) fetchAccountBalance(ctx context.Context) (*okxAccountBalance, erro
 }
 
 func (o *OKX) GetBalance(ctx context.Context) (*Balance, error) {
+	o.resetBalanceWarnings()
 	account, err := o.fetchAccountBalance(ctx)
 	if err != nil {
 		return nil, err
@@ -432,7 +434,7 @@ func (o *OKX) GetBalance(ctx context.Context) (*Balance, error) {
 	// there read as an account that emptied itself. A key not permitted to see
 	// it degrades to the trading wallet rather than reporting a hole.
 	if funding, err := o.fundingEquityUSD(ctx); err != nil {
-		o.noteCashflowWarning("okx_funding_balance_unreadable")
+		o.noteBalanceWarning("okx_funding_balance_unreadable")
 	} else {
 		equity += funding
 	}
