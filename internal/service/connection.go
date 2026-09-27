@@ -307,15 +307,7 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 	// DetectIsPaper runs inside the call above and can refresh too, AFTER the
 	// row was written. Catch that last rotation as well (E-H4).
 	if finalKey, finalSecret := effectiveOAuthCredentials(testConn, storedAPIKey, storedAPISecret); finalKey != storedAPIKey || finalSecret != storedAPISecret {
-		if err := s.PersistOAuthTokens(ctx, conn.UserUID, conn.Exchange, conn.Label, finalKey, finalSecret); err != nil && s.logger != nil {
-			s.logger.Error("tokens rotated during connection setup could not be stored; the connection will need re-authorization",
-				zap.String("user_uid", conn.UserUID),
-				zap.String("exchange", conn.Exchange),
-				zap.Error(err),
-			)
-		} else if err == nil {
-			_ = s.repo.UpdateCredentialsHash(ctx, conn.ID, hashCredentials(finalKey, finalSecret, req.Passphrase))
-		}
+		s.persistSetupRotation(ctx, conn, finalKey, finalSecret, req.Passphrase)
 	}
 
 	// The history rebuild stays behind the explicit opt-in.
@@ -710,6 +702,26 @@ func (s *ConnectionService) PersistOAuthTokens(ctx context.Context, userUID, exc
 		return fmt.Errorf("encrypt refresh token: %w", err)
 	}
 	return s.repo.UpdateOAuthTokens(ctx, userUID, exchange, label, encAccess, encRefresh)
+}
+
+func (s *ConnectionService) persistSetupRotation(ctx context.Context, conn *repository.ExchangeConnection, key, secret, passphrase string) {
+	if err := s.PersistOAuthTokens(ctx, conn.UserUID, conn.Exchange, conn.Label, key, secret); err != nil {
+		if s.logger != nil {
+			s.logger.Error("tokens rotated during connection setup could not be stored; the connection will need re-authorization",
+				zap.String("user_uid", conn.UserUID),
+				zap.String("exchange", conn.Exchange),
+				zap.Error(err),
+			)
+		}
+		return
+	}
+	if err := s.repo.UpdateCredentialsHash(ctx, conn.ID, hashCredentials(key, secret, passphrase)); err != nil && s.logger != nil {
+		s.logger.Warn("tokens rotated during connection setup: credentials hash not updated",
+			zap.String("user_uid", conn.UserUID),
+			zap.String("exchange", conn.Exchange),
+			zap.Error(err),
+		)
+	}
 }
 
 func hashCredentials(apiKey, apiSecret, passphrase string) string {
