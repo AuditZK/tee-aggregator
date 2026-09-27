@@ -117,10 +117,11 @@ type Snapshot struct {
 	IsHistorical bool `json:"is_historical,omitempty"`
 
 	// FromExternalRebuilder marks a snapshot reconstructed by the out-of-enclave
-	// history-rebuilder service (SEC-001). Such data is NOT covered by the
-	// signed report — GetVerifiableByUserAndDateRange filters it out. False for
-	// live snapshots and for IBKR Flex history rebuilt inside the enclave.
-	// Persisted only on the Go schema (migration 015).
+	// history-rebuilder service (SEC-001). The signed report keeps such days
+	// and labels them (verifiability_class, payload 1.3). False for live
+	// snapshots and for IBKR Flex history rebuilt inside the enclave. Read only
+	// where the column exists (migration 015, applied to the Prisma schema by
+	// hand).
 	FromExternalRebuilder bool `json:"from_external_rebuilder,omitempty"`
 }
 
@@ -281,7 +282,7 @@ func (r *SnapshotRepo) upsertTS(ctx context.Context, s *Snapshot, breakdownJSON 
 
 // GetByUserAndDateRange returns snapshots for a user within a date range.
 func (r *SnapshotRepo) GetByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
-	return r.getByUserAndDateRange(ctx, userUID, start, end, false)
+	return r.getByUserAndDateRange(ctx, userUID, start, end)
 }
 
 // GetVerifiableByUserAndDateRange returns snapshots eligible for inclusion in
@@ -295,19 +296,8 @@ func (r *SnapshotRepo) GetByUserAndDateRange(ctx context.Context, userUID string
 // this layer (SEC-001). That coarse-grained gate is now replaced by per-day
 // labelling so the same signed report can convey both live and rebuilt
 // history with cryptographically attested provenance.
-//
-// Callers that genuinely need the strict in-enclave-only set should use
-// GetStrictlyInEnclaveByUserAndDateRange.
 func (r *SnapshotRepo) GetVerifiableByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
-	return r.getByUserAndDateRange(ctx, userUID, start, end, false)
-}
-
-// GetStrictlyInEnclaveByUserAndDateRange returns only snapshots that never
-// left the SEV-SNP perimeter: live daily syncs plus IBKR Flex history
-// reconstructed in-enclave. External-rebuilder snapshots are excluded. Use
-// this when the caller wants the pre-1.3 "verifiable only" behaviour.
-func (r *SnapshotRepo) GetStrictlyInEnclaveByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
-	return r.getByUserAndDateRange(ctx, userUID, start, end, true)
+	return r.getByUserAndDateRange(ctx, userUID, start, end)
 }
 
 // GetExternalRebuilderDays returns the set of UTC day-keys (00:00:00 of the
@@ -563,7 +553,7 @@ func (r *SnapshotRepo) CountExternalRebuilderSnapshots(ctx context.Context, user
 	return n, nil
 }
 
-func (r *SnapshotRepo) getByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time, verifiableOnly bool) ([]*Snapshot, error) {
+func (r *SnapshotRepo) getByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
 	hasLabel := r.hasLabelColumn(ctx)
 	hasHist := r.hasIsHistoricalColumn(ctx)
 
@@ -579,19 +569,15 @@ func (r *SnapshotRepo) getByUserAndDateRange(ctx context.Context, userUID string
 	if hasHist {
 		histCol = snapshotIsHistoricalCol
 	}
-	whereExtra := ""
-	if verifiableOnly && r.hasFromExternalRebuilderColumn(ctx) {
-		whereExtra = " AND from_external_rebuilder = FALSE"
-	}
 	query := fmt.Sprintf(`
 		SELECT %s,
 			total_equity, realized_balance, unrealized_pnl,
 			deposits, withdrawals, total_trades, total_volume, total_fees,
 			breakdown_by_market, created_at%s
 		FROM snapshot_data
-		WHERE user_uid = $1 AND timestamp >= $2 AND timestamp <= $3%s
+		WHERE user_uid = $1 AND timestamp >= $2 AND timestamp <= $3
 		ORDER BY timestamp`,
-		selectCols, histCol, whereExtra,
+		selectCols, histCol,
 	)
 
 	rows, err := r.pool.Query(ctx, query, userUID, start, end)
