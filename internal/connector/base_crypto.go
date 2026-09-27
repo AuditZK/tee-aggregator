@@ -336,9 +336,11 @@ func (b *CryptoBase) signedQueryGET(ctx context.Context, apiKeyHeader, path, par
 // stablecoinsUSD lists the assets valued 1:1 with USD. Kept deliberately small
 // and well-known — pricing an unknown "stable" through the ticker map is safer
 // than mis-pegging it to exactly 1.
+// BNFCR is Binance's USDⓈ-M margin credit for EEA accounts (Credits Trading
+// Mode), 1 BNFCR = 1 USD by the venue's definition and without a ticker.
 var stablecoinsUSD = map[string]struct{}{
 	"USDT": {}, "USDC": {}, "USD": {}, "BUSD": {},
-	"DAI": {}, "FDUSD": {}, "TUSD": {},
+	"DAI": {}, "FDUSD": {}, "TUSD": {}, "BNFCR": {},
 }
 
 // ErrSpotPricingUnavailable marks a sync refused because the venue's spot

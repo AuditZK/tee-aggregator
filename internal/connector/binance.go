@@ -172,7 +172,7 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 
 	var futures *Balance
 	b.capabilityWarnings = nil
-	if fut, ferr := b.getFuturesBalance(ctx); ferr == nil && fut != nil {
+	if fut, ferr := b.getFuturesBalance(ctx, priceMap); ferr == nil && fut != nil {
 		total.Equity += fut.Equity
 		total.UnrealizedPnL += fut.UnrealizedPnL
 		futures = fut
@@ -387,7 +387,7 @@ func (b *Binance) marginNetEquityUSD(ctx context.Context, path string, priceMap 
 	return netBtc * priceMap["BTCUSDT"], nil
 }
 
-func (b *Binance) getFuturesBalance(ctx context.Context) (*Balance, error) {
+func (b *Binance) getFuturesBalance(ctx context.Context, priceMap map[string]float64) (*Balance, error) {
 	params := url.Values{}
 	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v2/account", params, true)
 	if err != nil {
@@ -405,9 +405,11 @@ func (b *Binance) getFuturesBalance(ctx context.Context) (*Balance, error) {
 	// non-USDT collateral. It never overlaps the spot wallet, so summing the two
 	// in GetBalance does not double-count.
 	var resp struct {
-		TotalMarginBalance    string `json:"totalMarginBalance"`
-		TotalUnrealizedProfit string `json:"totalUnrealizedProfit"`
-		AvailableBalance      string `json:"availableBalance"`
+		TotalWalletBalance    string                   `json:"totalWalletBalance"`
+		TotalMarginBalance    string                   `json:"totalMarginBalance"`
+		TotalUnrealizedProfit string                   `json:"totalUnrealizedProfit"`
+		AvailableBalance      string                   `json:"availableBalance"`
+		Assets                []binanceFuturesAssetRow `json:"assets"`
 	}
 
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -417,6 +419,21 @@ func (b *Binance) getFuturesBalance(ctx context.Context) (*Balance, error) {
 	equity, _ := strconv.ParseFloat(resp.TotalMarginBalance, 64)
 	unrealized, _ := strconv.ParseFloat(resp.TotalUnrealizedProfit, 64)
 	available, _ := strconv.ParseFloat(resp.AvailableBalance, 64)
+
+	// In single-asset mode the totals count USDT alone: a USDC or BNFCR margin
+	// wallet would read as its USDT leftover. Measured before shipping with the
+	// balance probe across every connected Binance account: none held
+	// collateral outside its totals, so no live equity jumps on the change.
+	if binanceTotalsCoverUSDTOnly(resp.TotalWalletBalance, resp.Assets) {
+		for _, a := range resp.Assets {
+			if strings.EqualFold(a.Asset, "USDT") {
+				continue
+			}
+			equity += binanceMarginAssetUSD(a.Asset, a.MarginBalance, priceMap)
+			unrealized += binanceMarginAssetUSD(a.Asset, a.UnrealizedProfit, priceMap)
+			available += binanceMarginAssetUSD(a.Asset, a.AvailableBalance, priceMap)
+		}
+	}
 
 	// /fapi/v2/account is being retired and returns HTTP 200 with an empty
 	// totalMarginBalance for some accounts — NOT an error, so the fallback

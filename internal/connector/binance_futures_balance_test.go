@@ -36,7 +36,7 @@ func TestBinance_FuturesBalance_FallsBackWhenAccountReportsZero(t *testing.T) {
 	client := &http.Client{Transport: hostRewriter{base: http.DefaultTransport, target: target}}
 	b := NewBinanceWithClient(&Credentials{APIKey: "k", APISecret: "s"}, client)
 
-	bal, err := b.getFuturesBalance(context.Background())
+	bal, err := b.getFuturesBalance(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("getFuturesBalance: %v", err)
 	}
@@ -96,11 +96,77 @@ func TestBinance_FuturesBalance_ZeroStaysZeroWhenBothEmpty(t *testing.T) {
 	client := &http.Client{Transport: hostRewriter{base: http.DefaultTransport, target: target}}
 	b := NewBinanceWithClient(&Credentials{APIKey: "k", APISecret: "s"}, client)
 
-	bal, err := b.getFuturesBalance(context.Background())
+	bal, err := b.getFuturesBalance(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("getFuturesBalance: %v", err)
 	}
 	if bal.Equity != 0 {
 		t.Fatalf("expected 0 for a genuinely empty wallet, got %v", bal.Equity)
+	}
+}
+
+func futuresAccountServer(t *testing.T, account string) *Binance {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(account))
+	}))
+	t.Cleanup(srv.Close)
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: hostRewriter{base: http.DefaultTransport, target: target}}
+	return NewBinanceWithClient(&Credentials{APIKey: "k", APISecret: "s"}, client)
+}
+
+// In single-asset mode the account totals count USDT alone, so a BNFCR (or
+// USDC) margin wallet must be added from the per-asset rows or it reads as its
+// USDT leftover.
+func TestBinance_FuturesBalance_CountsCollateralOutsideUSDTOnlyTotals(t *testing.T) {
+	b := futuresAccountServer(t, `{
+		"totalWalletBalance":"2.00","totalMarginBalance":"2.00","totalUnrealizedProfit":"0","availableBalance":"2.00",
+		"assets":[
+			{"asset":"USDT","walletBalance":"2.00","marginBalance":"2.00","unrealizedProfit":"0","availableBalance":"2.00"},
+			{"asset":"BNFCR","walletBalance":"500","marginBalance":"510","unrealizedProfit":"10","availableBalance":"400"}
+		]}`)
+	bal, err := b.getFuturesBalance(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("getFuturesBalance: %v", err)
+	}
+	if bal.Equity != 512 || bal.UnrealizedPnL != 10 || bal.Available != 402 {
+		t.Fatalf("want equity 512 / uPnL 10 / available 402, got %v / %v / %v", bal.Equity, bal.UnrealizedPnL, bal.Available)
+	}
+}
+
+// Multi-assets totals already fold every asset in; adding the rows again
+// would double the wallet.
+func TestBinance_FuturesBalance_MultiAssetTotalsAreNotDoubled(t *testing.T) {
+	b := futuresAccountServer(t, `{
+		"totalWalletBalance":"150","totalMarginBalance":"150","totalUnrealizedProfit":"0","availableBalance":"150",
+		"assets":[
+			{"asset":"USDT","walletBalance":"100","marginBalance":"100","unrealizedProfit":"0","availableBalance":"100"},
+			{"asset":"USDC","walletBalance":"50","marginBalance":"50","unrealizedProfit":"0","availableBalance":"50"}
+		]}`)
+	bal, err := b.getFuturesBalance(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("getFuturesBalance: %v", err)
+	}
+	if bal.Equity != 150 {
+		t.Fatalf("want the multi-asset total 150 untouched, got %v", bal.Equity)
+	}
+}
+
+// Non-stable collateral outside USDT-only totals is valued at its spot price.
+func TestBinance_FuturesBalance_PricesNonStableCollateral(t *testing.T) {
+	b := futuresAccountServer(t, `{
+		"totalWalletBalance":"0","totalMarginBalance":"0","totalUnrealizedProfit":"0","availableBalance":"0",
+		"assets":[
+			{"asset":"USDT","walletBalance":"0","marginBalance":"0","unrealizedProfit":"0","availableBalance":"0"},
+			{"asset":"BNB","walletBalance":"2","marginBalance":"2","unrealizedProfit":"0","availableBalance":"2"}
+		]}`)
+	bal, err := b.getFuturesBalance(context.Background(), map[string]float64{"BNBUSDT": 600})
+	if err != nil {
+		t.Fatalf("getFuturesBalance: %v", err)
+	}
+	if bal.Equity != 1200 {
+		t.Fatalf("want 2 BNB at 600 = 1200, got %v", bal.Equity)
 	}
 }
