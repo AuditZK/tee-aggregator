@@ -1,13 +1,7 @@
-// Package connector provides exchange-specific implementations.
-//
-// Architecture:
-//   - CryptoBase: shared HTTP client + helpers for all crypto exchange connectors
-//   - Native connectors (Binance, Bybit, OKX, Kraken, MEXC): direct HTTP with HMAC signing (~1MB each)
-//   - CCXT connector: dynamic wrapper for minor exchanges (~67-150MB per LoadMarkets)
-//   - Specialized connectors: IBKR (Flex XML), cTrader (WebSocket), MetaTrader (mt-bridge), etc.
-//
-// Use native connectors for major exchanges to minimize memory usage.
-// Use CCXT only for exchanges without a native connector.
+// Package connector provides exchange-specific implementations. CryptoBase
+// holds the HTTP client and signing helpers shared by the crypto venues;
+// IBKR (Flex XML), cTrader (WebSocket) and MetaTrader (mt-bridge) bring their
+// own transport.
 package connector
 
 import (

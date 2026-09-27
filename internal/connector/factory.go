@@ -32,8 +32,6 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 	exchange := strings.ToLower(strings.TrimSpace(creds.Exchange))
 
 	switch exchange {
-	// Major crypto exchanges — native connectors (5MB vs CCXT's 150MB per LoadMarkets)
-	// Native connectors use direct HTTP with HMAC signing, no market loading.
 	case "binance", "binance_futures", "binanceusdm":
 		// Route through proxy if configured (Binance geo-blocks EU regions).
 		// proxyCfg.ShouldProxy is nil-safe and returns false when no proxy is set.

@@ -984,20 +984,15 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		return nil, fmt.Errorf(errFmtNoActiveConnections, userUID)
 	}
 
-	// Phase 1: Build snapshots with limited concurrency (max 2 per user).
-	// CCXT connectors load markets (~40MB each), so 10 in parallel = OOM on small VMs.
+	// Phase 1: build snapshots with bounded concurrency.
 	var (
 		results []*SyncResult
 		mu      sync.Mutex
 		wg      sync.WaitGroup
 	)
 
-	// PERF-005: 4 native Go connectors in parallel ≈ 20 MB peak heap
-	// (struct + http.Client + JSON parsing). The previous "sequential per
-	// user" comment referenced CCXT (Python wrapper, ~150 MB/LoadMarkets)
-	// which the Go enclave doesn't use — every connector under
-	// internal/connector/ is native Go. Going from 1 → 4 turns a 19×Δ
-	// per-connector worst case into roughly ⌈19/4⌉×Δ.
+	// PERF-005: four connectors in parallel peak around 20 MB of heap and
+	// divide a user's worst-case wall time by about four.
 	connSem := make(chan struct{}, 4)
 	// 5min matches the IBKR Flex poll budget (~4min for 30-day/YTD reports) with
 	// a safety margin; other connectors are sub-second so the ceiling never hits.
