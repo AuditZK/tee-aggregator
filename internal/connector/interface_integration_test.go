@@ -38,24 +38,22 @@ func TestOptionalInterfaces(t *testing.T) {
 		cashflow bool
 		balMkt   bool
 		funding  bool
-		earn     bool
-		mktDet   bool
 		paper    bool
 	}{
-		{"Deribit", NewDeribit(&Credentials{APIKey: "k", APISecret: "s"}), true, true, true, false, false, true},
-		{"IBKR", NewIBKR(&Credentials{APIKey: "t", APISecret: "q"}), true, true, false, false, false, true},
-		{"Alpaca", NewAlpaca(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, false, false, true},
-		{"Hyperliquid", NewHyperliquid(&Credentials{WalletAddress: "0x1"}), true, true, true, false, false, true},
-		{"Lighter", NewLighter(&Credentials{WalletAddress: "0x1"}), false, true, false, false, false, true},
-		{"MEXC", NewMEXC(&Credentials{APIKey: "k", APISecret: "s"}), true, true, true, false, false, false},
+		{"Deribit", NewDeribit(&Credentials{APIKey: "k", APISecret: "s"}), true, true, true, true},
+		{"IBKR", NewIBKR(&Credentials{APIKey: "t", APISecret: "q"}), true, true, false, true},
+		{"Alpaca", NewAlpaca(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, true},
+		{"Hyperliquid", NewHyperliquid(&Credentials{WalletAddress: "0x1"}), true, true, true, true},
+		{"Lighter", NewLighter(&Credentials{WalletAddress: "0x1"}), false, true, false, true},
+		{"MEXC", NewMEXC(&Credentials{APIKey: "k", APISecret: "s"}), true, true, true, false},
 		// Bybit reads its capital flows from the unified transaction log, like
 		// the other crypto venues; without the fetcher every snapshot carried
 		// deposits=0 and a deposit read as performance.
-		{"Bybit", NewBybit(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, false, false, false},
+		{"Bybit", NewBybit(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, false},
 		// IG funds overnight on CFD positions and books it as its own ledger
 		// row, so the funding fetcher is not swap-only.
-		{"IG", NewIG(&Credentials{APIKey: "k", APISecret: "s", Passphrase: "u"}, false), true, false, true, false, false, true},
-		{"Mock", NewMock(), false, false, false, false, false, false},
+		{"IG", NewIG(&Credentials{APIKey: "k", APISecret: "s", Passphrase: "u"}, false), true, false, true, true},
+		{"Mock", NewMock(), false, false, false, false},
 	}
 
 	for _, tt := range tests {
@@ -73,16 +71,6 @@ func TestOptionalInterfaces(t *testing.T) {
 			_, hasFF := tt.conn.(FundingFeesFetcher)
 			if hasFF != tt.funding {
 				t.Errorf("FundingFeesFetcher: got %v, want %v", hasFF, tt.funding)
-			}
-
-			_, hasEB := tt.conn.(EarnBalanceFetcher)
-			if hasEB != tt.earn {
-				t.Errorf("EarnBalanceFetcher: got %v, want %v", hasEB, tt.earn)
-			}
-
-			_, hasMD := tt.conn.(MarketTypeDetector)
-			if hasMD != tt.mktDet {
-				t.Errorf("MarketTypeDetector: got %v, want %v", hasMD, tt.mktDet)
 			}
 
 			_, hasPD := tt.conn.(PaperAccountDetector)
