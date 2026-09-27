@@ -24,6 +24,11 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          staticcheck ./cmd/... ./internal/... ./pkg/...
+
       - name: Test
         run: go test ./internal/... ./pkg/... -count=1
 
@@ -31,3 +36,20 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
+
+  race:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The race detector is a C runtime: it needs cgo, and gcc ships with the runner.
+      - name: Test with the race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./internal/... ./pkg/... -count=1 -timeout 20m
