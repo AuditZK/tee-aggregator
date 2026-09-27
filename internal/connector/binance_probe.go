@@ -37,15 +37,15 @@ func binanceTotalsCoverUSDTOnly(totalWallet string, assets []binanceFuturesAsset
 	return total == 0
 }
 
-// binanceMarginAssetUSD values a futures margin asset. BNFCR, the EEA credit
-// asset, is 1:1 with USD by the venue's definition and has no ticker.
+// binanceMarginAssetUSD values a futures margin asset: stablecoins (BNFCR
+// included) at par, other coins at the spot ticker.
 func binanceMarginAssetUSD(asset, qty string, priceMap map[string]float64) float64 {
 	q, _ := strconv.ParseFloat(qty, 64)
 	if q == 0 {
 		return 0
 	}
 	asset = strings.ToUpper(asset)
-	if IsStablecoinUSD(asset) || asset == "BNFCR" {
+	if IsStablecoinUSD(asset) {
 		return q
 	}
 	return q * priceMap[asset+"USDT"]
