@@ -1,14 +1,18 @@
 // Package reportverify is the canonical verifier for signed reports produced
 // by the zero-knowledge-aggregator-go enclave.
 //
-// It implements the full end-to-end verification procedure documented at
-// internal/signing/report.go:32-47, so integrators do not have to reimplement
-// the six steps and get one wrong. Every method here is strict: any missing
+// It implements the full end-to-end verification procedure documented on
+// EnclaveAttestation in internal/signing, so integrators do not have to
+// reimplement the six steps and get one wrong. Every method here is strict: any missing
 // input, mismatched public key, unbound report_data, or out-of-allowlist
 // measurement is a hard error.
 //
 // Typical usage:
 //
+//	var report reportverify.SignedReport
+//	if err := json.Unmarshal(body, &report); err != nil {
+//	    // not a signed report
+//	}
 //	v := &reportverify.Verifier{
 //	    ExpectedSigningPublicKey: publishedKey,        // base64 DER SPKI
 //	    AllowedMeasurements:      []string{"12345..."}, // hex launch measurements
@@ -17,7 +21,7 @@
 //	    Nonce:                    clientNonce, // optional — required for replay-safe verification
 //	    RequireSevSnp:            true,
 //	}
-//	if err := v.Verify(report); err != nil {
+//	if err := v.Verify(&report); err != nil {
 //	    // report MUST NOT be trusted
 //	}
 //
@@ -48,6 +52,10 @@ var (
 	ErrVcekUnverified        = errors.New("reportverify: attestation.vcekVerified == false and no VCEKChecker supplied")
 	ErrMissingExpectedInput  = errors.New("reportverify: a required expected input is empty")
 )
+
+// SignedReport is the report as the enclave serves it, re-exported because a
+// module outside this one cannot import internal/signing to name it.
+type SignedReport = signing.SignedReport
 
 // VCEKChecker is an optional hook that a caller can plug in to verify the
 // SEV-SNP VCEK certificate chain against the AMD KDS out-of-band. When nil,
@@ -100,7 +108,7 @@ type Verifier struct {
 
 // Verify performs all six end-to-end checks. Returns nil only when the
 // report can be trusted.
-func (v *Verifier) Verify(report *signing.SignedReport) error {
+func (v *Verifier) Verify(report *SignedReport) error {
 	if report == nil {
 		return ErrNilReport
 	}
