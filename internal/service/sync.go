@@ -2648,11 +2648,11 @@ func (s *SyncService) applyInceptionDeposit(ctx context.Context, connMeta *repos
 //
 // Read off the first live run of this gate rather than picked: the observed
 // divergences fell in two clumps with two decades of empty space between them,
-// 0.004% on a $5,301 hyperliquid account against 1.4% on a $125,414 binance one
-// and 14% on a dust account. Anything inside the first clump is the instruments
-// disagreeing about a price; anything past it is them disagreeing about the
-// account. The 50% the rebuilder's own gate carried sat far above both, which
-// is why it published a $22,244 error.
+// thousandths of a percent on one side, a percent and more on the other.
+// Anything inside the first clump is the instruments disagreeing about a price;
+// anything past it is them disagreeing about the account. The 50% the
+// rebuilder's own gate carried sat far above both, which is why it published a
+// day off by a fifth.
 const reproductionTolerance = 0.001
 
 // contradictedDay reports the first day a reconstruction disagrees with a day
@@ -2666,9 +2666,9 @@ const reproductionTolerance = 0.001
 // window that ran out, a walk anchored wrong — and every OTHER day it produced
 // is built the same way. Rejecting the batch whole is the only honest read.
 //
-// Measured 2026-08-31: a binance rebuild wrote $116,040.69 for a day the live
-// sync had measured at $94,584.28. The rebuilder's own witness gate passed it,
-// tolerating up to 50%.
+// A rebuild once wrote a day about a fifth above what the live sync had
+// measured, and the rebuilder's own witness gate passed it, tolerating up to
+// 50%.
 func contradictedDay(rebuilt, existing []*repository.Snapshot) (*repository.Snapshot, float64, bool) {
 	measured := make(map[time.Time]float64, len(existing))
 	for _, e := range existing {
@@ -2676,9 +2676,9 @@ func contradictedDay(rebuilt, existing []*repository.Snapshot) (*repository.Snap
 			// Reconstructed too — nothing independent to check against. The
 			// external rebuilder's rows carry from_external_rebuilder rather
 			// than is_historical; holding a fresh reconstruction to them
-			// rejected every rebuild that changed its own method (2026-09-13:
-			// the first mark-to-market pass on a bybit history was thrown out
-			// against the realized-only pass of the same morning).
+			// rejected every rebuild that changed its own method (the first
+			// mark-to-market pass on a history was thrown out against the
+			// realized-only pass published hours earlier).
 			continue
 		}
 		if e.TotalEquity <= 0 {
@@ -2923,8 +2923,8 @@ func buildHistoricalSnapshots(
 	// persistHistoricalSnapshots: stamping the BATCH-earliest day here was
 	// wrong for rolling reconstruction windows — every re-run whose window
 	// start had advanced stamped a NEW day while the previous stamp stayed in
-	// DB, compounding phantom deposits day after day (observed: a $253k
-	// account carrying $506k of "deposits" across two consecutive days). The
+	// DB, compounding phantom deposits day after day (observed: an account
+	// carrying twice its equity in "deposits" across two consecutive days). The
 	// replacement checks the DB for older rows and stamps only the true
 	// inception day.
 

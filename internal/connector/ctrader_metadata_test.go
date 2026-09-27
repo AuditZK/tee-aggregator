@@ -12,8 +12,8 @@ import (
 // DetectIsPaper must trust cTrader's per-account IsLive flag, not the
 // passphrase-seeded c.isLive. OAuth connections never carry "demo" in the
 // passphrase, so c.isLive defaults to live; a demo account (IsLive=false) must
-// still be reported as paper — the youceef.bouanani case where a demo balance
-// reset to $1M surfaced as a verifiable +921% track record. Mixed accounts
+// still be reported as paper, or a demo balance reset surfaces as a verifiable
+// track record with a four-digit return. Mixed accounts
 // mirror ensureAccountID and prefer the live one.
 func TestCTraderDetectIsPaper(t *testing.T) {
 	cases := []struct {

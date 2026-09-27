@@ -40,8 +40,8 @@ const binanceCounterpartWindow = 10 * time.Minute
 // sub-account's own transfers with its master, and any USDⓈ-M transfer row
 // no known transfer explains (a futures transfer to a sub-account, a trading
 // bot, copy trading). Without them the money reads as a trading loss or gain
-// (2026-09 field case: a master funded a new sub-account's futures wallet from
-// the app and its whole track record read -100%). Best-effort throughout: a
+// (field case: a master funded a new sub-account's futures wallet from the app
+// and its whole track record read as a total loss). Best-effort throughout: a
 // key that is not a master reads no sub-account list, a key without futures
 // reads no income, and neither touches the flows already collected.
 func (b *Binance) fetchSubAccountAndStrayFlows(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) {

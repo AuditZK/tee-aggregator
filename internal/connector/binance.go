@@ -165,8 +165,9 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	// key without the futures/margin scope, a product never enabled). A
 	// TRANSIENT failure (429/5xx/network — e.g. the midnight herd rate-limiting
 	// fapi through the shared egress) must fail the whole sync instead:
-	// silently dropping a wallet persisted snapshots $16k-$20k short, and a
-	// failed sync is a retry while a wrong snapshot is a lie on the curve.
+	// silently dropping a wallet persisted snapshots short by the whole
+	// wallet, and a failed sync is a retry while a wrong snapshot is a lie on
+	// the curve.
 	b.coverage = nil
 	b.noteWallet(binanceWalletSpot, nil) // reached: getSpotBalance failing is fatal above
 
@@ -393,9 +394,8 @@ func (b *Binance) getFuturesBalance(ctx context.Context, priceMap map[string]flo
 	if err != nil {
 		// /fapi/v2/account is being retired by Binance and already errors for
 		// some accounts while /fapi/v2/balance still answers (observed in the
-		// field: a sub-account whose $16k USDⓈ-M wallet silently vanished from
-		// the summed equity because the caller treats this read as
-		// best-effort). Fall back to the balance endpoint before giving up.
+		// field: a sub-account's USDⓈ-M wallet silently vanished from the
+		// summed equity because the caller treats this read as best-effort). Fall back to the balance endpoint before giving up.
 		return b.getFuturesBalanceFromBalanceEndpoint(ctx)
 	}
 
@@ -437,11 +437,12 @@ func (b *Binance) getFuturesBalance(ctx context.Context, priceMap map[string]flo
 
 	// /fapi/v2/account is being retired and returns HTTP 200 with an empty
 	// totalMarginBalance for some accounts — NOT an error, so the fallback
-	// above never fires (observed in the field: a $20k USDⓈ-M master account
-	// read as $0 while /fapi/v2/balance still answered $20k). A genuine zero and
-	// a degraded-empty response are indistinguishable here, so when the account
-	// endpoint reports nothing, cross-check the balance endpoint and prefer it
-	// when it finds funds; a truly empty futures wallet still reads 0 from both.
+	// above never fires (observed in the field: a funded USDⓈ-M master account
+	// read as zero while /fapi/v2/balance still answered its balance). A
+	// genuine zero and a degraded-empty response are indistinguishable here, so
+	// when the account endpoint reports nothing, cross-check the balance
+	// endpoint and prefer it when it finds funds; a truly empty futures wallet
+	// still reads 0 from both.
 	if equity == 0 {
 		if bal, berr := b.getFuturesBalanceFromBalanceEndpoint(ctx); berr == nil && bal.Equity > 0 {
 			return bal, nil

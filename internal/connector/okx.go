@@ -291,10 +291,10 @@ type okxCurrencyBalance struct {
 // What this must never go back to: Σ availBal in modes 2/3/4. availBal is
 // "available balance of currency" — the balance not locked by ORDERS. It does
 // not deduct the margin held by open cross positions, so on a margin account
-// it sums to the entire equity. Live proof, 2026-09-11: an OKX account running
-// a short options straddle against a perpetual hedge reported 22 077 free out
-// of 22 077 equity, and every OKX row written between 2026-08-31 and 2026-09-14
-// had free margin exactly equal to equity.
+// it sums to the entire equity. An account running a short options straddle
+// against a perpetual hedge reported every dollar of its equity as free, and
+// every OKX row written on that basis carried free margin exactly equal to
+// equity.
 const (
 	okxBasisAdjEqMinusIMR = "account.adjEq - account.imr"
 	okxBasisSumAvailEq    = "sum(details.availEq * usd_rate)"

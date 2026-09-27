@@ -15,18 +15,17 @@ func reconstructed(ts time.Time, equity float64) *repository.Snapshot {
 	return &repository.Snapshot{Timestamp: ts, TotalEquity: equity, IsHistorical: true}
 }
 
-// The defect, measured on 2026-08-31: a binance reconstruction wrote
-// $116,040.69 for a day the live sync had already measured at $94,584.28, and
-// it was published. The rebuilder's own witness gate let it through, tolerating
-// a 50% divergence.
+// The defect: a reconstruction wrote a day about a fifth above what the live
+// sync had already measured, and it was published. The rebuilder's own witness
+// gate let it through, tolerating a 50% divergence.
 func TestContradictedDay_RejectsAReconstructionThatRewritesAMeasuredDay(t *testing.T) {
 	existing := []*repository.Snapshot{
-		measured(day(2026, time.August, 29), 94465.33),
-		measured(day(2026, time.August, 30), 94584.28),
+		measured(day(2026, time.March, 9), 100000.00),
+		measured(day(2026, time.March, 10), 100100.00),
 	}
 	rebuilt := []*repository.Snapshot{
-		reconstructed(day(2026, time.August, 29), 115917.33),
-		reconstructed(day(2026, time.August, 30), 116040.69),
+		reconstructed(day(2026, time.March, 9), 122700.00),
+		reconstructed(day(2026, time.March, 10), 122800.00),
 	}
 
 	got, measuredEq, bad := contradictedDay(rebuilt, existing)
@@ -34,21 +33,21 @@ func TestContradictedDay_RejectsAReconstructionThatRewritesAMeasuredDay(t *testi
 	if !bad {
 		t.Fatal("a reconstruction contradicting a measured day was accepted")
 	}
-	if !got.Timestamp.Equal(day(2026, time.August, 29)) {
-		t.Fatalf("reported %s, want the first contradicted day 2026-08-29", got.Timestamp.Format("2006-01-02"))
+	if !got.Timestamp.Equal(day(2026, time.March, 9)) {
+		t.Fatalf("reported %s, want the first contradicted day 2026-03-09", got.Timestamp.Format("2006-01-02"))
 	}
-	if measuredEq != 94465.33 {
-		t.Fatalf("measured equity = %v, want 94465.33", measuredEq)
+	if measuredEq != 100000.00 {
+		t.Fatalf("measured equity = %v, want 100000", measuredEq)
 	}
 }
 
 // Agreement on every shared day is the whole gate: a reconstruction that
 // reproduces what we measured is trusted for the days we did not.
 func TestContradictedDay_AcceptsAReconstructionThatReproducesTheOverlap(t *testing.T) {
-	existing := []*repository.Snapshot{measured(day(2026, time.August, 30), 94584.28)}
+	existing := []*repository.Snapshot{measured(day(2026, time.March, 10), 100100.00)}
 	rebuilt := []*repository.Snapshot{
-		reconstructed(day(2026, time.August, 20), 91000),
-		reconstructed(day(2026, time.August, 30), 94584.28),
+		reconstructed(day(2026, time.March, 1), 96000),
+		reconstructed(day(2026, time.March, 10), 100100.00),
 	}
 
 	if _, _, bad := contradictedDay(rebuilt, existing); bad {
@@ -59,8 +58,8 @@ func TestContradictedDay_AcceptsAReconstructionThatReproducesTheOverlap(t *testi
 // No overlap, nothing to check. A first backfill on a fresh connection must not
 // be blocked for lack of a day to compare against.
 func TestContradictedDay_NoOverlapPasses(t *testing.T) {
-	existing := []*repository.Snapshot{measured(day(2026, time.August, 30), 94584.28)}
-	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.June, 3), 3310.97)}
+	existing := []*repository.Snapshot{measured(day(2026, time.March, 10), 100100.00)}
+	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.February, 3), 3500.00)}
 
 	if _, _, bad := contradictedDay(rebuilt, existing); bad {
 		t.Fatal("rejected a reconstruction that shares no day with the measured series")
@@ -71,8 +70,8 @@ func TestContradictedDay_NoOverlapPasses(t *testing.T) {
 // against an earlier reconstruction proves nothing — both come from the same
 // instrument and would agree on being wrong together.
 func TestContradictedDay_IgnoresPreviouslyReconstructedDays(t *testing.T) {
-	existing := []*repository.Snapshot{reconstructed(day(2026, time.August, 30), 81213.19)}
-	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.August, 30), 116040.69)}
+	existing := []*repository.Snapshot{reconstructed(day(2026, time.March, 10), 86000.00)}
+	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.March, 10), 122800.00)}
 
 	if _, _, bad := contradictedDay(rebuilt, existing); bad {
 		t.Fatal("treated an earlier reconstruction as an independent witness")
@@ -83,20 +82,19 @@ func TestContradictedDay_IgnoresPreviouslyReconstructedDays(t *testing.T) {
 // instruments disagreeing about the account. Both bounds come from the gate's
 // first live run.
 func TestContradictedDay_ToleranceSeparatesNoiseFromDivergence(t *testing.T) {
-	// 20 cents on $5,301 — hyperliquid, the live path and the rebuilder pricing
-	// the same holdings from different sources. Same account.
+	// 0.004%: the live path and the rebuilder pricing the same holdings from
+	// different sources. Same account.
 	if _, _, bad := contradictedDay(
-		[]*repository.Snapshot{reconstructed(day(2026, time.June, 1), 5300.971997)},
-		[]*repository.Snapshot{measured(day(2026, time.June, 1), 5301.174097)},
+		[]*repository.Snapshot{reconstructed(day(2026, time.February, 1), 5000.00)},
+		[]*repository.Snapshot{measured(day(2026, time.February, 1), 5000.20)},
 	); bad {
 		t.Fatal("valuation noise between two price sources rejected a faithful reconstruction")
 	}
 
-	// $1,818 on $125,414 — 1.4%, published under the 50% tolerance the
-	// rebuilder's own gate carried.
+	// 1.4%, published under the 50% tolerance the rebuilder's own gate carried.
 	if _, _, bad := contradictedDay(
-		[]*repository.Snapshot{reconstructed(day(2026, time.June, 2), 123595.21)},
-		[]*repository.Snapshot{measured(day(2026, time.June, 2), 125413.64)},
+		[]*repository.Snapshot{reconstructed(day(2026, time.February, 2), 98600.00)},
+		[]*repository.Snapshot{measured(day(2026, time.February, 2), 100000.00)},
 	); !bad {
 		t.Fatal("a 1.4% divergence passed — the gate is a business tolerance again")
 	}
@@ -105,9 +103,9 @@ func TestContradictedDay_ToleranceSeparatesNoiseFromDivergence(t *testing.T) {
 // Days are compared by date, whatever time of day either row carries.
 func TestContradictedDay_ComparesByDayNotInstant(t *testing.T) {
 	existing := []*repository.Snapshot{
-		{Timestamp: time.Date(2026, time.August, 30, 13, 45, 0, 0, time.UTC), TotalEquity: 94584.28},
+		{Timestamp: time.Date(2026, time.March, 10, 13, 45, 0, 0, time.UTC), TotalEquity: 100100.00},
 	}
-	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.August, 30), 116040.69)}
+	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.March, 10), 122800.00)}
 
 	if _, _, bad := contradictedDay(rebuilt, existing); !bad {
 		t.Fatal("a mid-day measured row escaped the comparison")
@@ -116,11 +114,11 @@ func TestContradictedDay_ComparesByDayNotInstant(t *testing.T) {
 
 // A live row at zero is far more often a degenerate sync than a funded account
 // measured empty — the rest of the service already refuses to anchor on one.
-// Witnessing against it discarded 89 days of a sound reconstruction on this
-// gate's first live run.
+// Witnessing against it discarded a sound reconstruction whole on this gate's
+// first live run.
 func TestContradictedDay_ZeroEquityDayIsNotAWitness(t *testing.T) {
-	existing := []*repository.Snapshot{measured(day(2026, time.June, 3), 0)}
-	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.June, 3), 896.57)}
+	existing := []*repository.Snapshot{measured(day(2026, time.February, 3), 0)}
+	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.February, 3), 900.00)}
 
 	if _, _, bad := contradictedDay(rebuilt, existing); bad {
 		t.Fatal("a live row at zero was treated as a measurement worth trusting")
@@ -129,8 +127,8 @@ func TestContradictedDay_ZeroEquityDayIsNotAWitness(t *testing.T) {
 
 // But a funded day still witnesses, even when the reconstruction claims zero.
 func TestContradictedDay_FundedDayWitnessesAgainstAZeroRebuild(t *testing.T) {
-	existing := []*repository.Snapshot{measured(day(2026, time.June, 3), 3310.97)}
-	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.June, 3), 0)}
+	existing := []*repository.Snapshot{measured(day(2026, time.February, 3), 3500.00)}
+	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.February, 3), 0)}
 
 	if _, _, bad := contradictedDay(rebuilt, existing); !bad {
 		t.Fatal("a reconstruction wiping a funded day to zero was accepted")
@@ -140,12 +138,12 @@ func TestContradictedDay_FundedDayWitnessesAgainstAZeroRebuild(t *testing.T) {
 // The external rebuilder's rows carry from_external_rebuilder, not
 // is_historical. They are reconstructions too: a fresh pass that changes its
 // own method (mark-to-market where the previous pass published realized only)
-// must not be held to them. Measured 2026-09-13 on a bybit history: the first
-// per-leg pass was rejected against the realized-only pass of the same morning.
+// must not be held to them, or the first mark-to-market pass is rejected
+// against the realized-only pass published hours earlier.
 func TestContradictedDay_IgnoresRowsTheExternalRebuilderWrote(t *testing.T) {
-	previous := &repository.Snapshot{Timestamp: day(2026, time.June, 20), TotalEquity: 11115.84, FromExternalRebuilder: true}
+	previous := &repository.Snapshot{Timestamp: day(2026, time.February, 20), TotalEquity: 11100.00, FromExternalRebuilder: true}
 	existing := []*repository.Snapshot{previous}
-	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.June, 20), 10862.86)}
+	rebuilt := []*repository.Snapshot{reconstructed(day(2026, time.February, 20), 10850.00)}
 
 	if _, _, bad := contradictedDay(rebuilt, existing); bad {
 		t.Fatal("a reconstruction was held to a day the previous reconstruction wrote")

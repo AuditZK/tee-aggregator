@@ -1263,9 +1263,8 @@ func (i *IBKR) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, e
 //
 // The Currency field of Equity Summary is the answer when a query selects it.
 // Ours did not ask for it until 2026-09-16, so an existing account's statement
-// is simply silent, and silence has been read as dollars: two accounts of one
-// customer, a French PEA and its CTO, have been served in dollars since June
-// 2025 while a PEA cannot hold anything but euros.
+// is simply silent, and silence has been read as dollars: accounts that can
+// hold nothing but euros have been served in dollars.
 //
 // The statement still knows. Money crossing the account boundary is recorded
 // in the currency the account is funded in, so when every deposit, withdrawal

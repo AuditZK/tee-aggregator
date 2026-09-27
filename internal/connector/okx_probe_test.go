@@ -46,10 +46,10 @@ func (f *okxFakeRouter) connector() *OKX {
 }
 
 const okxProbePortfolioBalance = `{"code":"0","data":[{` +
-	`"totalEq":"22077.42","isoEq":"0","adjEq":"21880.10","availEq":"20950.33","ordFroz":"0",` +
-	`"imr":"1214.88","mmr":"402.51","mgnRatio":"54.36","upl":"-97.34","uTime":"1757548800000","details":[` +
-	`{"ccy":"BTC","eq":"0.1801","eqUsd":"19056.32","cashBal":"0.1801","availBal":"0.1801","availEq":"0.1801","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""},` +
-	`{"ccy":"USDC","eq":"3021.10","eqUsd":"3021.10","cashBal":"3021.10","availBal":"3021.10","availEq":"3021.10","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""}` +
+	`"totalEq":"25431.17","isoEq":"0","adjEq":"24876.52","availEq":"23712.08","ordFroz":"0",` +
+	`"imr":"1318.64","mmr":"436.21","mgnRatio":"53.87","upl":"-112.73","uTime":"1757548800000","details":[` +
+	`{"ccy":"BTC","eq":"0.2013","eqUsd":"21883.88","cashBal":"0.2013","availBal":"0.2013","availEq":"0.2013","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""},` +
+	`{"ccy":"USDC","eq":"3547.29","eqUsd":"3547.29","cashBal":"3547.29","availBal":"3547.29","availEq":"3547.29","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""}` +
 	`]}]}`
 
 // The probe's whole job is to let an operator see the venue's own figures next
@@ -80,11 +80,11 @@ func TestOKXProbeBalance_ReportsRawFieldsBesideTheDerivedBalance(t *testing.T) {
 	// Raw, verbatim, strings — an inapplicable field must stay empty rather
 	// than arrive as a zero somebody reads as measured.
 	for field, want := range map[string]string{
-		"totalEq": "22077.42",
-		"adjEq":   "21880.10",
-		"availEq": "20950.33",
-		"imr":     "1214.88",
-		"upl":     "-97.34",
+		"totalEq": "25431.17",
+		"adjEq":   "24876.52",
+		"availEq": "23712.08",
+		"imr":     "1318.64",
+		"upl":     "-112.73",
 	} {
 		if got := probe.Account[field]; got != want {
 			t.Errorf("account[%s] = %q, want %q", field, got, want)
@@ -100,9 +100,9 @@ func TestOKXProbeBalance_ReportsRawFieldsBesideTheDerivedBalance(t *testing.T) {
 	if probe.Derived == nil {
 		t.Fatal("probe carries no derived balance — the comparison is the point")
 	}
-	assertNear(t, "derived equity", probe.Derived.Equity, 22077.42)
-	assertNear(t, "derived available", probe.Derived.Available, 21880.10-1214.88)
-	assertNear(t, "derived unrealized", probe.Derived.UnrealizedPnL, -97.34)
+	assertNear(t, "derived equity", probe.Derived.Equity, 25431.17)
+	assertNear(t, "derived available", probe.Derived.Available, 24876.52-1318.64)
+	assertNear(t, "derived unrealized", probe.Derived.UnrealizedPnL, -112.73)
 }
 
 // The account mode is a nicety; the balance is the answer. A key that cannot

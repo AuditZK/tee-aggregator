@@ -365,9 +365,9 @@ func (r *SnapshotRepo) GetExternalRebuilderDays(ctx context.Context, userUID str
 //
 // A signed report is cached against the period it covers, never against the
 // rows it was computed from. A history rebuild rewrites those rows under it
-// (a Bybit history moving from realized-only to mark-to-market took a period
-// from 54% to 43.7% total return, and its max drawdown from 5.5% to 9.9%),
-// and the cache then keeps serving numbers the data no longer supports. This
+// (moving a history from realized-only to mark-to-market changes both its
+// total return and its max drawdown), and the cache then keeps serving
+// numbers the data no longer supports. This
 // is the stamp the report cache compares against to notice that.
 //
 // The Go schema has no updated_at and its snapshot upsert leaves created_at
