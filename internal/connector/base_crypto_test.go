@@ -214,66 +214,6 @@ func TestNewCryptoBase_DefaultTimeout(t *testing.T) {
 	}
 }
 
-func TestCryptoBase_DoRequest_HappyPath(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer srv.Close()
-
-	b := NewCryptoBase("k", "s", srv.URL)
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/whatever", nil)
-	body, err := b.DoRequest(req)
-	if err != nil {
-		t.Fatalf("err=%v", err)
-	}
-	if string(body) != `{"ok":true}` {
-		t.Fatalf("body=%s", body)
-	}
-}
-
-func TestCryptoBase_DoRequest_4xxReturnsError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":"bad creds"}`))
-	}))
-	defer srv.Close()
-
-	b := NewCryptoBase("k", "s", srv.URL)
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/x", nil)
-	body, err := b.DoRequest(req)
-	if err == nil {
-		t.Fatal("expected error for 401")
-	}
-	if !strings.Contains(err.Error(), "401") {
-		t.Errorf("err=%q must mention status code", err)
-	}
-	if len(body) == 0 {
-		t.Error("body should be returned alongside the error for diagnostics")
-	}
-}
-
-func TestCryptoBase_DoJSON_HappyPath(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"value":42}`))
-	}))
-	defer srv.Close()
-
-	b := NewCryptoBase("k", "s", srv.URL)
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
-
-	var out struct {
-		Value int `json:"value"`
-	}
-	if err := b.DoJSON(req, &out); err != nil {
-		t.Fatalf("err=%v", err)
-	}
-	if out.Value != 42 {
-		t.Fatalf("got %d", out.Value)
-	}
-}
-
 // CONN-004 retry: 429 followed by 200 must succeed within maxRetryAttempts,
 // and buildReq must be invoked once per attempt — that is what re-signs the
 // request and is the whole reason retryHTTP takes a builder.
@@ -382,20 +322,6 @@ func TestSignedQueryGET_RetriesWithFreshSignature(t *testing.T) {
 	}
 	if len(seen) != 2 || seen[0] == seen[1] {
 		t.Fatalf("timestamps=%v — retry must rebuild with a fresh signed timestamp", seen)
-	}
-}
-
-func TestCryptoBase_GET_BuildsRequest(t *testing.T) {
-	b := NewCryptoBase("k", "s", "http://x/")
-	req, err := b.GET("http://x/y?q=1")
-	if err != nil {
-		t.Fatalf("err=%v", err)
-	}
-	if req.Method != http.MethodGet {
-		t.Fatalf("method=%q", req.Method)
-	}
-	if req.URL.RawQuery != "q=1" {
-		t.Fatalf("rawquery=%q", req.URL.RawQuery)
 	}
 }
 

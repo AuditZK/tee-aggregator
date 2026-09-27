@@ -166,29 +166,6 @@ func NewCryptoBase(apiKey, apiSecret, baseURL string) CryptoBase {
 	}
 }
 
-// DoRequest executes an HTTP request and returns the raw body (single-shot).
-// Use retryHTTP for signed reads that should survive a transient 429 / 5xx
-// (CONN-004) — it re-signs the request on each attempt.
-func (b *CryptoBase) DoRequest(req *http.Request) ([]byte, error) {
-	resp, err := b.Client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// CONN-AUDIT-001: bound the response so a hostile upstream cannot OOM the
-	// enclave. ReadCappedBody closes resp.Body on return.
-	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
-	if err != nil {
-		return body, err
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return body, fmt.Errorf("HTTP %d: %s", resp.StatusCode, TruncatedBody(body))
-	}
-
-	return body, nil
-}
-
 // retryHTTP sends the request produced by buildReq and returns the response
 // body. On a transient failure — a network error, HTTP 429, or HTTP 5xx — it
 // calls buildReq AGAIN (rebuilding, and therefore re-signing, the request with
@@ -259,21 +236,6 @@ func retryHTTP(client *http.Client, buildReq func() (*http.Request, error)) ([]b
 		lastErr = fmt.Errorf("%w: %w", ErrTransient, lastErr)
 	}
 	return lastBody, lastErr
-}
-
-// DoJSON executes an HTTP request and unmarshals the JSON response.
-func (b *CryptoBase) DoJSON(req *http.Request, out interface{}) error {
-	body, err := b.DoRequest(req)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(body, out)
-}
-
-// GET is a convenience method for authenticated GET requests.
-// Subclasses should add their own signing logic to the request before calling DoRequest.
-func (b *CryptoBase) GET(url string) (*http.Request, error) {
-	return http.NewRequest("GET", url, nil)
 }
 
 // signHMACHex returns the hex-encoded HMAC-SHA256 of msg under secret — the

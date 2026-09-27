@@ -35,10 +35,3 @@ func (m *MemoryProtection) CheckPtraceProtection() bool { return false }
 
 // CheckMlock is a no-op on Windows.
 func (m *MemoryProtection) CheckMlock() bool { return false }
-
-// WipeBuffer overwrites a buffer with zeros.
-func (m *MemoryProtection) WipeBuffer(buf []byte) {
-	for i := range buf {
-		buf[i] = 0
-	}
-}

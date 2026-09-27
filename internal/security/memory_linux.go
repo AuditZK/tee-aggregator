@@ -3,7 +3,6 @@
 package security
 
 import (
-	"crypto/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -79,12 +78,4 @@ func (m *MemoryProtection) CheckMlock() bool {
 	}
 
 	return false
-}
-
-// WipeBuffer overwrites a buffer with random data then zeros.
-func (m *MemoryProtection) WipeBuffer(buf []byte) {
-	rand.Read(buf)
-	for i := range buf {
-		buf[i] = 0
-	}
 }
