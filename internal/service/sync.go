@@ -850,10 +850,7 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 				}
 			}
 		} else {
-			s.logger.Debug("cashflow fetch failed (non-critical)",
-				zap.String("exchange", connMeta.Exchange),
-				zap.Error(err),
-			)
+			s.warnCashflowFetchFailed(connMeta, err)
 		}
 	}
 
@@ -1499,6 +1496,8 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 					withdrawals += -cf.Amount
 				}
 			}
+		} else {
+			s.warnCashflowFetchFailed(connMeta, err)
 		}
 	}
 
@@ -1561,6 +1560,17 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	s.warnOnAberrantDailyMove(ctx, result.snapshot)
 
 	return result
+}
+
+// A missed deposit reads as performance for the day, so the failure is an
+// operator's concern even though the snapshot is still written.
+func (s *SyncService) warnCashflowFetchFailed(connMeta *repository.ExchangeConnection, err error) {
+	s.logger.Warn("cashflow fetch failed; deposits and withdrawals read as zero for this window",
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("label", connMeta.Label),
+		zap.Error(err),
+	)
 }
 
 func findConnection(connections []*repository.ExchangeConnection, exchange, label string) *repository.ExchangeConnection {
