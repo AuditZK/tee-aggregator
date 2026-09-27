@@ -383,9 +383,9 @@ func main() {
 		// the ordering the anchor depends on is unchanged: the row the sync
 		// writes is the equity anchor the rebuild dispatch reads
 		// (EndEquityOverride). Without it the walk-family rebuilders calibrate
-		// on their own wallet valuation and the anchor gate has no witness
-		// (2026-08-04: a mispriced walk published a 93k account at 3k because
-		// connect-time rebuilds carried no anchor).
+		// on their own wallet valuation and the anchor gate has no witness (a
+		// mispriced walk once published an account at a small fraction of its
+		// equity because connect-time rebuilds carried no anchor).
 		connSvc.SetPostCreateRebuildHook(func(ctx context.Context, userUID, exchange, label string) {
 			syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
 		})

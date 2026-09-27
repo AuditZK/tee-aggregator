@@ -32,13 +32,13 @@ func (f *fakeProber) ProbeBalance(_ context.Context, userUID, exchange, label st
 }
 
 // okxProbeFromVenue builds the probe the OKX connector would return, by
-// actually fetching the venue payload over HTTP — the shape of the customer's
-// portfolio-margin account, served by an httptest stand-in for OKX.
+// actually fetching the venue payload over HTTP — a portfolio-margin account's
+// shape, served by an httptest stand-in for OKX.
 func okxProbeFromVenue(t *testing.T) *connector.BalanceProbe {
 	t.Helper()
-	const body = `{"code":"0","data":[{"totalEq":"22077.42","adjEq":"21880.10","availEq":"20950.33",` +
-		`"imr":"1214.88","mmr":"402.51","upl":"-97.34","details":[` +
-		`{"ccy":"USDC","eq":"3021.10","eqUsd":"3021.10","availBal":"3021.10","availEq":"3021.10","upl":"0"}]}]}`
+	const body = `{"code":"0","data":[{"totalEq":"25431.17","adjEq":"24876.52","availEq":"23712.08",` +
+		`"imr":"1318.64","mmr":"436.21","upl":"-112.73","details":[` +
+		`{"ccy":"USDC","eq":"3547.29","eqUsd":"3547.29","availBal":"3547.29","availEq":"3547.29","upl":"0"}]}]}`
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -68,12 +68,12 @@ func okxProbeFromVenue(t *testing.T) *connector.BalanceProbe {
 		MarginBasis: "account.adjEq - account.imr",
 		Account:     account,
 		Currencies: []map[string]string{
-			{"ccy": "USDC", "availBal": "3021.10", "availEq": "3021.10", "upl": "0"},
+			{"ccy": "USDC", "availBal": "3547.29", "availEq": "3547.29", "upl": "0"},
 		},
 		Derived: &connector.Balance{
-			Available:     21880.10 - 1214.88,
-			Equity:        22077.42,
-			UnrealizedPnL: -97.34,
+			Available:     24876.52 - 1318.64,
+			Equity:        25431.17,
+			UnrealizedPnL: -112.73,
 			Currency:      "USDT",
 		},
 	}
@@ -116,7 +116,7 @@ func TestHandleAdminBalanceProbe_ServesTheFiguresAndLogsNone(t *testing.T) {
 	if !got.Success || got.Probe == nil {
 		t.Fatalf("response carries no probe: %s", rec.Body.String())
 	}
-	if got.Probe.Account["adjEq"] != "21880.10" || got.Probe.Account["imr"] != "1214.88" {
+	if got.Probe.Account["adjEq"] != "24876.52" || got.Probe.Account["imr"] != "1318.64" {
 		t.Errorf("raw account fields missing from the response: %v", got.Probe.Account)
 	}
 	if got.Probe.MarginBasis != "account.adjEq - account.imr" {
@@ -130,7 +130,7 @@ func TestHandleAdminBalanceProbe_ServesTheFiguresAndLogsNone(t *testing.T) {
 	if len(entries) != 1 || entries[0].Message != "balance probe served" {
 		t.Fatalf("log entries = %v, want exactly one \"balance probe served\"", entries)
 	}
-	for _, amount := range []string{"22077", "21880", "1214", "97.34", "3021", "acct-2", "user_abc1234567890"} {
+	for _, amount := range []string{"25431", "24876", "1318", "112.73", "3547", "acct-2", "user_abc1234567890"} {
 		if strings.Contains(fmt.Sprint(entries[0].ContextMap()), amount) ||
 			strings.Contains(entries[0].Message, amount) {
 			t.Errorf("log line leaks %q: %v %v", amount, entries[0].Message, entries[0].ContextMap())

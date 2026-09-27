@@ -12,8 +12,8 @@ import (
 
 // /fapi/v2/account is being retired and answers HTTP 200 with an empty
 // totalMarginBalance for some accounts — no error, so the on-error fallback
-// never fires and a funded futures wallet reads as $0 (observed in the field:
-// a ~$20k master account). getFuturesBalance must cross-check /fapi/v2/balance
+// never fires and a funded futures wallet reads as zero (observed in the field
+// on a master account). getFuturesBalance must cross-check /fapi/v2/balance
 // when the account endpoint reports nothing and prefer it when it finds funds.
 func TestBinance_FuturesBalance_FallsBackWhenAccountReportsZero(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +48,8 @@ func TestBinance_FuturesBalance_FallsBackWhenAccountReportsZero(t *testing.T) {
 // Retry exhaustion on 429/5xx must surface as ErrTransient, and GetBalance
 // must FAIL on a transiently unreadable wallet instead of silently summing
 // without it (observed: the midnight herd 429'd the fapi reads and equity
-// persisted $16k-$20k short; a failed sync retries, a wrong snapshot lies).
+// persisted short by the whole wallet; a failed sync retries, a wrong snapshot
+// lies).
 func TestBinance_GetBalance_FailsOnTransientFuturesError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

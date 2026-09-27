@@ -74,16 +74,16 @@ func TestOKXGetBalance_MarginAwareFieldsPerAccountMode(t *testing.T) {
 		{
 			// acctLv 3. Account-level adjEq/imr/upl are all in USD already.
 			// availBal sums to the entire equity, which is the production
-			// symptom; the account-level pair says 39 540 of 42 832 is free.
+			// symptom; the account-level pair says 36 900 of 40 000 is free.
 			name: "acctLv 3 multi-currency margin: adjEq minus imr",
 			body: `{"code":"0","data":[{` +
-				`"totalEq":"42832.11","isoEq":"0","adjEq":"42100.55","availEq":"39560.00","ordFroz":"0",` +
-				`"imr":"2560.55","mmr":"512.11","mgnRatio":"82.13","upl":"-84.20","details":[` +
-				`{"ccy":"USDT","eq":"42832.11","eqUsd":"42832.11","cashBal":"42916.31","availBal":"42832.11","availEq":"40271.56","frozenBal":"0","isoEq":"0","upl":"-84.20","imr":"","mmr":""}` +
+				`"totalEq":"40000.00","isoEq":"0","adjEq":"39300.00","availEq":"36900.00","ordFroz":"0",` +
+				`"imr":"2400.00","mmr":"480.00","mgnRatio":"82.00","upl":"-80.00","details":[` +
+				`{"ccy":"USDT","eq":"40000.00","eqUsd":"40000.00","cashBal":"40080.00","availBal":"40000.00","availEq":"37600.00","frozenBal":"0","isoEq":"0","upl":"-80.00","imr":"","mmr":""}` +
 				`]}]}`,
-			wantEquity:            42832.11,
-			wantAvailable:         42100.55 - 2560.55,
-			wantUnrealized:        -84.20,
+			wantEquity:            40000.00,
+			wantAvailable:         39300.00 - 2400.00,
+			wantUnrealized:        -80.00,
 			wantBasis:             okxBasisAdjEqMinusIMR,
 			freeMustBeBelowEquity: true,
 		},
@@ -92,18 +92,18 @@ func TestOKXGetBalance_MarginAwareFieldsPerAccountMode(t *testing.T) {
 			// mostly in a non-USDT coin, availBal equal to the balance on every
 			// line, per-currency upl flat at 0 while the account-level upl
 			// carries the cross-margin loss, imr > 0 from the open straddle.
-			// Summing availBal here returns 22 077.42 — the equity, to the
-			// cent — and summing per-currency upl returns 0.
-			name: "acctLv 4 portfolio margin: the customer's shape must not return free == equity",
+			// Summing availBal here returns the equity to the cent, and summing
+			// per-currency upl returns 0.
+			name: "acctLv 4 portfolio margin: the reported shape must not return free == equity",
 			body: `{"code":"0","data":[{` +
-				`"totalEq":"22077.42","isoEq":"0","adjEq":"21880.10","availEq":"20950.33","ordFroz":"0",` +
-				`"imr":"1214.88","mmr":"402.51","mgnRatio":"54.36","upl":"-97.34","details":[` +
-				`{"ccy":"BTC","eq":"0.1801","eqUsd":"19056.32","cashBal":"0.1801","availBal":"0.1801","availEq":"0.1801","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""},` +
-				`{"ccy":"USDC","eq":"3021.10","eqUsd":"3021.10","cashBal":"3021.10","availBal":"3021.10","availEq":"3021.10","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""}` +
+				`"totalEq":"25000.00","isoEq":"0","adjEq":"24800.00","availEq":"23700.00","ordFroz":"0",` +
+				`"imr":"1300.00","mmr":"430.00","mgnRatio":"54.00","upl":"-110.00","details":[` +
+				`{"ccy":"BTC","eq":"0.2000","eqUsd":"21500.00","cashBal":"0.2000","availBal":"0.2000","availEq":"0.2000","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""},` +
+				`{"ccy":"USDC","eq":"3500.00","eqUsd":"3500.00","cashBal":"3500.00","availBal":"3500.00","availEq":"3500.00","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""}` +
 				`]}]}`,
-			wantEquity:            22077.42,
-			wantAvailable:         21880.10 - 1214.88,
-			wantUnrealized:        -97.34,
+			wantEquity:            25000.00,
+			wantAvailable:         24800.00 - 1300.00,
+			wantUnrealized:        -110.00,
 			wantBasis:             okxBasisAdjEqMinusIMR,
 			freeMustBeBelowEquity: true,
 		},
@@ -190,14 +190,14 @@ func TestOKXGetBalance_EquityStaysTotalEqNotAdjEq(t *testing.T) {
 	assertNear(t, "unrealized", balance.UnrealizedPnL, 41.5)
 }
 
-// okxBodyPortfolioMargin is the customer's account shape: portfolio margin,
+// okxBodyPortfolioMargin is the shape that exposed the availBal bug: portfolio margin,
 // equity mostly in a non-USDT coin, availBal equal to the balance on every
 // line.
 const okxBodyPortfolioMargin = `{"code":"0","data":[{` +
-	`"totalEq":"22077.42","isoEq":"0","adjEq":"21880.10","availEq":"20950.33","ordFroz":"0",` +
-	`"imr":"1214.88","mmr":"402.51","mgnRatio":"54.36","upl":"-97.34","details":[` +
-	`{"ccy":"BTC","eq":"0.1801","eqUsd":"19056.32","cashBal":"0.1801","availBal":"0.1801","availEq":"0.1801","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""},` +
-	`{"ccy":"USDC","eq":"3021.10","eqUsd":"3021.10","cashBal":"3021.10","availBal":"3021.10","availEq":"3021.10","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""}` +
+	`"totalEq":"25431.17","isoEq":"0","adjEq":"24876.52","availEq":"23712.08","ordFroz":"0",` +
+	`"imr":"1318.64","mmr":"436.21","mgnRatio":"53.87","upl":"-112.73","details":[` +
+	`{"ccy":"BTC","eq":"0.2013","eqUsd":"21883.88","cashBal":"0.2013","availBal":"0.2013","availEq":"0.2013","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""},` +
+	`{"ccy":"USDC","eq":"3547.29","eqUsd":"3547.29","cashBal":"3547.29","availBal":"3547.29","availEq":"3547.29","frozenBal":"0","isoEq":"0","upl":"0","imr":"","mmr":""}` +
 	`]}]}`
 
 // One request per wallet, and not one more. The perimeter covers the trading

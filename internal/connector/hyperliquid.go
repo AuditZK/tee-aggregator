@@ -92,8 +92,7 @@ func (h *Hyperliquid) GetBalance(ctx context.Context) (*Balance, error) {
 	// spotClearinghouseState.balances[].total AND is already counted inside
 	// clearinghouseState.marginSummary.accountValue. Adding spot.total raw
 	// double-counts the collateral, inflating reported equity by exactly
-	// totalMarginUsed (incident 2026-05-24: a HL user showed a phantom
-	// +15% / +$900 overnight while doing nothing).
+	// totalMarginUsed (an idle account showed a phantom overnight gain).
 	//
 	// Fix: add only the spot portion NOT reserved as perp margin
 	// (= total − hold). For pure-spot users (no perp positions, hold=0)
@@ -274,7 +273,7 @@ func (h *Hyperliquid) fetchSpotPriceMap(ctx context.Context) (map[string]float64
 		return nil, fmt.Errorf("parse spotMetaAndAssetCtxs: %w", err)
 	}
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("spotMetaAndAssetCtxs: expected 2 parts, got %d", len(parts))
+		return nil, fmt.Errorf("parse spotMetaAndAssetCtxs: expected 2 parts, got %d", len(parts))
 	}
 	var meta struct {
 		Tokens []struct {

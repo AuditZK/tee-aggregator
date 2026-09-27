@@ -20,8 +20,8 @@ func summaryReport(currencyAttr string) []byte {
 }
 
 // Nothing downstream converts currencies, so a EUR account's figures travel as
-// EUR under a USD label. A French PEA is EUR by construction and two of them
-// were being served as dollars.
+// EUR under a USD label, and an account that can hold nothing but euros was
+// served as dollars.
 func TestGetBalance_NonUSDAccountIsReported(t *testing.T) {
 	i := &IBKR{}
 	bal, err := i.parseBalanceFromReport(summaryReport(`currency="EUR"`))

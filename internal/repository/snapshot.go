@@ -365,9 +365,9 @@ func (r *SnapshotRepo) GetExternalRebuilderDays(ctx context.Context, userUID str
 //
 // A signed report is cached against the period it covers, never against the
 // rows it was computed from. A history rebuild rewrites those rows under it
-// (a Bybit history moving from realized-only to mark-to-market took a period
-// from 54% to 43.7% total return, and its max drawdown from 5.5% to 9.9%),
-// and the cache then keeps serving numbers the data no longer supports. This
+// (moving a history from realized-only to mark-to-market changes both its
+// total return and its max drawdown), and the cache then keeps serving
+// numbers the data no longer supports. This
 // is the stamp the report cache compares against to notice that.
 //
 // The Go schema has no updated_at and its snapshot upsert leaves created_at
@@ -1022,7 +1022,7 @@ func (r *SnapshotRepo) GetLatestByUserExchangeLabelBefore(ctx context.Context, u
 		return nil, err
 	}
 	defer rows.Close()
-	snapshots, err := r.scanSnapshots(rows, false, hasHist)
+	snapshots, err := r.scanSnapshots(rows, true, hasHist)
 	if err != nil {
 		return nil, err
 	}
@@ -1293,9 +1293,20 @@ func (r *SnapshotRepo) hasLabelColumn(ctx context.Context) bool {
 		return r.hasLabelCol
 	}
 
+	// A failed probe is retried on the next call rather than latched for the
+	// life of the process as "column absent".
+	probeFailed := false
+	probe := func(column string) bool {
+		exists, err := r.columnExists(ctx, "snapshot_data", column)
+		if err != nil {
+			probeFailed = true
+		}
+		return exists
+	}
+
 	// Detect TS Prisma schema (camelCase) vs Go schema (snake_case).
 	// If "userUid" column exists in snapshot_data → TS schema.
-	tsSchema, _ := r.columnExists(ctx, "snapshot_data", "userUid")
+	tsSchema := probe("userUid")
 	r.isTSSchema = tsSchema
 
 	if tsSchema {
@@ -1309,42 +1320,22 @@ func (r *SnapshotRepo) hasLabelColumn(ctx context.Context) bool {
 		// verifiability_class labelling (payload 1.3+) was dead on the very
 		// deployment that needed it. Migration 015's ALTER is applied to the
 		// TS schema by hand, so probe for the column instead of assuming.
-		originExists, err := r.columnExists(ctx, "snapshot_data", "from_external_rebuilder")
-		if err != nil {
-			r.hasFromExternalRebuilderCol = false
-		} else {
-			r.hasFromExternalRebuilderCol = originExists
-		}
+		r.hasFromExternalRebuilderCol = probe("from_external_rebuilder")
 	} else {
-		exists, err := r.columnExists(ctx, "snapshot_data", "label")
-		if err != nil {
-			r.hasLabelCol = false
-		} else {
-			r.hasLabelCol = exists
-		}
-		histExists, err := r.columnExists(ctx, "snapshot_data", "is_historical")
-		if err != nil {
-			r.hasIsHistoricalCol = false
-		} else {
-			r.hasIsHistoricalCol = histExists
-		}
-		originExists, err := r.columnExists(ctx, "snapshot_data", "from_external_rebuilder")
-		if err != nil {
-			r.hasFromExternalRebuilderCol = false
-		} else {
-			r.hasFromExternalRebuilderCol = originExists
-		}
+		r.hasLabelCol = probe("label")
+		r.hasIsHistoricalCol = probe("is_historical")
+		r.hasFromExternalRebuilderCol = probe("from_external_rebuilder")
 	}
 
 	updatedName, createdName := "updated_at", "created_at"
 	if tsSchema {
 		updatedName, createdName = "updatedAt", "createdAt"
 	}
-	updatedExists, _ := r.columnExists(ctx, "snapshot_data", updatedName)
-	createdExists, _ := r.columnExists(ctx, "snapshot_data", createdName)
+	updatedExists := probe(updatedName)
+	createdExists := probe(createdName)
 	r.changeStampExpr = snapshotChangeStampExpr(tsSchema, updatedExists, createdExists)
 
-	r.capabilitiesLoaded = true
+	r.capabilitiesLoaded = !probeFailed
 	return r.hasLabelCol
 }
 

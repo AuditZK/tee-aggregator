@@ -18,11 +18,11 @@ func snap(ts time.Time, equity, deposits float64) *repository.Snapshot {
 // The bug this exists for, reproduced at the unit level. The connect hook runs
 // the live sync first (it writes the equity anchor the rebuild dispatch needs),
 // so the connection's first snapshot is TODAY, carrying an inception deposit
-// worth the whole balance. The reconstruction then lands 79 earlier days and
+// worth the whole balance. The reconstruction then lands the earlier days and
 // stamps the real inception underneath. One Bybit account came out reporting
 // close to twice the capital ever deposited, halving its return.
 func TestSupersededConnectStamp_ClearsTheConnectTimeStamp(t *testing.T) {
-	live := snap(day(2026, time.August, 26), 10093.99, 10093.99)
+	live := snap(day(2026, time.August, 26), 10000.00, 10000.00)
 	got := supersededConnectStamp([]*repository.Snapshot{live}, day(2026, time.June, 8))
 	if got == nil {
 		t.Fatal("the connect-time stamp was left in place, the account still double-counts its capital")
@@ -86,11 +86,11 @@ func TestSupersededConnectStamp_KeepsRealTransfers(t *testing.T) {
 // Float equality cannot be exact across the equity/deposit round trip, so the
 // match is bounded rather than strict.
 func TestSupersededConnectStamp_ToleratesFloatDrift(t *testing.T) {
-	drifted := snap(day(2026, time.August, 26), 10093.99233949, 10093.992339490001)
+	drifted := snap(day(2026, time.August, 26), 10050.12345678, 10050.123456780001)
 	if got := supersededConnectStamp([]*repository.Snapshot{drifted}, day(2026, time.June, 8)); got == nil {
 		t.Fatal("a stamp missed over floating-point noise")
 	}
-	wayOff := snap(day(2026, time.August, 26), 10093.99, 10093.50)
+	wayOff := snap(day(2026, time.August, 26), 10050.00, 10049.50)
 	if got := supersededConnectStamp([]*repository.Snapshot{wayOff}, day(2026, time.June, 8)); got != nil {
 		t.Fatal("matched a deposit that is nowhere near the balance")
 	}
@@ -105,12 +105,12 @@ func TestSupersededConnectStamp_NoExistingHistory(t *testing.T) {
 // The external rebuilder dates the inception deposit off the ledger, so the
 // reconstructed series arrives with its earliest day already stamped. The
 // connect-time stamp it lands under must still be cleared — coupling the two
-// left it in place on a second Bybit account: the live sync wrote today's row
-// as a first sync (deposit = whole balance), the rebuild filled 258 days
-// beneath it a minute later, and the aggregate read the day as -31%.
+// left it in place on a Bybit account: the live sync wrote today's row as a
+// first sync (deposit = whole balance), the rebuild filled the history beneath
+// it a minute later, and the aggregate read the day as a large loss.
 func TestResolveInception_ClearsStampUnderALedgerDatedSeries(t *testing.T) {
-	earliest := snap(day(2025, time.December, 14), 107.27, 107.27)
-	live := snap(day(2026, time.August, 29), 8139.34, 8139.34)
+	earliest := snap(day(2025, time.December, 14), 100.00, 100.00)
+	live := snap(day(2026, time.August, 29), 8200.00, 8200.00)
 
 	stamp, superseded := resolveInception(earliest, []*repository.Snapshot{live})
 	if stamp {
@@ -128,7 +128,7 @@ func TestResolveInception_ClearsStampUnderALedgerDatedSeries(t *testing.T) {
 // stamp AND clears the connect-time row.
 func TestResolveInception_StampsAndClearsWhenSeriesCarriesNoDeposit(t *testing.T) {
 	earliest := snap(day(2026, time.June, 8), 43, 0)
-	live := snap(day(2026, time.August, 26), 10093.99, 10093.99)
+	live := snap(day(2026, time.August, 26), 10000.00, 10000.00)
 
 	stamp, superseded := resolveInception(earliest, []*repository.Snapshot{live})
 	if !stamp {
@@ -154,18 +154,18 @@ func TestResolveInception_OlderHistoryDisablesBoth(t *testing.T) {
 	}
 }
 
-// The defect one OKX account exposed on 2026-08-30. The rebuild opened
+// The defect a zero-padded OKX rebuild exposed. The rebuild opened
 // on zero-equity padding, so the earliest day of the batch carried no equity;
 // the rule bailed on it and never reached the clearing, leaving the whole
 // balance booked as a deposit on connection day. Whichever end the padding is
 // read from, the funded day is the one that counts.
 func TestEarliestFundedDay_SkipsTheZeroPadding(t *testing.T) {
-	funded := snap(day(2026, time.August, 21), 3310.97, 0)
+	funded := snap(day(2026, time.August, 21), 3300.00, 0)
 	batch := []*repository.Snapshot{
 		snap(day(2026, time.June, 3), 0, 0),
 		snap(day(2026, time.June, 4), 0, 0),
 		funded,
-		snap(day(2026, time.August, 22), 3551.59, 0),
+		snap(day(2026, time.August, 22), 3550.00, 0),
 	}
 
 	got := earliestFundedDay(batch)
@@ -195,14 +195,14 @@ func TestEarliestFundedDay_EmptyBatchIsNil(t *testing.T) {
 }
 
 // End to end over the pure half of the rule: a zero-padded reconstruction
-// landing under a connect-time stamp must clear it. This is the $3,569.14
-// phantom deposit, reproduced.
+// landing under a connect-time stamp must clear it. This is the phantom
+// deposit, reproduced.
 func TestZeroPaddedReconstruction_ClearsTheConnectStamp(t *testing.T) {
-	live := snap(day(2026, time.August, 30), 3569.14, 3569.14)
+	live := snap(day(2026, time.August, 30), 3600.00, 3600.00)
 	batch := []*repository.Snapshot{
 		snap(day(2026, time.June, 3), 0, 0),
-		snap(day(2026, time.August, 21), 3310.97, 0),
-		snap(day(2026, time.August, 29), 3529.17, 0),
+		snap(day(2026, time.August, 21), 3300.00, 0),
+		snap(day(2026, time.August, 29), 3530.00, 0),
 	}
 
 	earliest := earliestFundedDay(batch)
@@ -215,7 +215,7 @@ func TestZeroPaddedReconstruction_ClearsTheConnectStamp(t *testing.T) {
 		t.Error("the real inception day was left unstamped, the account reports its opening balance as pure gain")
 	}
 	if superseded == nil {
-		t.Fatal("the connect-time stamp survived — the account still reports a $3,569.14 deposit it never received")
+		t.Fatal("the connect-time stamp survived — the account still reports a deposit it never received")
 	}
 	if superseded.Deposits != 0 {
 		t.Fatalf("cleared deposits = %v, want 0", superseded.Deposits)

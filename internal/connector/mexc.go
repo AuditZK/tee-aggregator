@@ -15,7 +15,7 @@ const mexcAPI = "https://api.mexc.com"
 // QUAL-001: extracted to remove a 3-way duplication of the spot-account path.
 const mexcPathAccount = "/api/v3/account"
 
-// MEXC implements Connector for MEXC exchange using native HTTP (no CCXT).
+// MEXC implements Connector for MEXC exchange.
 // Uses HMAC-SHA256 signing, same as Binance.
 type MEXC struct {
 	base CryptoBase

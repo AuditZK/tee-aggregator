@@ -617,14 +617,13 @@ func TestBuildCTraderHistoricalSnapshots_CarryForwardAndWithdraw(t *testing.T) {
 // reconstruction must record the NET capital added (new balance minus the
 // balance just before), not the raw delta — recording the full amount would
 // push cumulative deposits above equity and show a phantom loss.
-// Reproduces youceef.bouanani: $100k funded 05-31, traded to $102,484.54 by
-// 06-13, reset to $1,000,000 on 06-14.
+// Synthetic account: 50k funded, traded to 51,234.56, then reset to 500k.
 func TestBuildCTraderHistoricalSnapshots_DemoResetRecordsNetDeposit(t *testing.T) {
-	day531 := time.Date(2026, 5, 31, 0, 0, 0, 0, time.UTC)
-	day613 := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
-	reset614 := time.Date(2026, 6, 14, 17, 53, 58, 0, time.UTC)
+	inceptionDay := time.Date(2026, 3, 2, 0, 0, 0, 0, time.UTC)
+	tradeDay := time.Date(2026, 3, 12, 12, 0, 0, 0, time.UTC)
+	resetAt := time.Date(2026, 3, 13, 17, 53, 58, 0, time.UTC)
 
-	dealJSON := fmt.Sprintf(`{"deal":[{"dealId":1,"positionId":1,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":%d,"executionPrice":1.1,"tradeSide":2,"dealStatus":2,"commission":-450,"closePositionDetail":{"grossProfit":248454,"balance":10248454,"moneyDigits":2},"moneyDigits":2}]}`, day613.UnixMilli())
+	dealJSON := fmt.Sprintf(`{"deal":[{"dealId":1,"positionId":1,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":%d,"executionPrice":1.1,"tradeSide":2,"dealStatus":2,"commission":-450,"closePositionDetail":{"grossProfit":123456,"balance":5123456,"moneyDigits":2},"moneyDigits":2}]}`, tradeDay.UnixMilli())
 	var dr struct {
 		Deal []cTraderDeal `json:"deal"`
 	}
@@ -633,11 +632,11 @@ func TestBuildCTraderHistoricalSnapshots_DemoResetRecordsNetDeposit(t *testing.T
 	}
 
 	cfs := []ctraderDepositWithdraw{
-		{OperationType: 0, Balance: 10000000, Delta: 10000000, Timestamp: day531.UnixMilli(), MoneyDigits: 2},    // $100k inception
-		{OperationType: 0, Balance: 100000000, Delta: 100000000, Timestamp: reset614.UnixMilli(), MoneyDigits: 2}, // $1M reset (delta == balance)
+		{OperationType: 0, Balance: 5000000, Delta: 5000000, Timestamp: inceptionDay.UnixMilli(), MoneyDigits: 2}, // 50k inception
+		{OperationType: 0, Balance: 50000000, Delta: 50000000, Timestamp: resetAt.UnixMilli(), MoneyDigits: 2},    // 500k reset (delta == balance)
 	}
 
-	now := time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
 	snaps := buildCTraderHistoricalSnapshots(dr.Deal, cfs, now)
 
 	byDay := map[string]*HistoricalSnapshot{}
@@ -648,23 +647,23 @@ func TestBuildCTraderHistoricalSnapshots_DemoResetRecordsNetDeposit(t *testing.T
 	}
 
 	// Inception is a real deposit (running balance was 0 -> not a reset).
-	if d := byDay["20260531"]; d == nil || d.Deposits != 100000 {
-		t.Fatalf("05-31 inception: want deposits=100000, got %+v", d)
+	if d := byDay["20260302"]; d == nil || d.Deposits != 50000 {
+		t.Fatalf("inception: want deposits=50000, got %+v", d)
 	}
-	// Reset day: NET capital (1,000,000 - 102,484.54), equity is the new $1M.
-	d614 := byDay["20260614"]
-	if d614 == nil {
-		t.Fatal("06-14 reset row missing")
+	// Reset day: NET capital (500,000 - 51,234.56), equity is the new 500k.
+	reset := byDay["20260313"]
+	if reset == nil {
+		t.Fatal("reset row missing")
 	}
-	if !floatNear(d614.Deposits, 897515.46, 0.5) {
-		t.Fatalf("06-14 reset deposit: want ~897515.46 net, got %v (raw 1,000,000 double-counts the discarded balance)", d614.Deposits)
+	if !floatNear(reset.Deposits, 448765.44, 0.5) {
+		t.Fatalf("reset deposit: want ~448765.44 net, got %v (raw 500,000 double-counts the discarded balance)", reset.Deposits)
 	}
-	if !floatNear(d614.TotalEquity, 1000000, 0.01) {
-		t.Fatalf("06-14 equity: want 1,000,000, got %v", d614.TotalEquity)
+	if !floatNear(reset.TotalEquity, 500000, 0.01) {
+		t.Fatalf("reset equity: want 500,000, got %v", reset.TotalEquity)
 	}
 	// Cumulative deposits stay below equity — no phantom loss.
-	if totalDeposits >= 1000000 {
-		t.Fatalf("cumulative deposits %v must stay below equity (raw capture would reach 1,100,000)", totalDeposits)
+	if totalDeposits >= 500000 {
+		t.Fatalf("cumulative deposits %v must stay below equity (raw capture would reach 550,000)", totalDeposits)
 	}
 }
 

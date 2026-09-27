@@ -47,11 +47,15 @@ func (r *SyncStatusRepo) detectSchema(ctx context.Context) {
 
 	// Check if sync_statuses uses camelCase (TS) or snake_case (Go)
 	var exists bool
-	r.pool.QueryRow(ctx, `
+	if err := r.pool.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM information_schema.columns
 			WHERE table_schema = 'public' AND table_name = 'sync_statuses' AND column_name = 'userUid'
-		)`).Scan(&exists)
+		)`).Scan(&exists); err != nil {
+		// Retried on the next call rather than latched as the Go schema.
+		r.isTSSchema = false
+		return
+	}
 
 	r.isTSSchema = exists
 	r.schemaDetected = true

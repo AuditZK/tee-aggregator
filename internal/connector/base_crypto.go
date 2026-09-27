@@ -1,13 +1,7 @@
-// Package connector provides exchange-specific implementations.
-//
-// Architecture:
-//   - CryptoBase: shared HTTP client + helpers for all crypto exchange connectors
-//   - Native connectors (Binance, Bybit, OKX, Kraken, MEXC): direct HTTP with HMAC signing (~1MB each)
-//   - CCXT connector: dynamic wrapper for minor exchanges (~67-150MB per LoadMarkets)
-//   - Specialized connectors: IBKR (Flex XML), cTrader (WebSocket), MetaTrader (mt-bridge), etc.
-//
-// Use native connectors for major exchanges to minimize memory usage.
-// Use CCXT only for exchanges without a native connector.
+// Package connector provides exchange-specific implementations. CryptoBase
+// holds the HTTP client and signing helpers shared by the crypto venues;
+// IBKR (Flex XML), cTrader (WebSocket) and MetaTrader (mt-bridge) bring their
+// own transport.
 package connector
 
 import (
@@ -260,7 +254,7 @@ func retryHTTP(client *http.Client, buildReq func() (*http.Request, error)) ([]b
 	// rate-limit blip from a real refusal: a best-effort wallet read must
 	// FAIL the sync on transient errors instead of silently writing a
 	// snapshot without the wallet (observed: the midnight herd 429'd the
-	// futures reads and equity persisted $16k-$20k short).
+	// futures reads and equity persisted short by the whole wallet).
 	if lastErr != nil && !errors.Is(lastErr, ErrTransient) {
 		lastErr = fmt.Errorf("%w: %w", ErrTransient, lastErr)
 	}

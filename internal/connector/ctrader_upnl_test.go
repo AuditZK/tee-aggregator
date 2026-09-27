@@ -50,7 +50,7 @@ func newCTraderBalanceServer(t *testing.T, opts *ctraderBalanceOpts) *CTrader {
 			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadTraderRes, map[string]any{
 				"trader": map[string]any{
 					"ctidTraderAccountId": 12345,
-					"balance":             1000000, // 10 000.00
+					"balance":             1000000, // synthetic 10 000.00
 					"moneyDigits":         2,
 					"depositAssetId":      opts.depositAssetID,
 				},
