@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -704,6 +705,7 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 			zap.String("label", connMeta.Label),
 			zap.String("reason", reason),
 		)
+		s.collectCapabilityWarnings(conn, connMeta, result)
 		s.recordRateLimitHit(ctx, connMeta)
 		s.scheduleDeferredRetry(connMeta, rateLimitRetryDelay)
 		return result
@@ -753,22 +755,8 @@ func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.E
 		}
 	}
 
-	// 6bis. Key-scope gaps discovered during the balance fetch — forwarded
-	// through the sync status so the frontend can ask the user to widen the
-	// key (see connector.CapabilityWarner).
-	if cw, ok := conn.(connector.CapabilityWarner); ok {
-		// APPEND: the reconstruction step above may already have recorded one
-		// (E-M4), and overwriting would drop it.
-		if warns := cw.CapabilityWarnings(); len(warns) > 0 {
-			result.CapabilityWarnings = append(result.CapabilityWarnings, warns...)
-			s.logger.Warn("connector reported capability gaps",
-				zap.String("user_uid", connMeta.UserUID),
-				zap.String("exchange", connMeta.Exchange),
-				zap.String("label", connMeta.Label),
-				zap.Strings("warnings", warns),
-			)
-		}
-	}
+	// 6bis. Read after cashflows: Bybit and OKX find their gaps there.
+	s.collectCapabilityWarnings(conn, connMeta, result)
 
 	// 7. Enrich breakdown with per-market equity if connector supports it
 	if bmFetcher, ok := conn.(connector.BalanceByMarketFetcher); ok {
@@ -1282,24 +1270,6 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	}
 	s.logger.Info("balance fetched", zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.Duration("elapsed", time.Since(start)))
 
-	// Key-scope gaps discovered during the balance fetch — same hook as
-	// syncConnection (the scheduler goes through THIS function, which is
-	// where the midnight herd actually detects a key that cannot read part
-	// of the account; see connector.CapabilityWarner).
-	if cw, ok := conn.(connector.CapabilityWarner); ok {
-		// APPEND: the reconstruction step above may already have recorded one
-		// (E-M4), and overwriting would drop it.
-		if warns := cw.CapabilityWarnings(); len(warns) > 0 {
-			result.CapabilityWarnings = append(result.CapabilityWarnings, warns...)
-			s.logger.Warn("connector reported capability gaps",
-				zap.String("user_uid", connMeta.UserUID),
-				zap.String("exchange", connMeta.Exchange),
-				zap.String("label", connMeta.Label),
-				zap.Strings("warnings", warns),
-			)
-		}
-	}
-
 	// Same window semantics as syncConnection above: the snapshot lands at
 	// startOfDay (today 00:00 UTC), so we pull trades/cashflows from the
 	// preceding window — 24h normally, stretched back to the last snapshot
@@ -1321,6 +1291,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 			zap.String("label", connMeta.Label),
 			zap.String("reason", reason),
 		)
+		s.collectCapabilityWarnings(conn, connMeta, result)
 		s.recordRateLimitHit(ctx, connMeta)
 		s.scheduleDeferredRetry(connMeta, rateLimitRetryDelay)
 		return result
@@ -1363,6 +1334,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 			s.warnCashflowFetchFailed(connMeta, err)
 		}
 	}
+	s.collectCapabilityWarnings(conn, connMeta, result)
 
 	if bmFetcher, ok := conn.(connector.BalanceByMarketFetcher); ok {
 		if marketBalances, err := bmFetcher.GetBalanceByMarket(ctx); err == nil {
@@ -1434,6 +1406,32 @@ func (s *SyncService) warnCashflowFetchFailed(connMeta *repository.ExchangeConne
 		zap.String("label", connMeta.Label),
 		zap.Error(err),
 	)
+}
+
+// collectCapabilityWarnings forwards the connector's key-scope gaps to the sync
+// status. It runs once every read that can report one is done, and before an
+// early return, so it adds only what the result does not carry yet (the
+// reconstruction step may have recorded its own, E-M4).
+func (s *SyncService) collectCapabilityWarnings(conn connector.Connector, connMeta *repository.ExchangeConnection, result *SyncResult) {
+	cw, ok := conn.(connector.CapabilityWarner)
+	if !ok {
+		return
+	}
+	var added []string
+	for _, w := range cw.CapabilityWarnings() {
+		if !slices.Contains(result.CapabilityWarnings, w) {
+			result.CapabilityWarnings = append(result.CapabilityWarnings, w)
+			added = append(added, w)
+		}
+	}
+	if len(added) > 0 {
+		s.logger.Warn("connector reported capability gaps",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Strings("warnings", added),
+		)
+	}
 }
 
 func findConnection(connections []*repository.ExchangeConnection, exchange, label string) *repository.ExchangeConnection {

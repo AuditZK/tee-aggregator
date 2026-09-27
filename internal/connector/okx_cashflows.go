@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -390,13 +391,33 @@ func okxPriceInUSD(ccys []string, tickers []okxTicker) map[string]float64 {
 	return prices
 }
 
-// CapabilityWarnings implements CapabilityWarner with markers from the LAST
-// GetCashflows call — the sync layer fetches cashflows before it reads the
-// warner, so they ride the same sync status as balance-scope gaps.
+// CapabilityWarnings implements CapabilityWarner with the markers of the LAST
+// GetBalance and the LAST GetCashflows. Each call resets only its own list, so
+// a cashflow read cannot erase a gap the balance read found.
 func (o *OKX) CapabilityWarnings() []string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return append([]string(nil), o.cashflowWarnings...)
+	out := append([]string(nil), o.balanceWarnings...)
+	for _, w := range o.cashflowWarnings {
+		if !slices.Contains(out, w) {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+func (o *OKX) resetBalanceWarnings() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.balanceWarnings = nil
+}
+
+func (o *OKX) noteBalanceWarning(w string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !slices.Contains(o.balanceWarnings, w) {
+		o.balanceWarnings = append(o.balanceWarnings, w)
+	}
 }
 
 func (o *OKX) resetCashflowWarnings() {
