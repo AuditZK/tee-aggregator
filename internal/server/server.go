@@ -188,7 +188,9 @@ func (s *Server) Start(ctx context.Context) error {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		s.http.Shutdown(shutdownCtx)
+		if err := s.http.Shutdown(shutdownCtx); err != nil {
+			s.logger.Warn("REST server did not drain its connections before the deadline", zap.Error(err))
+		}
 		if s.pool != nil {
 			s.pool.Close()
 		}
@@ -200,7 +202,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	cert, err := tls.X509KeyPair(s.handler.tlsKeygen.CertPEM(), s.handler.tlsKeygen.KeyPEM())
 	if err != nil {
-		return fmt.Errorf("failed to parse REST TLS keypair: %w", err)
+		return fmt.Errorf("parse REST TLS keypair: %w", err)
 	}
 
 	s.http.TLSConfig = &tls.Config{

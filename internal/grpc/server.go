@@ -126,7 +126,7 @@ func NewServer(logger *zap.Logger, svcs Services, opts ServerOptions) *Server {
 func (s *Server) Start(port int, tlsConfig *tls.Config) error {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		return fmt.Errorf("failed to listen: %w", err)
+		return fmt.Errorf("listen for gRPC: %w", err)
 	}
 
 	s.grpcServer = grpc.NewServer(s.serverOptions(tlsConfig)...)

@@ -410,7 +410,7 @@ func (s *Service) fetchWithSnpguest(ctx context.Context, reportData string) (*Se
 	parseSnpguestReport(string(displayOutput), report)
 
 	if report.Measurement == "" {
-		return nil, fmt.Errorf("failed to parse measurement from snpguest output")
+		return nil, fmt.Errorf("parse snpguest output: no measurement found")
 	}
 
 	// Fallback: if display-report didn't emit the Report Data section (older

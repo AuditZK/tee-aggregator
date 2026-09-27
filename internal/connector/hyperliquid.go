@@ -273,7 +273,7 @@ func (h *Hyperliquid) fetchSpotPriceMap(ctx context.Context) (map[string]float64
 		return nil, fmt.Errorf("parse spotMetaAndAssetCtxs: %w", err)
 	}
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("spotMetaAndAssetCtxs: expected 2 parts, got %d", len(parts))
+		return nil, fmt.Errorf("parse spotMetaAndAssetCtxs: expected 2 parts, got %d", len(parts))
 	}
 	var meta struct {
 		Tokens []struct {

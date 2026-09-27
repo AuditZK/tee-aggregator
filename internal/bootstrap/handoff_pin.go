@@ -101,12 +101,12 @@ func normalizeFingerprint(s string) ([]byte, error) {
 	t = strings.ReplaceAll(t, ":", "")
 	t = strings.ToLower(t)
 	if len(t) != sha256.Size*2 {
-		return nil, fmt.Errorf("PeerTLSFingerprint: expected %d hex chars (SHA-256), got %d",
+		return nil, fmt.Errorf("parse peer TLS fingerprint: expected %d hex chars (SHA-256), got %d",
 			sha256.Size*2, len(t))
 	}
 	raw, err := hex.DecodeString(t)
 	if err != nil {
-		return nil, fmt.Errorf("PeerTLSFingerprint: not valid hex: %w", err)
+		return nil, fmt.Errorf("parse peer TLS fingerprint: not valid hex: %w", err)
 	}
 	return raw, nil
 }
