@@ -746,6 +746,8 @@ func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflo
 	// Universal transfers are best-effort per type: a key without a given
 	// wallet product errors for that type, which must not zero the flows above.
 	b.fetchExternalTransfers(ctx, since, now, add, usdValue)
+	b.fetchSubAccountAndStrayFlows(ctx, since, now, add, usdValue)
+	b.fetchFiatFlows(ctx, since, now, add, usdValue)
 
 	return flows, nil
 }
