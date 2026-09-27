@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -161,5 +162,47 @@ func TestIsBinanceRefusal(t *testing.T) {
 		if got := isBinanceRefusal(err); got != want {
 			t.Errorf("%v: got %v, want %v", err, got, want)
 		}
+	}
+}
+
+// A bank withdrawal is a cashflow: an account used as an off-ramp (crypto in,
+// converted to EUR, EUR wired out) must not read the wire as a trading loss.
+func TestBinance_Cashflows_BankWithdrawalIsAWithdrawal(t *testing.T) {
+	stamp := time.Now().UTC().Add(-time.Hour).UnixMilli()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		q := r.URL.Query()
+		switch {
+		case strings.Contains(r.URL.Path, "/api/v3/ticker/price"):
+			_, _ = w.Write([]byte(`[{"symbol":"EURUSDT","price":"1.10"}]`))
+		case strings.Contains(r.URL.Path, "/capital/"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/fiat/orders") && q.Get("transactionType") == "1":
+			_, _ = fmt.Fprintf(w, `{"data":[{"fiatCurrency":"EUR","indicatedAmount":"300","amount":"299","totalFee":"1","status":"Successful","createTime":%d},{"fiatCurrency":"EUR","indicatedAmount":"80","amount":"80","status":"Failed","createTime":%d}]}`, stamp, stamp)
+		case strings.Contains(r.URL.Path, "/fiat/"):
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		case strings.Contains(r.URL.Path, "/sub-account/"):
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":-12022,"msg":"not a master"}`))
+		case strings.Contains(r.URL.Path, "/fapi/v1/income"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/asset/transfer"):
+			_, _ = w.Write([]byte(`{"total":0,"rows":[]}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: hostRewriter{base: http.DefaultTransport, target: target}}
+	b := NewBinanceWithClient(&Credentials{APIKey: "k", APISecret: "s"}, client)
+
+	flows, err := b.GetCashflows(context.Background(), time.Now().UTC().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	got := cashflowAmounts(flows)
+	if len(got) != 1 || math.Abs(got[0]+330) > 1e-9 {
+		t.Fatalf("want one withdrawal of 300 EUR at 1.10 = -330, got %v", got)
 	}
 }

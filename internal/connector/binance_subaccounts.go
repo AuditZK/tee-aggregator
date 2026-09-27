@@ -337,3 +337,71 @@ func binanceTransferKey(kind string, id json.RawMessage, t int64, asset, qty str
 	}
 	return kind + ":" + strconv.FormatInt(t, 10) + ":" + asset + ":" + qty
 }
+
+// fetchFiatFlows books bank transfers (fiat orders) and card purchases and
+// sales (fiat payments). Neither shows in the crypto deposit or withdrawal
+// history, so an account used as an off-ramp (crypto in, converted to EUR,
+// EUR wired out) read the withdrawal as a trading loss. Mirrors the history
+// rebuilder's fetchFiatFlows. Best-effort: a refusal or an unreadable page
+// adds nothing.
+func (b *Binance) fetchFiatFlows(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) {
+	type fiatRow struct {
+		FiatCurrency    string `json:"fiatCurrency"`
+		IndicatedAmount string `json:"indicatedAmount"`
+		Amount          string `json:"amount"`
+		TotalFee        string `json:"totalFee"`
+		SourceAmount    string `json:"sourceAmount"`
+		ObtainAmount    string `json:"obtainAmount"`
+		CryptoCurrency  string `json:"cryptoCurrency"`
+		Status          string `json:"status"`
+		CreateTime      int64  `json:"createTime"`
+	}
+	read := func(path, txType string) []fiatRow {
+		body, err := b.doRequest(ctx, "GET", binanceSpotAPI, path, url.Values{
+			"transactionType": {txType},
+			"beginTime":       {strconv.FormatInt(since.UnixMilli(), 10)},
+			"endTime":         {strconv.FormatInt(now.UnixMilli(), 10)},
+			"rows":            {"500"},
+		}, true)
+		if err != nil {
+			return nil
+		}
+		var resp struct {
+			Data []fiatRow `json:"data"`
+		}
+		if json.Unmarshal(body, &resp) != nil {
+			return nil
+		}
+		return resp.Data
+	}
+	parse := func(s string) float64 {
+		v, _ := strconv.ParseFloat(s, 64)
+		return v
+	}
+
+	for _, o := range read("/sapi/v1/fiat/orders", "0") {
+		if strings.EqualFold(o.Status, "Successful") {
+			add(time.UnixMilli(o.CreateTime).UTC(), usdValue(o.FiatCurrency, parse(o.Amount)))
+		}
+	}
+	for _, o := range read("/sapi/v1/fiat/orders", "1") {
+		if !strings.EqualFold(o.Status, "Successful") {
+			continue
+		}
+		debited := parse(o.IndicatedAmount)
+		if debited == 0 {
+			debited = parse(o.Amount) + parse(o.TotalFee)
+		}
+		add(time.UnixMilli(o.CreateTime).UTC(), -usdValue(o.FiatCurrency, debited))
+	}
+	for _, p := range read("/sapi/v1/fiat/payments", "0") {
+		if strings.EqualFold(p.Status, "Completed") {
+			add(time.UnixMilli(p.CreateTime).UTC(), usdValue(p.CryptoCurrency, parse(p.ObtainAmount)))
+		}
+	}
+	for _, p := range read("/sapi/v1/fiat/payments", "1") {
+		if strings.EqualFold(p.Status, "Completed") {
+			add(time.UnixMilli(p.CreateTime).UTC(), -usdValue(p.CryptoCurrency, parse(p.SourceAmount)))
+		}
+	}
+}
