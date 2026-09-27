@@ -39,7 +39,7 @@ func newBinanceMarketTestServer(t *testing.T, reqCount *atomic.Int32, futuresMod
 			}
 			_, _ = w.Write([]byte(`[{"asset":"USDT","balance":"16100","crossUnPnl":"-100","availableBalance":"14500"}]`))
 		case strings.Contains(p, "/sapi/v1/margin/account"):
-			// Cross margin: 2 BTC net × $121k = $242,000 — must land in the SPOT
+			// Cross margin, synthetic: 2 BTC net × $121k = $242,000, must land in the SPOT
 			// bucket to match the rebuilder's two-bucket seam convention.
 			_, _ = w.Write([]byte(`{"totalNetAssetOfBtc":"2"}`))
 		default:

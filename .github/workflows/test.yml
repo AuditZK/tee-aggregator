@@ -21,6 +21,9 @@ jobs:
       - name: Build
         run: go build ./...
 
+      - name: No account figures in comments
+        run: bash scripts/check-comment-figures.sh
+
       - name: Vet
         run: go vet ./...
 
