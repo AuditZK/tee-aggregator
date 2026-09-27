@@ -603,7 +603,14 @@ func main() {
 	// successor enclave can fetch this enclave's master key over an
 	// attested ECIES channel during an upgrade window. Only enabled
 	// when keyMgmt is wired (i.e. we have a real master key to hand off).
-	if keyMgmt != nil {
+	// TEE-01: every request is refused anyway until an operator key that
+	// decodes is set, so the endpoint is not exposed before then.
+	if _, pkErr := bootstrap.DecodeOperatorPubkey(); keyMgmt != nil && pkErr != nil {
+		logger.Info("B2 handoff endpoint not registered: no operator public key to verify a signed allowlist against",
+			zap.Error(pkErr),
+			zap.String("hint", "set operatorPubkey in internal/bootstrap/signed_allowlist.go (see cmd/release-sign) to enable enclave-to-enclave handoff"),
+		)
+	} else if keyMgmt != nil {
 		handoffSrv, hsErr := bootstrap.NewHandoffServer(bootstrap.HandoffServerOptions{
 			KeyExporter: keyMgmt,
 			Logger:      logger,
