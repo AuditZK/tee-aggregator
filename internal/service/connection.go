@@ -556,23 +556,30 @@ func (s *ConnectionService) GetDecryptedCredentialsByLabel(ctx context.Context, 
 	return s.decryptConnection(conn)
 }
 
+// decryptConnection opens each field. A value bound to its row (SEC-01) only
+// opens with that row's user, id and field; one written before binding
+// existed opens as before.
 func (s *ConnectionService) decryptConnection(conn *repository.ExchangeConnection) (*Credentials, error) {
-	// Decrypt API key — try Go format (3 fields base64), fallback to TS format (1 field hex)
-	apiKey, err := s.decryptField(conn.EncryptedAPIKey, conn.APIKeyIV, conn.APIKeyAuthTag)
+	open := func(field, ciphertext, iv, authTag string) (string, error) {
+		if encryption.IsBoundTS(ciphertext) {
+			return s.encryption.DecryptTSBound(ciphertext, encryption.ConnectionFieldAAD(conn.UserUID, conn.ID, field))
+		}
+		return s.decryptField(ciphertext, iv, authTag)
+	}
+
+	apiKey, err := open(encryption.FieldAPIKey, conn.EncryptedAPIKey, conn.APIKeyIV, conn.APIKeyAuthTag)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt api key: %w", err)
 	}
 
-	// Decrypt API secret
-	apiSecret, err := s.decryptField(conn.EncryptedAPISecret, conn.APISecretIV, conn.APISecretAuthTag)
+	apiSecret, err := open(encryption.FieldAPISecret, conn.EncryptedAPISecret, conn.APISecretIV, conn.APISecretAuthTag)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt api secret: %w", err)
 	}
 
-	// Decrypt passphrase (if present)
 	var passphrase string
 	if conn.EncryptedPassphrase != "" {
-		passphrase, err = s.decryptField(conn.EncryptedPassphrase, conn.PassphraseIV, conn.PassphraseAuthTag)
+		passphrase, err = open(encryption.FieldPassphrase, conn.EncryptedPassphrase, conn.PassphraseIV, conn.PassphraseAuthTag)
 		if err != nil {
 			return nil, fmt.Errorf("decrypt passphrase: %w", err)
 		}

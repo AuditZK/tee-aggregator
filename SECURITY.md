@@ -95,12 +95,36 @@ The enclave processes sensitive data (API credentials, individual trades, positi
 
 | Data Type | Inside Enclave | Crosses Boundary | Available to API Gateway |
 |-----------|----------------|------------------|--------------------------|
-| **API Credentials** | ✅ Decrypted | ❌ NEVER | ❌ NEVER |
+| **API Credentials** | ✅ Decrypted | ⚠️ Two named services only, see [Credential egress](#credential-egress) | ❌ NEVER |
 | **Individual Trades** | ✅ Processed | ❌ NEVER | ❌ NEVER |
 | **Trade Prices** | ✅ Used for P&L | ❌ NEVER | ❌ NEVER |
 | **Position Sizes** | ✅ Aggregated | ❌ NEVER | ❌ NEVER |
 | **Daily Equity Snapshots** | ✅ Created | ✅ YES | ✅ YES (read-only) |
 | **Total P&L** | ✅ Calculated | ✅ YES | ✅ YES (read-only) |
+
+### Credential egress
+
+Two services outside the SEV-SNP perimeter receive decrypted credentials. No
+other code path may send them anywhere.
+
+1. **History rebuilder** (`internal/rebuilderclient`, `SEC-ZK-001`). Called
+   only for connections whose owner asked for a history rebuild at connect
+   time, then by the nightly recalibration for those same connections. It
+   reconstructs the days before the connection existed. Those days are stored
+   with `from_external_rebuilder` and are never presented as verifiable. The
+   channel is HTTPS to `rebuilder.auditzk.com`, trusted only when the
+   certificate chains to one of Let's Encrypt's four ISRG roots (`SEC-03`), and
+   authenticated with `REBUILDER_INTERNAL_TOKEN` (the enclave refuses to start
+   with a rebuilder URL and no token, `CFG-002`).
+2. **MetaTrader bridge** (`internal/connector/metatrader.go`, `SEC-13`). MT4
+   and MT5 expose no API the enclave can call itself: the bridge logs into the
+   broker with the account's investor password, which is read-only. The
+   channel is an HTTPS vhost restricted to the enclave host's egress address,
+   and every request is HMAC-signed with `MT_BRIDGE_HMAC_SECRET` (missing or
+   short, the enclave refuses to start). The consequence is stated plainly: an
+   MT account's balances and deals reach the enclave through the bridge, so
+   those figures are as trustworthy as the bridge's operator, not as the
+   hardware.
 
 ---
 
@@ -162,7 +186,21 @@ certificate chain against the AMD root. The resulting flags — `Verified`,
 }
 ```
 
-#### 4. Threat Mitigation
+#### 4. What the public REST endpoint proves
+
+Public TLS for the enclave's domain terminates at the Caddy sidecar on the same
+host, which re-encrypts to the enclave without checking its certificate
+(`proxy/Caddyfile.tee-prod`). The TLS key bound into the attestation's
+`report_data` can therefore only be checked on a direct connection, the gRPC
+listener the gateway dials. On the REST path, what a client can rely on is what
+the enclave signs: reports carry an ECDSA P-256 signature from a key bound to
+the attestation, and credentials submitted through `/api/v1/credentials/connect`
+are encrypted to the attested E2E key. An intermediary can drop or delay a
+response; it cannot forge a signed report or read a submitted credential.
+Pinning the enclave certificate in Caddy would not change that, since whoever
+could intercept that hop also controls Caddy's configuration.
+
+#### 5. Threat Mitigation
 
 | Threat | Without SEV-SNP | With SEV-SNP |
 |--------|-----------------|--------------|
@@ -270,40 +308,19 @@ turn decrypt them inside the TEE.
 
 #### Encryption Format
 
-```
-[Nonce (12 bytes)] + [Auth Tag (16 bytes)] + [Encrypted Data (variable)]
-       ↓                       ↓                        ↓
-   Random                 Integrity                 Ciphertext
-   per message            protection             (API keys, secrets)
-```
+Each secret is one column holding `hex(iv_16 || tag_16 || ciphertext)`,
+AES-256-GCM with a 16-byte nonce (the layout the production schema was created
+with).
 
 #### Credential Storage
 
-**Database Schema:**
-```sql
-CREATE TABLE exchange_connections (
-  encrypted_api_key      TEXT NOT NULL,  -- AES-256-GCM encrypted
-  encrypted_api_secret   TEXT NOT NULL,  -- AES-256-GCM encrypted
-  encrypted_passphrase   TEXT,           -- AES-256-GCM encrypted (optional)
-  credentials_hash       TEXT            -- SHA-256 hash for deduplication
-);
-```
+Production columns: `"encryptedApiKey"`, `"encryptedApiSecret"`,
+`"encryptedPassphrase"` (optional) and `"credentialsHash"` on
+`exchange_connections`.
 
-**Decryption Process:**
-```go
-// Credentials decrypted ONLY in enclave memory
-apiKey, err := encryptionSvc.Decrypt(conn.EncryptedAPIKey)
-apiSecret, err := encryptionSvc.Decrypt(conn.EncryptedAPISecret)
-
-// Used for exchange API authentication
-exchange, err := factory.New(conn.Exchange, &Credentials{
-    APIKey:    apiKey,    // In-memory only
-    APISecret: apiSecret, // In-memory only
-})
-
-// Credentials NEVER logged (see Secure Logging)
-// Credentials NEVER transmitted outside enclave
-```
+Credentials are decrypted only in enclave memory, used to build the exchange
+connector, never logged (see Secure Logging), and never sent anywhere except
+the two services in [Credential egress](#credential-egress).
 
 **Credentials Hash (Deduplication):**
 ```go
@@ -312,6 +329,18 @@ h := sha256.New()
 h.Write([]byte(apiKey + ":" + apiSecret + ":" + passphrase))
 hash := hex.EncodeToString(h.Sum(nil))
 ```
+
+#### Precision of amounts (`DATA-01`)
+
+Amounts are `float64` from the connector to the signature, and the production
+columns are `double precision`: nothing is rounded on the way, so a signed
+figure is the stored figure, to 15-17 significant digits (below a micro-dollar
+on a billion). The signed payload is canonical JSON in which each number is
+written in the shortest form that parses back to the same `float64`, so a
+verifier that parses the payload and rebuilds its canonical form gets the
+signed bytes. A NaN or an infinity cannot be encoded: signing fails instead of
+emitting a value a verifier would read differently. Both properties are pinned
+by `internal/signing/canonical_amounts_test.go`.
 
 ---
 

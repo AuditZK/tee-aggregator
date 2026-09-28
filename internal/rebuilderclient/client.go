@@ -138,7 +138,8 @@ func New(baseURL, authToken string, logger *zap.Logger) *Client {
 		baseURL:   baseURL,
 		authToken: authToken,
 		httpClient: &http.Client{
-			Timeout: RequestTimeout,
+			Timeout:   RequestTimeout,
+			Transport: pinnedTransport(),
 		},
 		logger: logger,
 	}
