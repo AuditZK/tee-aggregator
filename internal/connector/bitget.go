@@ -21,13 +21,18 @@ type Bitget struct {
 	base       CryptoBase
 	passphrase string
 
-	// cashflowNotes carries the markers the last GetCashflows raised.
-	cashflowNotes cashflowNotes
+	// balanceNotes and cashflowNotes carry the markers the last GetBalance
+	// and GetCashflows raised.
+	balanceNotes  noteList
+	cashflowNotes noteList
 }
 
-// CapabilityWarnings implements CapabilityWarner with the flows the last
-// GetCashflows could not value.
-func (b *Bitget) CapabilityWarnings() []string { return b.cashflowNotes.get() }
+// CapabilityWarnings implements CapabilityWarner with the wallets the last
+// GetBalance could not read and the flows the last GetCashflows could not
+// value.
+func (b *Bitget) CapabilityWarnings() []string {
+	return append(b.balanceNotes.get(), b.cashflowNotes.get()...)
+}
 
 // NewBitget creates a new Bitget connector.
 func NewBitget(creds *Credentials) *Bitget {
@@ -134,14 +139,23 @@ func (b *Bitget) GetBalance(ctx context.Context) (*Balance, error) {
 	}
 	spotEquity := ValueSpotHoldingsUSD(holdings, priceMap)
 
-	// Futures balance over both stable-margined products (ignore errors —
-	// account may not have futures enabled).
+	// Futures balance over both stable-margined products. A key without the
+	// futures scope leaves that wallet outside the equity and says so; any
+	// other failure fails the sync, since a snapshot short by the whole
+	// futures wallet would stand while a failed sync is retried.
+	var warnings []string
 	futuresEquity := 0.0
 	futuresUnrealized := 0.0
 	for _, pt := range bitgetMixProductTypes {
 		futBody, ferr := b.doRequest(ctx, "GET", "/api/v2/mix/account/accounts?productType="+pt)
 		if ferr != nil {
-			continue
+			if isBitgetPermissionRefusal(ferr) {
+				if !slices.Contains(warnings, "futures_permission_missing") {
+					warnings = append(warnings, "futures_permission_missing")
+				}
+				continue
+			}
+			return nil, fmt.Errorf("futures balance %s: %w", pt, ferr)
 		}
 		var futResp struct {
 			Data []struct {
@@ -151,8 +165,8 @@ func (b *Bitget) GetBalance(ctx context.Context) (*Balance, error) {
 				Available     string `json:"available"`
 			} `json:"data"`
 		}
-		if json.Unmarshal(futBody, &futResp) != nil {
-			continue
+		if err := json.Unmarshal(futBody, &futResp); err != nil {
+			return nil, fmt.Errorf("parse futures balance %s: %w", pt, err)
 		}
 		for _, a := range futResp.Data {
 			if IsStablecoinUSD(a.MarginCoin) {
@@ -164,6 +178,7 @@ func (b *Bitget) GetBalance(ctx context.Context) (*Balance, error) {
 		}
 	}
 
+	b.balanceNotes.set(warnings)
 	return &Balance{
 		Equity:        spotEquity + futuresEquity,
 		Available:     spotAvailable,

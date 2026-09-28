@@ -47,7 +47,7 @@ type Binance struct {
 	// fetched at all and therefore not listed.
 	coverage []WalletCoverage
 	// cashflowNotes carries the markers the last GetCashflows raised.
-	cashflowNotes cashflowNotes
+	cashflowNotes noteList
 }
 
 // Binance wallet names. Their own vocabulary, not market types: cross and

@@ -7,20 +7,20 @@ import (
 	"sync"
 )
 
-// cashflowNotes holds the markers the last GetCashflows raised. Each call
+// noteList holds the markers one kind of read raised last time. Each read
 // replaces them, so a problem that has gone away stops being reported.
-type cashflowNotes struct {
+type noteList struct {
 	mu    sync.Mutex
 	marks []string
 }
 
-func (n *cashflowNotes) set(marks []string) {
+func (n *noteList) set(marks []string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.marks = marks
 }
 
-func (n *cashflowNotes) get() []string {
+func (n *noteList) get() []string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return slices.Clone(n.marks)
