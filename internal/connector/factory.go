@@ -2,9 +2,9 @@ package connector
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
+	"github.com/trackrecord/enclave/internal/config"
 	"github.com/trackrecord/enclave/internal/proxy"
 )
 
@@ -150,11 +150,8 @@ func (f *Factory) SupportedExchanges() []string {
 	return exchanges
 }
 
-// isProductionEnv reports whether the enclave runs in production. The mock
-// connector is gated on this so fabricated balances/trades cannot enter the
-// signed-report pipeline. Mirrors the ENV / NODE_ENV check the gRPC and REST
-// layers use.
+// isProductionEnv gates the mock connector, so fabricated balances and trades
+// cannot enter the signed-report pipeline.
 func isProductionEnv() bool {
-	return strings.EqualFold(os.Getenv("ENV"), "production") ||
-		strings.EqualFold(os.Getenv("NODE_ENV"), "production")
+	return config.IsProductionEnv()
 }
