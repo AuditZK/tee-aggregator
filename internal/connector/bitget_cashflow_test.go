@@ -39,7 +39,7 @@ func TestBitgetCashflows_TransferPairing(t *testing.T) {
 		{t: bgAt("2026-07-08T10:01:30Z"), delta: 21.54, businessType: "trans_from_exchange"}, // pairs with leg 2
 		{t: bgAt("2026-07-08T15:00:00Z"), delta: 50, businessType: "trans_from_exchange"},    // no spot leg — UNPAIRED
 	}
-	dep, wd := bgSum(classifyBitgetCashflows(spot, mix, nil))
+	dep, wd := bgSum(classifyBitgetCashflows(spot, mix, nil, nil))
 	if !bgApprox(dep, 21.54+50) || wd != 0 {
 		t.Fatalf("got dep=%v wd=%v, want dep=71.54 wd=0", dep, wd)
 	}
@@ -56,7 +56,7 @@ func TestBitgetCashflows_FuturesExternalTypes(t *testing.T) {
 		{t: bgAt("2026-07-08T14:00:00Z"), delta: 300, businessType: "close_long"},                // pnl — not cashflow
 		{t: bgAt("2026-07-08T15:00:00Z"), delta: -0.2, businessType: "contract_settle_fee"},      // fee — not cashflow
 	}
-	dep, wd := bgSum(classifyBitgetCashflows(nil, mix, nil))
+	dep, wd := bgSum(classifyBitgetCashflows(nil, mix, nil, nil))
 	if !bgApprox(dep, 106) || !bgApprox(wd, 40) {
 		t.Fatalf("got dep=%v wd=%v, want dep=106 wd=40", dep, wd)
 	}
@@ -75,7 +75,7 @@ func TestBitgetCashflows_SpotGroupsAndValuation(t *testing.T) {
 		{t: bgAt("2026-07-08T14:00:00Z"), coin: "SCAM", size: 999, groupType: "deposit"},     // unpriceable → 0
 		{t: bgAt("2026-07-08T15:00:00Z"), coin: "USDT", size: 7, groupType: "transaction"},   // trade — not cashflow
 	}
-	dep, wd := bgSum(classifyBitgetCashflows(spot, nil, prices))
+	dep, wd := bgSum(classifyBitgetCashflows(spot, nil, prices, nil))
 	if !bgApprox(dep, 6000+0.03) || !bgApprox(wd, 450) {
 		t.Fatalf("got dep=%v wd=%v, want dep=6000.03 wd=450", dep, wd)
 	}

@@ -27,7 +27,14 @@ type MEXC struct {
 	cachedSpotEquity    float64
 	cachedFuturesEquity float64
 	cachedFuturesAvail  float64
+
+	// cashflowNotes carries the markers the last GetCashflows raised.
+	cashflowNotes cashflowNotes
 }
+
+// CapabilityWarnings implements CapabilityWarner with the flows the last
+// GetCashflows could not value.
+func (m *MEXC) CapabilityWarnings() []string { return m.cashflowNotes.get() }
 
 // NewMEXC creates a new MEXC connector.
 func NewMEXC(creds *Credentials) *MEXC {
@@ -448,6 +455,7 @@ func (m *MEXC) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, 
 	// cashflow that skews the TWR permanently. Price map fetched lazily, on
 	// the first non-stable coin seen.
 	var priceMap map[string]float64
+	unpriced := unpricedAssets{}
 	usdValue := func(coin string, qty float64) float64 {
 		if IsStablecoinUSD(coin) {
 			return qty
@@ -462,8 +470,12 @@ func (m *MEXC) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, 
 		if p := priceMap[strings.ToUpper(coin)+"USDT"]; p > 0 {
 			return qty * p
 		}
-		return 0 // unpriceable dust — never fabricate a flow from it
+		if qty != 0 {
+			unpriced.add(coin)
+		}
+		return 0
 	}
+	defer func() { m.cashflowNotes.set(unpriced.markers("mexc")) }()
 
 	depBody, err := m.signedGET(ctx, "/sapi/v1/capital/deposit/hisrec",
 		fmt.Sprintf("startTime=%d&limit=100", since.UnixMilli()))
