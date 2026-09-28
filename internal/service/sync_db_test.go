@@ -150,6 +150,9 @@ type scriptedConnector struct {
 	cashflows   []*connector.Cashflow
 	cashflowErr error
 	warnings    []string
+	// cashflowWarning is raised only while the cashflows are read, the way
+	// Bybit and OKX find their gaps.
+	cashflowWarning string
 
 	mu    sync.Mutex
 	reads int
@@ -184,10 +187,19 @@ func (c *scriptedConnector) TestConnection(context.Context) error { return nil }
 func (c *scriptedConnector) Exchange() string                     { return c.exchange }
 
 func (c *scriptedConnector) GetCashflows(context.Context, time.Time) ([]*connector.Cashflow, error) {
+	if c.cashflowWarning != "" {
+		c.mu.Lock()
+		c.warnings = append(c.warnings, c.cashflowWarning)
+		c.mu.Unlock()
+	}
 	return c.cashflows, c.cashflowErr
 }
 
-func (c *scriptedConnector) CapabilityWarnings() []string { return slices.Clone(c.warnings) }
+func (c *scriptedConnector) CapabilityWarnings() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.warnings)
+}
 
 func TestDBSyncWritesSnapshotAndStatus(t *testing.T) {
 	for _, p := range syncPaths {
@@ -226,6 +238,27 @@ func TestDBSyncWritesSnapshotAndStatus(t *testing.T) {
 			}
 			if st.ErrorMessage != "warning: futures_permission_missing" {
 				t.Errorf("errorMessage = %q, want the capability warning", st.ErrorMessage)
+			}
+		})
+	}
+}
+
+func TestDBWarningsFoundWhileReadingCashflowsReachTheStatus(t *testing.T) {
+	for _, p := range syncPaths {
+		t.Run(p.name, func(t *testing.T) {
+			h := newDBHarness(t)
+			h.seedConnection(t, "bybit", "main", dbKey, dbSecret)
+			h.plant(dbKey, dbSecret, &scriptedConnector{
+				exchange:        "bybit",
+				balances:        []connector.Balance{{Equity: 1000, Available: 1000}},
+				cashflowWarning: "funding_wallet_unreadable",
+			})
+
+			if res := p.run(h, "bybit", "main"); !res.Success {
+				t.Fatalf("sync failed: %+v", res)
+			}
+			if st := h.status(t, "bybit", "main"); st.ErrorMessage != "warning: funding_wallet_unreadable" {
+				t.Errorf("errorMessage = %q, want the warning raised during the cashflow read", st.ErrorMessage)
 			}
 		})
 	}

@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"time"
 
 	pb "github.com/trackrecord/enclave/api/proto"
 	"github.com/trackrecord/enclave/internal/attestation"
 	"github.com/trackrecord/enclave/internal/auth"
+	"github.com/trackrecord/enclave/internal/config"
 	"github.com/trackrecord/enclave/internal/errsanitize"
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/service"
@@ -279,9 +279,7 @@ func (s *Server) authInterceptor(
 }
 
 func (s *Server) isProduction() bool {
-	env := strings.ToLower(os.Getenv("ENV"))
-	nodeEnv := strings.ToLower(os.Getenv("NODE_ENV"))
-	return env == "production" || nodeEnv == "production"
+	return config.IsProductionEnv()
 }
 
 func (s *Server) sanitizeErrorForClient(err error) string {
@@ -309,9 +307,7 @@ func (s *Server) sanitizeMessageForClient(msg string) string {
 }
 
 func currentEnclaveMode() string {
-	env := strings.ToLower(os.Getenv("ENV"))
-	nodeEnv := strings.ToLower(os.Getenv("NODE_ENV"))
-	if env == "production" || nodeEnv == "production" {
+	if config.IsProductionEnv() {
 		return "production"
 	}
 	return "development"

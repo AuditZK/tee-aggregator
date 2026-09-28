@@ -7,13 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/trackrecord/enclave/internal/attestation"
 	"github.com/trackrecord/enclave/internal/auth"
+	"github.com/trackrecord/enclave/internal/config"
 	"github.com/trackrecord/enclave/internal/connector"
 	"github.com/trackrecord/enclave/internal/encryption"
 	"github.com/trackrecord/enclave/internal/repository"
@@ -80,12 +80,9 @@ func (h *Handler) sanitizeErr(err error) string {
 	return err.Error()
 }
 
-// isProduction mirrors the gRPC server check so the REST sanitizer uses
-// the same toggle.
+// isProduction gates the REST error sanitizer.
 func isProduction() bool {
-	env := strings.ToLower(os.Getenv("ENV"))
-	nodeEnv := strings.ToLower(os.Getenv("NODE_ENV"))
-	return env == "production" || nodeEnv == "production"
+	return config.IsProductionEnv()
 }
 
 // QUAL-001: error / status messages reused across REST handlers. Extracted

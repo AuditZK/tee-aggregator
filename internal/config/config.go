@@ -16,7 +16,10 @@ type Config struct {
 	DatabaseURL   string
 	EncryptionKey []byte // 32 bytes for AES-256
 	Env           string
-	LogLevel      string // "debug", "info", "warn", "error"
+	// NodeEnv is the Node convention some deployments set instead of ENV;
+	// either one at "production" turns every production guard on.
+	NodeEnv  string
+	LogLevel string // "debug", "info", "warn", "error"
 
 	// Log streaming & metrics
 	LogStreamPort   int
@@ -232,6 +235,7 @@ func Load() *Config {
 		DatabaseURL:   getEnv("DATABASE_URL", ""),
 		EncryptionKey: getEncryptionKey(),
 		Env:           getEnv("ENV", "development"),
+		NodeEnv:       getEnv("NODE_ENV", ""),
 		LogLevel:      getEnv("LOG_LEVEL", "info"),
 
 		LogStreamPort:   getEnvInt("LOG_STREAM_PORT", 50052),
@@ -348,8 +352,24 @@ func parseMeasurementAllowlist(raw string) []string {
 	return out
 }
 
+// IsDevelopment is true unless production is declared (IsProductionEnv's
+// rule, applied to the loaded values).
 func (c *Config) IsDevelopment() bool {
-	return c.Env != "production"
+	return !isProduction(c.Env, c.NodeEnv)
+}
+
+// IsProductionEnv is the one definition of production (ARCH-008): ENV or
+// NODE_ENV set to "production", in any case. It reads the process
+// environment, for code that runs without a Config. Two rules used to
+// coexist: with ENV=Production the boot guards relaxed while the error
+// sanitizers and the mock-connector ban engaged.
+func IsProductionEnv() bool {
+	return isProduction(os.Getenv("ENV"), os.Getenv("NODE_ENV"))
+}
+
+func isProduction(env, nodeEnv string) bool {
+	return strings.EqualFold(strings.TrimSpace(env), "production") ||
+		strings.EqualFold(strings.TrimSpace(nodeEnv), "production")
 }
 
 func getEnv(key, fallback string) string {
