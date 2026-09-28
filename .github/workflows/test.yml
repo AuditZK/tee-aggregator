@@ -67,7 +67,7 @@ jobs:
       - name: Test against the production schema
         env:
           TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/postgres?sslmode=disable
-        run: go test ./internal/... ./pkg/... -count=1 -run 'TestDB|TestNew'
+        run: go test ./cmd/... ./internal/... ./pkg/... -count=1
 
   race:
     runs-on: ubuntu-latest

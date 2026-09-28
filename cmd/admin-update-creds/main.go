@@ -163,17 +163,42 @@ type updateCredsArgs struct {
 func updateTS(ctx context.Context, pool *pgxpool.Pool, enc *encryption.Service, args updateCredsArgs) error {
 	userUID, exchange, label := args.UserUID, args.Exchange, args.Label
 	apiKey, apiSecret, passphrase, dryRun := args.APIKey, args.APISecret, args.Passphrase, args.DryRun
-	encKey, err := enc.EncryptTSString(apiKey)
+
+	// SEC-01: the ciphertexts are bound to the row's user and id, so the row
+	// must be known, and unique, before anything is encrypted.
+	var rowID, rowUser string
+	var matches int
+	idRows, err := pool.Query(ctx, `SELECT id, "userUid" FROM exchange_connections
+	    WHERE "userUid" = $1 AND exchange = $2 AND TRIM(label) = TRIM($3)`, userUID, exchange, label)
+	if err != nil {
+		return fmt.Errorf("look up row: %w", err)
+	}
+	for idRows.Next() {
+		if err := idRows.Scan(&rowID, &rowUser); err != nil {
+			idRows.Close()
+			return fmt.Errorf("scan row: %w", err)
+		}
+		matches++
+	}
+	idRows.Close()
+	if matches != 1 {
+		return fmt.Errorf("%d rows match %s/%s/%q, want exactly 1", matches, userUID, exchange, label)
+	}
+	seal := func(field, plaintext string) (string, error) {
+		return enc.EncryptTSBound(plaintext, encryption.ConnectionFieldAAD(rowUser, rowID, field))
+	}
+
+	encKey, err := seal(encryption.FieldAPIKey, apiKey)
 	if err != nil {
 		return fmt.Errorf("encrypt api_key: %w", err)
 	}
-	encSecret, err := enc.EncryptTSString(apiSecret)
+	encSecret, err := seal(encryption.FieldAPISecret, apiSecret)
 	if err != nil {
 		return fmt.Errorf("encrypt api_secret: %w", err)
 	}
 	var encPass *string
 	if passphrase != "" {
-		v, err := enc.EncryptTSString(passphrase)
+		v, err := seal(encryption.FieldPassphrase, passphrase)
 		if err != nil {
 			return fmt.Errorf("encrypt passphrase: %w", err)
 		}
@@ -187,9 +212,7 @@ func updateTS(ctx context.Context, pool *pgxpool.Pool, enc *encryption.Service, 
 	        "encryptedPassphrase" = $3,
 	        "isActive" = true,
 	        "updatedAt" = NOW()
-	    WHERE "userUid" = $4
-	      AND exchange = $5
-	      AND TRIM(label) = TRIM($6)
+	    WHERE id = $4
 	    RETURNING id, "userUid", exchange, label, "isActive"`
 
 	if dryRun {
@@ -200,7 +223,7 @@ func updateTS(ctx context.Context, pool *pgxpool.Pool, enc *encryption.Service, 
 		return nil
 	}
 
-	rows, err := pool.Query(ctx, query, encKey, encSecret, encPass, userUID, exchange, label)
+	rows, err := pool.Query(ctx, query, encKey, encSecret, encPass, rowID)
 	if err != nil {
 		return err
 	}
