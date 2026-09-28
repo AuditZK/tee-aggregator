@@ -58,6 +58,9 @@ Thumbs.db
 *.pem
 *.key
 *.log
+# Public CA roots and a public chain, needed by the build and its tests
+!internal/rebuilderclient/isrg_roots.pem
+!internal/rebuilderclient/testdata/*.pem
 
 # Audit (local only, never commit)
 doc/AUDIT_PROMPT.md
