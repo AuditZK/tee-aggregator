@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 var ErrDecryptionFailed = errors.New("decryption failed: authentication error")
@@ -138,6 +139,13 @@ func (s *Service) DecryptWithAAD(data *EncryptedData, aad []byte) ([]byte, error
 // decrypt sides cannot drift on byte layout. The field argument is a short
 // constant ("api_key", "api_secret", "passphrase") that prevents an attacker
 // from swapping the three encrypted columns within the same row.
+// Credential columns, as named inside ConnectionFieldAAD.
+const (
+	FieldAPIKey     = "api_key"
+	FieldAPISecret  = "api_secret"
+	FieldPassphrase = "passphrase"
+)
+
 func ConnectionFieldAAD(userUID, connectionID, field string) []byte {
 	if userUID == "" || connectionID == "" || field == "" {
 		return nil
@@ -150,14 +158,92 @@ func ConnectionFieldAAD(userUID, connectionID, field string) []byte {
 // This allows the Go enclave to read credentials encrypted by the TS enclave
 // when deployed on the same hardware (same ENCRYPTION_KEY / DEK).
 func (s *Service) DecryptTSFormat(hexData string) ([]byte, error) {
+	return s.openTS(hexData, nil)
+}
+
+// DecryptTSString decrypts a TS-format hex string and returns a string.
+func (s *Service) DecryptTSString(hexData string) (string, error) {
+	plaintext, err := s.DecryptTSFormat(hexData)
+	if err != nil {
+		return "", err
+	}
+	return string(plaintext), nil
+}
+
+// EncryptTSFormat produces the single-column hex string used by the TS enclave
+// schema for encrypted credentials: hex(iv_16 || tag_16 || ciphertext).
+// The GCM nonce is 16 bytes to match the TS convention (not the stdlib 12).
+func (s *Service) EncryptTSFormat(plaintext []byte) (string, error) {
+	return s.sealTS(plaintext, nil)
+}
+
+// EncryptTSString is a string-typed convenience wrapper around EncryptTSFormat.
+func (s *Service) EncryptTSString(plaintext string) (string, error) {
+	return s.EncryptTSFormat([]byte(plaintext))
+}
+
+// boundTSPrefix marks a TS-layout value sealed with the AAD of the row that
+// holds it (SEC-01). Hex never contains a colon, so a value without it is
+// always one written before binding existed.
+const boundTSPrefix = "v2:"
+
+// IsBoundTS reports whether a stored TS-layout value is bound to its row.
+func IsBoundTS(stored string) bool {
+	return strings.HasPrefix(stored, boundTSPrefix)
+}
+
+// EncryptTSBound seals plaintext in the TS layout with aad bound into the
+// tag: moved to another row, or read with another field's aad, it no longer
+// opens.
+func (s *Service) EncryptTSBound(plaintext string, aad []byte) (string, error) {
+	if len(aad) == 0 {
+		return "", errors.New("encrypt bound credential: empty aad")
+	}
+	sealed, err := s.sealTS([]byte(plaintext), aad)
+	if err != nil {
+		return "", err
+	}
+	return boundTSPrefix + sealed, nil
+}
+
+// DecryptTSBound opens a value EncryptTSBound produced with the same aad.
+func (s *Service) DecryptTSBound(stored string, aad []byte) (string, error) {
+	if !IsBoundTS(stored) || len(aad) == 0 {
+		return "", ErrDecryptionFailed
+	}
+	plaintext, err := s.openTS(strings.TrimPrefix(stored, boundTSPrefix), aad)
+	if err != nil {
+		return "", err
+	}
+	return string(plaintext), nil
+}
+
+func (s *Service) sealTS(plaintext, aad []byte) (string, error) {
+	// PERF-003: s.aead16 is the cached 16-byte-nonce GCM (TS-format).
+	gcm := s.aead16
+
+	iv := make([]byte, tsIVLen)
+	if _, err := rand.Read(iv); err != nil {
+		return "", fmt.Errorf("generate iv: %w", err)
+	}
+
+	sealed := gcm.Seal(nil, iv, plaintext, aad)
+	tagSize := gcm.Overhead()
+	ciphertext := sealed[:len(sealed)-tagSize]
+	authTag := sealed[len(sealed)-tagSize:]
+
+	// TS layout: iv(16) + tag(16) + ciphertext, all hex-encoded.
+	return hex.EncodeToString(iv) + hex.EncodeToString(authTag) + hex.EncodeToString(ciphertext), nil
+}
+
+func (s *Service) openTS(hexData string, aad []byte) ([]byte, error) {
 	if len(hexData) < (tsIVLen+tsTagLen)*2 {
 		return nil, fmt.Errorf("ts encrypted data too short: %d chars", len(hexData))
 	}
 
-	// Parse hex-encoded components using stdlib hex.DecodeString
-	ivHex := hexData[:tsIVLen*2]                        // first 32 hex chars = 16 bytes IV
-	tagHex := hexData[tsIVLen*2 : (tsIVLen+tsTagLen)*2] // next 32 hex chars = 16 bytes tag
-	ciphertextHex := hexData[(tsIVLen+tsTagLen)*2:]     // remainder = ciphertext
+	ivHex := hexData[:tsIVLen*2]
+	tagHex := hexData[tsIVLen*2 : (tsIVLen+tsTagLen)*2]
+	ciphertextHex := hexData[(tsIVLen+tsTagLen)*2:]
 
 	iv, err := hex.DecodeString(ivHex)
 	if err != nil {
@@ -177,50 +263,14 @@ func (s *Service) DecryptTSFormat(hexData string) ([]byte, error) {
 	// PERF-003: s.aead16 is the cached 16-byte-nonce GCM (TS-format).
 	gcm := s.aead16
 
-	// Reconstruct sealed data (ciphertext + auth tag)
 	sealed := append(ciphertext, authTag...)
 
-	plaintext, err := gcm.Open(nil, iv, sealed, nil)
+	plaintext, err := gcm.Open(nil, iv, sealed, aad)
 	if err != nil {
 		return nil, ErrDecryptionFailed
 	}
 
 	return plaintext, nil
-}
-
-// DecryptTSString decrypts a TS-format hex string and returns a string.
-func (s *Service) DecryptTSString(hexData string) (string, error) {
-	plaintext, err := s.DecryptTSFormat(hexData)
-	if err != nil {
-		return "", err
-	}
-	return string(plaintext), nil
-}
-
-// EncryptTSFormat produces the single-column hex string used by the TS enclave
-// schema for encrypted credentials: hex(iv_16 || tag_16 || ciphertext).
-// The GCM nonce is 16 bytes to match the TS convention (not the stdlib 12).
-func (s *Service) EncryptTSFormat(plaintext []byte) (string, error) {
-	// PERF-003: s.aead16 is the cached 16-byte-nonce GCM (TS-format).
-	gcm := s.aead16
-
-	iv := make([]byte, tsIVLen)
-	if _, err := rand.Read(iv); err != nil {
-		return "", fmt.Errorf("generate iv: %w", err)
-	}
-
-	sealed := gcm.Seal(nil, iv, plaintext, nil)
-	tagSize := gcm.Overhead()
-	ciphertext := sealed[:len(sealed)-tagSize]
-	authTag := sealed[len(sealed)-tagSize:]
-
-	// TS layout: iv(16) + tag(16) + ciphertext, all hex-encoded.
-	return hex.EncodeToString(iv) + hex.EncodeToString(authTag) + hex.EncodeToString(ciphertext), nil
-}
-
-// EncryptTSString is a string-typed convenience wrapper around EncryptTSFormat.
-func (s *Service) EncryptTSString(plaintext string) (string, error) {
-	return s.EncryptTSFormat([]byte(plaintext))
 }
 
 const (
