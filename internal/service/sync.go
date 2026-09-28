@@ -1040,117 +1040,205 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		zap.String("exchange", connMeta.Exchange),
 		zap.String("label", connMeta.Label),
 	)
-
 	result := &SyncResult{
 		UserUID:  connMeta.UserUID,
 		Exchange: connMeta.Exchange,
 		Label:    connMeta.Label,
 	}
 
+	conn, ok := s.connectorFor(ctx, connMeta, result, start)
+	if !ok {
+		return result
+	}
+	s.reconstructIfEverySync(ctx, connMeta, conn, result)
+	balance, ok := s.liveBalance(ctx, conn, connMeta, result, start)
+	if !ok {
+		return result
+	}
+
+	// The snapshot lands at startOfDay (today 00:00 UTC), so trades and
+	// cashflows come from the window before it: 24h, or back to the last
+	// snapshot after a missed sync (activityWindowStart).
+	now := time.Now().UTC()
+	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	if s.skipStaleStatement(ctx, conn, connMeta, result, startOfDay) {
+		return result
+	}
+
+	act := s.readActivity(ctx, conn, connMeta, s.activityWindowStart(ctx, connMeta, startOfDay), now)
+	// After the cashflow read: Bybit and OKX find their gaps there.
+	s.collectCapabilityWarnings(conn, connMeta, result)
+	s.completeBreakdown(ctx, conn, connMeta, act.breakdown, balance)
+
+	deposits, withdrawals := s.reconcileCapitalFlow(ctx, connMeta, startOfDay, act.trades, balance.Equity, balance.UnrealizedPnL, act.fundingCharges, act.deposits, act.withdrawals)
+	// UX-001: the first snapshot of a connection that reported no cashflow
+	// books the balance it already holds as a deposit, so its returns have a
+	// base and the equity curve an inception marker.
+	if deposits == 0 && balance.Equity > 0 && s.isFirstSync(ctx, connMeta) {
+		deposits = balance.Equity
+	}
+
+	result.snapshot = &repository.Snapshot{
+		UserUID:   connMeta.UserUID,
+		Exchange:  connMeta.Exchange,
+		Label:     connMeta.Label,
+		Timestamp: startOfDay,
+		// equity == realized + unrealized. The available cash is not the
+		// realized balance: on a margin account it can be deeply negative
+		// while the equity is positive.
+		TotalEquity:     balance.Equity,
+		RealizedBalance: balance.Equity - balance.UnrealizedPnL,
+		UnrealizedPnL:   balance.UnrealizedPnL,
+		Deposits:        deposits,
+		Withdrawals:     withdrawals,
+		TotalTrades:     len(act.trades),
+		TotalVolume:     act.breakdown.totalVolume(),
+		TotalFees:       act.breakdown.totalFees(),
+		Breakdown:       act.breakdown.toRepo(balance.Equity, balance.Available, len(act.trades)),
+		// Explicit, so an upsert over a row once written as reconstructed
+		// flips it back to live.
+		IsHistorical: false,
+	}
+	result.TradeCount = len(act.trades)
+	result.SnapshotEquity = balance.Equity
+	result.SnapshotTimestamp = startOfDay
+
+	// Safety net (AUDIT_HL_DAILY_GAIN_BUG.md): flag implausible daily moves
+	// before they land in metrics. Detection only, the write still happens.
+	s.warnOnAberrantDailyMove(ctx, result.snapshot)
+
+	return result
+}
+
+// connectorFor decrypts the connection's credentials and returns its
+// connector, or records the failure on result.
+func (s *SyncService) connectorFor(ctx context.Context, connMeta *repository.ExchangeConnection, result *SyncResult, start time.Time) (connector.Connector, bool) {
 	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
 	if err != nil {
 		result.Error = egressSyncError("get credentials", err)
 		s.logger.Error(classifySyncError("get credentials: "+err.Error()), zap.String("exchange", connMeta.Exchange), zap.String("step", "decrypt"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
-		return result
+		return nil, false
 	}
-
 	conn, err := s.getOrCreateConnector(connMeta.Exchange, connMeta.UserUID, connMeta.Label, creds)
 	if err != nil {
 		result.Error = egressSyncError("create connector", err)
 		s.logger.Error(classifySyncError("create connector: "+err.Error()), zap.String("exchange", connMeta.Exchange), zap.String("step", "connector"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
-		return result
+		return nil, false
 	}
+	return conn, true
+}
 
-	// History reconstruction (see syncConnection for the gating rules). The
-	// scheduler path goes through buildConnectionSnapshot, not syncConnection,
-	// so we duplicate the call here to cover both manual and scheduled syncs.
-	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
-		// IBKR and cTrader re-run reconstruction every sync; others reconstruct
-		// ONCE at connect via ReconstructHistoryOnConnect. IBKR re-emits its full
-		// Flex window cheaply; cTrader re-runs a BOUNDED recent window
-		// (everySyncReconstructSince) to self-heal the live/reconstruction
-		// boundary deposit double-count. Gated INSIDE the HistoricalSnapshotProvider
-		// type assertion, so live-only exchanges (HL/MEXC/Lighter) are unaffected.
-		if reconstructsEverySync(connMeta.Exchange) {
-			noteReconstructionFailure(result, s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange), reconstructOpts{}))
-		}
+// reconstructIfEverySync re-runs the history reconstruction of the venues
+// that do it on every sync. IBKR re-emits its full Flex window cheaply;
+// cTrader re-runs a bounded recent window (everySyncReconstructSince) to heal
+// the live/reconstruction boundary deposit double-count. Every other venue
+// reconstructs once, at connect (ReconstructHistoryOnConnect).
+func (s *SyncService) reconstructIfEverySync(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, result *SyncResult) {
+	hsp, ok := conn.(connector.HistoricalSnapshotProvider)
+	if !ok || !reconstructsEverySync(connMeta.Exchange) {
+		return
 	}
+	noteReconstructionFailure(result, s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange), reconstructOpts{}))
+}
 
+// liveBalance reads the balance through the collapse guard, or records the
+// failure on result.
+func (s *SyncService) liveBalance(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, result *SyncResult, start time.Time) (*connector.Balance, bool) {
 	balance, err := s.fetchBalanceWithCollapseGuard(ctx, conn, connMeta)
 	if err != nil {
 		result.Error = egressSyncError("get balance", err)
 		result.RateLimited = isRateLimitError(err.Error())
 		s.logger.Error(classifySyncError("get balance: "+err.Error()), zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.String("step", "get_balance"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
-		return result
+		return nil, false
 	}
 	s.logger.Info("balance fetched", zap.String("exchange", connMeta.Exchange), zap.String("label", connMeta.Label), zap.Duration("elapsed", time.Since(start)))
+	return balance, true
+}
 
-	// Same window semantics as syncConnection above: the snapshot lands at
-	// startOfDay (today 00:00 UTC), so we pull trades/cashflows from the
-	// preceding window — 24h normally, stretched back to the last snapshot
-	// when a sync was missed (see activityWindowStart).
-	now := time.Now().UTC()
-	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-
-	// Freshness guard (root fix, audit 2026-08-01): refuse to stamp a stale
-	// statement figure with today's date — that fabricated the J−2 phantom
-	// snapshots. Writing nothing is honest (the reconstruction fills the day),
-	// and the deferred retry picks up the fresh statement the same day, the
-	// same recovery already used for the shared-token 1018 race.
-	if reason := staleBalanceSkipReason(conn, startOfDay); reason != "" {
-		result.Skipped = true
-		result.SkipReason = reason
-		s.logger.Warn("skipping live snapshot: stale statement",
-			zap.String("user_uid", connMeta.UserUID),
-			zap.String("exchange", connMeta.Exchange),
-			zap.String("label", connMeta.Label),
-			zap.String("reason", reason),
-		)
-		s.collectCapabilityWarnings(conn, connMeta, result)
-		s.recordRateLimitHit(ctx, connMeta)
-		s.scheduleDeferredRetry(connMeta, rateLimitRetryDelay)
-		return result
+// skipStaleStatement refuses to stamp a statement older than the last
+// trading day with today's date, which fabricated phantom snapshots (audit
+// 2026-08-01). Writing nothing is honest: the reconstruction fills the day
+// and the deferred retry picks up the fresh statement.
+func (s *SyncService) skipStaleStatement(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, result *SyncResult, startOfDay time.Time) bool {
+	reason := staleBalanceSkipReason(conn, startOfDay)
+	if reason == "" {
+		return false
 	}
+	result.Skipped = true
+	result.SkipReason = reason
+	s.logger.Warn("skipping live snapshot: stale statement",
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("label", connMeta.Label),
+		zap.String("reason", reason),
+	)
+	s.collectCapabilityWarnings(conn, connMeta, result)
+	s.recordRateLimitHit(ctx, connMeta)
+	s.scheduleDeferredRetry(connMeta, rateLimitRetryDelay)
+	return true
+}
 
-	activityStart := s.activityWindowStart(ctx, connMeta, startOfDay)
+// liveActivity is what a sync reads over its activity window.
+type liveActivity struct {
+	trades         []*connector.Trade
+	breakdown      *aggregatedBreakdown
+	fundingCharges float64
+	deposits       float64
+	withdrawals    float64
+}
 
-	var trades []*connector.Trade
+// readActivity reads the window's trades, funding fees and cashflows. Trades
+// and funding fees are best-effort.
+func (s *SyncService) readActivity(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, from, now time.Time) liveActivity {
+	var act liveActivity
 	var swapSymbols []string
-	trades, _ = conn.GetTrades(ctx, activityStart, now)
-	for _, t := range trades {
+	act.trades, _ = conn.GetTrades(ctx, from, now)
+	for _, t := range act.trades {
 		if t.MarketType == connector.MarketSwap {
 			swapSymbols = appendUnique(swapSymbols, t.Symbol)
 		}
 	}
+	act.breakdown = s.aggregateTrades(act.trades)
 
-	breakdown := s.aggregateTrades(trades)
-
-	var fundingCharges float64
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
-		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, activityStart); err == nil {
+		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, from); err == nil {
 			for _, f := range fees {
-				fundingCharges += f.Amount
+				act.fundingCharges += f.Amount
 			}
-			breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = fundingCharges
+			act.breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = act.fundingCharges
 		}
 	}
+	act.deposits, act.withdrawals = s.readCashflows(ctx, conn, connMeta, from)
+	return act
+}
 
-	var deposits, withdrawals float64
-	if cfFetcher, ok := conn.(connector.CashflowFetcher); ok {
-		if cashflows, err := cfFetcher.GetCashflows(ctx, activityStart); err == nil {
-			for _, cf := range cashflows {
-				if cf.Amount > 0 {
-					deposits += cf.Amount
-				} else {
-					withdrawals += -cf.Amount
-				}
-			}
+// readCashflows sums the window's deposits and withdrawals. A failed read is
+// logged and leaves the window without flows.
+func (s *SyncService) readCashflows(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, from time.Time) (deposits, withdrawals float64) {
+	cfFetcher, ok := conn.(connector.CashflowFetcher)
+	if !ok {
+		return 0, 0
+	}
+	cashflows, err := cfFetcher.GetCashflows(ctx, from)
+	if err != nil {
+		s.warnCashflowFetchFailed(connMeta, err)
+		return 0, 0
+	}
+	for _, cf := range cashflows {
+		if cf.Amount > 0 {
+			deposits += cf.Amount
 		} else {
-			s.warnCashflowFetchFailed(connMeta, err)
+			withdrawals -= cf.Amount
 		}
 	}
-	s.collectCapabilityWarnings(conn, connMeta, result)
+	return deposits, withdrawals
+}
 
+// completeBreakdown fills each market's equity from the connector when it
+// reports one, and otherwise gives the whole equity to the venue's primary
+// market: breakdown_by_market must always carry equity, the gRPC mapper
+// builds the global aggregate from it.
+func (s *SyncService) completeBreakdown(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, breakdown *aggregatedBreakdown, balance *connector.Balance) {
 	if bmFetcher, ok := conn.(connector.BalanceByMarketFetcher); ok {
 		if marketBalances, err := bmFetcher.GetBalanceByMarket(ctx); err == nil {
 			s.enrichBreakdownWithBalances(breakdown, marketBalances)
@@ -1161,55 +1249,11 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 			)
 		}
 	}
-
-	// TS parity: breakdown_by_market must always carry equity (same as
-	// syncConnection step 7b above).
 	if !breakdown.hasAnyEquity() {
 		m := breakdown.getOrCreateMarket(primaryMarketType(connMeta.Exchange))
 		m.equity = balance.Equity
 		m.availableMargin = balance.Available
 	}
-
-	// Balance-reconciled capital flow: same override as the non-atomic path
-	// (doc/plan-balance-reconciled-cashflow.md). No-op for ineligible exchanges.
-	deposits, withdrawals = s.reconcileCapitalFlow(ctx, connMeta, startOfDay, trades, balance.Equity, balance.UnrealizedPnL, fundingCharges, deposits, withdrawals)
-
-	// Inception-deposit convention (UX-001): see the non-atomic path above
-	// for the full rationale. Both call sites need the same fallback,
-	// otherwise the atomic-sync flow leaves new connections with deposits=0
-	// when the connector lacks CashflowFetcher.
-	if deposits == 0 && balance.Equity > 0 && s.isFirstSync(ctx, connMeta) {
-		deposits = balance.Equity
-	}
-
-	// TS parity: realizedBalance = equity - unrealizedPnL. See the non-atomic
-	// path above for the full rationale.
-	result.snapshot = &repository.Snapshot{
-		UserUID:         connMeta.UserUID,
-		Exchange:        connMeta.Exchange,
-		Label:           connMeta.Label,
-		Timestamp:       startOfDay,
-		TotalEquity:     balance.Equity,
-		RealizedBalance: balance.Equity - balance.UnrealizedPnL,
-		UnrealizedPnL:   balance.UnrealizedPnL,
-		Deposits:        deposits,
-		Withdrawals:     withdrawals,
-		TotalTrades:     len(trades),
-		TotalVolume:     breakdown.totalVolume(),
-		TotalFees:       breakdown.totalFees(),
-		Breakdown:       breakdown.toRepo(balance.Equity, balance.Available, len(trades)),
-		// Live snapshot: see syncConnection above for rationale.
-		IsHistorical: false,
-	}
-	result.TradeCount = len(trades)
-	result.SnapshotEquity = balance.Equity
-	result.SnapshotTimestamp = startOfDay
-
-	// Safety net (AUDIT_HL_DAILY_GAIN_BUG.md): flag implausible daily moves
-	// before they land in metrics. Detection only, the write still happens.
-	s.warnOnAberrantDailyMove(ctx, result.snapshot)
-
-	return result
 }
 
 // A missed deposit reads as performance for the day, so the failure is an
