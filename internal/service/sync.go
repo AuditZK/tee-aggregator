@@ -2941,12 +2941,21 @@ func (s *SyncService) fetchBalanceWithCollapseGuard(ctx context.Context, conn co
 	if err2 != nil {
 		return nil, fmt.Errorf("collapse-guard re-read: %w", err2)
 	}
-	s.logger.Info("collapse-guard re-read result (SANITY-001)",
+	log, msg := s.logger.Info, "collapse-guard re-read result (SANITY-001)"
+	if second.Equity < lastEquity*collapseGuardRatio {
+		// Persisted as measured: a liquidation reads exactly like this, and
+		// refusing it would hide a real loss. Operator-only, on purpose: any
+		// sync-status marker but an `_unpriced:` one tells the user to
+		// recreate their key, which is the wrong message after a crash.
+		log, msg = s.logger.Warn, "balance collapse confirmed on re-read, persisted as measured (SANITY-001)"
+	}
+	log(msg,
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
 		zap.String("label", connMeta.Label),
 		zap.Float64("first_equity", balance.Equity),
 		zap.Float64("second_equity", second.Equity),
+		zap.Float64("last_equity", lastEquity),
 	)
 	return second, nil
 }
