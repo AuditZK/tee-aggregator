@@ -176,6 +176,8 @@ CREATE INDEX "signed_reports_userUid_idx" ON public.signed_reports USING btree (
 
 CREATE UNIQUE INDEX "signed_reports_userUid_startDate_endDate_benchmark_key" ON public.signed_reports USING btree ("userUid", "startDate", "endDate", benchmark);
 
+CREATE INDEX idx_signed_reports_user_created ON public.signed_reports USING btree ("userUid", "createdAt" DESC);
+
 CREATE INDEX snapshot_data_exchange_timestamp_idx ON public.snapshot_data USING btree (exchange, "timestamp");
 
 CREATE UNIQUE INDEX "snapshot_data_userUid_timestamp_exchange_label_key" ON public.snapshot_data USING btree ("userUid", "timestamp", exchange, label);
