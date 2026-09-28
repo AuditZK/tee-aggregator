@@ -50,6 +50,10 @@ type Server struct {
 	// already holds the DEK; set by tests, which have no enclave to unwrap.
 	probeSvc balanceProbeRunner
 
+	// reflowSvc overrides the reflower behind the admin reflow endpoint, for
+	// the same reason as probeSvc.
+	reflowSvc cashflowReflower
+
 	// handoffHandler, when non-nil, exposes the B2 handoff endpoint
 	// at POST /api/v1/admin/handoff. Successor enclaves use this to
 	// fetch the master key from this instance during an upgrade window.
@@ -140,6 +144,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/admin/refresh-metadata", s.localhostOnly(s.handleAdminRefreshMetadata))
 	mux.HandleFunc("/api/v1/admin/raw-statement", s.localhostOnly(s.handleAdminRawStatement))
 	mux.HandleFunc("/api/v1/admin/funding-probe", s.localhostOnly(s.handleAdminFundingProbe))
+	mux.HandleFunc("/api/v1/admin/reflow", s.localhostOnly(s.handleAdminReflow))
 
 	// B2 handoff: deliberately NOT gated by localhostOnly because the
 	// successor enclave runs in a different container with a non-loopback
@@ -765,6 +770,68 @@ func (s *Server) handleAdminFundingProbe(w http.ResponseWriter, r *http.Request)
 		zap.Int("bills", len(probe.Bills)),
 	)
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "funding": probe})
+}
+
+// cashflowReflower is the slice of the sync service the reflow endpoint needs.
+type cashflowReflower interface {
+	ReflowCashflows(ctx context.Context, userUID, exchange, label string, from, to time.Time, apply bool) ([]service.ReflowDay, error)
+}
+
+func (s *Server) reflower() cashflowReflower {
+	if s.reflowSvc != nil {
+		return s.reflowSvc
+	}
+	if s.handler == nil || s.handler.syncSvc == nil {
+		return nil
+	}
+	return s.handler.syncSvc
+}
+
+// handleAdminReflow re-derives a connection's stored deposits and withdrawals
+// between from and to under the current cashflow classification. A dry run
+// unless apply=1: the response lists every day as stored and as it would be.
+func (s *Server) handleAdminReflow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	from, ferr := time.Parse("2006-01-02", q.Get("from"))
+	to, terr := time.Parse("2006-01-02", q.Get("to"))
+	if ferr != nil || terr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from and to are required, YYYY-MM-DD"})
+		return
+	}
+	apply := q.Get("apply") == "1"
+
+	reflower := s.reflower()
+	if reflower == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+	extendWriteDeadline(w, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	days, err := reflower.ReflowCashflows(ctx, userUID, exchange, label, from, to, apply)
+	if err != nil {
+		s.log().Error("admin reflow failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "apply": apply, "count": len(days), "days": days})
 }
 
 // adminReconstructTimeout outlasts the rebuilder call it waits on: expiring
