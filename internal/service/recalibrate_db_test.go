@@ -66,12 +66,17 @@ func (f *fakeRebuilder) serve(t *testing.T) *httptest.Server {
 // snapshot written.
 func (h *dbHarness) seedRecalibrationCandidate(t *testing.T, consented bool) *repository.ExchangeConnection {
 	t.Helper()
+	return h.seedRecalibrationCandidateCreated(t, consented, startOfTodayUTC().Add(-12*time.Hour))
+}
+
+func (h *dbHarness) seedRecalibrationCandidateCreated(t *testing.T, consented bool, createdAt time.Time) *repository.ExchangeConnection {
+	t.Helper()
 	h.seedConnection(t, "binance", "main", dbKey, dbSecret)
 	conn, err := h.conns.GetByUserExchangeLabel(h.ctx, dbUser, "binance", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.pool.Exec(h.ctx, `UPDATE exchange_connections SET "createdAt" = $1`, startOfTodayUTC().Add(-12*time.Hour)); err != nil {
+	if _, err := h.pool.Exec(h.ctx, `UPDATE exchange_connections SET "createdAt" = $1`, createdAt); err != nil {
 		t.Fatal(err)
 	}
 	if consented {
@@ -132,28 +137,46 @@ func TestDBRecalibrationRewritesHistoryAndFinalizes(t *testing.T) {
 	}
 }
 
+type countingMetrics struct{ counts map[string]int }
+
+func (c *countingMetrics) IncrCounter(name string, _ ...string) { c.counts[name]++ }
+
 func TestDBRecalibrationFailureLeavesConnectionForRetry(t *testing.T) {
-	core, logs := observer.New(zapcore.DebugLevel)
-	h := newDBHarness(t)
-	h.sync.logger = zap.New(core)
-	h.seedRecalibrationCandidate(t, true)
-	fake := &fakeRebuilder{fail: true}
-	h.sync.SetRebuilderClient(rebuilderclient.New(fake.serve(t).URL, rebuilderToken, zap.NewNop()))
+	cases := []struct {
+		name      string
+		createdAt time.Time
+		level     zapcore.Level
+	}{
+		{"first night stays a warning", startOfTodayUTC().Add(-12 * time.Hour), zapcore.WarnLevel},
+		{"third night is raised", startOfTodayUTC().Add(-60 * time.Hour), zapcore.ErrorLevel},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			core, logs := observer.New(zapcore.DebugLevel)
+			h := newDBHarness(t)
+			h.sync.logger = zap.New(core)
+			counters := &countingMetrics{counts: map[string]int{}}
+			h.sync.SetMetrics(counters)
+			h.seedRecalibrationCandidateCreated(t, true, tc.createdAt)
+			fake := &fakeRebuilder{fail: true}
+			h.sync.SetRebuilderClient(rebuilderclient.New(fake.serve(t).URL, rebuilderToken, zap.NewNop()))
 
-	h.sync.RecalibrateRebuiltHistories(h.ctx)
+			h.sync.RecalibrateRebuiltHistories(h.ctx)
 
-	if fake.calls.Load() != 1 {
-		t.Fatalf("rebuilder calls = %d, want 1", fake.calls.Load())
-	}
-	if at := h.finalizedAt(t); at != nil {
-		t.Errorf("failed recalibration stamped finalized at %v", at)
-	}
-	failed := logs.FilterMessage("midnight recalibration: connection failed").All()
-	if len(failed) != 1 || failed[0].Level != zapcore.WarnLevel {
-		t.Fatalf("failure log = %+v, want one Warn", failed)
-	}
-	if errs := logs.FilterLevelExact(zapcore.ErrorLevel).Len(); errs != 0 {
-		t.Errorf("%d Error logs on a single failure", errs)
+			if fake.calls.Load() != 1 {
+				t.Fatalf("rebuilder calls = %d, want 1", fake.calls.Load())
+			}
+			if at := h.finalizedAt(t); at != nil {
+				t.Errorf("failed recalibration stamped finalized at %v", at)
+			}
+			failed := logs.FilterMessage("midnight recalibration: connection failed").All()
+			if len(failed) != 1 || failed[0].Level != tc.level {
+				t.Fatalf("failure log = %+v, want one at %v", failed, tc.level)
+			}
+			if got := counters.counts["recalibration_failures_total"]; got != 1 {
+				t.Errorf("recalibration_failures_total += %d, want 1", got)
+			}
+		})
 	}
 }
 

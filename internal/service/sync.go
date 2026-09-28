@@ -305,6 +305,19 @@ type SyncService struct {
 	// the same single-use refresh token — whichever refreshes second is
 	// rejected, and the pair the loser then persists is already dead.
 	connectorGroup singleflight.Group
+
+	// counters is optional; nil when the metrics server is off.
+	counters counterIncrementer
+}
+
+// counterIncrementer is the slice of the metrics server the service feeds.
+type counterIncrementer interface {
+	IncrCounter(name string, labels ...string)
+}
+
+// SetMetrics wires the Prometheus counters. Nil-safe.
+func (s *SyncService) SetMetrics(c counterIncrementer) {
+	s.counters = c
 }
 
 // NewSyncService creates a new sync service
@@ -1957,6 +1970,19 @@ func externalRebuilderSupports(exchange string) bool {
 // re-egressing credentials to the rebuilder on every nightly tick forever.
 const maxRebuildRetryDays = 7
 
+// recalibrationErrorAfterNights: one failed night is routine, a venue
+// hiccup the next night repairs. A second is raised to Error so errtrack
+// shows it before the retry window closes on it without a word (OPS-02: the
+// 2026-05-28 failures went unseen for days).
+const recalibrationErrorAfterNights = 2
+
+// nightsUnfinalized counts the midnight passes a connection has been through
+// since it was created, the day it was created excluded.
+func nightsUnfinalized(createdAt, cutoff time.Time) int {
+	created := createdAt.UTC().Truncate(24 * time.Hour)
+	return int(cutoff.Sub(created) / (24 * time.Hour))
+}
+
 // ErrHistoryNotDeletable is returned for a connection whose history was
 // reconstructed inside the perimeter. Those rows are indistinguishable from
 // live ones on the production schema, so there is nothing safe to delete.
@@ -2077,12 +2103,22 @@ func (s *SyncService) RecalibrateRebuiltHistories(ctx context.Context) {
 				continue
 			}
 			failed++
+			if s.counters != nil {
+				s.counters.IncrCounter("recalibration_failures_total")
+			}
+			nights := nightsUnfinalized(conn.CreatedAt, cutoff)
+			log := s.logger.Warn
+			if nights >= recalibrationErrorAfterNights {
+				log = s.logger.Error
+			}
 			// LOG-CREDS-001: identifiers only — recalibrateOne wraps every
 			// error so the resulting string never contains plaintext creds.
-			s.logger.Warn("midnight recalibration: connection failed",
+			log("midnight recalibration: connection failed",
 				zap.String("user_uid", conn.UserUID),
 				zap.String("exchange", conn.Exchange),
 				zap.String("label", conn.Label),
+				zap.Int("nights_unfinalized", nights),
+				zap.Int("retried_for_nights", maxRebuildRetryDays),
 				zap.Error(err),
 			)
 			continue

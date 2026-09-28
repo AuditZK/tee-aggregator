@@ -650,6 +650,9 @@ func main() {
 		if measurementRecovered {
 			metricsServer.IncrCounter("enclave_measurement_recovery_total")
 		}
+		if syncSvc != nil {
+			syncSvc.SetMetrics(metricsServer)
+		}
 	}
 
 	// 18. Start sync scheduler (honours ENABLE_DAILY_SYNC)
