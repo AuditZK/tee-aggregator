@@ -198,11 +198,14 @@ func (w dayWindow) filter(hs []*connector.HistoricalSnapshot) []*connector.Histo
 // take the second reading: a transient zero heals, a real crash reads the
 // same twice and stands.
 const (
-	collapseGuardRatio    = 0.5             // re-read when equity < 50% of the last snapshot
-	collapseGuardFloorUSD = 100.0           // dust accounts skip the guard (noise)
-	collapseGuardDelay    = 2 * time.Minute // long enough to exit a settlement window
+	collapseGuardRatio    = 0.5   // re-read when equity < 50% of the last snapshot
+	collapseGuardFloorUSD = 100.0 // dust accounts skip the guard (noise)
 	collapseGuardLookback = 5 * 24 * time.Hour
 )
+
+// collapseGuardDelay is long enough to exit a settlement window. A variable
+// only so tests can run the guard without waiting it out.
+var collapseGuardDelay = 2 * time.Minute
 
 // ctraderRecurringReconstructDays bounds cTrader's every-sync reconstruction
 // window. The deep historical backfill runs once at connect (since=zero); the
