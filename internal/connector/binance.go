@@ -46,6 +46,8 @@ type Binance struct {
 	// tried", not "did we try everything the account holds" — Earn is not
 	// fetched at all and therefore not listed.
 	coverage []WalletCoverage
+	// cashflowNotes carries the markers the last GetCashflows raised.
+	cashflowNotes cashflowNotes
 }
 
 // Binance wallet names. Their own vocabulary, not market types: cross and
@@ -56,6 +58,11 @@ const (
 	binanceWalletCoinM    = "coinm_futures"
 	binanceWalletCross    = "cross_margin"
 	binanceWalletIsolated = "isolated_margin"
+
+	// Wallets GetBalance does not read: a transfer to one leaves the equity.
+	binanceWalletFunding = "funding"
+	binanceWalletOption  = "option"
+	binanceWalletMining  = "mining"
 )
 
 // Coverage implements CoverageReporter.
@@ -281,12 +288,13 @@ func (b *Binance) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error
 	return slices.Clone(b.cachedBreakdown), nil
 }
 
-// CapabilityWarnings implements CapabilityWarner with the key-scope gaps
-// discovered by the last GetBalance call.
+// CapabilityWarnings implements CapabilityWarner with the key-scope gaps the
+// last GetBalance found and the flows the last GetCashflows could not value.
 func (b *Binance) CapabilityWarnings() []string {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return slices.Clone(b.capabilityWarnings)
+	out := slices.Clone(b.capabilityWarnings)
+	b.mu.Unlock()
+	return append(out, b.cashflowNotes.get()...)
 }
 
 func (b *Binance) getSpotBalance(ctx context.Context, priceMap map[string]float64) (*Balance, error) {
@@ -717,26 +725,84 @@ func (b *Binance) getFuturesTrades(ctx context.Context, start, end time.Time) ([
 	return trades, nil
 }
 
-// binanceExternalTransferTypes are the universal-transfer types with exactly
-// one side inside the tracked perimeter (spot MAIN + UMFUTURE): money through
-// them is a real deposit/withdrawal from the timeline's perspective. Sign:
-// +1 = into the perimeter, -1 = out. MAIN_UMFUTURE / UMFUTURE_MAIN move value
-// between the two tracked wallets and are deliberately absent (they cancel).
-// Must mirror the rebuilder's table (history-rebuilder-go exchanges/binance)
-// so live and rebuilt cashflows stay consistent across the stitch.
-var binanceExternalTransferTypes = map[string]float64{
-	"FUNDING_MAIN":     +1,
-	"MAIN_FUNDING":     -1,
-	"FUNDING_UMFUTURE": +1,
-	"UMFUTURE_FUNDING": -1,
-	"MARGIN_MAIN":      +1,
-	"MAIN_MARGIN":      -1,
-	"CMFUTURE_MAIN":    +1,
-	"MAIN_CMFUTURE":    -1,
-	"MAIN_OPTION":      -1,
-	"OPTION_MAIN":      +1,
-	"MAIN_MINING":      -1,
-	"MINING_MAIN":      +1,
+// binanceTransferWallets maps each universal-transfer type to the wallets it
+// moves value between. Whether a type is a cashflow is not a property of the
+// type: it depends on which wallets the equity measures (binanceTransferSign).
+var binanceTransferWallets = map[string][2]string{
+	"MAIN_UMFUTURE":         {binanceWalletSpot, binanceWalletUM},
+	"UMFUTURE_MAIN":         {binanceWalletUM, binanceWalletSpot},
+	"MAIN_CMFUTURE":         {binanceWalletSpot, binanceWalletCoinM},
+	"CMFUTURE_MAIN":         {binanceWalletCoinM, binanceWalletSpot},
+	"MAIN_MARGIN":           {binanceWalletSpot, binanceWalletCross},
+	"MARGIN_MAIN":           {binanceWalletCross, binanceWalletSpot},
+	"UMFUTURE_MARGIN":       {binanceWalletUM, binanceWalletCross},
+	"MARGIN_UMFUTURE":       {binanceWalletCross, binanceWalletUM},
+	"CMFUTURE_MARGIN":       {binanceWalletCoinM, binanceWalletCross},
+	"MARGIN_CMFUTURE":       {binanceWalletCross, binanceWalletCoinM},
+	"ISOLATEDMARGIN_MARGIN": {binanceWalletIsolated, binanceWalletCross},
+	"MARGIN_ISOLATEDMARGIN": {binanceWalletCross, binanceWalletIsolated},
+	"MAIN_ISOLATED_MARGIN":  {binanceWalletSpot, binanceWalletIsolated},
+	"ISOLATED_MARGIN_MAIN":  {binanceWalletIsolated, binanceWalletSpot},
+	"MAIN_FUNDING":          {binanceWalletSpot, binanceWalletFunding},
+	"FUNDING_MAIN":          {binanceWalletFunding, binanceWalletSpot},
+	"UMFUTURE_FUNDING":      {binanceWalletUM, binanceWalletFunding},
+	"FUNDING_UMFUTURE":      {binanceWalletFunding, binanceWalletUM},
+	"CMFUTURE_FUNDING":      {binanceWalletCoinM, binanceWalletFunding},
+	"FUNDING_CMFUTURE":      {binanceWalletFunding, binanceWalletCoinM},
+	"MARGIN_FUNDING":        {binanceWalletCross, binanceWalletFunding},
+	"FUNDING_MARGIN":        {binanceWalletFunding, binanceWalletCross},
+	"MAIN_OPTION":           {binanceWalletSpot, binanceWalletOption},
+	"OPTION_MAIN":           {binanceWalletOption, binanceWalletSpot},
+	"UMFUTURE_OPTION":       {binanceWalletUM, binanceWalletOption},
+	"OPTION_UMFUTURE":       {binanceWalletOption, binanceWalletUM},
+	"MARGIN_OPTION":         {binanceWalletCross, binanceWalletOption},
+	"OPTION_MARGIN":         {binanceWalletOption, binanceWalletCross},
+	"MAIN_MINING":           {binanceWalletSpot, binanceWalletMining},
+	"MINING_MAIN":           {binanceWalletMining, binanceWalletSpot},
+}
+
+// binanceLiveWallets are the wallets GetBalance sums into the equity.
+var binanceLiveWallets = []string{binanceWalletSpot, binanceWalletUM, binanceWalletCoinM, binanceWalletCross, binanceWalletIsolated}
+
+// binanceTransferSign is +1 when the transfer brings value into the measured
+// wallets, -1 when it takes value out, 0 when it moves value between two of
+// them or between two it does not measure.
+func binanceTransferSign(typ string, measured map[string]bool) float64 {
+	w, ok := binanceTransferWallets[typ]
+	if !ok {
+		return 0
+	}
+	from, to := measured[w[0]], measured[w[1]]
+	switch {
+	case to && !from:
+		return +1
+	case from && !to:
+		return -1
+	}
+	return 0
+}
+
+// measuredWallets is what the last GetBalance actually read. A wallet the key
+// cannot open is outside the equity, so money moved into it did leave. With no
+// balance read yet (an operator dump of cashflows alone), every live wallet
+// counts.
+func (b *Binance) measuredWallets() map[string]bool {
+	b.mu.Lock()
+	coverage := slices.Clone(b.coverage)
+	b.mu.Unlock()
+	out := map[string]bool{}
+	if len(coverage) == 0 {
+		for _, w := range binanceLiveWallets {
+			out[w] = true
+		}
+		return out
+	}
+	for _, c := range coverage {
+		if c.Status == WalletRead {
+			out[c.Wallet] = true
+		}
+	}
+	return out
 }
 
 func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
@@ -749,8 +815,11 @@ func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflo
 		}
 	}
 
-	// Price map only fetched lazily, on the first non-stable coin seen.
+	// Price map only fetched lazily, on the first non-stable coin seen. A
+	// flow no price can value is left out rather than booked at a guess, and
+	// named in the warnings so its absence from the returns is visible.
 	var priceMap map[string]float64
+	unpriced := unpricedAssets{}
 	usdValue := func(coin string, qty float64) float64 {
 		if IsStablecoinUSD(coin) {
 			return qty
@@ -765,8 +834,12 @@ func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflo
 		if p := priceMap[strings.ToUpper(coin)+"USDT"]; p > 0 {
 			return qty * p
 		}
-		return 0 // unpriceable dust — never fabricate a flow from it
+		if qty != 0 {
+			unpriced.add(coin)
+		}
+		return 0
 	}
+	defer func() { b.cashflowNotes.set(unpriced.markers("binance")) }()
 
 	// On-chain flows are load-bearing: a broken deposit feed silently books
 	// every inflow as trading gain, so their errors fail the fetch.
@@ -778,7 +851,7 @@ func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflo
 	}
 	// Universal transfers are best-effort per type: a key without a given
 	// wallet product errors for that type, which must not zero the flows above.
-	b.fetchExternalTransfers(ctx, since, now, add, usdValue)
+	b.fetchExternalTransfers(ctx, since, now, b.measuredWallets(), add, usdValue)
 	b.fetchSubAccountAndStrayFlows(ctx, since, now, add, usdValue)
 	b.fetchFiatFlows(ctx, since, now, add, usdValue)
 
@@ -842,8 +915,12 @@ func (b *Binance) fetchOnChainWithdrawals(ctx context.Context, since, now time.T
 	return nil
 }
 
-func (b *Binance) fetchExternalTransfers(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) {
-	for typ, sign := range binanceExternalTransferTypes {
+func (b *Binance) fetchExternalTransfers(ctx context.Context, since, now time.Time, measured map[string]bool, add func(time.Time, float64), usdValue func(string, float64) float64) {
+	for typ := range binanceTransferWallets {
+		sign := binanceTransferSign(typ, measured)
+		if sign == 0 {
+			continue
+		}
 		params := url.Values{}
 		params.Set("type", typ)
 		params.Set("startTime", strconv.FormatInt(since.UnixMilli(), 10))

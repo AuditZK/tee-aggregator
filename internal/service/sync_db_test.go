@@ -12,6 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/trackrecord/enclave/internal/cache"
 	"github.com/trackrecord/enclave/internal/connector"
@@ -324,16 +326,19 @@ func TestDBCollapseGuard(t *testing.T) {
 	t.Cleanup(func() { collapseGuardDelay = prev })
 
 	cases := []struct {
-		name   string
-		second float64
+		name          string
+		second        float64
+		operatorWarns int
 	}{
-		{"transient zero heals", 950},
-		{"confirmed collapse stands", 100},
+		{"transient zero heals", 950, 0},
+		{"confirmed collapse stands", 100, 1},
 	}
 	for _, p := range syncPaths {
 		for _, tc := range cases {
 			t.Run(p.name+"/"+tc.name, func(t *testing.T) {
+				core, logs := observer.New(zapcore.DebugLevel)
 				h := newDBHarness(t)
+				h.sync.logger = zap.New(core)
 				h.seedConnection(t, "binance", "main", dbKey, dbSecret)
 				if err := h.snaps.Upsert(h.ctx, &repository.Snapshot{
 					UserUID: dbUser, Exchange: "binance", Label: "main",
@@ -357,8 +362,12 @@ func TestDBCollapseGuard(t *testing.T) {
 				if snap := h.snapshotToday(t, "binance", "main"); snap.TotalEquity != tc.second {
 					t.Errorf("persisted equity = %v, want the second reading %v", snap.TotalEquity, tc.second)
 				}
+				// A marker here would tell the user to recreate their key.
 				if st := h.status(t, "binance", "main"); st.ErrorMessage != "" {
 					t.Errorf("errorMessage = %q, want none", st.ErrorMessage)
+				}
+				if got := logs.FilterMessage("balance collapse confirmed on re-read, persisted as measured (SANITY-001)").FilterLevelExact(zapcore.WarnLevel).Len(); got != tc.operatorWarns {
+					t.Errorf("operator warnings = %d, want %d", got, tc.operatorWarns)
 				}
 			})
 		}

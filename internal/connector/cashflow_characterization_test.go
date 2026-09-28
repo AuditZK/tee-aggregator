@@ -2,7 +2,6 @@ package connector
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -55,12 +54,14 @@ func TestBinance_Cashflows_UniversalTransferSigns(t *testing.T) {
 		{"MAIN_MINING", -100}, {"MINING_MAIN", 100},
 		{"MAIN_UMFUTURE", 0},
 		// CONN-07: margin and COIN-M sit inside the live equity, so these
-		// move value between tracked wallets.
-		{"MARGIN_MAIN", 100}, {"MAIN_MARGIN", -100},
-		{"CMFUTURE_MAIN", 100}, {"MAIN_CMFUTURE", -100},
-		// CONN-07: and these cross the perimeter without being read.
-		{"FUNDING_MARGIN", 0}, {"MARGIN_FUNDING", 0},
-		{"FUNDING_CMFUTURE", 0}, {"CMFUTURE_FUNDING", 0},
+		// move value between measured wallets.
+		{"MARGIN_MAIN", 0}, {"MAIN_MARGIN", 0},
+		{"CMFUTURE_MAIN", 0}, {"MAIN_CMFUTURE", 0},
+		{"MARGIN_ISOLATEDMARGIN", 0}, {"UMFUTURE_MARGIN", 0},
+		// And these cross into or out of the measured wallets.
+		{"FUNDING_MARGIN", 100}, {"MARGIN_FUNDING", -100},
+		{"FUNDING_CMFUTURE", 100}, {"CMFUTURE_FUNDING", -100},
+		{"UMFUTURE_OPTION", -100}, {"OPTION_MARGIN", 100},
 	}
 	stamp := time.Now().UTC().Add(-time.Hour).UnixMilli()
 	for _, tc := range cases {
@@ -87,7 +88,32 @@ func TestBinance_Cashflows_UniversalTransferSigns(t *testing.T) {
 	}
 }
 
-func TestBinance_Cashflows_UnpricedDepositIsDroppedSilently(t *testing.T) {
+func TestBinanceTransferSignFollowsTheWalletsRead(t *testing.T) {
+	all := map[string]bool{}
+	for _, w := range binanceLiveWallets {
+		all[w] = true
+	}
+	noMargin := map[string]bool{binanceWalletSpot: true, binanceWalletUM: true, binanceWalletCoinM: true}
+	cases := []struct {
+		typ      string
+		measured map[string]bool
+		want     float64
+	}{
+		{"MAIN_MARGIN", all, 0},
+		{"MAIN_MARGIN", noMargin, -1},
+		{"MARGIN_MAIN", noMargin, +1},
+		{"FUNDING_MARGIN", noMargin, 0},
+		{"FUNDING_MAIN", noMargin, +1},
+		{"NOT_A_TYPE", all, 0},
+	}
+	for _, tc := range cases {
+		if got := binanceTransferSign(tc.typ, tc.measured); got != tc.want {
+			t.Errorf("%s with %d wallets read = %v, want %v", tc.typ, len(tc.measured), got, tc.want)
+		}
+	}
+}
+
+func TestBinance_Cashflows_UnpricedDepositIsNamed(t *testing.T) {
 	stamp := time.Now().UTC().Add(-time.Hour).UnixMilli()
 	cases := []struct {
 		name   string
@@ -121,15 +147,14 @@ func TestBinance_Cashflows_UnpricedDepositIsDroppedSilently(t *testing.T) {
 			if got := cashflowAmounts(flows); !slices.Equal(got, []float64{100}) {
 				t.Errorf("flows = %v, want only the stablecoin deposit", got)
 			}
-			// The dropped BTC deposit leaves no trace.
-			if w := b.CapabilityWarnings(); len(w) != 0 {
-				t.Errorf("warnings = %v, want none", w)
+			if w := b.CapabilityWarnings(); !slices.Equal(w, []string{"binance_cashflow_unpriced:BTC"}) {
+				t.Errorf("warnings = %v, want the BTC deposit named", w)
 			}
 		})
 	}
 }
 
-func TestMEXC_Cashflows_UnpricedDepositIsDroppedSilently(t *testing.T) {
+func TestMEXC_Cashflows_UnpricedDepositIsNamed(t *testing.T) {
 	stamp := time.Now().UTC().Add(-time.Hour).UnixMilli()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -153,6 +178,9 @@ func TestMEXC_Cashflows_UnpricedDepositIsDroppedSilently(t *testing.T) {
 	}
 	if got := cashflowAmounts(flows); !slices.Equal(got, []float64{100}) {
 		t.Errorf("flows = %v, want only the stablecoin deposit", got)
+	}
+	if w := m.CapabilityWarnings(); !slices.Equal(w, []string{"mexc_cashflow_unpriced:BTC"}) {
+		t.Errorf("warnings = %v, want the BTC deposit named", w)
 	}
 }
 
@@ -211,10 +239,11 @@ func TestBitget_Cashflows(t *testing.T) {
 	matchedMix := fmt.Sprintf(`{"code":"00000","data":{"bills":[{"cTime":"%d","amount":"50","businessType":"trans_from_exchange"}],"endId":""}}`, stamp)
 
 	cases := []struct {
-		name    string
-		ledger  bitgetLedger
-		want    []float64
-		wantErr error
+		name      string
+		ledger    bitgetLedger
+		want      []float64
+		wantWarns []string
+		wantFail  bool
 	}{
 		{
 			name:   "transfer to futures matched and cancelled",
@@ -234,6 +263,12 @@ func TestBitget_Cashflows(t *testing.T) {
 			name: "futures ledger failing otherwise",
 			ledger: bitgetLedger{spot: spot, mixStatus: http.StatusBadRequest,
 				mixBody: `{"code":"40808","msg":"Parameter verification exception"}`},
+			wantFail: true,
+		},
+		{
+			name: "futures ledger refused inside a 2xx answer",
+			ledger: bitgetLedger{spot: spot,
+				mixBody: `{"code":"40014","msg":"Incorrect permissions"}`},
 			want: []float64{-50, -30, 100},
 		},
 		{
@@ -243,20 +278,20 @@ func TestBitget_Cashflows(t *testing.T) {
 			want: []float64{100, 30000},
 		},
 		{
-			// The stablecoin deposit is lost with the unpriced one.
 			name: "non-stable deposit with tickers down",
 			ledger: bitgetLedger{spot: bitgetSpotBills(stamp, "BTC:deposit:0.5", "USDT:deposit:100"),
 				mixBody: `{"code":"00000","data":{"bills":[],"endId":""}}`, tickerDown: true},
-			wantErr: ErrSpotPricingUnavailable,
+			want:      []float64{100},
+			wantWarns: []string{"bitget_cashflow_unpriced:BTC"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			b := bitgetFlowServer(t, tc.ledger)
 			flows, err := b.GetCashflows(context.Background(), time.Now().UTC().Add(-24*time.Hour))
-			if tc.wantErr != nil {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			if tc.wantFail {
+				if err == nil {
+					t.Fatalf("flows = %v, want the fetch to fail", cashflowAmounts(flows))
 				}
 				return
 			}
@@ -265,6 +300,9 @@ func TestBitget_Cashflows(t *testing.T) {
 			}
 			if got := cashflowAmounts(flows); !slices.Equal(got, tc.want) {
 				t.Errorf("flows = %v, want %v", got, tc.want)
+			}
+			if got := b.CapabilityWarnings(); !slices.Equal(got, tc.wantWarns) {
+				t.Errorf("warnings = %v, want %v", got, tc.wantWarns)
 			}
 		})
 	}

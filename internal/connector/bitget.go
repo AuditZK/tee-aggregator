@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,7 +20,14 @@ const bitgetAPI = "https://api.bitget.com"
 type Bitget struct {
 	base       CryptoBase
 	passphrase string
+
+	// cashflowNotes carries the markers the last GetCashflows raised.
+	cashflowNotes cashflowNotes
 }
+
+// CapabilityWarnings implements CapabilityWarner with the flows the last
+// GetCashflows could not value.
+func (b *Bitget) CapabilityWarnings() []string { return b.cashflowNotes.get() }
 
 // NewBitget creates a new Bitget connector.
 func NewBitget(creds *Credentials) *Bitget {
@@ -321,24 +330,28 @@ func (b *Bitget) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow
 	if err != nil {
 		return nil, fmt.Errorf("spot bills: %w", err)
 	}
-	mixBills := b.fetchMixBills(ctx, since, now) // best-effort per product
+	mixBills, err := b.fetchMixBills(ctx, since, now)
+	if err != nil {
+		return nil, fmt.Errorf("futures bills: %w", err)
+	}
 
-	// Price map only when a non-stable coin shows up in the window. Same
-	// contract as GetBalance: no map while non-stables are present means the
-	// cashflow would be valued 0 and silently lost — fail transient instead.
+	// Price map only when a non-stable coin shows up in the window. Without
+	// it, those flows are left out and named in the warnings; the stablecoin
+	// flows of the same window still count.
 	priceMap := map[string]float64{}
 	for _, sb := range spotBills {
 		if !IsStablecoinUSD(sb.coin) {
-			pm, perr := b.fetchPriceMap(ctx)
-			if perr != nil {
-				return nil, fmt.Errorf("%w: bitget spot tickers: %v", ErrSpotPricingUnavailable, perr)
+			if pm, perr := b.fetchPriceMap(ctx); perr == nil {
+				priceMap = pm
 			}
-			priceMap = pm
 			break
 		}
 	}
 
-	return classifyBitgetCashflows(spotBills, mixBills, priceMap), nil
+	unpriced := unpricedAssets{}
+	flows := classifyBitgetCashflows(spotBills, mixBills, priceMap, unpriced)
+	b.cashflowNotes.set(unpriced.markers("bitget"))
+	return flows, nil
 }
 
 // fetchSpotBills pages the whole spot ledger over [since, now].
@@ -387,9 +400,12 @@ func (b *Bitget) fetchSpotBills(ctx context.Context, since, now time.Time) ([]bi
 	return bills, nil
 }
 
-// fetchMixBills pages the futures ledgers of both stable-margined products.
-// Best-effort: a product the account never enabled just contributes nothing.
-func (b *Bitget) fetchMixBills(ctx context.Context, since, now time.Time) []bitgetMixBill {
+// fetchMixBills pages the futures ledgers of both stable-margined products. A
+// key without the futures permission contributes nothing: its futures wallet
+// is outside the equity too, so a transfer into it did leave. Any other
+// failure is an error, because a futures leg that is unknown rather than
+// absent would turn an internal transfer into a withdrawal (CONN-09).
+func (b *Bitget) fetchMixBills(ctx context.Context, since, now time.Time) ([]bitgetMixBill, error) {
 	var bills []bitgetMixBill
 	for _, pt := range bitgetMixProductTypes {
 		idLessThan := ""
@@ -401,7 +417,10 @@ func (b *Bitget) fetchMixBills(ctx context.Context, since, now time.Time) []bitg
 			}
 			body, err := b.doRequest(ctx, "GET", path)
 			if err != nil {
-				break
+				if isBitgetPermissionRefusal(err) {
+					break
+				}
+				return nil, fmt.Errorf("%s: %w", pt, err)
 			}
 			var resp struct {
 				Data struct {
@@ -413,8 +432,8 @@ func (b *Bitget) fetchMixBills(ctx context.Context, since, now time.Time) []bitg
 					EndID string `json:"endId"`
 				} `json:"data"`
 			}
-			if json.Unmarshal(body, &resp) != nil {
-				break
+			if err := json.Unmarshal(body, &resp); err != nil {
+				return nil, fmt.Errorf("parse %s bills: %w", pt, err)
 			}
 			for _, r := range resp.Data.Bills {
 				ms, _ := strconv.ParseInt(r.CTime, 10, 64)
@@ -431,7 +450,24 @@ func (b *Bitget) fetchMixBills(ctx context.Context, since, now time.Time) []bitg
 			idLessThan = resp.Data.EndID
 		}
 	}
-	return bills
+	return bills, nil
+}
+
+// bitgetPermissionCodes are the refusals that mean the key lacks a scope, as
+// opposed to a request that failed.
+var bitgetPermissionCodes = []string{"40014"}
+
+var bitgetErrorCode = regexp.MustCompile(`"code"\s*:\s*"(\d+)"|\(code (\d+)\)`)
+
+// isBitgetPermissionRefusal reads the vendor code from either shape doRequest
+// returns: the raw body of a non-2xx answer, or the code of a 2xx one.
+func isBitgetPermissionRefusal(err error) bool {
+	m := bitgetErrorCode.FindStringSubmatch(err.Error())
+	if m == nil {
+		return false
+	}
+	code := m[1] + m[2]
+	return slices.Contains(bitgetPermissionCodes, code)
 }
 
 // fetchPriceMap loads every spot pair's last price in one public call.
@@ -494,7 +530,7 @@ func pairBitgetTransfers(spotBills []bitgetSpotBill, mixBills []bitgetMixBill) (
 // classifyBitgetCashflows turns the raw ledgers into signed USD cashflows.
 // Pure (no IO) — the ticker map is injected — so the perimeter rules stay
 // unit-testable.
-func classifyBitgetCashflows(spotBills []bitgetSpotBill, mixBills []bitgetMixBill, priceMap map[string]float64) []*Cashflow {
+func classifyBitgetCashflows(spotBills []bitgetSpotBill, mixBills []bitgetMixBill, priceMap map[string]float64, unpriced unpricedAssets) []*Cashflow {
 	spotMatched, futMatched := pairBitgetTransfers(spotBills, mixBills)
 
 	var flows []*Cashflow
@@ -510,7 +546,10 @@ func classifyBitgetCashflows(spotBills []bitgetSpotBill, mixBills []bitgetMixBil
 		if p := priceMap[strings.ToUpper(coin)+"USDT"]; p > 0 {
 			return qty * p
 		}
-		return 0 // unpriceable dust — never fabricate a flow from it
+		if qty != 0 && unpriced != nil {
+			unpriced.add(coin)
+		}
+		return 0
 	}
 
 	for si, sb := range spotBills {
