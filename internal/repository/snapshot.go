@@ -1051,6 +1051,24 @@ func (r *SnapshotRepo) ExistsForUserExchangeLabel(ctx context.Context, userUID, 
 	return true, nil
 }
 
+// UpdateFlows rewrites one snapshot's deposits and withdrawals, only if they
+// still hold the values the caller read, and leaves every other column as it
+// was. Reports whether the row changed.
+func (r *SnapshotRepo) UpdateFlows(ctx context.Context, id string, oldDeposits, oldWithdrawals, deposits, withdrawals float64) (bool, error) {
+	r.hasLabelColumn(ctx)
+	if !r.isTSSchema {
+		return false, errors.New("update snapshot flows: production schema only")
+	}
+	tag, err := r.pool.Exec(ctx, `UPDATE snapshot_data
+		SET deposits = $1, withdrawals = $2, "updatedAt" = $3
+		WHERE id = $4 AND deposits = $5 AND withdrawals = $6`,
+		deposits, withdrawals, time.Now().UTC(), id, oldDeposits, oldWithdrawals)
+	if err != nil {
+		return false, fmt.Errorf("update snapshot flows: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // GetEarliestTimestamp returns the oldest snapshot timestamp for a
 // (user, exchange, label) tuple. Used by the IBKR Flex sync to detect when
 // the broker's history has been extended retroactively (e.g. user widened

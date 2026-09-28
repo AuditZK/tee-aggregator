@@ -29,7 +29,7 @@ type MEXC struct {
 	cachedFuturesAvail  float64
 
 	// cashflowNotes carries the markers the last GetCashflows raised.
-	cashflowNotes cashflowNotes
+	cashflowNotes noteList
 }
 
 // CapabilityWarnings implements CapabilityWarner with the flows the last
