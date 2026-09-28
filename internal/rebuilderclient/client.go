@@ -120,6 +120,14 @@ type Client struct {
 	logger     *zap.Logger
 }
 
+// RequestTimeout bounds one /history/rebuild call. The rebuild is synchronous
+// on the rebuilder side and a high-frequency Binance account pages its income
+// ledgers for close to an hour. Each link must outlast the one behind it, or
+// it cancels a rebuild the next link was still allowed to finish: rebuilder
+// REBUILD_TIMEOUT_SECONDS (3600) < nginx proxy_read_timeout on the rebuilder
+// vhost (3660) < this < every enclave context waiting on it.
+const RequestTimeout = 3720 * time.Second
+
 // New constructs a Client. baseURL is the rebuilder service root (no trailing
 // slash); authToken is sent as `X-Internal-Token` and must match the
 // rebuilder's REBUILDER_INTERNAL_TOKEN env. Either may be empty in dev mode
@@ -130,16 +138,7 @@ func New(baseURL, authToken string, logger *zap.Logger) *Client {
 		baseURL:   baseURL,
 		authToken: authToken,
 		httpClient: &http.Client{
-			// /history/rebuild is synchronous on the rebuilder side: the
-			// response body lands AFTER the per-exchange reconstruction
-			// completes. Binance HF accounts page a 90-day income ledger
-			// paced against Binance's request-weight cap (~70 calls/min),
-			// which runs up to ~20-25 min worst case — the whole chain must
-			// survive it: this client, the rebuilder's
-			// REBUILD_TIMEOUT_SECONDS and nginx's proxy_read_timeout on the
-			// rebuilder vhost (the shortest link cancels the request context
-			// and aborts the rebuild mid-page).
-			Timeout: 1920 * time.Second,
+			Timeout: RequestTimeout,
 		},
 		logger: logger,
 	}

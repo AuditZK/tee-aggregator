@@ -17,6 +17,7 @@ import (
 	"github.com/trackrecord/enclave/internal/auth"
 	"github.com/trackrecord/enclave/internal/config"
 	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/rebuilderclient"
 	"github.com/trackrecord/enclave/internal/service"
 	"github.com/trackrecord/enclave/internal/validation"
 	"go.uber.org/zap"
@@ -327,8 +328,8 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 	// money field, on purpose, so the days would arrive empty. Synchronous for
 	// the same reason — there is nothing to come back for later.
 	if dryRun {
-		extendWriteDeadline(w, 45*time.Minute)
-		ctx, cancel := context.WithTimeout(r.Context(), 45*time.Minute)
+		extendWriteDeadline(w, adminReconstructTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), adminReconstructTimeout)
 		defer cancel()
 		days := s.handler.syncSvc.DryRunReconstructRange(ctx, userUID, exchange, label, from, to)
 		rows := make([]map[string]any, 0, len(days))
@@ -348,10 +349,7 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 	}
 
 	go func() {
-		// Must exceed the rebuilder-client chain (1920s): a binance HF 90-day
-		// income paging rebuild runs up to ~25 min, and this context
-		// cancelling first aborts it server-side mid-page.
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), adminReconstructTimeout)
 		defer cancel()
 		if fromStr == "" {
 			s.handler.syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
@@ -768,6 +766,10 @@ func (s *Server) handleAdminFundingProbe(w http.ResponseWriter, r *http.Request)
 	)
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "funding": probe})
 }
+
+// adminReconstructTimeout outlasts the rebuilder call it waits on: expiring
+// first would abort, mid-page, a rebuild the rebuilder may still finish.
+const adminReconstructTimeout = rebuilderclient.RequestTimeout + 5*time.Minute
 
 // extendWriteDeadline lifts the server-wide 60s WriteTimeout for one request.
 //

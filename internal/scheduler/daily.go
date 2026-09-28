@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/trackrecord/enclave/internal/rebuilderclient"
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/service"
 	"go.uber.org/zap"
@@ -162,11 +163,7 @@ func (s *SyncScheduler) executeDailySync() {
 	// retried on the next nightly tick (RebuildFinalizedAt only stamps on
 	// success). Silent no-op when the rebuilder is unconfigured (dev) or the
 	// migration hasn't been applied (HasRebuildFinalizedAtCol → false).
-	//
-	// Own context, NOT the 30-minute sync budget: one binance 90-day HF
-	// rebuild pages its income ledger for up to ~25 min, and a night with
-	// several queued connections must not cancel itself mid-rebuild.
-	recalCtx, recalCancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	recalCtx, recalCancel := context.WithTimeout(context.Background(), recalibrationBudget)
 	s.syncSvc.RecalibrateRebuiltHistories(recalCtx)
 	recalCancel()
 
@@ -178,6 +175,12 @@ func (s *SyncScheduler) executeDailySync() {
 		zap.Duration("duration", time.Since(start)),
 	)
 }
+
+// recalibrationBudget is the midnight recalibration pass's own context, not
+// the sync budget: connections rebuild one after the other and each may take
+// the full rebuilder call, so a night with a few high-frequency Binance
+// accounts queued must not cancel the ones behind them.
+const recalibrationBudget = 4 * rebuilderclient.RequestTimeout
 
 // RunNow executes sync immediately for all users (for manual trigger / testing).
 func (s *SyncScheduler) RunNow() {

@@ -156,3 +156,14 @@ func mustJSON(v string) []byte {
 var jsonMarshal = func(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
+
+func TestClient_TimeoutIsTheChainLink(t *testing.T) {
+	c := New("https://rebuilder.invalid", "token", zap.NewNop())
+	if c.httpClient.Timeout != RequestTimeout {
+		t.Fatalf("client timeout = %v, want RequestTimeout %v", c.httpClient.Timeout, RequestTimeout)
+	}
+	// rebuilder REBUILD_TIMEOUT_SECONDS 3600 < nginx proxy_read_timeout 3660 < this.
+	if RequestTimeout <= 3660*time.Second {
+		t.Fatalf("RequestTimeout %v does not outlast nginx's 3660s", RequestTimeout)
+	}
+}
