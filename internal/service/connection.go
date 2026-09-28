@@ -235,6 +235,7 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 	}
 
 	conn := &repository.ExchangeConnection{
+		ID:                  repository.NewConnectionID(),
 		UserUID:             req.UserUID,
 		Exchange:            normalizedExchange,
 		Label:               normalizedLabel,
@@ -249,23 +250,13 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 	// auth_tag separately (12-byte nonce, all base64). Picking the wrong
 	// one produces rows that fail GCM auth-tag verification on read.
 	if s.repo.IsTSSchema(ctx) {
-		apiKeyTS, err := s.encryption.EncryptTSString(storedAPIKey)
+		bound, err := s.bindCredentials(conn, storedAPIKey, storedAPISecret, req.Passphrase)
 		if err != nil {
-			return fmt.Errorf("encrypt api key (ts): %w", err)
+			return err
 		}
-		apiSecretTS, err := s.encryption.EncryptTSString(storedAPISecret)
-		if err != nil {
-			return fmt.Errorf("encrypt api secret (ts): %w", err)
-		}
-		conn.EncryptedAPIKey = apiKeyTS
-		conn.EncryptedAPISecret = apiSecretTS
-		if req.Passphrase != "" {
-			passTS, err := s.encryption.EncryptTSString(req.Passphrase)
-			if err != nil {
-				return fmt.Errorf("encrypt passphrase (ts): %w", err)
-			}
-			conn.EncryptedPassphrase = passTS
-		}
+		conn.EncryptedAPIKey = bound.APIKey
+		conn.EncryptedAPISecret = bound.APISecret
+		conn.EncryptedPassphrase = bound.Passphrase
 	} else {
 		apiKeyEnc, err := s.encryption.EncryptString(storedAPIKey)
 		if err != nil {
@@ -544,7 +535,7 @@ func (s *ConnectionService) GetDecryptedCredentials(ctx context.Context, userUID
 	if err != nil {
 		return nil, err
 	}
-	return s.decryptConnection(conn)
+	return s.openConnection(ctx, conn)
 }
 
 // GetDecryptedCredentialsByLabel retrieves and decrypts credentials for a specific connection label.
@@ -553,35 +544,97 @@ func (s *ConnectionService) GetDecryptedCredentialsByLabel(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	return s.decryptConnection(conn)
+	return s.openConnection(ctx, conn)
 }
 
-// decryptConnection opens each field. A value bound to its row (SEC-01) only
-// opens with that row's user, id and field; one written before binding
-// existed opens as before.
-func (s *ConnectionService) decryptConnection(conn *repository.ExchangeConnection) (*Credentials, error) {
+// openConnection decrypts a row and, when it still holds ciphertexts written
+// before binding existed, rewrites them bound to the row (SEC-01). Until every
+// row is bound, a legacy ciphertext copied into another row still opens there;
+// the nightly pass reads every active connection, so one night binds them all.
+func (s *ConnectionService) openConnection(ctx context.Context, conn *repository.ExchangeConnection) (*Credentials, error) {
+	creds, legacy, err := s.decryptConnection(conn)
+	if err != nil || !legacy || !s.repo.IsTSSchema(ctx) {
+		return creds, err
+	}
+	s.rebindLegacyRow(ctx, conn, creds)
+	return creds, nil
+}
+
+func (s *ConnectionService) rebindLegacyRow(ctx context.Context, conn *repository.ExchangeConnection, creds *Credentials) {
+	bound, err := s.bindCredentials(conn, creds.APIKey, creds.APISecret, creds.Passphrase)
+	if err == nil {
+		old := repository.StoredCredentials{APIKey: conn.EncryptedAPIKey, APISecret: conn.EncryptedAPISecret, Passphrase: conn.EncryptedPassphrase}
+		var rewritten bool
+		if rewritten, err = s.repo.RebindCredentials(ctx, conn.ID, old, bound); err == nil && rewritten && s.logger != nil {
+			s.logger.Info("connection credentials bound to their row (SEC-01)",
+				zap.String("user_uid", conn.UserUID),
+				zap.String("exchange", conn.Exchange),
+				zap.String("label", conn.Label),
+			)
+		}
+	}
+	if err != nil && s.logger != nil {
+		s.logger.Warn("binding legacy credentials to their row failed; retried on the next read",
+			zap.String("user_uid", conn.UserUID),
+			zap.String("exchange", conn.Exchange),
+			zap.String("label", conn.Label),
+			zap.Error(err),
+		)
+	}
+}
+
+// bindCredentials encrypts a row's secrets bound to its user and id.
+func (s *ConnectionService) bindCredentials(conn *repository.ExchangeConnection, apiKey, apiSecret, passphrase string) (repository.StoredCredentials, error) {
+	var out repository.StoredCredentials
+	seal := func(field, plaintext string) (string, error) {
+		v, err := s.encryption.EncryptTSBound(plaintext, encryption.ConnectionFieldAAD(conn.UserUID, conn.ID, field))
+		if err != nil {
+			return "", fmt.Errorf("encrypt %s: %w", field, err)
+		}
+		return v, nil
+	}
+	var err error
+	if out.APIKey, err = seal(encryption.FieldAPIKey, apiKey); err != nil {
+		return out, err
+	}
+	if out.APISecret, err = seal(encryption.FieldAPISecret, apiSecret); err != nil {
+		return out, err
+	}
+	if passphrase != "" {
+		if out.Passphrase, err = seal(encryption.FieldPassphrase, passphrase); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
+// decryptConnection opens each field and reports whether any of them was
+// still in a format bound to nothing.
+func (s *ConnectionService) decryptConnection(conn *repository.ExchangeConnection) (*Credentials, bool, error) {
+	var legacy bool
 	open := func(field, ciphertext, iv, authTag string) (string, error) {
 		if encryption.IsBoundTS(ciphertext) {
 			return s.encryption.DecryptTSBound(ciphertext, encryption.ConnectionFieldAAD(conn.UserUID, conn.ID, field))
 		}
+		legacy = true
 		return s.decryptField(ciphertext, iv, authTag)
 	}
 
 	apiKey, err := open(encryption.FieldAPIKey, conn.EncryptedAPIKey, conn.APIKeyIV, conn.APIKeyAuthTag)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt api key: %w", err)
+		return nil, false, fmt.Errorf("decrypt api key: %w", err)
 	}
 
 	apiSecret, err := open(encryption.FieldAPISecret, conn.EncryptedAPISecret, conn.APISecretIV, conn.APISecretAuthTag)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt api secret: %w", err)
+		return nil, false, fmt.Errorf("decrypt api secret: %w", err)
 	}
 
 	var passphrase string
 	if conn.EncryptedPassphrase != "" {
 		passphrase, err = open(encryption.FieldPassphrase, conn.EncryptedPassphrase, conn.PassphraseIV, conn.PassphraseAuthTag)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt passphrase: %w", err)
+			return nil, false, fmt.Errorf("decrypt passphrase: %w", err)
 		}
 	}
 
@@ -591,7 +644,7 @@ func (s *ConnectionService) decryptConnection(conn *repository.ExchangeConnectio
 		APIKey:     apiKey,
 		APISecret:  apiSecret,
 		Passphrase: passphrase,
-	}, nil
+	}, legacy, nil
 }
 
 // GetActiveConnections returns all active connections for a user (encrypted)
@@ -683,15 +736,15 @@ func (s *ConnectionService) decryptField(ciphertext, iv, authTag string) (string
 // the cTrader connector's token persister after a successful OAuth refresh so
 // the next boot does not start with an already-expired access_token.
 func (s *ConnectionService) PersistOAuthTokens(ctx context.Context, userUID, exchange, label, accessToken, refreshToken string) error {
-	encAccess, err := s.encryption.EncryptTSString(accessToken)
+	conn, err := s.repo.GetByUserExchangeLabel(ctx, userUID, normalizeExchange(exchange), strings.TrimSpace(label))
 	if err != nil {
-		return fmt.Errorf("encrypt access token: %w", err)
+		return fmt.Errorf("look up connection for token rotation: %w", err)
 	}
-	encRefresh, err := s.encryption.EncryptTSString(refreshToken)
+	bound, err := s.bindCredentials(conn, accessToken, refreshToken, "")
 	if err != nil {
-		return fmt.Errorf("encrypt refresh token: %w", err)
+		return err
 	}
-	return s.repo.UpdateOAuthTokens(ctx, userUID, exchange, label, encAccess, encRefresh)
+	return s.repo.UpdateOAuthTokens(ctx, userUID, exchange, label, bound.APIKey, bound.APISecret)
 }
 
 func (s *ConnectionService) persistSetupRotation(ctx context.Context, conn *repository.ExchangeConnection, key, secret, passphrase string) {

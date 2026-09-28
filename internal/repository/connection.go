@@ -211,8 +211,11 @@ func (r *ConnectionRepo) createTS(
 		encPassphrase = &p
 	}
 
+	if conn.ID == "" {
+		conn.ID = NewConnectionID()
+	}
 	columns := []string{`id`, `"userUid"`, `exchange`, `label`}
-	args := []any{"cuid_" + randomHex(20), conn.UserUID, conn.Exchange, conn.Label}
+	args := []any{conn.ID, conn.UserUID, conn.Exchange, conn.Label}
 
 	if hasCredHash {
 		columns = append(columns, `"credentialsHash"`)
@@ -262,6 +265,36 @@ func (r *ConnectionRepo) createTS(
 		return err
 	}
 	return nil
+}
+
+// NewConnectionID returns a cuid-shaped id for a production-schema row. The
+// service draws it before encrypting, because the ciphertext is bound to it.
+func NewConnectionID() string {
+	return "cuid_" + randomHex(20)
+}
+
+// RebindCredentials swaps a row's ciphertexts for re-encrypted ones only if
+// they are still the ones that were read: a token rotation landing in
+// between wins, and the rebind is retried on the next read. Reports whether
+// the row was rewritten.
+func (r *ConnectionRepo) RebindCredentials(ctx context.Context, connID string, old, bound StoredCredentials) (bool, error) {
+	if !r.IsTSSchema(ctx) {
+		return false, errors.New("rebind credentials: production schema only")
+	}
+	tag, err := r.pool.Exec(ctx, `UPDATE exchange_connections
+		SET "encryptedApiKey" = $1, "encryptedApiSecret" = $2, "encryptedPassphrase" = NULLIF($3, '')
+		WHERE id = $4 AND "encryptedApiKey" = $5 AND "encryptedApiSecret" = $6
+		  AND coalesce("encryptedPassphrase", '') = $7`,
+		bound.APIKey, bound.APISecret, bound.Passphrase, connID, old.APIKey, old.APISecret, old.Passphrase)
+	if err != nil {
+		return false, fmt.Errorf("rebind credentials: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// StoredCredentials are a row's three ciphertext columns as stored.
+type StoredCredentials struct {
+	APIKey, APISecret, Passphrase string
 }
 
 // randomHex returns 2n hex characters of random data, used as the random

@@ -408,9 +408,9 @@ func TestDBConnectionCredentialsRoundTrip(t *testing.T) {
 	}
 }
 
-// SEC-01: nothing binds a ciphertext to its row yet, so one moved from
-// another connection decrypts as if it belonged there.
-func TestDBMovedCiphertextIsAccepted(t *testing.T) {
+// SEC-01: a ciphertext written before binding existed still opens in another
+// row, until every row is bound and the legacy read is closed.
+func TestDBLegacyCiphertextStillOpensElsewhere(t *testing.T) {
 	h := newDBHarness(t)
 	h.seedConnection(t, "binance", "a", "key-of-a", "secret-of-a")
 	h.seedConnection(t, "binance", "b", "key-of-b", "secret-of-b")

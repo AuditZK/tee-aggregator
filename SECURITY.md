@@ -318,6 +318,17 @@ Production columns: `"encryptedApiKey"`, `"encryptedApiSecret"`,
 `"encryptedPassphrase"` (optional) and `"credentialsHash"` on
 `exchange_connections`.
 
+**Binding to the row (`SEC-01`).** A ciphertext written today is prefixed
+`v2:` and sealed with additional authenticated data
+`userUid | row id | field`. Someone with write access to the database, the
+host included, cannot move a user's credentials into another user's row, or
+swap the key and the secret of one row: the tag no longer verifies and the
+sync fails. Rows written before binding existed are read in the old format and
+rewritten bound on that read, under a compare-and-swap so a token rotation in
+between wins. The nightly pass reads every active connection, so one night
+binds them all. Until the old-format read is closed, an old-format ciphertext
+copied into another row still opens there.
+
 Credentials are decrypted only in enclave memory, used to build the exchange
 connector, never logged (see Secure Logging), and never sent anywhere except
 the two services in [Credential egress](#credential-egress).
