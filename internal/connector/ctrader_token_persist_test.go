@@ -6,9 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func ctraderRefreshServer(t *testing.T, body string) *httptest.Server {
@@ -116,6 +119,59 @@ func TestCTraderRefresh_ArmsProactiveRefresh(t *testing.T) {
 	// 60 s of life, 5 min window → due immediately.
 	if !c.needsProactiveRefresh() {
 		t.Fatal("a token expiring in 60 s must be due for a proactive refresh")
+	}
+}
+
+// cTrader requires the application auth first on every connection. The
+// proactive refresh dropped the socket and let the next request open a new one
+// without it, so the call right after the refresh was refused.
+func TestCTraderProactiveRefresh_ReauthenticatesTheNewSession(t *testing.T) {
+	var mu sync.Mutex
+	appAuthed := map[*websocket.Conn]bool{}
+	var seenToken string
+
+	wsServer := newCTraderWSServer(t, func(conn *websocket.Conn, msg wsTestMessage) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch msg.PayloadType {
+		case ctraderPayloadAppAuthReq:
+			appAuthed[conn] = true
+			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadAppAuthRes, map[string]any{})
+		case ctraderPayloadGetAccountsReq:
+			if !appAuthed[conn] {
+				sendWSError(t, conn, msg.ClientMsgID, "CH_CLIENT_NOT_AUTHENTICATED", "application not authorized on this connection")
+				return
+			}
+			seenToken, _ = msg.Payload["accessToken"].(string)
+			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadGetAccountsRes, map[string]any{
+				"ctidTraderAccount": []map[string]any{{"ctidTraderAccountId": 12345, "isLive": true}},
+			})
+		default:
+			t.Errorf("unexpected payloadType: %d", msg.PayloadType)
+		}
+	})
+	defer wsServer.Close()
+	tokenServer := ctraderRefreshServer(t, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
+
+	c := &CTrader{
+		clientID:          "id",
+		clientSecret:      "secret",
+		accessToken:       "old-access",
+		refreshToken:      "old-refresh",
+		accessTokenExpiry: time.Now().Add(time.Minute),
+		isLive:            true,
+		wsLiveURL:         toWSURL(wsServer.URL),
+		authURL:           tokenServer.URL,
+		httpClient:        &http.Client{Timeout: 5 * time.Second},
+	}
+
+	if _, err := c.getAccounts(context.Background()); err != nil {
+		t.Fatalf("the call after a proactive refresh failed: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seenToken != "new-access" {
+		t.Fatalf("request carried %q, want the refreshed token", seenToken)
 	}
 }
 

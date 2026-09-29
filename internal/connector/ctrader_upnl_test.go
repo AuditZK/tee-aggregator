@@ -24,6 +24,8 @@ type ctraderBalanceOpts struct {
 	depositAssetID int64
 	// onUnrealized counts 2187 requests.
 	seen map[int]int
+	// accounts replaces the single live account the token grants.
+	accounts []map[string]any
 }
 
 func newCTraderBalanceServer(t *testing.T, opts *ctraderBalanceOpts) *CTrader {
@@ -38,11 +40,12 @@ func newCTraderBalanceServer(t *testing.T, opts *ctraderBalanceOpts) *CTrader {
 		case ctraderPayloadAppAuthReq:
 			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadAppAuthRes, map[string]any{})
 		case ctraderPayloadGetAccountsReq:
+			accounts := opts.accounts
+			if accounts == nil {
+				accounts = []map[string]any{{"ctidTraderAccountId": 12345, "isLive": true}}
+			}
 			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadGetAccountsRes, map[string]any{
-				"ctidTraderAccount": []map[string]any{{
-					"ctidTraderAccountId": 12345,
-					"isLive":              true,
-				}},
+				"ctidTraderAccount": accounts,
 			})
 		case ctraderPayloadAccountAuthReq:
 			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadAccountAuthRes, map[string]any{})

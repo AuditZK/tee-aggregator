@@ -161,6 +161,9 @@ type reconstructOpts struct {
 	// examined and stays. Zero means the rebuilder stated no horizon, and the
 	// prune falls back to owning the whole rebuilt history.
 	coveredFrom time.Time
+	// recurring marks the bounded every-sync re-run, which may fill and
+	// correct days but owns none a previous reconstruction wrote.
+	recurring bool
 }
 
 // contains reports whether dayKey (a UTC midnight) falls inside the window.
@@ -209,19 +212,17 @@ var collapseGuardDelay = 2 * time.Minute
 
 // ctraderRecurringReconstructDays bounds cTrader's every-sync reconstruction
 // window. The deep historical backfill runs once at connect (since=zero); the
-// recurring re-run only needs to re-own the recent boundary day(s) so the live
-// path's 24h-window deposit — attributed to the NEXT day — is overwritten by
-// the reconstruction's correct calendar-day attribution. Must comfortably
-// exceed the max plausible lag between a deposit and the next daily sync.
+// recurring re-run fills recent days no sync wrote and corrects the flows of
+// the days the live sync measured (mergeRealizedOnly). Must comfortably exceed
+// the max plausible lag between a deposit and the next daily sync.
 const ctraderRecurringReconstructDays = 14
 
 // reconstructsEverySync reports whether an exchange's in-enclave history
 // provider is re-run on every sync (not just at connect). IBKR's Flex is a
 // single cheap call; cTrader re-runs a bounded recent window (see
-// everySyncReconstructSince) to self-heal the live/reconstruction boundary
-// double-count — its connect-time deposit lands on the reconstruction's
-// calendar-day row AND on the next live snapshot's 24h window, so the recurring
-// re-run re-emits that boundary day with deposits=0, overwriting the live row.
+// everySyncReconstructSince): the ledger's calendar-day flows see through a
+// demo reset the live cash-flow read books at its raw size, and replace the
+// mid-day measurement a connect or a manual re-sync leaves behind.
 //
 // IMPORTANT: only ever consulted INSIDE a conn.(connector.HistoricalSnapshotProvider)
 // type assertion. Non-reconstructed exchanges (Hyperliquid/MEXC/Lighter) never
@@ -2070,6 +2071,7 @@ func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.Excha
 // the DB on the next sync — we log "history reconstruction detected" the
 // first time we see Flex go further back than what we already have.
 func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.HistoricalSnapshotProvider, since time.Time, opts reconstructOpts) error {
+	opts.recurring = !since.IsZero()
 	firstSync := s.isFirstSync(ctx, connMeta)
 	if firstSync {
 		s.logger.Info("history backfill — first sync",
@@ -2113,6 +2115,116 @@ func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *
 
 	s.persistHistoricalSnapshots(ctx, connMeta, historicalSnapshots, firstSync, sourceInEnclave, opts)
 	return nil
+}
+
+// checkAgainstStoredDays holds a reconstruction to the days already stored for
+// the connection before anything is written. A realized-only in-enclave
+// reconstruction is folded into them (mergeRealizedOnly), which also names the
+// stored days it vacates; any other must reproduce every measured equity
+// (contradictedDay).
+func (s *SyncService) checkAgainstStoredDays(ctx context.Context, connMeta *repository.ExchangeConnection, snapshots []*repository.Snapshot, source string, opts reconstructOpts) ([]*repository.Snapshot, []time.Time, error) {
+	existing, rerr := s.snapshotRepo.GetByUserAndDateRange(ctx, connMeta.UserUID, time.Unix(0, 0).UTC(), time.Now().UTC().Add(24*time.Hour))
+	mine := make([]*repository.Snapshot, 0, len(existing))
+	for _, e := range existing {
+		if e.Exchange == connMeta.Exchange && e.Label == connMeta.Label {
+			mine = append(mine, e)
+		}
+	}
+
+	if source == sourceInEnclave && realizedOnlyReconstruction(connMeta.Exchange) {
+		// Writing without the stored rows would overwrite the live
+		// measurements the merge exists to keep.
+		if rerr != nil {
+			return nil, nil, fmt.Errorf("read stored snapshots before merging the reconstruction: %w", rerr)
+		}
+		return s.mergeRealizedReconstruction(connMeta, snapshots, mine, opts)
+	}
+	if rerr != nil {
+		return snapshots, nil, nil
+	}
+
+	day, measured, bad := contradictedDay(snapshots, mine)
+	if !bad {
+		return snapshots, nil, nil
+	}
+	// A dry run exists to inspect a disagreement, so returning here silenced
+	// the dump in exactly the case worth dumping: the operator saw one
+	// rejected day and never the series around it.
+	if opts.dryRun {
+		s.logger.Warn("history reconstruction DRY RUN — contradicts a measured day (series follows)",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.String("day", day.Timestamp.Format("2006-01-02")),
+			zap.Float64("rebuilt_equity", day.TotalEquity),
+			zap.Float64("measured_equity", measured),
+		)
+		return snapshots, nil, nil
+	}
+	s.logger.Error("history reconstruction rejected — contradicts a measured day",
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("label", connMeta.Label),
+		zap.String("source", source),
+		zap.String("day", day.Timestamp.Format("2006-01-02")),
+		zap.Float64("rebuilt_equity", day.TotalEquity),
+		zap.Float64("measured_equity", measured),
+		zap.Int("days_discarded", len(snapshots)),
+		zap.String("hint", "the reconstruction did not reproduce a day the live sync measured; nothing was written"),
+	)
+	return nil, nil, fmt.Errorf("reconstruction contradicts the measured equity on %s", day.Timestamp.Format("2006-01-02"))
+}
+
+// mergeRealizedReconstruction folds a realized-only reconstruction into the
+// stored rows, or refuses it when most measured days contradict it. A dry run
+// logs the refusal and carries on, like the equity witness, so the series
+// around it still reaches the operator.
+func (s *SyncService) mergeRealizedReconstruction(connMeta *repository.ExchangeConnection, rebuilt, stored []*repository.Snapshot, opts reconstructOpts) ([]*repository.Snapshot, []time.Time, error) {
+	mode := realizedFull
+	switch {
+	case opts.recurring:
+		mode = realizedRecurring
+	case opts.window.isSet():
+		mode = realizedWindow
+	}
+	m := mergeRealizedOnly(rebuilt, stored, mode)
+
+	if m.rejected() {
+		fields := []zap.Field{
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.String("day", m.contradicted.Timestamp.Format("2006-01-02")),
+			zap.Float64("rebuilt_realized", m.rebuiltAt),
+			zap.Float64("measured_realized", m.contradicted.RealizedBalance),
+			zap.Int("days_reproduced", m.agree),
+			zap.Int("days_contradicted", m.disagree),
+		}
+		switch {
+		case opts.dryRun:
+			s.logger.Warn("history reconstruction DRY RUN — most measured days contradict it (series follows)", fields...)
+		case mode == realizedRecurring && m.agree+m.disagree == 1:
+			// The day after a connect, the only measured day is the connect
+			// itself, taken mid-day: alone it cannot tell that from another
+			// account. The next midnight sync adds the day that settles it.
+			s.logger.Info("history reconstruction deferred — its only measured day disagrees", fields...)
+			return nil, nil, nil
+		default:
+			s.logger.Error("history reconstruction rejected — most measured days contradict its realized balance",
+				append(fields, zap.String("hint", "the reconstruction does not describe the account the live sync measures; nothing was written"))...)
+			return nil, nil, fmt.Errorf("reconstruction contradicts the measured realized balance on %d of %d days", m.disagree, m.agree+m.disagree)
+		}
+	}
+	if len(m.vacated) > 0 {
+		s.logger.Info("history reconstruction vacates reconstructed days its dating no longer produces",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Time("first_vacated", m.vacated[0]),
+			zap.Int("days_vacated", len(m.vacated)),
+		)
+	}
+	return m.write, m.vacated, nil
 }
 
 // noteReconstructionFailure records a failed history reconstruction on the
@@ -2202,41 +2314,12 @@ func (s *SyncService) persistHistoricalSnapshots(
 		)
 	}
 
-	if existing, rerr := s.snapshotRepo.GetByUserAndDateRange(ctx, connMeta.UserUID, time.Unix(0, 0).UTC(), time.Now().UTC().Add(24*time.Hour)); rerr == nil {
-		mine := make([]*repository.Snapshot, 0, len(existing))
-		for _, e := range existing {
-			if e.Exchange == connMeta.Exchange && e.Label == connMeta.Label {
-				mine = append(mine, e)
-			}
-		}
-		if day, measured, bad := contradictedDay(snapshots, mine); bad {
-			// A dry run exists to inspect a disagreement, so returning here
-			// silenced the dump in exactly the case worth dumping: the
-			// operator saw one rejected day and never the series around it.
-			if opts.dryRun {
-				s.logger.Warn("history reconstruction DRY RUN — contradicts a measured day (series follows)",
-					zap.String("user_uid", connMeta.UserUID),
-					zap.String("exchange", connMeta.Exchange),
-					zap.String("label", connMeta.Label),
-					zap.String("day", day.Timestamp.Format("2006-01-02")),
-					zap.Float64("rebuilt_equity", day.TotalEquity),
-					zap.Float64("measured_equity", measured),
-				)
-			} else {
-				s.logger.Error("history reconstruction rejected — contradicts a measured day",
-					zap.String("user_uid", connMeta.UserUID),
-					zap.String("exchange", connMeta.Exchange),
-					zap.String("label", connMeta.Label),
-					zap.String("source", source),
-					zap.String("day", day.Timestamp.Format("2006-01-02")),
-					zap.Float64("rebuilt_equity", day.TotalEquity),
-					zap.Float64("measured_equity", measured),
-					zap.Int("days_discarded", len(snapshots)),
-					zap.String("hint", "the reconstruction did not reproduce a day the live sync measured; nothing was written"),
-				)
-				return fmt.Errorf("reconstruction contradicts the measured equity on %s", day.Timestamp.Format("2006-01-02"))
-			}
-		}
+	snapshots, vacated, err := s.checkAgainstStoredDays(ctx, connMeta, snapshots, source, opts)
+	if err != nil {
+		return err
+	}
+	if len(snapshots) == 0 && !opts.dryRun {
+		return nil
 	}
 
 	// Dry run: everything above already happened (including, for non-ZK
@@ -2265,6 +2348,7 @@ func (s *SyncService) persistHistoricalSnapshots(
 			zap.String("exchange", connMeta.Exchange),
 			zap.String("label", connMeta.Label),
 			zap.Int("days", len(snapshots)),
+			zap.Int("days_vacated", len(vacated)),
 		)
 		return nil
 	}
@@ -2276,8 +2360,13 @@ func (s *SyncService) persistHistoricalSnapshots(
 	// at connection time and is never re-attempted — so absorb a transient DB
 	// blip with a bounded retry rather than permanently leaving the connection
 	// without history. IBKR re-runs every sync and self-heals regardless.
-	err := retryWithBackoff(ctx, 3, time.Second, func() error {
-		return s.snapshotRepo.UpsertBatch(ctx, snapshots)
+	err = retryWithBackoff(ctx, 3, time.Second, func() error {
+		return s.snapshotRepo.UpsertBatchVacating(ctx, snapshots, repository.VacatedDays{
+			UserUID:  connMeta.UserUID,
+			Exchange: connMeta.Exchange,
+			Label:    connMeta.Label,
+			Days:     vacated,
+		})
 	})
 	if err != nil {
 		s.logger.Error("history reconstruction failed — transaction rolled back, no snapshots written",
