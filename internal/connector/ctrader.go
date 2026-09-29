@@ -41,8 +41,8 @@ const (
 	// cTrader does NOT expose cash flows in the deal list (2133/2134).
 	ctraderPayloadCashFlowHistoryReq = 2143
 	ctraderPayloadCashFlowHistoryRes = 2144
-	ctraderPayloadSymbolByIDReq  = 2116
-	ctraderPayloadSymbolByIDRes  = 2117
+	ctraderPayloadSymbolByIDReq      = 2116
+	ctraderPayloadSymbolByIDRes      = 2117
 
 	// ProtoOAGetPositionUnrealizedPnLReq/Res — the ONLY place cTrader exposes
 	// unrealized PnL. ProtoOAPosition (from the reconcile, 2124/2125) carries
@@ -204,10 +204,9 @@ func (d *dealStatus) UnmarshalJSON(b []byte) error {
 type cTraderPosition struct {
 	PositionID int64 `json:"positionId"`
 	TradeData  struct {
-		SymbolID   int64     `json:"symbolId"`
-		Volume     int64     `json:"volume"`
-		TradeSide  tradeSide `json:"tradeSide"`
-		UsedMargin int64     `json:"usedMargin"`
+		SymbolID  int64     `json:"symbolId"`
+		Volume    int64     `json:"volume"`
+		TradeSide tradeSide `json:"tradeSide"`
 	} `json:"tradeData"`
 	// cTrader's ProtoOAPosition.price is a double (the actual entry price, e.g.
 	// 1.15229), NOT a scaled integer — decode it as float64 and use it directly.
@@ -241,17 +240,21 @@ type cTraderAsset struct {
 }
 
 type cTraderDeal struct {
-	DealID              int64     `json:"dealId"`
-	OrderID             int64     `json:"orderId"`
-	SymbolID            int64     `json:"symbolId"`
-	TradeSide           tradeSide `json:"tradeSide"`
-	FilledVolume        int64     `json:"filledVolume"`
-	ExecutionPrice      float64    `json:"executionPrice"`
-	ExecutionTimestamp  int64      `json:"executionTimestamp"`
-	Commission          int64      `json:"commission"`
-	DealStatus          dealStatus `json:"dealStatus"`
-	MoneyDigits         int        `json:"moneyDigits"`
-	ClosePositionDetail *struct {
+	DealID             int64      `json:"dealId"`
+	OrderID            int64      `json:"orderId"`
+	SymbolID           int64      `json:"symbolId"`
+	TradeSide          tradeSide  `json:"tradeSide"`
+	FilledVolume       int64      `json:"filledVolume"`
+	ExecutionPrice     float64    `json:"executionPrice"`
+	ExecutionTimestamp int64      `json:"executionTimestamp"`
+	Commission         int64      `json:"commission"`
+	DealStatus         dealStatus `json:"dealStatus"`
+	MoneyDigits        int        `json:"moneyDigits"`
+	// BaseToUsdConversionRate prices one unit of the symbol's base asset in
+	// dollars at execution, which is what makes a notional comparable across
+	// a book quoted in yen, francs and dollars.
+	BaseToUsdConversionRate float64 `json:"baseToUsdConversionRate"`
+	ClosePositionDetail     *struct {
 		GrossProfit int64 `json:"grossProfit"`
 		Commission  int64 `json:"commission"`
 		Swap        int64 `json:"swap"`
@@ -327,6 +330,12 @@ type CTrader struct {
 
 	accountMu sync.Mutex
 	accountID int64
+	// pinnedAccountID is the ctidTraderAccountId the connection was created
+	// for. Zero leaves the choice to selectCTraderAccount's fallback.
+	pinnedAccountID int64
+	// accountUnpinned is set when the token grants several live accounts and
+	// nothing names the one this connection syncs.
+	accountUnpinned atomic.Bool
 	// authenticatedAccountID is the account the CURRENT socket has already
 	// run ProtoOAAccountAuthReq for. Re-sending it before every request was a
 	// free contributor to the per-payload-type rate limit (E-M7). Reset by
@@ -369,24 +378,31 @@ type CTrader struct {
 
 // NewCTrader creates a new cTrader connector.
 // TS-parity credentials:
-// - apiKey = access_token
-// - apiSecret = refresh_token (optional)
-// - passphrase = "demo" to force demo WebSocket endpoint
-// - CTRADER_CLIENT_ID / CTRADER_CLIENT_SECRET for app auth + refresh flow
+//   - apiKey = access_token
+//   - apiSecret = refresh_token (optional)
+//   - passphrase = "demo" to force demo WebSocket endpoint, or the numeric
+//     ctidTraderAccountId the connection syncs
+//   - CTRADER_CLIENT_ID / CTRADER_CLIENT_SECRET for app auth + refresh flow
 func NewCTrader(creds *Credentials) *CTrader {
 	clientID := firstNonEmpty(creds.ClientID, os.Getenv("CTRADER_CLIENT_ID"))
 	clientSecret := firstNonEmpty(creds.ClientSecret, os.Getenv("CTRADER_CLIENT_SECRET"))
 	accessToken := firstNonEmpty(creds.AccessToken, creds.APIKey)
 	refreshToken := strings.TrimSpace(creds.APISecret)
-	isLive := strings.ToLower(strings.TrimSpace(creds.Passphrase)) != "demo"
+	passphrase := strings.TrimSpace(creds.Passphrase)
+	isLive := !strings.EqualFold(passphrase, "demo")
+	pinned, err := strconv.ParseInt(passphrase, 10, 64)
+	if err != nil || pinned < 0 {
+		pinned = 0
+	}
 
 	return &CTrader{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		accessToken:  accessToken,
-		refreshToken: refreshToken,
-		isLive:       isLive,
-		httpClient:   &http.Client{Timeout: 30 * time.Second},
+		clientID:        clientID,
+		clientSecret:    clientSecret,
+		accessToken:     accessToken,
+		refreshToken:    refreshToken,
+		isLive:          isLive,
+		pinnedAccountID: pinned,
+		httpClient:      &http.Client{Timeout: 30 * time.Second},
 		wsDialer: &websocket.Dialer{
 			HandshakeTimeout: 10 * time.Second,
 		},
@@ -432,24 +448,53 @@ func (c *CTrader) CurrentCredentials() (string, string) {
 // c.isLive is only a WS-routing seed derived from the passphrase, and OAuth
 // connections never carry "demo" there — so it defaults to live and every OAuth
 // demo account was classified real, presenting a resettable demo balance as a
-// verifiable track record. Mirror ensureAccountID's prefer-live selection so
-// the flag matches the account that actually gets synced.
+// verifiable track record. The selection is ensureAccountID's, so the flag
+// matches the account that actually gets synced.
 func (c *CTrader) DetectIsPaper(ctx context.Context) (bool, error) {
 	accounts, err := c.getAccounts(ctx)
 	if err != nil {
 		return false, err
 	}
-	if len(accounts) == 0 {
-		return false, fmt.Errorf("no cTrader accounts found")
-	}
-	selected := accounts[0]
-	for _, acct := range accounts {
-		if acct.IsLive {
-			selected = acct
-			break
-		}
+	selected, _, err := selectCTraderAccount(accounts, c.pinnedAccountID)
+	if err != nil {
+		return false, err
 	}
 	return !selected.IsLive, nil
+}
+
+// errCTraderPinnedAccountNotGranted: the connection names an account its token
+// no longer grants. Falling back to another account would splice a different
+// account's balance into this connection's history.
+var errCTraderPinnedAccountNotGranted = errors.New("the cTrader account this connection was created for is not granted by its token; the account must be re-authorized")
+
+// selectCTraderAccount picks the account a connection syncs: the pinned one
+// when the connection names it, otherwise the first live account the token
+// grants, or the first account when none is live. unpinned reports a choice
+// made between several live accounts with nothing to say which one was meant.
+func selectCTraderAccount(accounts []cTraderAccount, pinned int64) (selected cTraderAccount, unpinned bool, err error) {
+	if len(accounts) == 0 {
+		return cTraderAccount{}, false, fmt.Errorf("no cTrader accounts found")
+	}
+	if pinned != 0 {
+		for _, acct := range accounts {
+			if acct.CtidTraderAccountID == pinned {
+				return acct, false, nil
+			}
+		}
+		return cTraderAccount{}, false, errCTraderPinnedAccountNotGranted
+	}
+	selected = accounts[0]
+	live := 0
+	for _, acct := range accounts {
+		if !acct.IsLive {
+			continue
+		}
+		if live == 0 {
+			selected = acct
+		}
+		live++
+	}
+	return selected, live > 1, nil
 }
 
 func (c *CTrader) TestConnection(ctx context.Context) error {
@@ -515,7 +560,7 @@ func (c *CTrader) GetPositions(ctx context.Context) ([]*Position, error) {
 			EntryPrice:    p.Price,
 			MarkPrice:     0,
 			UnrealizedPnL: pnlByPosition[p.PositionID],
-			MarketType:    detectCTraderMarketType(symbol),
+			MarketType:    MarketCFD,
 		})
 	}
 
@@ -528,50 +573,88 @@ func (c *CTrader) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade
 		return nil, err
 	}
 
-	deals, err := c.getDealsRaw(ctx, accountID, start.UnixMilli(), end.UnixMilli())
+	deals, err := c.getAllDeals(ctx, accountID, start, end)
 	if err != nil {
 		return nil, err
 	}
 
 	trades := make([]*Trade, 0, len(deals))
 	for _, d := range deals {
-		if d.DealStatus != "FILLED" && d.DealStatus != "PARTIALLY_FILLED" {
+		if !d.filled() {
 			continue
 		}
 
-		symbol := c.getSymbolName(ctx, d.SymbolID, accountID)
 		side := "buy"
 		if strings.EqualFold(string(d.TradeSide), "SELL") {
 			side = "sell"
 		}
 
-		// E-M6: money fields honour moneyDigits. Volumes (FilledVolume) do
-		// NOT — cTrader scales them by a fixed 1/100 — so only realizedPnL
-		// and the fee move to the money divisor.
-		realizedPnL := 0.0
-		if d.ClosePositionDetail != nil {
-			md := d.ClosePositionDetail.MoneyDigits
-			if md == 0 {
-				md = d.MoneyDigits
-			}
-			realizedPnL = float64(d.ClosePositionDetail.GrossProfit-d.ClosePositionDetail.Commission-d.ClosePositionDetail.Swap) / ctraderMoneyDivisor(md)
-		}
-
 		trades = append(trades, &Trade{
 			ID:          strconv.FormatInt(d.DealID, 10),
-			Symbol:      symbol,
+			Symbol:      c.getSymbolName(ctx, d.SymbolID, accountID),
 			Side:        side,
 			Price:       d.ExecutionPrice,
-			Quantity:    float64(d.FilledVolume) / 100.0,
-			Fee:         float64(d.Commission) / ctraderMoneyDivisor(d.MoneyDigits),
+			Quantity:    d.units(),
+			USDNotional: d.usdNotional(),
+			Fee:         d.fee(),
 			FeeCurrency: c.accountCurrency(),
-			RealizedPnL: realizedPnL,
+			RealizedPnL: d.realizedPnL(),
 			Timestamp:   time.UnixMilli(d.ExecutionTimestamp).UTC(),
-			MarketType:  detectCTraderMarketType(symbol),
+			// The bucket the equity is filed under (primaryMarketType). Gold
+			// and indices used to land in forex or commodities, markets that
+			// then carried trades and no equity.
+			MarketType: MarketCFD,
 		})
 	}
 
 	return trades, nil
+}
+
+func (d cTraderDeal) filled() bool {
+	return d.DealStatus == "FILLED" || d.DealStatus == "PARTIALLY_FILLED"
+}
+
+// units is the filled size in base-asset units. Volumes do not follow
+// moneyDigits: cTrader scales them by a fixed 1/100 (E-M6).
+func (d cTraderDeal) units() float64 {
+	return float64(d.FilledVolume) / 100.0
+}
+
+// usdNotional is the dollar value traded, 0 when the deal does not carry the
+// rate that prices it.
+func (d cTraderDeal) usdNotional() float64 {
+	if d.BaseToUsdConversionRate <= 0 {
+		return 0
+	}
+	return d.units() * d.BaseToUsdConversionRate
+}
+
+func (d cTraderDeal) notional() float64 {
+	if v := d.usdNotional(); v > 0 {
+		return v
+	}
+	return d.units() * d.ExecutionPrice
+}
+
+// fee is the commission as the positive cost every other venue reports;
+// cTrader signs a charge negative.
+func (d cTraderDeal) fee() float64 {
+	return -float64(d.Commission) / ctraderMoneyDivisor(d.MoneyDigits)
+}
+
+// realizedPnL is a closing deal's net result. Gross profit, swap and
+// commission all arrive signed from the account's side, so they add; the
+// closing balance moves by exactly that sum.
+func (d cTraderDeal) realizedPnL() float64 {
+	cpd := d.ClosePositionDetail
+	if cpd == nil {
+		return 0
+	}
+	md := cpd.MoneyDigits
+	if md == 0 {
+		md = d.MoneyDigits
+	}
+	return float64(cpd.GrossProfit+cpd.Swap+cpd.Commission) / ctraderMoneyDivisor(md)
 }
 
 func (c *CTrader) ensureState() {
@@ -643,17 +726,11 @@ func (c *CTrader) ensureAccountID(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(accounts) == 0 {
-		return 0, fmt.Errorf("no cTrader accounts found")
+	selected, unpinned, err := selectCTraderAccount(accounts, c.pinnedAccountID)
+	if err != nil {
+		return 0, err
 	}
-
-	selected := accounts[0]
-	for _, acct := range accounts {
-		if acct.IsLive {
-			selected = acct
-			break
-		}
-	}
+	c.accountUnpinned.Store(unpinned)
 
 	// Route the WS endpoint by the selected account's live/demo flag. c.isLive is
 	// initially derived from the passphrase, but OAuth connections never carry
@@ -717,6 +794,9 @@ func (c *CTrader) getAccounts(ctx context.Context) ([]cTraderAccount, error) {
 
 func (c *CTrader) getAccountBalance(ctx context.Context, accountID int64) (*cTraderBalanceInfo, error) {
 	c.resetCapabilityWarnings()
+	if c.accountUnpinned.Load() {
+		c.addCapabilityWarning("multiple_live_accounts_unpinned")
+	}
 
 	trader, err := c.getTraderInfo(ctx, accountID)
 	if err != nil {
@@ -755,12 +835,8 @@ func (c *CTrader) getAccountBalance(ctx context.Context, accountID int64) (*cTra
 		if p.MoneyDigits > 0 {
 			posDivisor = math.Pow10(p.MoneyDigits)
 		}
-		used := p.UsedMargin
-		if used <= 0 {
-			used = p.TradeData.UsedMargin
-		}
-		if used > 0 {
-			marginUsed += float64(used) / posDivisor
+		if p.UsedMargin > 0 {
+			marginUsed += float64(p.UsedMargin) / posDivisor
 		}
 	}
 
@@ -981,38 +1057,6 @@ func (c *CTrader) getPositionsRaw(ctx context.Context, accountID int64) ([]cTrad
 	return resp.Position, nil
 }
 
-func (c *CTrader) getDealsRaw(ctx context.Context, accountID, fromTS, toTS int64) ([]cTraderDeal, error) {
-	if err := c.authenticateAccount(ctx, accountID); err != nil {
-		return nil, err
-	}
-
-	raw, err := c.sendMessage(
-		ctx,
-		ctraderPayloadDealListReq,
-		map[string]any{
-			"ctidTraderAccountId": accountID,
-			"fromTimestamp":       fromTS,
-			"toTimestamp":         toTS,
-			"maxRows":             1000,
-		},
-		ctraderPayloadDealListRes,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	var resp struct {
-		Deal []cTraderDeal `json:"deal"`
-	}
-	if err := decodeRawPayload(raw, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Deal == nil {
-		return []cTraderDeal{}, nil
-	}
-	return resp.Deal, nil
-}
-
 func (c *CTrader) getSymbolName(ctx context.Context, symbolID, accountID int64) string {
 	if symbolID <= 0 {
 		return ""
@@ -1162,10 +1206,9 @@ func (c *CTrader) sendWithTokenRefresh(ctx context.Context, call func() (json.Ra
 	// the request it breaks. Only armed once a previous refresh told us the
 	// lifetime — the connect-time token arrives without one.
 	if c.needsProactiveRefresh() {
-		if err := c.refreshAccessToken(ctx); err != nil {
+		if err := c.refreshAndReconnect(ctx, "cTrader reconnect after proactive token refresh"); err != nil {
 			return nil, err
 		}
-		c.disconnect(errors.New("cTrader reconnect after proactive token refresh"))
 	}
 
 	raw, err := call()
@@ -1191,19 +1234,34 @@ func (c *CTrader) sendWithTokenRefresh(ctx context.Context, call func() (json.Ra
 		return nil, err
 	}
 
-	if err := c.refreshAccessToken(ctx); err != nil {
+	if err := c.refreshAndReconnect(ctx, "cTrader reconnect after token refresh"); err != nil {
 		return nil, err
 	}
-
-	c.disconnect(errors.New("cTrader reconnect after token refresh"))
-	if err := c.ensureConnected(ctx); err != nil {
-		return nil, err
-	}
-	if err := c.authenticateApp(ctx); err != nil {
-		return nil, err
-	}
-
 	return call()
+}
+
+// refreshAndReconnect rotates the token and opens an app-authenticated session
+// for it. The proactive path used to stop at the disconnect: the next request
+// then went out on a fresh socket that had never sent the application auth
+// cTrader requires first on every connection, and failed.
+func (c *CTrader) refreshAndReconnect(ctx context.Context, reason string) error {
+	if err := c.refreshAccessToken(ctx); err != nil {
+		return err
+	}
+	c.dropRefreshedSession(errors.New(reason))
+	if err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
+	return c.authenticateApp(ctx)
+}
+
+// dropRefreshedSession closes the socket the old token authenticated. cTrader
+// answers a refresh by pushing ProtoOAAccountsTokenInvalidatedEvent onto that
+// socket; the flag is cleared only once disconnect has run, because from then
+// on the read loop ignores anything the old socket still delivers.
+func (c *CTrader) dropRefreshedSession(cause error) {
+	c.disconnect(cause)
+	c.tokenInvalidated.Store(false)
 }
 
 func (c *CTrader) refreshAccessToken(ctx context.Context) error {
@@ -1287,7 +1345,6 @@ func (c *CTrader) refreshAccessToken(ctx context.Context) error {
 	if tokenResp.ExpiresIn > 0 {
 		c.accessTokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 	}
-	c.tokenInvalidated.Store(false)
 
 	// Persist refreshed tokens to DB SYNCHRONOUSLY, with the error checked.
 	// cTrader rotates single-use refresh tokens (each refresh invalidates the
@@ -1433,8 +1490,7 @@ func (c *CTrader) readLoop(ws *websocket.Conn) {
 		// answered next; flagging it here makes the very next call surface an
 		// OAuth-shaped error the sync layer can classify as reauth_required.
 		if msg.PayloadType == ctraderPayloadTokenInvalidatedEvent {
-			c.tokenInvalidated.Store(true)
-			c.failPending(errors.New(ctraderTokenInvalidatedError))
+			c.invalidateToken(ws)
 			continue
 		}
 		if msg.ClientMsgID == "" {
@@ -1462,6 +1518,22 @@ func (c *CTrader) readLoop(ws *websocket.Conn) {
 		}
 
 		deliverCTraderResponse(respCh, wsResponse{payloadType: msg.PayloadType, payload: msg.Payload})
+	}
+}
+
+// invalidateToken records ProtoOAAccountsTokenInvalidatedEvent unless it came
+// in on a socket already replaced. cTrader also pushes it when this instance
+// refreshes the token itself, and honouring that late copy failed every call
+// made with the fresh token as needing re-authorization.
+func (c *CTrader) invalidateToken(ws *websocket.Conn) {
+	c.connMu.Lock()
+	current := c.ws == ws
+	if current {
+		c.tokenInvalidated.Store(true)
+	}
+	c.connMu.Unlock()
+	if current {
+		c.failPending(errors.New(ctraderTokenInvalidatedError))
 	}
 }
 
@@ -1689,29 +1761,6 @@ func isAlreadyLoggedIn(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "ALREADY_LOGGED_IN")
 }
 
-// detectCTraderMarketType guesses market type from symbol name.
-func detectCTraderMarketType(symbol string) string {
-	// Forex pairs typically have 6 chars (EURUSD, GBPJPY, etc.)
-	if len(symbol) == 6 {
-		return MarketForex
-	}
-	// Indices
-	indices := []string{"US500", "US30", "US100", "DE30", "UK100", "JP225", "AU200"}
-	for _, idx := range indices {
-		if symbol == idx {
-			return MarketCFD
-		}
-	}
-	// Commodities
-	commodities := []string{"XAUUSD", "XAGUSD", "XPTUSD", "USOIL", "UKOIL"}
-	for _, c := range commodities {
-		if symbol == c {
-			return MarketCommodities
-		}
-	}
-	return MarketCFD
-}
-
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
 		trimmed := strings.TrimSpace(v)
@@ -1727,10 +1776,7 @@ func firstNonEmpty(values ...string) string {
 // surface cash flows in the deal list, so the deal-list approach never
 // detected anything. Each entry is a ProtoOADepositWithdraw with an
 // operationType (ProtoOAChangeBalanceType) and a delta scaled by moneyDigits.
-//
-// Only BALANCE_DEPOSIT (0) and BALANCE_WITHDRAW (1) are treated as cash flows:
-// every other operationType (swap, commission, rebate, dividend, fee…) is a
-// trading effect already reflected in equity/PnL and must not be double-counted.
+// Which operation types are capital is ctraderCapitalOps' call.
 func (c *CTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
 	entries, err := c.getRawCashflows(ctx, since)
 	if err != nil {
@@ -1759,8 +1805,8 @@ func (c *CTrader) getRawCashflows(ctx context.Context, since time.Time) ([]ctrad
 
 // GetRawCashflowEntries returns cTrader's balance-operation ledger for
 // [since, now] with every operationType included and money values decoded.
-// GetCashflows recognizes only deposit/withdraw (op 0/1); this exposes the
-// untyped operations (demo resets, adjustments) a balance jump may hide behind.
+// GetCashflows keeps only the capital operations; this exposes everything a
+// balance jump may hide behind (demo resets, charges, adjustments).
 func (c *CTrader) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error) {
 	entries, err := c.getRawCashflows(ctx, since)
 	if err != nil {
@@ -1794,6 +1840,40 @@ const (
 	ctraderOpWithdraw = 1 // ProtoOAChangeBalanceType.BALANCE_WITHDRAW
 )
 
+// ctraderCapitalOps holds the ProtoOAChangeBalanceType values that bring money
+// in or take it out without the account having traded for it, with the
+// direction each one moves the balance. Only deposits and withdrawals used to
+// count, so a transfer from the client's other account on the same server
+// read as profit.
+//
+// Everything absent stays in performance: swaps, dividends, volume rebates,
+// GSL and rollover charges, the fees a copier pays (4, 12, 28, 34), the
+// inactivity fee, and negative balance protection, which floors a loss at
+// zero rather than funding the account. ProtoOATrader keeps the
+// non-withdrawable bonus (19, 20) in a field of its own, apart from the
+// `balance` the equity reads; its conversion into real balance (38) is capital.
+var ctraderCapitalOps = map[int]float64{
+	ctraderOpDeposit:  +1,
+	ctraderOpWithdraw: -1,
+	3:                 +1, // BALANCE_DEPOSIT_STRATEGY_COMMISSION_INNER, received from copiers
+	5:                 +1, // BALANCE_DEPOSIT_IB_COMMISSIONS
+	6:                 -1, // BALANCE_WITHDRAW_IB_SHARED_PERCENTAGE
+	7:                 +1, // BALANCE_DEPOSIT_IB_SHARED_PERCENTAGE_FROM_SUB_IB
+	8:                 +1, // BALANCE_DEPOSIT_IB_SHARED_PERCENTAGE_FROM_BROKER
+	11:                +1, // BALANCE_DEPOSIT_STRATEGY_COMMISSION_OUTER
+	13:                -1, // BALANCE_WITHDRAW_BONUS_COMPENSATION, IB commission shared with the broker
+	14:                -1, // BALANCE_WITHDRAW_IB_SHARED_PERCENTAGE_TO_BROKER
+	27:                +1, // BALANCE_DEPOSIT_MANAGEMENT_FEE, received from copiers
+	29:                +1, // BALANCE_DEPOSIT_PERFORMANCE_FEE, received from copiers
+	30:                -1, // BALANCE_WITHDRAW_FOR_SUBACCOUNT
+	31:                +1, // BALANCE_DEPOSIT_TO_SUBACCOUNT
+	32:                -1, // BALANCE_WITHDRAW_FROM_SUBACCOUNT
+	33:                +1, // BALANCE_DEPOSIT_FROM_SUBACCOUNT
+	36:                +1, // BALANCE_DEPOSIT_TRANSFER, from another account on the same server
+	37:                -1, // BALANCE_WITHDRAW_TRANSFER, to another account on the same server
+	38:                +1, // BALANCE_DEPOSIT_CONVERTED_BONUS
+}
+
 // ctraderMoneyDivisor returns 10^moneyDigits (default 100 = 2 digits) used to
 // convert cTrader's integer money values to a decimal amount.
 func ctraderMoneyDivisor(moneyDigits int) float64 {
@@ -1815,22 +1895,18 @@ func parseCTraderDepositWithdraws(raw json.RawMessage) ([]ctraderDepositWithdraw
 	return resp.DepositWithdraw, nil
 }
 
-// ctraderCashflowAmount returns the signed amount for a deposit/withdraw entry
-// (positive deposit, negative withdrawal), or ok=false when the entry is not a
-// user capital flow (swap/commission/rebate/dividend/fee/etc., which are
-// trading effects already reflected in equity/PnL).
+// ctraderCashflowAmount returns the signed amount of a capital entry (positive
+// in, negative out), or ok=false for an entry that is a result of trading.
 func ctraderCashflowAmount(dw ctraderDepositWithdraw) (float64, bool) {
-	if dw.OperationType != ctraderOpDeposit && dw.OperationType != ctraderOpWithdraw {
+	sign, ok := ctraderCapitalOps[dw.OperationType]
+	if !ok {
 		return 0, false
 	}
 	amount := math.Abs(float64(dw.Delta)) / ctraderMoneyDivisor(dw.MoneyDigits)
 	if amount == 0 {
 		return 0, false
 	}
-	if dw.OperationType == ctraderOpWithdraw {
-		amount = -amount
-	}
-	return amount, true
+	return sign * amount, true
 }
 
 // parseCTraderCashflows extracts user deposits/withdrawals from a
@@ -1970,9 +2046,9 @@ func (c *CTrader) sendPaged(ctx context.Context, payloadType int, payload map[st
 // entirely in-enclave (ZK-native — no credentials leave the SEV-SNP perimeter).
 //
 // cTrader exposes no daily-NAV history, so the curve is computed from
-// authoritative balance-after values: every closing deal and every
-// deposit/withdrawal carries the account balance after it. Daily equity is the
-// latest such balance at or before the end of each day (carry-forward).
+// authoritative balance-after values: every closing deal and every ledger
+// entry carries the account balance after it (buildCTraderHistoricalSnapshots
+// says which instant each row holds).
 //
 // Caveat: historical UNREALIZED PnL on positions held overnight is not
 // reconstructed (no historical mark prices here) — the realized balance is used
@@ -1989,6 +2065,9 @@ func (c *CTrader) GetHistoricalSnapshots(ctx context.Context, since time.Time) (
 	if start.IsZero() || start.Before(now.Add(-ctraderMaxLookback)) {
 		start = now.Add(-ctraderMaxLookback)
 	}
+	// Whole days only: a scan starting mid-day hands the first row part of
+	// that day's flows.
+	start = truncUTCDay(start)
 
 	deals, err := c.getAllDeals(ctx, accountID, start, now)
 	if err != nil {
@@ -2006,7 +2085,7 @@ func (c *CTrader) GetHistoricalSnapshots(ctx context.Context, since time.Time) (
 				earliest = d.ExecutionTimestamp
 			}
 		}
-		if cs := time.UnixMilli(earliest).UTC().Add(-ctraderInceptionBuffer); cs.After(cashflowStart) {
+		if cs := truncUTCDay(time.UnixMilli(earliest).UTC().Add(-ctraderInceptionBuffer)); cs.After(cashflowStart) {
 			cashflowStart = cs
 		}
 	}
@@ -2018,9 +2097,8 @@ func (c *CTrader) GetHistoricalSnapshots(ctx context.Context, since time.Time) (
 	return buildCTraderHistoricalSnapshots(deals, cashflows, now), nil
 }
 
-// getAllDeals fetches every deal in [start, end], following hasMore pagination.
-// Deals are returned ascending by executionTimestamp, so each page advances the
-// window past the last deal seen.
+// getAllDeals fetches every deal in [start, end], following hasMore pagination
+// forward in time from the newest deal each page holds.
 func (c *CTrader) getAllDeals(ctx context.Context, accountID int64, start, end time.Time) ([]cTraderDeal, error) {
 	if err := c.authenticateAccount(ctx, accountID); err != nil {
 		return nil, err
@@ -2059,30 +2137,41 @@ func (c *CTrader) getAllDeals(ctx context.Context, accountID int64, start, end t
 			complete = true
 			break
 		}
-		last := resp.Deal[len(resp.Deal)-1].ExecutionTimestamp
-		// CONN-05: re-fetch from `last` (not last+1) so a deal sharing the
-		// boundary millisecond with the page's last deal isn't skipped; the
-		// dedup-by-dealId above drops the re-read overlap. If the window neither
-		// advanced nor yielded anything new, stop — a full page packed into a
-		// single millisecond, where we can't progress without skipping.
-		if last <= from && added == 0 {
-			complete = true
+		// CONN-05: re-fetch from the newest deal's millisecond (not +1) so a
+		// deal sharing it isn't skipped; the dedup-by-dealId above drops the
+		// re-read overlap. The newest rather than the last listed: Spotware
+		// documents no order within a page, and a page listed newest-first
+		// would send the cursor back to its oldest deal, re-read the same page
+		// and end the walk as if the ledger were exhausted.
+		newest := newestExecution(resp.Deal)
+		if newest <= from && added == 0 {
+			// A full page inside one millisecond: no way past it without
+			// skipping deals, so the history is not complete.
 			break
 		}
-		from = last
+		from = newest
 	}
 
-	// E-H1: running out of pages is not the end of the ledger. cTrader pages
-	// FORWARD in time, so the deals beyond the cap are the most RECENT ones —
-	// the carry-forward builder then draws a flat line from the truncation
-	// point to today and calls it a track record. Same stance as ig.go: refuse
-	// a history we know is incomplete rather than hand back a plausible one.
+	// E-H1: a walk that cannot reach the end of the ledger has lost its most
+	// RECENT deals — the carry-forward builder then draws a flat line from the
+	// truncation point to today and calls it a track record. Same stance as
+	// ig.go: refuse a history we know is incomplete rather than hand back a
+	// plausible one.
 	if !complete {
-		return nil, fmt.Errorf("ctrader deal history exceeds %d pages of 1000 for %s..%s: refusing a truncated history",
-			c.maxDealPages,
-			start.UTC().Format(time.DateOnly), end.UTC().Format(time.DateOnly))
+		return nil, fmt.Errorf("ctrader deal history for %s..%s could not be paged to its end within %d pages of 1000: refusing a truncated history",
+			start.UTC().Format(time.DateOnly), end.UTC().Format(time.DateOnly), c.maxDealPages)
 	}
 	return all, nil
+}
+
+func newestExecution(deals []cTraderDeal) int64 {
+	var newest int64
+	for _, d := range deals {
+		if d.ExecutionTimestamp > newest {
+			newest = d.ExecutionTimestamp
+		}
+	}
+	return newest
 }
 
 // appendUnseenDeals appends deals whose dealId hasn't been seen yet (recording
@@ -2158,26 +2247,12 @@ func truncUTCDay(t time.Time) time.Time {
 }
 
 // ctraderBalancePoints returns sorted authoritative balance-after samples from
-// closing deals and cash flows (cTrader reports the account balance after each).
+// closing deals and from every ledger entry. Swaps, dividends, charges and
+// transfers move the balance too; a curve fed only by deposits and
+// withdrawals held their effect back until the next closing deal.
 func ctraderBalancePoints(deals []cTraderDeal, cashflows []ctraderDepositWithdraw) []ctraderBalPoint {
-	var points []ctraderBalPoint
-	for _, d := range deals {
-		if d.ClosePositionDetail == nil || d.ClosePositionDetail.Balance == nil {
-			continue
-		}
-		md := d.ClosePositionDetail.MoneyDigits
-		if md == 0 {
-			md = d.MoneyDigits
-		}
-		points = append(points, ctraderBalPoint{
-			t:   time.UnixMilli(d.ExecutionTimestamp).UTC(),
-			bal: float64(*d.ClosePositionDetail.Balance) / ctraderMoneyDivisor(md),
-		})
-	}
+	points := ctraderDealBalancePoints(deals)
 	for _, cf := range cashflows {
-		if _, ok := ctraderCashflowAmount(cf); !ok {
-			continue
-		}
 		points = append(points, ctraderBalPoint{
 			t:   time.UnixMilli(cf.Timestamp).UTC(),
 			bal: float64(cf.Balance) / ctraderMoneyDivisor(cf.MoneyDigits),
@@ -2309,7 +2384,7 @@ func ctraderDealBalancePoints(deals []cTraderDeal) []ctraderBalPoint {
 func ctraderTradesByDay(deals []cTraderDeal) map[string]*ctraderTradeDay {
 	byDay := map[string]*ctraderTradeDay{}
 	for _, d := range deals {
-		if d.DealStatus != "FILLED" && d.DealStatus != "PARTIALLY_FILLED" {
+		if !d.filled() {
 			continue
 		}
 		key := time.UnixMilli(d.ExecutionTimestamp).UTC().Format("20060102")
@@ -2319,9 +2394,9 @@ func ctraderTradesByDay(deals []cTraderDeal) map[string]*ctraderTradeDay {
 			byDay[key] = e
 		}
 		e.count++
-		notional := (float64(d.FilledVolume) / 100.0) * d.ExecutionPrice
+		notional := d.notional()
 		e.volume += notional
-		e.fees += float64(d.Commission) / ctraderMoneyDivisor(d.MoneyDigits)
+		e.fees += d.fee()
 		if strings.EqualFold(string(d.TradeSide), "SELL") {
 			e.shortTrades++
 			e.shortVolume += notional
@@ -2335,7 +2410,14 @@ func ctraderTradesByDay(deals []cTraderDeal) map[string]*ctraderTradeDay {
 
 // buildCTraderHistoricalSnapshots turns raw deal + cash-flow history into a
 // daily equity timeline. Pure (no I/O) so it is unit-testable against captured
-// payloads. Today is intentionally excluded — it is owned by the live sync.
+// payloads.
+//
+// A row holds the balance at the midnight that opens its date, with the flows
+// and trades of the day before: what the live sync reads at 00:00 UTC, over
+// the window it reads, under the date it stamps. Rows keyed by the day that
+// had just closed sat one day off the live series and every other venue.
+// The first row is the day after the first balance change; today's row is the
+// live sync's.
 func buildCTraderHistoricalSnapshots(deals []cTraderDeal, cashflows []ctraderDepositWithdraw, now time.Time) []*HistoricalSnapshot {
 	points := ctraderBalancePoints(deals, cashflows)
 	if len(points) == 0 {
@@ -2344,14 +2426,14 @@ func buildCTraderHistoricalSnapshots(deals []cTraderDeal, cashflows []ctraderDep
 	cfByDay := ctraderCashflowsByDay(deals, cashflows)
 	tByDay := ctraderTradesByDay(deals)
 
-	firstDay := truncUTCDay(points[0].t)
-	lastDay := truncUTCDay(now).Add(-24 * time.Hour) // yesterday; today is the live branch's
+	firstRow := truncUTCDay(points[0].t).Add(24 * time.Hour)
+	lastRow := truncUTCDay(now).Add(-24 * time.Hour)
 
 	var out []*HistoricalSnapshot
-	for day := firstDay; !day.After(lastDay); day = day.Add(24 * time.Hour) {
-		bal := ctraderBalanceAt(points, day.Add(24*time.Hour))
-		snap := &HistoricalSnapshot{Date: day, TotalEquity: bal, RealizedBalance: bal}
-		key := day.Format("20060102")
+	for row := firstRow; !row.After(lastRow); row = row.Add(24 * time.Hour) {
+		bal := ctraderBalanceAt(points, row)
+		snap := &HistoricalSnapshot{Date: row, TotalEquity: bal, RealizedBalance: bal}
+		key := row.Add(-24 * time.Hour).Format("20060102")
 		if e := cfByDay[key]; e != nil {
 			snap.Deposits = e.deposits
 			snap.Withdrawals = e.withdrawals

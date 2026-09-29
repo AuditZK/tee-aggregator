@@ -70,6 +70,39 @@ func TestCTraderRequestTimeout_InvalidatesSocket(t *testing.T) {
 	}
 }
 
+// cTrader pushes ProtoOAAccountsTokenInvalidatedEvent onto the old socket when
+// this instance refreshes the token itself. Honoured after the refresh, that
+// late copy failed every call made with the fresh token as a dead
+// authorization, and the sync reported the account as needing reconnection.
+func TestCTraderTokenInvalidated_OnlyFromTheCurrentSocket(t *testing.T) {
+	replaced, current := &websocket.Conn{}, &websocket.Conn{}
+	c := &CTrader{pending: map[string]chan wsResponse{}}
+	c.ws = current
+
+	c.invalidateToken(replaced)
+	if c.tokenInvalidated.Load() {
+		t.Fatal("an event from a replaced socket invalidated the current token")
+	}
+
+	c.invalidateToken(current)
+	if !c.tokenInvalidated.Load() {
+		t.Fatal("the current socket's invalidation was dropped")
+	}
+}
+
+// Once the refreshed session's socket is gone nothing it still delivers can
+// count, so the flag is cleared after the disconnect, not before it.
+func TestCTraderDropRefreshedSession_ClearsTheInvalidation(t *testing.T) {
+	c := &CTrader{pending: map[string]chan wsResponse{}}
+	c.tokenInvalidated.Store(true)
+
+	c.dropRefreshedSession(context.Canceled)
+
+	if c.tokenInvalidated.Load() {
+		t.Fatal("the fresh token starts out marked invalid")
+	}
+}
+
 // A socket that produces nothing at all must eventually fail its read, which
 // is the only signal a half-open connection ever gives.
 func TestCTraderReadDeadline_TearsDownSilentSocket(t *testing.T) {

@@ -360,7 +360,11 @@ type Trade struct {
 	// equity option, 50 on an ES future. Zero means Quantity is already in
 	// the price's unit, which is every spot venue and every connector not
 	// yet taught its own contract sizes.
-	Multiplier  float64   `json:"multiplier,omitempty"`
+	Multiplier float64 `json:"multiplier,omitempty"`
+	// USDNotional is the dollar value traded, for a venue that states it. A
+	// CFD book is quoted in a dozen currencies, and summing Price*Quantity
+	// across it added a yen notional to a dollar total at 150 times its size.
+	USDNotional float64   `json:"usd_notional,omitempty"`
 	Fee         float64   `json:"fee"`
 	FeeCurrency string    `json:"fee_currency"`
 	RealizedPnL float64   `json:"realized_pnl"`
@@ -368,10 +372,14 @@ type Trade struct {
 	MarketType  string    `json:"market_type"` // "spot", "stocks", "swap", "futures", "options"
 }
 
-// Notional is the value traded, in the currency Price is quoted in. Reading
-// Price * Quantity off a contract undercounts it by the multiplier, which put
-// a day of equity options on the dashboard at one hundredth of its size.
+// Notional is the value traded, in dollars when the venue states it and in the
+// currency Price is quoted in otherwise. Reading Price * Quantity off a
+// contract undercounts it by the multiplier, which put a day of equity options
+// on the dashboard at one hundredth of its size.
 func (t *Trade) Notional() float64 {
+	if t.USDNotional > 0 {
+		return t.USDNotional
+	}
 	if t.Multiplier > 0 {
 		return t.Price * t.Quantity * t.Multiplier
 	}

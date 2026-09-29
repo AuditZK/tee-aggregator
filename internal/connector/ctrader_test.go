@@ -539,6 +539,8 @@ func TestCTraderDealUnmarshal_RealPayload(t *testing.T) {
 func TestBuildCTraderHistoricalSnapshots_RealRoundTrip(t *testing.T) {
 	// Real captured payloads: a $1000 deposit (balance 8.89 -> 1008.89) then a
 	// 1-lot EURUSD round-trip closing at balance 996.42, all on 2026-06-05 UTC.
+	// They land on the 06-06 row: the balance at the midnight that opens it,
+	// with the flows and trades of the day before.
 	dealJSON := `{"deal":[{"dealId":320460360,"positionId":264207985,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":1780689978964,"executionPrice":1.15225,"tradeSide":2,"dealStatus":2,"commission":-450,"closePositionDetail":{"grossProfit":-347,"swap":0,"commission":-900,"balance":99642,"moneyDigits":2},"moneyDigits":2},{"dealId":320455222,"positionId":264207985,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":1780688563637,"executionPrice":1.15229,"tradeSide":1,"dealStatus":2,"commission":-450,"moneyDigits":2}]}`
 	var dr struct {
 		Deal []cTraderDeal `json:"deal"`
@@ -551,15 +553,19 @@ func TestBuildCTraderHistoricalSnapshots_RealRoundTrip(t *testing.T) {
 		t.Fatalf("parse cashflows: %v", err)
 	}
 
-	now := time.Date(2026, 6, 6, 10, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 6, 7, 10, 0, 0, 0, time.UTC)
 	snaps := buildCTraderHistoricalSnapshots(dr.Deal, cfs, now)
 
 	if len(snaps) != 1 {
 		t.Fatalf("got %d snapshots, want 1", len(snaps))
 	}
 	s := snaps[0]
-	if s.Date.Format("20060102") != "20260605" {
-		t.Fatalf("date: got %s, want 20260605", s.Date.Format("20060102"))
+	if s.Date.Format("20060102") != "20260606" {
+		t.Fatalf("date: got %s, want 20260606", s.Date.Format("20060102"))
+	}
+	// cTrader signs the commission negative; the fee is the cost paid.
+	if !floatNear(s.TotalFees, 9, 1e-9) {
+		t.Fatalf("fees: got %v, want 9 paid", s.TotalFees)
 	}
 	if !floatNear(s.TotalEquity, 996.42, 0.01) {
 		t.Fatalf("equity: got %v, want 996.42", s.TotalEquity)
@@ -587,7 +593,7 @@ func TestBuildCTraderHistoricalSnapshots_RealRoundTrip(t *testing.T) {
 func TestBuildCTraderHistoricalSnapshots_CarryForwardAndWithdraw(t *testing.T) {
 	day1 := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	day3 := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 6, 4, 9, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 6, 5, 9, 0, 0, 0, time.UTC)
 
 	cashflows := []ctraderDepositWithdraw{
 		{OperationType: 0, Balance: 100000, Delta: 100000, Timestamp: day1.UnixMilli(), MoneyDigits: 2}, // +$1000 -> 1000
@@ -596,19 +602,19 @@ func TestBuildCTraderHistoricalSnapshots_CarryForwardAndWithdraw(t *testing.T) {
 	snaps := buildCTraderHistoricalSnapshots(nil, cashflows, now)
 
 	if len(snaps) != 3 {
-		t.Fatalf("got %d snapshots, want 3 (06-01..06-03)", len(snaps))
+		t.Fatalf("got %d snapshots, want 3 (06-02..06-04)", len(snaps))
 	}
-	// 06-01: deposit day, equity 1000
-	if snaps[0].Date.Format("20060102") != "20260601" || snaps[0].TotalEquity != 1000 || snaps[0].Deposits != 1000 {
-		t.Fatalf("day1: %+v", snaps[0])
+	// 06-02 opens on the 06-01 deposit.
+	if snaps[0].Date.Format("20060102") != "20260602" || snaps[0].TotalEquity != 1000 || snaps[0].Deposits != 1000 {
+		t.Fatalf("06-02: %+v", snaps[0])
 	}
-	// 06-02: no activity, equity carried forward
-	if snaps[1].Date.Format("20060102") != "20260602" || snaps[1].TotalEquity != 1000 || snaps[1].Deposits != 0 || snaps[1].Withdrawals != 0 {
-		t.Fatalf("day2 (carry-forward): %+v", snaps[1])
+	// 06-03: nothing happened on 06-02, equity carried forward.
+	if snaps[1].Date.Format("20060102") != "20260603" || snaps[1].TotalEquity != 1000 || snaps[1].Deposits != 0 || snaps[1].Withdrawals != 0 {
+		t.Fatalf("06-03 (carry-forward): %+v", snaps[1])
 	}
-	// 06-03: withdrawal, equity 800
-	if snaps[2].Date.Format("20060102") != "20260603" || snaps[2].TotalEquity != 800 || snaps[2].Withdrawals != 200 {
-		t.Fatalf("day3: %+v", snaps[2])
+	// 06-04 opens on the 06-03 withdrawal.
+	if snaps[2].Date.Format("20060102") != "20260604" || snaps[2].TotalEquity != 800 || snaps[2].Withdrawals != 200 {
+		t.Fatalf("06-04: %+v", snaps[2])
 	}
 }
 
@@ -646,12 +652,13 @@ func TestBuildCTraderHistoricalSnapshots_DemoResetRecordsNetDeposit(t *testing.T
 		totalDeposits += s.Deposits
 	}
 
-	// Inception is a real deposit (running balance was 0 -> not a reset).
-	if d := byDay["20260302"]; d == nil || d.Deposits != 50000 {
+	// Inception is a real deposit (running balance was 0 -> not a reset). It
+	// lands on the row whose midnight follows it.
+	if d := byDay["20260303"]; d == nil || d.Deposits != 50000 {
 		t.Fatalf("inception: want deposits=50000, got %+v", d)
 	}
-	// Reset day: NET capital (500,000 - 51,234.56), equity is the new 500k.
-	reset := byDay["20260313"]
+	// Row after the reset: NET capital (500,000 - 51,234.56), equity the new 500k.
+	reset := byDay["20260314"]
 	if reset == nil {
 		t.Fatal("reset row missing")
 	}
@@ -680,11 +687,12 @@ func floatNear(a, b, tol float64) bool {
 // reconstructsEverySync). If this breaks, cTrader silently stops backfilling.
 var _ HistoricalSnapshotProvider = (*CTrader)(nil)
 
-func TestBuildCTraderHistoricalSnapshots_BoundaryHeal(t *testing.T) {
-	// Real round-trip + deposit on 2026-06-05, reconstructed on a LATER heal day
-	// (now=2026-06-07). The recurring re-run must emit the boundary day 06-06
-	// with Deposits=0 (overwriting the live path's spurious 24h-window deposit)
-	// while keeping 06-05 as the single real deposit, equity carried forward.
+// The live sync runs at 00:00 UTC and stamps what it reads with that day: the
+// equity at midnight, and the flows and trades of the 24 hours before. A
+// rebuilt row must say the same thing under the same date, or the two series
+// sit a day apart and the witness comparing them rejects every day that moved.
+func TestBuildCTraderHistoricalSnapshots_RowIsWhatTheMidnightSyncReads(t *testing.T) {
+	// Real round-trip + deposit on 2026-06-05, rebuilt on 06-09.
 	dealJSON := `{"deal":[{"dealId":320460360,"positionId":264207985,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":1780689978964,"executionPrice":1.15225,"tradeSide":2,"dealStatus":2,"commission":-450,"closePositionDetail":{"grossProfit":-347,"swap":0,"commission":-900,"balance":99642,"moneyDigits":2},"moneyDigits":2},{"dealId":320455222,"positionId":264207985,"volume":10000000,"filledVolume":10000000,"symbolId":1,"executionTimestamp":1780688563637,"executionPrice":1.15229,"tradeSide":1,"dealStatus":2,"commission":-450,"moneyDigits":2}]}`
 	var dr struct {
 		Deal []cTraderDeal `json:"deal"`
@@ -696,8 +704,14 @@ func TestBuildCTraderHistoricalSnapshots_BoundaryHeal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse cashflows: %v", err)
 	}
+	// A synthetic 100 withdrawal at noon on 06-07: the 06-07 row opens before
+	// it, the 06-08 row after it.
+	cfs = append(cfs, ctraderDepositWithdraw{
+		OperationType: ctraderOpWithdraw, Delta: -10000, Balance: 89642,
+		Timestamp: time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC).UnixMilli(), MoneyDigits: 2,
+	})
 
-	now := time.Date(2026, 6, 7, 10, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC)
 	snaps := buildCTraderHistoricalSnapshots(dr.Deal, cfs, now)
 
 	byDay := map[string]*HistoricalSnapshot{}
@@ -707,18 +721,23 @@ func TestBuildCTraderHistoricalSnapshots_BoundaryHeal(t *testing.T) {
 		total += s.Deposits
 	}
 
-	if d := byDay["20260605"]; d == nil || d.Deposits != 1000 {
-		t.Fatalf("06-05: want deposits=1000, got %+v", d)
+	if _, ok := byDay["20260605"]; ok {
+		t.Fatal("a row for 06-05 would hold the balance at 06-05 00:00, before the account had any")
 	}
 	d06 := byDay["20260606"]
-	if d06 == nil {
-		t.Fatalf("06-06 boundary-heal row missing (cannot overwrite the live spurious deposit)")
+	if d06 == nil || d06.Deposits != 1000 || d06.TotalTrades != 2 || !floatNear(d06.TotalEquity, 996.42, 0.01) {
+		t.Fatalf("06-06 must read what a 06-06 00:00 sync reads (996.42, the 1000 deposit, 2 trades), got %+v", d06)
 	}
-	if d06.Deposits != 0 {
-		t.Fatalf("06-06 deposits: want 0 (heal), got %v", d06.Deposits)
+	d07 := byDay["20260607"]
+	if d07 == nil || d07.Deposits != 0 || d07.Withdrawals != 0 || d07.TotalTrades != 0 || !floatNear(d07.TotalEquity, 996.42, 0.01) {
+		t.Fatalf("06-07 opens on a quiet 06-06, before the noon withdrawal: got %+v", d07)
 	}
-	if !floatNear(d06.TotalEquity, 996.42, 0.01) {
-		t.Fatalf("06-06 equity: want 996.42 carry-forward, got %v", d06.TotalEquity)
+	d08 := byDay["20260608"]
+	if d08 == nil || d08.Withdrawals != 100 || !floatNear(d08.TotalEquity, 896.42, 0.01) {
+		t.Fatalf("06-08 opens after the 06-07 withdrawal: got %+v", d08)
+	}
+	if _, ok := byDay["20260609"]; ok {
+		t.Fatal("today's row belongs to the live sync")
 	}
 	if total != 1000 {
 		t.Fatalf("total deposits across series: want 1000 (counted exactly once), got %v", total)
