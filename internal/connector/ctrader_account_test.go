@@ -26,8 +26,10 @@ func TestCTraderGetBalance_WarnsWhenTheAccountIsAGuess(t *testing.T) {
 	}
 }
 
-// The passphrase slot carries either the demo routing seed or the account the
-// connection was created for.
+// The passphrase slot carries either the demo routing seed or, behind its
+// prefix, the account the connection was created for. Connections created
+// before 2026-09-09 hold the token lifetime there; read as an account, it
+// failed every one of them in production as needing re-authorization.
 func TestNewCTrader_ReadsThePassphrase(t *testing.T) {
 	cases := []struct {
 		passphrase string
@@ -37,8 +39,11 @@ func TestNewCTrader_ReadsThePassphrase(t *testing.T) {
 		{"", true, 0},
 		{"demo", false, 0},
 		{" DEMO ", false, 0},
-		{"41234567", true, 41234567},
-		{"-5", true, 0},
+		{"ctid:41234567", true, 41234567},
+		{"2628000", true, 0},
+		{"41234567", true, 0},
+		{"ctid:-5", true, 0},
+		{"ctid:", true, 0},
 		{"account-7", true, 0},
 	}
 	for _, tc := range cases {
