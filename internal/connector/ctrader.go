@@ -380,8 +380,8 @@ type CTrader struct {
 // TS-parity credentials:
 //   - apiKey = access_token
 //   - apiSecret = refresh_token (optional)
-//   - passphrase = "demo" to force demo WebSocket endpoint, or the numeric
-//     ctidTraderAccountId the connection syncs
+//   - passphrase = "demo" to force demo WebSocket endpoint, or
+//     "ctid:<ctidTraderAccountId>" to pin the account the connection syncs
 //   - CTRADER_CLIENT_ID / CTRADER_CLIENT_SECRET for app auth + refresh flow
 func NewCTrader(creds *Credentials) *CTrader {
 	clientID := firstNonEmpty(creds.ClientID, os.Getenv("CTRADER_CLIENT_ID"))
@@ -390,9 +390,14 @@ func NewCTrader(creds *Credentials) *CTrader {
 	refreshToken := strings.TrimSpace(creds.APISecret)
 	passphrase := strings.TrimSpace(creds.Passphrase)
 	isLive := !strings.EqualFold(passphrase, "demo")
-	pinned, err := strconv.ParseInt(passphrase, 10, 64)
-	if err != nil || pinned < 0 {
-		pinned = 0
+	// Only the explicit prefix pins: connections created before 2026-09-09
+	// hold the token lifetime ("2628000") here, and read as an account id it
+	// refused every one of them as re-authorization required.
+	var pinned int64
+	if id, ok := strings.CutPrefix(passphrase, ctraderPinPrefix); ok {
+		if n, err := strconv.ParseInt(id, 10, 64); err == nil && n > 0 {
+			pinned = n
+		}
 	}
 
 	return &CTrader{
@@ -461,6 +466,10 @@ func (c *CTrader) DetectIsPaper(ctx context.Context) (bool, error) {
 	}
 	return !selected.IsLive, nil
 }
+
+// ctraderPinPrefix marks a passphrase that names the account a connection
+// syncs.
+const ctraderPinPrefix = "ctid:"
 
 // errCTraderPinnedAccountNotGranted: the connection names an account its token
 // no longer grants. Falling back to another account would splice a different
