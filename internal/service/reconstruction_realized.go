@@ -33,25 +33,10 @@ func isLiveMeasurement(s *repository.Snapshot) bool {
 		b.Forex != nil || b.Commodities != nil
 }
 
-// realizedMode is how much of a connection's stored history a realized-only
-// reconstruction owns.
-type realizedMode int
-
-const (
-	// realizedFull (connect, admin reconstruct) rewrites every reconstructed
-	// day it spans and vacates the one its new dating left behind.
-	realizedFull realizedMode = iota
-	// realizedWindow (gap repair) rewrites the days of its window, no other.
-	realizedWindow
-	// realizedRecurring (every sync) never rewrites a reconstructed day.
-	realizedRecurring
-)
-
 // realizedMerge is what a realized-only reconstruction does to the rows a
 // connection already holds.
 type realizedMerge struct {
-	write   []*repository.Snapshot
-	vacated []time.Time
+	write []*repository.Snapshot
 	// agree and disagree count the measured days whose realized balance the
 	// reconstruction reproduces or not; contradicted is the first of the
 	// latter and rebuiltAt the balance the reconstruction gave it.
@@ -69,82 +54,74 @@ func (m realizedMerge) rejected() bool { return m.disagree > m.agree }
 // mergeRealizedOnly folds a realized-only reconstruction into a connection's
 // stored rows.
 //
+// A connection with nothing stored before today takes the whole series: that
+// is the backfill at connect.
+//
+// Once a history is stored, the reconstruction never rewrites, extends or cuts
+// it, because what the broker serves now is not what it served then. A demo
+// reset erases the ledger before it: rebuilt from what is left, the account
+// starts on the reset, booked as a deposit of the full new balance, and the
+// stored days before it no longer add up with it. A broker can also serve more
+// than it once did, and a series grown backwards moves the account's
+// inception. So a day a previous reconstruction wrote stays as it is, and a
+// day nobody wrote is filled only when the day before it is held: a live row
+// written after a sync gap carries the flows of the whole gap, and filling the
+// gap from inside a 14-day window would drop the rest.
+//
 // A day the live sync measured keeps its measurement when the rebuild
 // reproduces its realized balance: the live row also holds the unrealized PnL,
 // the free margin and the per-market split the rebuild cannot know. It takes
 // only the rebuilt flows, which follow calendar days and see through a demo
 // reset. A measured day the rebuild does not reproduce was measured mid-day,
 // and the midnight rebuild replaces it.
-//
-// The recurring run leaves every reconstructed day alone, and writes a day only
-// when the day before it is held. A live row written after a sync gap carries
-// the flows of the whole gap; handing it the flows of its last day alone, or
-// filling the gap from inside a 14-day window, would drop the rest.
-//
-// A full run also vacates the stored reconstructed days its series no longer
-// covers, from the day before its first row. Rows were once keyed by the day
-// that had just closed; the row that dating left before the new first row
-// holds the same flows as that first row.
-func mergeRealizedOnly(rebuilt, existing []*repository.Snapshot, mode realizedMode) realizedMerge {
+func mergeRealizedOnly(rebuilt, existing []*repository.Snapshot, today time.Time) realizedMerge {
 	const day = 24 * time.Hour
+	fresh := true
 	stored := make(map[time.Time]*repository.Snapshot, len(existing))
 	for _, e := range existing {
-		stored[e.Timestamp.UTC().Truncate(day)] = e
+		d := e.Timestamp.UTC().Truncate(day)
+		stored[d] = e
+		if d.Before(today) {
+			fresh = false
+		}
 	}
 	ordered := append([]*repository.Snapshot(nil), rebuilt...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Timestamp.Before(ordered[j].Timestamp) })
 
 	var m realizedMerge
-	emitted := make(map[time.Time]bool, len(ordered))
 	written := make(map[time.Time]bool, len(ordered))
 	for _, r := range ordered {
 		d := r.Timestamp.UTC().Truncate(day)
-		emitted[d] = true
 		prev := d.Add(-day)
 		_, prevStored := stored[prev]
-		bounded := mode == realizedRecurring && !prevStored && !written[prev]
+		held := fresh || prevStored || written[prev]
 
 		e := stored[d]
 		switch {
 		case e == nil:
-			if bounded {
-				continue
+			if held {
+				m.write = append(m.write, r)
+				written[d] = true
 			}
-			m.write = append(m.write, r)
-			written[d] = true
 		case isLiveMeasurement(e) && e.RealizedBalance > 0:
 			if !reproduces(r.RealizedBalance, e.RealizedBalance) {
 				m.disagree++
 				if m.contradicted == nil {
 					m.contradicted, m.rebuiltAt = e, r.RealizedBalance
 				}
-				if !bounded {
+				if held {
 					m.write = append(m.write, r)
 				}
 				continue
 			}
 			m.agree++
-			if bounded || (e.Deposits == r.Deposits && e.Withdrawals == r.Withdrawals) {
+			if !held || (e.Deposits == r.Deposits && e.Withdrawals == r.Withdrawals) {
 				continue
 			}
 			kept := *e
 			kept.Deposits, kept.Withdrawals = r.Deposits, r.Withdrawals
 			m.write = append(m.write, &kept)
-		case mode != realizedRecurring:
-			m.write = append(m.write, r)
 		}
-	}
-
-	if mode == realizedFull && len(ordered) > 0 {
-		from := ordered[0].Timestamp.UTC().Truncate(day).Add(-day)
-		to := ordered[len(ordered)-1].Timestamp.UTC().Truncate(day)
-		for d, e := range stored {
-			if d.Before(from) || d.After(to) || emitted[d] || isLiveMeasurement(e) {
-				continue
-			}
-			m.vacated = append(m.vacated, d)
-		}
-		sort.Slice(m.vacated, func(i, j int) bool { return m.vacated[i].Before(m.vacated[j]) })
 	}
 	return m
 }

@@ -54,6 +54,11 @@ func writtenOn(m realizedMerge, d time.Time) *repository.Snapshot {
 	return nil
 }
 
+// today sits after every day the tests below store or rebuild.
+var today = day(2026, time.June, 1)
+
+func may(n int) time.Time { return day(2026, time.May, 1).AddDate(0, 0, n) }
+
 func TestRealizedOnlyReconstruction(t *testing.T) {
 	if !realizedOnlyReconstruction("cTrader") || !realizedOnlyReconstruction("ctrader") {
 		t.Fatal("cTrader's reconstruction is realized-only")
@@ -84,13 +89,12 @@ func TestIsLiveMeasurement(t *testing.T) {
 // and takes the rebuilt flows, which see through a demo reset the live read
 // booked at its raw size.
 func TestMergeRealizedOnly_KeepsTheMeasurementAndTakesTheFlows(t *testing.T) {
-	d0, d1 := day(2026, time.May, 4), day(2026, time.May, 5)
-	stored := []*repository.Snapshot{liveRow(d0, 1000, 0, 0), liveRow(d1, 10000, 250, 10000)}
-	rebuilt := []*repository.Snapshot{rebuiltRow(d1, 10000, 9000)}
+	stored := []*repository.Snapshot{liveRow(may(3), 1000, 0, 0), liveRow(may(4), 10000, 250, 10000)}
+	rebuilt := []*repository.Snapshot{rebuiltRow(may(4), 10000, 9000)}
 
-	m := mergeRealizedOnly(rebuilt, stored, realizedRecurring)
+	m := mergeRealizedOnly(rebuilt, stored, today)
 
-	got := writtenOn(m, d1)
+	got := writtenOn(m, may(4))
 	if got == nil {
 		t.Fatal("the corrected flows were not written")
 	}
@@ -109,10 +113,9 @@ func TestMergeRealizedOnly_KeepsTheMeasurementAndTakesTheFlows(t *testing.T) {
 }
 
 func TestMergeRealizedOnly_LeavesAMatchingMeasurementUntouched(t *testing.T) {
-	d0, d1 := day(2026, time.May, 4), day(2026, time.May, 5)
-	stored := []*repository.Snapshot{liveRow(d0, 1000, 0, 0), liveRow(d1, 1000, 40, 0)}
+	stored := []*repository.Snapshot{liveRow(may(3), 1000, 0, 0), liveRow(may(4), 1000, 40, 0)}
 
-	m := mergeRealizedOnly([]*repository.Snapshot{rebuiltRow(d1, 1000, 0)}, stored, realizedRecurring)
+	m := mergeRealizedOnly([]*repository.Snapshot{rebuiltRow(may(4), 1000, 0)}, stored, today)
 
 	if len(m.write) != 0 {
 		t.Fatalf("rewrote a day that needed nothing: %+v", m.write)
@@ -123,20 +126,19 @@ func TestMergeRealizedOnly_LeavesAMatchingMeasurementUntouched(t *testing.T) {
 // rebuild replaces that row, and one such day among agreeing ones does not
 // condemn the reconstruction.
 func TestMergeRealizedOnly_ReplacesAMidDayMeasurement(t *testing.T) {
-	d0, d1, d2 := day(2026, time.May, 4), day(2026, time.May, 5), day(2026, time.May, 6)
 	stored := []*repository.Snapshot{
-		liveRow(d0, 1000, 0, 0),
-		liveRow(d1, 1000, 0, 0),
-		liveRow(d2, 1180, 0, 200), // measured at 14:00, after a deposit and a trade
+		liveRow(may(3), 1000, 0, 0),
+		liveRow(may(4), 1000, 0, 0),
+		liveRow(may(5), 1180, 0, 200), // synthetic: measured at 14:00, after a deposit and a trade
 	}
-	rebuilt := []*repository.Snapshot{rebuiltRow(d1, 1000, 0), rebuiltRow(d2, 1000, 0)}
+	rebuilt := []*repository.Snapshot{rebuiltRow(may(4), 1000, 0), rebuiltRow(may(5), 1000, 0)}
 
-	m := mergeRealizedOnly(rebuilt, stored, realizedRecurring)
+	m := mergeRealizedOnly(rebuilt, stored, today)
 
 	if m.rejected() {
 		t.Fatalf("one mid-day measurement rejected the reconstruction (agree=%d disagree=%d)", m.agree, m.disagree)
 	}
-	got := writtenOn(m, d2)
+	got := writtenOn(m, may(5))
 	if got == nil || got.RealizedBalance != 1000 || got.Deposits != 0 {
 		t.Fatalf("the mid-day row was not replaced by the midnight rebuild: %+v", got)
 	}
@@ -144,116 +146,128 @@ func TestMergeRealizedOnly_ReplacesAMidDayMeasurement(t *testing.T) {
 
 // A reconstruction of another account disagrees with every measured day.
 func TestMergeRealizedOnly_RejectsWhenMostMeasuredDaysDisagree(t *testing.T) {
-	d0, d1, d2 := day(2026, time.May, 4), day(2026, time.May, 5), day(2026, time.May, 6)
-	stored := []*repository.Snapshot{liveRow(d0, 1000, 0, 0), liveRow(d1, 1000, 0, 0), liveRow(d2, 1010, 0, 0)}
-	rebuilt := []*repository.Snapshot{rebuiltRow(d1, 52000, 0), rebuiltRow(d2, 52100, 0)}
+	stored := []*repository.Snapshot{liveRow(may(3), 1000, 0, 0), liveRow(may(4), 1000, 0, 0), liveRow(may(5), 1010, 0, 0)}
+	rebuilt := []*repository.Snapshot{rebuiltRow(may(4), 52000, 0), rebuiltRow(may(5), 52100, 0)}
 
-	m := mergeRealizedOnly(rebuilt, stored, realizedFull)
+	m := mergeRealizedOnly(rebuilt, stored, today)
 
 	if !m.rejected() {
 		t.Fatal("a reconstruction contradicting every measured day was accepted")
 	}
-	if m.contradicted == nil || !m.contradicted.Timestamp.Equal(d1) || m.rebuiltAt != 52000 {
+	if m.contradicted == nil || !m.contradicted.Timestamp.Equal(may(4)) || m.rebuiltAt != 52000 {
 		t.Fatalf("reported %+v / %v, want the first contradicted day", m.contradicted, m.rebuiltAt)
 	}
 }
 
 // The day after a connect, the connect-time row is the only measured day and
-// it was taken mid-day. The recurring run waits for the next midnight sync
-// rather than raising an alarm; a full run, which an operator started, says
-// so.
+// it was taken mid-day. The reconstruction waits for the next midnight sync
+// rather than raising an alarm.
 func TestMergeRealizedReconstruction_ALoneContradictionWaitsForASecondDay(t *testing.T) {
-	d0, d1 := day(2026, time.May, 4), day(2026, time.May, 5)
-	stored := []*repository.Snapshot{storedReconstruction(d0, 1000, 1000), liveRow(d1, 1180, 0, 0)}
-	rebuilt := []*repository.Snapshot{rebuiltRow(d1, 1000, 0)}
+	stored := []*repository.Snapshot{storedReconstruction(may(3), 1000, 1000), liveRow(may(4), 1180, 0, 0)}
+	rebuilt := []*repository.Snapshot{rebuiltRow(may(4), 1000, 0)}
 	s := &SyncService{logger: zap.NewNop()}
 	conn := &repository.ExchangeConnection{UserUID: "user-1", Exchange: "ctrader", Label: "main"}
 
-	write, vacated, err := s.mergeRealizedReconstruction(conn, rebuilt, stored, reconstructOpts{recurring: true})
-	if err != nil || len(write) != 0 || len(vacated) != 0 {
-		t.Fatalf("recurring: write=%d vacated=%d err=%v, want a quiet deferral", len(write), len(vacated), err)
-	}
-
-	if _, _, err := s.mergeRealizedReconstruction(conn, rebuilt, stored, reconstructOpts{}); err == nil {
-		t.Fatal("a full run contradicted by its only measured day went through silently")
+	write, err := s.mergeRealizedReconstruction(conn, rebuilt, stored, reconstructOpts{}, today)
+	if err != nil || len(write) != 0 {
+		t.Fatalf("write=%d err=%v, want a quiet deferral", len(write), err)
 	}
 }
 
-// A day an earlier reconstruction wrote belongs to full runs: the recurring
-// run must not rewrite old-dated rows piecemeal, or the day before its window
-// and the first day inside it carry the same flows.
-func TestMergeRealizedOnly_OnlyAFullRunRewritesReconstructedDays(t *testing.T) {
-	d0, d1 := day(2026, time.May, 4), day(2026, time.May, 5)
-	stored := []*repository.Snapshot{storedReconstruction(d0, 1000, 1000), storedReconstruction(d1, 1010, 0)}
-	rebuilt := []*repository.Snapshot{rebuiltRow(d1, 1000, 1000)}
+// A new connection holds nothing before today, so the backfill takes the
+// whole series.
+func TestMergeRealizedOnly_ANewConnectionTakesTheWholeSeries(t *testing.T) {
+	stored := []*repository.Snapshot{liveRow(today, 1200, 0, 1200)}
+	rebuilt := []*repository.Snapshot{rebuiltRow(may(0), 1000, 1000), rebuiltRow(may(1), 1100, 0), rebuiltRow(may(2), 1200, 0)}
 
-	if m := mergeRealizedOnly(rebuilt, stored, realizedRecurring); len(m.write) != 0 {
-		t.Fatalf("the recurring run rewrote a reconstructed day: %+v", m.write)
-	}
-	if m := mergeRealizedOnly(rebuilt, stored, realizedFull); writtenOn(m, d1) == nil {
-		t.Fatal("a full run left a reconstructed day it re-emits unwritten")
+	m := mergeRealizedOnly(rebuilt, stored, today)
+
+	if len(m.write) != 3 {
+		t.Fatalf("wrote %d days of a new connection's history, want 3", len(m.write))
 	}
 }
 
-// The recurring run writes a day only when the day before it is held. A gap
-// longer than its window keeps its flows on the live row after it.
-func TestMergeRealizedOnly_RecurringFillsOnlyFromAHeldDay(t *testing.T) {
-	d := func(n int) time.Time { return day(2026, time.May, 1).Add(time.Duration(n) * 24 * time.Hour) }
+// A demo reset erases the ledger before it. Rebuilt from what is left, the
+// account starts on the reset with the whole new balance booked as a deposit,
+// while the stored days before it hold the account as it was. In production a
+// full reconstruction rewrote the day after the reset with that raw deposit
+// and deleted the reset day, which carried the net figure: the account showed
+// a total loss on that day.
+func TestMergeRealizedOnly_AResetLedgerDoesNotRewriteTheStoredHistory(t *testing.T) {
+	// Synthetic: 1000 funded, traded to 1050, reset to 10000 on may(3), net 8950.
 	stored := []*repository.Snapshot{
-		liveRow(d(0), 1000, 0, 0),
-		liveRow(d(6), 1500, 0, 450), // after a gap: carries the flows of d(1)..d(5)
+		storedReconstruction(may(0), 1000, 1000),
+		storedReconstruction(may(1), 1020, 0),
+		storedReconstruction(may(2), 1050, 0),
+		storedReconstruction(may(3), 10000, 8950),
+		storedReconstruction(may(4), 10000, 0),
+		liveRow(may(5), 10000, 0, 0),
+	}
+	// What the broker serves now: nothing before the reset.
+	rebuilt := []*repository.Snapshot{rebuiltRow(may(4), 10000, 10000), rebuiltRow(may(5), 10000, 0)}
+
+	m := mergeRealizedOnly(rebuilt, stored, today)
+
+	for _, w := range m.write {
+		if w.Deposits != 0 {
+			t.Fatalf("wrote %s with a deposit of %v over the stored history", w.Timestamp.Format(time.DateOnly), w.Deposits)
+		}
+	}
+	if writtenOn(m, may(4)) != nil {
+		t.Fatal("rewrote a day a previous reconstruction wrote")
+	}
+}
+
+// A broker can also serve more than it once did. Grown backwards, the series
+// moved the account's inception and added capital nobody had booked.
+func TestMergeRealizedOnly_ALongerLedgerDoesNotExtendTheStoredHistory(t *testing.T) {
+	stored := []*repository.Snapshot{
+		storedReconstruction(may(10), 50, 50),
+		storedReconstruction(may(11), 50, 0),
+		liveRow(may(12), 50, 0, 0),
+	}
+	rebuilt := []*repository.Snapshot{rebuiltRow(may(1), 1000, 1000)}
+	for n := 2; n <= 12; n++ {
+		rebuilt = append(rebuilt, rebuiltRow(may(n), 50, 0))
+	}
+
+	m := mergeRealizedOnly(rebuilt, stored, today)
+
+	for _, w := range m.write {
+		if w.Timestamp.Before(may(10)) {
+			t.Fatalf("extended the stored history back to %s", w.Timestamp.Format(time.DateOnly))
+		}
+	}
+}
+
+// A day nobody wrote is filled only when the day before it is held. A gap
+// longer than the recurring window keeps its flows on the live row after it.
+func TestMergeRealizedOnly_FillsOnlyFromAHeldDay(t *testing.T) {
+	stored := []*repository.Snapshot{
+		liveRow(may(0), 1000, 0, 0),
+		liveRow(may(6), 1500, 0, 450), // after a gap: carries the flows of may(1)..may(5)
 	}
 	rebuilt := []*repository.Snapshot{
-		rebuiltRow(d(1), 1000, 0),
-		rebuiltRow(d(2), 1100, 100),
-		rebuiltRow(d(4), 1300, 200),
-		rebuiltRow(d(5), 1450, 150),
-		rebuiltRow(d(6), 1500, 0),
+		rebuiltRow(may(1), 1000, 0),
+		rebuiltRow(may(2), 1100, 100),
+		rebuiltRow(may(4), 1300, 200),
+		rebuiltRow(may(5), 1450, 150),
+		rebuiltRow(may(6), 1500, 0),
 	}
 
-	m := mergeRealizedOnly(rebuilt, stored, realizedRecurring)
+	m := mergeRealizedOnly(rebuilt, stored, today)
 
 	for _, n := range []int{1, 2} {
-		if writtenOn(m, d(n)) == nil {
-			t.Errorf("d(%d) follows a held day and was not filled", n)
+		if writtenOn(m, may(n)) == nil {
+			t.Errorf("may(%d) follows a held day and was not filled", n)
 		}
 	}
 	for _, n := range []int{4, 5} {
-		if writtenOn(m, d(n)) != nil {
-			t.Errorf("d(%d) filled although d(3) is held by nobody: the gap's early flows would be lost", n)
+		if writtenOn(m, may(n)) != nil {
+			t.Errorf("may(%d) filled although may(3) is held by nobody: the gap's early flows would be lost", n)
 		}
 	}
-	if got := writtenOn(m, d(6)); got != nil {
+	if got := writtenOn(m, may(6)); got != nil {
 		t.Fatalf("the live row after the gap lost its flows to one day's: %+v", got)
-	}
-}
-
-// Rows used to be keyed by the day that had just closed. The one that dating
-// left just before the new first row holds the same flows as that first row:
-// an inception deposit counted twice reads as a total loss.
-func TestMergeRealizedOnly_FullRunVacatesTheOldDatingsLeftover(t *testing.T) {
-	d0, d1, d2 := day(2026, time.May, 4), day(2026, time.May, 5), day(2026, time.May, 6)
-	stored := []*repository.Snapshot{
-		storedReconstruction(d0, 1000, 1000),
-		storedReconstruction(d1, 1000, 0),
-	}
-	rebuilt := []*repository.Snapshot{rebuiltRow(d1, 1000, 1000), rebuiltRow(d2, 1000, 0)}
-
-	m := mergeRealizedOnly(rebuilt, stored, realizedFull)
-	if len(m.vacated) != 1 || !m.vacated[0].Equal(d0) {
-		t.Fatalf("vacated %v, want [%s]", m.vacated, d0.Format(time.DateOnly))
-	}
-
-	// Never a live row, and never outside a full run.
-	stored[0] = liveRow(d0, 1000, 0, 1000)
-	if m := mergeRealizedOnly(rebuilt, stored, realizedFull); len(m.vacated) != 0 {
-		t.Fatalf("vacated a live measurement: %v", m.vacated)
-	}
-	stored[0] = storedReconstruction(d0, 1000, 1000)
-	if m := mergeRealizedOnly(rebuilt, stored, realizedWindow); len(m.vacated) != 0 {
-		t.Fatalf("a gap repair vacated a day outside its window: %v", m.vacated)
-	}
-	if m := mergeRealizedOnly(rebuilt, stored, realizedRecurring); len(m.vacated) != 0 {
-		t.Fatalf("the recurring run vacated a day: %v", m.vacated)
 	}
 }
