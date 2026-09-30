@@ -514,28 +514,6 @@ func prunedRebuiltScope(isTS, hasLabel bool, userUID, exchange, label string, fr
 	), args
 }
 
-// vacatedDaysScope builds the predicate for UpsertBatchVacating: the listed
-// days of one connection and nothing else. Pure so the scoping can be
-// regression-tested without a live DB.
-func vacatedDaysScope(isTS, hasLabel bool, v VacatedDays) (string, []any) {
-	userCol := "user_uid"
-	if isTS {
-		userCol = `"userUid"`
-	}
-	args := []any{v.UserUID, v.Exchange}
-	clause := userCol + " = $1 AND exchange = $2"
-	if hasLabel {
-		clause += " AND label = $3"
-		args = append(args, v.Label)
-	}
-	days := make([]time.Time, 0, len(v.Days))
-	for _, d := range v.Days {
-		days = append(days, d.UTC())
-	}
-	args = append(args, days)
-	return fmt.Sprintf("%s AND timestamp = ANY($%d)", clause, len(args)), args
-}
-
 // rebuiltHistoryScope builds the predicate isolating one connection's
 // out-of-perimeter rebuilt rows, up to but excluding `before`.
 //
@@ -1127,22 +1105,6 @@ func (r *SnapshotRepo) GetEarliestTimestamp(ctx context.Context, userUID, exchan
 // UpsertBatch atomically upserts multiple snapshots in a single transaction.
 // If any snapshot fails, the entire batch is rolled back (TS parity: atomic daily sync).
 func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) error {
-	return r.UpsertBatchVacating(ctx, snapshots, VacatedDays{})
-}
-
-// VacatedDays names days of one connection that a write supersedes without
-// rewriting them. A reconstruction that moves its dates leaves behind the day
-// it moved away from, and that row counts a second time whatever flow it
-// carried.
-type VacatedDays struct {
-	UserUID, Exchange, Label string
-	Days                     []time.Time
-}
-
-// UpsertBatchVacating is UpsertBatch that also deletes the vacated days, in
-// the same transaction: the stale day never outlives the series that replaces
-// it, and never disappears without it.
-func (r *SnapshotRepo) UpsertBatchVacating(ctx context.Context, snapshots []*Snapshot, vacated VacatedDays) error {
 	if len(snapshots) == 0 {
 		return nil
 	}
@@ -1156,13 +1118,6 @@ func (r *SnapshotRepo) UpsertBatchVacating(ctx context.Context, snapshots []*Sna
 	hasLabel := r.hasLabelColumn(ctx)
 	hasHist := r.hasIsHistoricalColumn(ctx)
 	hasOrigin := r.hasFromExternalRebuilderColumn(ctx)
-
-	if len(vacated.Days) > 0 {
-		where, args := vacatedDaysScope(r.isTSSchema, hasLabel, vacated)
-		if _, err := tx.Exec(ctx, "DELETE FROM snapshot_data WHERE "+where, args...); err != nil {
-			return fmt.Errorf("delete vacated snapshots: %w", err)
-		}
-	}
 
 	for _, s := range snapshots {
 		breakdownJSON, _ := json.Marshal(s.Breakdown)

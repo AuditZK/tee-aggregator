@@ -8,15 +8,14 @@ import (
 	"github.com/trackrecord/enclave/internal/repository"
 )
 
-// A full cTrader reconstruction over a history written with the old dating
-// (each row keyed by the day that had just closed) and live days since the
-// connection. On the production schema nothing marks which rows are which, so
-// this runs against it.
-//
-// It must vacate the old inception row, which would otherwise count the
-// inception deposit a second time next to the new first row, rewrite the
-// other reconstructed days, and keep what the live sync measured.
-func TestDBCTraderFullReconstructionMigratesTheOldDating(t *testing.T) {
+// A full cTrader reconstruction over a connection that already holds its
+// history, on the production schema, where nothing marks which rows a
+// reconstruction wrote. The broker's ledger no longer matches what is stored:
+// it starts later, on a demo reset booked as a deposit of the whole new
+// balance, and it also reaches further back. In production this deleted the
+// reset day and wrote the raw deposit next to it. The stored history must come
+// out untouched.
+func TestDBCTraderFullReconstructionLeavesAStoredHistoryAlone(t *testing.T) {
 	h := newDBHarness(t)
 	h.seedConnection(t, "ctrader", "main", dbKey, dbSecret)
 	connMeta, err := h.conns.GetByUserExchangeLabel(h.ctx, dbUser, "ctrader", "main")
@@ -43,25 +42,26 @@ func TestDBCTraderFullReconstructionMigratesTheOldDating(t *testing.T) {
 			},
 		}
 	}
-	// Synthetic account: 1000 deposited on d(0), 100 earned on d(2), connected
-	// on d(3). The old dating put each day's close under that day's date.
-	if err := h.snaps.UpsertBatch(h.ctx, []*repository.Snapshot{
-		old(0, 1000, 1000),
-		old(1, 1000, 0),
-		old(2, 1100, 0),
-		live(3, 1100, 30),
-		live(4, 1100, 0),
-	}); err != nil {
+	// Synthetic account: 1000 funded on d(2), reset to 10000 on d(4) (net
+	// 8900 after trading to 1100), live since d(6).
+	seed := []*repository.Snapshot{
+		old(2, 1000, 1000),
+		old(3, 1100, 0),
+		old(4, 10000, 8900),
+		old(5, 10000, 0),
+		live(6, 10000, 30),
+		live(7, 10000, 0),
+	}
+	if err := h.snaps.UpsertBatch(h.ctx, seed); err != nil {
 		t.Fatalf("seed history: %v", err)
 	}
 
-	// The same account under the new dating: a row holds the midnight that
-	// opens it and the flows of the day before.
 	rebuilt := []*connector.HistoricalSnapshot{
-		{Date: d(1), TotalEquity: 1000, RealizedBalance: 1000, Deposits: 1000},
-		{Date: d(2), TotalEquity: 1000, RealizedBalance: 1000},
-		{Date: d(3), TotalEquity: 1100, RealizedBalance: 1100},
-		{Date: d(4), TotalEquity: 1100, RealizedBalance: 1100},
+		{Date: d(0), TotalEquity: 500, RealizedBalance: 500, Deposits: 500},
+		{Date: d(1), TotalEquity: 500, RealizedBalance: 500},
+		{Date: d(5), TotalEquity: 10000, RealizedBalance: 10000, Deposits: 10000},
+		{Date: d(6), TotalEquity: 10000, RealizedBalance: 10000},
+		{Date: d(7), TotalEquity: 10000, RealizedBalance: 10000},
 	}
 	if err := h.sync.persistHistoricalSnapshots(h.ctx, connMeta, rebuilt, false, sourceInEnclave, reconstructOpts{}); err != nil {
 		t.Fatalf("persist: %v", err)
@@ -72,23 +72,21 @@ func TestDBCTraderFullReconstructionMigratesTheOldDating(t *testing.T) {
 		t.Fatalf("read back: %v", err)
 	}
 	byDay := map[time.Time]*repository.Snapshot{}
-	var deposits float64
 	for _, r := range rows {
 		byDay[r.Timestamp.UTC()] = r
-		deposits += r.Deposits
 	}
-
-	if _, ok := byDay[d(0)]; ok {
-		t.Fatal("the old inception row survived next to the new first row")
+	if len(byDay) != len(seed) {
+		t.Fatalf("%d rows after the reconstruction, want the %d stored", len(byDay), len(seed))
 	}
-	if deposits != 1000 {
-		t.Fatalf("deposits across the history = %v, want the 1000 counted once", deposits)
-	}
-	if r := byDay[d(2)]; r == nil || r.TotalEquity != 1000 {
-		t.Fatalf("d(2) must hold the balance at its opening midnight, 1000: %+v", r)
-	}
-	r := byDay[d(3)]
-	if r == nil || r.TotalEquity != 1130 || r.UnrealizedPnL != 30 || r.Breakdown == nil || r.Breakdown.CFD == nil {
-		t.Fatalf("the live measurement of d(3) was overwritten: %+v", r)
+	for _, want := range seed {
+		got := byDay[want.Timestamp]
+		if got == nil {
+			t.Fatalf("%s was deleted", want.Timestamp.Format(time.DateOnly))
+		}
+		if got.TotalEquity != want.TotalEquity || got.Deposits != want.Deposits || got.UnrealizedPnL != want.UnrealizedPnL {
+			t.Fatalf("%s rewritten: equity %v deposits %v uPnL %v, stored %v / %v / %v",
+				want.Timestamp.Format(time.DateOnly), got.TotalEquity, got.Deposits, got.UnrealizedPnL,
+				want.TotalEquity, want.Deposits, want.UnrealizedPnL)
+		}
 	}
 }
