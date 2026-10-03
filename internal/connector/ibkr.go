@@ -193,6 +193,10 @@ type IBKR struct {
 	currencyWarning string
 	accountCurrency string
 
+	// statementWarning names a multi-account report narrowed to one account
+	// (statementReport); kept apart for the same reason as currencyWarning.
+	statementWarning string
+
 	// Cached from last GetBalance call (avoids extra Flex requests)
 	cachedBreakdown []*MarketBalance
 	cachedIsPaper   *bool
@@ -563,7 +567,7 @@ func scrubSecret(s, secret string) string {
 }
 
 func (i *IBKR) GetBalance(ctx context.Context) (*Balance, error) {
-	report, err := i.fetchFlexReport(ctx)
+	report, err := i.statementReport(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -598,6 +602,7 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 				OpenPositions struct {
 					OpenPosition []struct {
 						FifoPnlUnrealized string `xml:"fifoPnlUnrealized,attr"`
+						LevelOfDetail     string `xml:"levelOfDetail,attr"`
 					} `xml:"OpenPosition"`
 				} `xml:"OpenPositions"`
 			} `xml:"FlexStatement"`
@@ -645,7 +650,15 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 	// IBKR EquitySummary only has cfd/forexCfd unrealized fields — not stocks/futures.
 	// Sum fifoPnlUnrealized from OpenPositions for the complete picture.
 	if unrealized == 0 {
-		for _, pos := range flex.FlexStatements.FlexStatement.OpenPositions.OpenPosition {
+		positions := flex.FlexStatements.FlexStatement.OpenPositions.OpenPosition
+		summaryOnly := false
+		for _, pos := range positions {
+			summaryOnly = summaryOnly || strings.EqualFold(pos.LevelOfDetail, "SUMMARY")
+		}
+		for _, pos := range positions {
+			if summaryOnly && !strings.EqualFold(pos.LevelOfDetail, "SUMMARY") {
+				continue
+			}
 			pnl, _ := strconv.ParseFloat(pos.FifoPnlUnrealized, 64)
 			unrealized += pnl
 		}
@@ -708,7 +721,7 @@ func (i *IBKR) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
 }
 
 func (i *IBKR) GetPositions(ctx context.Context) ([]*Position, error) {
-	report, err := i.fetchFlexReport(ctx)
+	report, err := i.statementReport(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -733,6 +746,7 @@ func (i *IBKR) parsePositionsFromReport(report []byte) ([]*Position, error) {
 						CostBasisMoney    string `xml:"costBasisMoney,attr"`
 						FifoPnlUnrealized string `xml:"fifoPnlUnrealized,attr"`
 						AssetCategory     string `xml:"assetCategory,attr"`
+						LevelOfDetail     string `xml:"levelOfDetail,attr"`
 					} `xml:"OpenPosition"`
 				} `xml:"OpenPositions"`
 			} `xml:"FlexStatement"`
@@ -743,8 +757,19 @@ func (i *IBKR) parsePositionsFromReport(report []byte) ([]*Position, error) {
 		return nil, fmt.Errorf("parse flex positions: %w", err)
 	}
 
+	// With both "Summary" and "Lot" ticked each holding appears once per lot
+	// and once in total; the totals are the positions.
+	rows := flex.FlexStatements.FlexStatement.OpenPositions.OpenPosition
+	summaryOnly := false
+	for _, p := range rows {
+		summaryOnly = summaryOnly || strings.EqualFold(p.LevelOfDetail, "SUMMARY")
+	}
+
 	var positions []*Position
-	for _, p := range flex.FlexStatements.FlexStatement.OpenPositions.OpenPosition {
+	for _, p := range rows {
+		if summaryOnly && !strings.EqualFold(p.LevelOfDetail, "SUMMARY") {
+			continue
+		}
 		size, _ := strconv.ParseFloat(p.Position, 64)
 		if size == 0 {
 			continue
@@ -794,7 +819,7 @@ func (i *IBKR) parsePositionsFromReport(report []byte) ([]*Position, error) {
 // GetCashflows returns deposits and withdrawals since the given date.
 // Uses IBKR Flex CashTransactions.
 func (i *IBKR) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
-	report, err := i.fetchFlexReport(ctx)
+	report, err := i.statementReport(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -949,6 +974,30 @@ var flexPerformanceTypes = map[string]bool{
 	"Advisor Fees":                 true,
 }
 
+// flexCashLevels tells which CashTransaction rows restate others. A query with
+// both "Summary" and "Detail" ticked under Cash Transactions emits every
+// movement once per level, and a multi-currency account adds BASE_SUMMARY
+// roll-ups on top. Summing all of them booked each deposit at double its size,
+// so every funding day scored the excess as a loss. A level is set aside only
+// when the statement also carries the rows it restates: a query that asked for
+// one level alone, or never asked for any, keeps every row.
+type flexCashLevels struct {
+	hasDetail bool
+	hasPlain  bool
+}
+
+func (l *flexCashLevels) see(levelOfDetail, currency string) {
+	l.hasDetail = l.hasDetail || strings.EqualFold(levelOfDetail, "DETAIL")
+	l.hasPlain = l.hasPlain || currency != "BASE_SUMMARY"
+}
+
+func (l flexCashLevels) restates(levelOfDetail, currency string) bool {
+	if currency == "BASE_SUMMARY" {
+		return l.hasPlain
+	}
+	return l.hasDetail && levelOfDetail != "" && !strings.EqualFold(levelOfDetail, "DETAIL")
+}
+
 // parseFlexTimestamp accepts the two timestamp shapes Flex emits.
 func parseFlexTimestamp(v string) (time.Time, bool) {
 	if ts, err := time.Parse("20060102;150405", v); err == nil {
@@ -963,10 +1012,16 @@ func parseFlexTimestamp(v string) (time.Time, bool) {
 // CapabilityWarnings implements CapabilityWarner with the statement-shape
 // gaps found by the last Flex parse.
 func (i *IBKR) CapabilityWarnings() []string {
-	if i.currencyWarning == "" {
+	if i.currencyWarning == "" && i.statementWarning == "" {
 		return i.capabilityWarnings
 	}
-	return append(append([]string{}, i.capabilityWarnings...), i.currencyWarning)
+	out := append([]string{}, i.capabilityWarnings...)
+	for _, w := range []string{i.currencyWarning, i.statementWarning} {
+		if w != "" {
+			out = append(out, w)
+		}
+	}
+	return out
 }
 
 func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, error) {
@@ -976,10 +1031,11 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 			FlexStatement struct {
 				CashTransactions struct {
 					CashTransaction []struct {
-						Type     string `xml:"type,attr"`
-						Amount   string `xml:"amount,attr"`
-						Currency string `xml:"currency,attr"`
-						DateTime string `xml:"dateTime,attr"`
+						Type          string `xml:"type,attr"`
+						Amount        string `xml:"amount,attr"`
+						Currency      string `xml:"currency,attr"`
+						DateTime      string `xml:"dateTime,attr"`
+						LevelOfDetail string `xml:"levelOfDetail,attr"`
 					} `xml:"CashTransaction"`
 				} `xml:"CashTransactions"`
 				Transfers struct {
@@ -1006,8 +1062,17 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 	// gain, so it must at least leave a mark someone can find.
 	unknownTypes := map[string]int{}
 
+	rows := flex.FlexStatements.FlexStatement.CashTransactions.CashTransaction
+	var levels flexCashLevels
+	for _, tx := range rows {
+		levels.see(tx.LevelOfDetail, tx.Currency)
+	}
+
 	var cashflows []*Cashflow
-	for _, tx := range flex.FlexStatements.FlexStatement.CashTransactions.CashTransaction {
+	for _, tx := range rows {
+		if levels.restates(tx.LevelOfDetail, tx.Currency) {
+			continue
+		}
 		ts, ok := parseFlexTimestamp(tx.DateTime)
 		if !ok || ts.Before(since) {
 			continue
@@ -1090,7 +1155,7 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 // GetHistoricalSnapshots returns daily equity snapshots from IBKR Flex (up to 365 days).
 // Used for backfill on first sync.
 func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*HistoricalSnapshot, error) {
-	report, err := i.fetchFlexReport(ctx)
+	report, err := i.statementReport(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1246,7 +1311,7 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 }
 
 func (i *IBKR) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
-	report, err := i.fetchFlexReport(ctx)
+	report, err := i.statementReport(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1282,8 +1347,9 @@ func accountCurrency(declared string, report []byte) (ccy string, inferred bool)
 			FlexStatement struct {
 				CashTransactions struct {
 					CashTransaction []struct {
-						Type     string `xml:"type,attr"`
-						Currency string `xml:"currency,attr"`
+						Type          string `xml:"type,attr"`
+						Currency      string `xml:"currency,attr"`
+						LevelOfDetail string `xml:"levelOfDetail,attr"`
 					} `xml:"CashTransaction"`
 				} `xml:"CashTransactions"`
 				Transfers struct {
@@ -1300,9 +1366,14 @@ func accountCurrency(declared string, report []byte) (ccy string, inferred bool)
 	}
 
 	stmt := flex.FlexStatements.FlexStatement
+	var levels flexCashLevels
+	for _, tx := range stmt.CashTransactions.CashTransaction {
+		levels.see(tx.LevelOfDetail, tx.Currency)
+	}
 	seen := ""
 	for _, tx := range stmt.CashTransactions.CashTransaction {
-		if !flexCapitalTypes[tx.Type] {
+		// BASE_SUMMARY is a roll-up, never a currency the account was funded in.
+		if !flexCapitalTypes[tx.Type] || tx.Currency == "BASE_SUMMARY" || levels.restates(tx.LevelOfDetail, tx.Currency) {
 			continue
 		}
 		if tx.Currency == "" {
@@ -1356,6 +1427,7 @@ func (i *IBKR) parseTradesFromReport(report []byte, start, end time.Time) ([]*Tr
 						AssetCategory   string `xml:"assetCategory,attr"`
 						Multiplier      string `xml:"multiplier,attr"`
 						FifoPnlRealized string `xml:"fifoPnlRealized,attr"`
+						LevelOfDetail   string `xml:"levelOfDetail,attr"`
 					} `xml:"Trade"`
 				} `xml:"Trades"`
 			} `xml:"FlexStatement"`
@@ -1366,8 +1438,19 @@ func (i *IBKR) parseTradesFromReport(report []byte, start, end time.Time) ([]*Tr
 		return nil, fmt.Errorf("parse flex trades: %w", err)
 	}
 
+	// A query with every level ticked restates executions as orders and
+	// closed lots; when executions are present, only they are trades.
+	rows := flex.FlexStatements.FlexStatement.Trades.Trade
+	hasExecution := false
+	for _, t := range rows {
+		hasExecution = hasExecution || strings.EqualFold(t.LevelOfDetail, "EXECUTION")
+	}
+
 	var trades []*Trade
-	for _, t := range flex.FlexStatements.FlexStatement.Trades.Trade {
+	for _, t := range rows {
+		if hasExecution && t.LevelOfDetail != "" && !strings.EqualFold(t.LevelOfDetail, "EXECUTION") {
+			continue
+		}
 		// Parse datetime (format: YYYYMMDD;HHMMSS)
 		ts, err := time.Parse("20060102;150405", t.DateTime)
 		if err != nil {

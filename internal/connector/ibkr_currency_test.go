@@ -200,3 +200,17 @@ func TestAccountCurrency_DeclaredWinsOverTheInference(t *testing.T) {
 		t.Fatalf("warnings: got %v, want none", got)
 	}
 }
+
+// A multi-level statement adds BASE_SUMMARY roll-ups beside the real rows;
+// read as a second currency they made every such account "mixed".
+func TestAccountCurrency_SummaryRowsDoNotMakeFundingMixed(t *testing.T) {
+	report := []byte(`<FlexQueryResponse><FlexStatements><FlexStatement>
+      <CashTransactions>
+        <CashTransaction type="Deposits/Withdrawals" amount="5000" currency="EUR" dateTime="20260601;120000" levelOfDetail="DETAIL"/>
+        <CashTransaction type="Deposits/Withdrawals" amount="5000" currency="BASE_SUMMARY" dateTime="20260601;120000" levelOfDetail="SUMMARY"/>
+      </CashTransactions>
+    </FlexStatement></FlexStatements></FlexQueryResponse>`)
+	if ccy, inferred := accountCurrency("", report); ccy != "EUR" || !inferred {
+		t.Fatalf("got %q (inferred=%v), want EUR inferred", ccy, inferred)
+	}
+}
