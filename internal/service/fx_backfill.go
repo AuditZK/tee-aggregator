@@ -12,6 +12,9 @@ import (
 	"go.uber.org/zap"
 )
 
+// errNoStoredSnapshots: the connection has nothing stored to convert.
+var errNoStoredSnapshots = errors.New("no snapshots")
+
 // FXBackfillDay is one stored day of a USD backfill, as stored and as it
 // would be.
 type FXBackfillDay struct {
@@ -127,7 +130,7 @@ func (s *SyncService) ConvertStoredToUSD(ctx context.Context, userUID, exchange,
 		}
 	}
 	if len(rows) == 0 {
-		return nil, fmt.Errorf("no snapshots for %s/%s", exchange, label)
+		return nil, fmt.Errorf("%w for %s/%s", errNoStoredSnapshots, exchange, label)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Timestamp.Before(rows[j].Timestamp) })
 
@@ -155,4 +158,40 @@ func (s *SyncService) ConvertStoredToUSD(ctx context.Context, userUID, exchange,
 		zap.Int("converted", len(changed)),
 	)
 	return days, nil
+}
+
+// ensureStoredConverted converts a connection's stored days before the sync
+// writes its first converted one.
+//
+// Run by hand, the backfill was a race against the next sync: a converted day
+// written next to stored EUR days is a step the size of the rate, read as a
+// return, and the first IBKR reconstruction would be refused by the gate
+// against the unconverted days. And a hand-kept list of non-USD connections
+// misses the ones whose marker a later error overwrote. So the sync does it,
+// the first time it meets the account in a convertible currency, and does
+// not write until it has. Idempotent through the stamp; remembered per
+// process once every stored day is converted.
+func (s *SyncService) ensureStoredConverted(ctx context.Context, connMeta *repository.ExchangeConnection, currency string) error {
+	key := connMeta.UserUID + "|" + strings.ToLower(connMeta.Exchange) + "|" + connMeta.Label
+	if _, done := s.fxStoredDone.Load(key); done {
+		return nil
+	}
+	days, err := s.ConvertStoredToUSD(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, currency, true)
+	if errors.Is(err, errNoStoredSnapshots) {
+		s.fxStoredDone.Store(key, true)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("convert stored days: %w", err)
+	}
+	pending := 0
+	for _, d := range days {
+		if d.Kept == "no final rate yet" {
+			pending++
+		}
+	}
+	if pending == 0 {
+		s.fxStoredDone.Store(key, true)
+	}
+	return nil
 }

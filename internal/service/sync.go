@@ -310,6 +310,9 @@ type SyncService struct {
 	// fx converts accounts held in another currency than USD (fx.go). Nil =
 	// stored as the connector reports them, with an error logged.
 	fx fxRateSource
+	// fxStoredDone remembers the connections whose stored days are all
+	// converted (ensureStoredConverted), keyed user|exchange|label.
+	fxStoredDone sync.Map
 }
 
 // counterIncrementer is the slice of the metrics server the service feeds.

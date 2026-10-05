@@ -256,10 +256,15 @@ func (s *SyncService) convertLive(ctx context.Context, conn connector.Connector,
 	reason := ""
 	rates, err := loadFXRates(ctx, s.fx, currencies, from, measured)
 	var fx liveFX
-	if err != nil {
+	switch {
+	case err != nil:
 		reason = err.Error()
-	} else if fx, reason = applyLiveFX(balance, act, currency, trusted, measured, rates); reason != "" {
-		reason = "no final USD rate for " + reason
+	default:
+		if err := s.ensureStoredConverted(ctx, connMeta, currency); err != nil {
+			reason = err.Error()
+		} else if fx, reason = applyLiveFX(balance, act, currency, trusted, measured, rates); reason != "" {
+			reason = "no final USD rate for " + reason
+		}
 	}
 	if reason == "" {
 		return fx, true
@@ -374,6 +379,16 @@ func historyFXWindow(rows []*connector.HistoricalSnapshot, trusted bool) (curren
 	return currencies, from, to
 }
 
+// accountCurrencyOf is the convertible currency the rows are held in.
+func accountCurrencyOf(rows []*connector.HistoricalSnapshot) string {
+	for _, h := range rows {
+		if c, ok := fiatToConvert(h.Currency); ok {
+			return c
+		}
+	}
+	return ""
+}
+
 // convertHistoryToUSD converts a reconstruction before the gate and the
 // writes see it.
 func (s *SyncService) convertHistoryToUSD(ctx context.Context, connMeta *repository.ExchangeConnection, rows []*connector.HistoricalSnapshot) ([]*connector.HistoricalSnapshot, error) {
@@ -399,6 +414,13 @@ func (s *SyncService) convertHistoryToUSD(ctx context.Context, connMeta *reposit
 	rates, err := loadFXRates(ctx, s.fx, currencies, from, to)
 	if err != nil {
 		return nil, err
+	}
+	// The gate compares these rows with the stored ones: those must be in
+	// USD too. A reconstruction carries one account currency.
+	if c := accountCurrencyOf(rows); c != "" {
+		if err := s.ensureStoredConverted(ctx, connMeta, c); err != nil {
+			return nil, err
+		}
 	}
 	converted, err := convertHistory(rows, trusted, rates)
 	if err != nil {
