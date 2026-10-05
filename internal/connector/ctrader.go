@@ -854,9 +854,9 @@ func (c *CTrader) getAccountBalance(ctx context.Context, accountID int64) (*cTra
 
 	currency := c.resolveAccountCurrency(ctx, accountID, trader.DepositAssetID)
 	if currency != "" && currency != "USD" {
-		// E-C2: no FX conversion is performed anywhere downstream, so a
-		// non-USD account is reported in its own units. Say so instead of
-		// stamping "USD" on EUR figures.
+		// E-C2: the account is reported in its own units, which the sync
+		// converts to USD at each day's rate (service/fx.go). The marker
+		// tells the dashboard which currency it is held in.
 		c.addCapabilityWarning("account_currency_" + strings.ToLower(currency))
 	}
 	if currency == "" {
@@ -2103,7 +2103,25 @@ func (c *CTrader) GetHistoricalSnapshots(ctx context.Context, since time.Time) (
 		return nil, err
 	}
 
-	return buildCTraderHistoricalSnapshots(deals, cashflows, now), nil
+	// The balances are in the account's deposit currency, which the sync
+	// converts to USD. Resolved the way the live balance resolves it, from the
+	// same cache, so a rebuilt day and a live day never disagree on it; a
+	// failure here fails the reconstruction rather than leave it unlabelled
+	// next to converted live days.
+	trader, err := c.getTraderInfo(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	currency := c.resolveAccountCurrency(ctx, accountID, trader.DepositAssetID)
+
+	out := buildCTraderHistoricalSnapshots(deals, cashflows, now)
+	for _, snap := range out {
+		snap.Currency = currency
+		// A row holds the balance at the midnight opening its date, i.e. the
+		// close of the day before, with that day's flows.
+		snap.MeasuredOn = snap.Date.Add(-24 * time.Hour)
+	}
+	return out, nil
 }
 
 // getAllDeals fetches every deal in [start, end], following hasMore pagination

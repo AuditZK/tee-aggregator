@@ -158,6 +158,16 @@ type MarketMetrics struct {
 	ShortTrades     int     `json:"short_trades,omitempty"`
 	LongVolume      float64 `json:"long_volume,omitempty"`
 	ShortVolume     float64 `json:"short_volume,omitempty"`
+
+	// NativeCurrency and FXRateToUSD are set on the global entry of a row
+	// converted from an account the broker reports in another currency than
+	// USD: the currency it reported, and the rate its balances were
+	// multiplied by. Absent on a USD row, so a stored row says by itself
+	// whether it was converted, and a backfill never converts one twice.
+	// Kept inside global rather than beside it: every reader of this JSON
+	// treats each top-level key as a market.
+	NativeCurrency string  `json:"native_currency,omitempty"`
+	FXRateToUSD    float64 `json:"fx_rate_to_usd,omitempty"`
 }
 
 // SnapshotRepo handles snapshot persistence.

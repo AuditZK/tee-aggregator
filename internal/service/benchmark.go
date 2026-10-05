@@ -45,6 +45,9 @@ type BenchmarkService struct {
 	httpClient    *http.Client
 	baseURL       string
 	internalToken string
+
+	// fxCache holds the final FX rates already read (fx.go).
+	fxCache fxCache
 }
 
 // NewBenchmarkService creates a new benchmark service. baseURL is the

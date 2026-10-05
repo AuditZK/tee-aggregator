@@ -628,8 +628,9 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 		i.cachedBalanceAsOf = d
 	}
 	// Flex reports "in base currency" — the account's denomination, not always
-	// USD. Nothing downstream converts, so a EUR account's figures travel as
-	// EUR under a USD label unless somebody reads this.
+	// USD. Balance.Currency carries it to the sync, which converts to USD at
+	// the statement date's rate (service/fx.go); the marker below tells the
+	// dashboard which currency the account is held in.
 	currency, inferred := accountCurrency(summary.Currency, report)
 	switch {
 	case currency == "":
@@ -1208,6 +1209,7 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 				EquitySummaryInBase struct {
 					EquitySummaryByReportDateInBase []struct {
 						ReportDate    string `xml:"reportDate,attr"`
+						Currency      string `xml:"currency,attr"`
 						Total         string `xml:"total,attr"`
 						Cash          string `xml:"cash,attr"`
 						Stock         string `xml:"stock,attr"`
@@ -1224,9 +1226,22 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 		return nil, fmt.Errorf("parse flex historical: %w", err)
 	}
 
+	// The NAVs below are in the account's base currency, which the sync
+	// converts to USD day by day. Same resolution as the live balance, so a
+	// reconstructed day and a live day of one account never disagree on it.
+	summaries := flex.FlexStatements.FlexStatement.EquitySummaryInBase.EquitySummaryByReportDateInBase
+	baseCurrency := ""
+	if n := len(summaries); n > 0 {
+		baseCurrency, _ = accountCurrency(summaries[n-1].Currency, report)
+	}
+
 	// Parse cashflows grouped by date for deposit/withdrawal assignment
 	cashflows, _ := i.parseCashflowsFromReport(report, since)
-	cashflowsByDate := make(map[string]struct{ deposits, withdrawals float64 })
+	type dayFlows struct {
+		deposits, withdrawals float64
+		flows                 []*Cashflow
+	}
+	cashflowsByDate := make(map[string]dayFlows)
 	for _, cf := range cashflows {
 		dateKey := cf.Timestamp.Format("20060102")
 		entry := cashflowsByDate[dateKey]
@@ -1235,6 +1250,10 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 		} else {
 			entry.withdrawals += -cf.Amount
 		}
+		// Kept one by one: a USD wire into a EUR account is summed with the
+		// EUR ones above, and only the conversion, rate by rate, can tell
+		// them apart again.
+		entry.flows = append(entry.flows, cf)
 		cashflowsByDate[dateKey] = entry
 	}
 
@@ -1247,7 +1266,7 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 	tradesByDate := aggregateFlexTradesByDate(trades)
 
 	var snapshots []*HistoricalSnapshot
-	for _, s := range flex.FlexStatements.FlexStatement.EquitySummaryInBase.EquitySummaryByReportDateInBase {
+	for _, s := range summaries {
 		date, err := time.Parse("20060102", s.ReportDate)
 		if err != nil {
 			continue
@@ -1304,6 +1323,8 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 			LongVolume:      tr.longVolume,
 			ShortVolume:     tr.shortVolume,
 			Breakdown:       breakdown,
+			Currency:        baseCurrency,
+			Cashflows:       cf.flows,
 		})
 	}
 

@@ -311,6 +311,13 @@ func main() {
 		if syncStatusRepo != nil {
 			syncSvc.SetSyncStatusRepo(syncStatusRepo)
 		}
+		// Accounts held in EUR, GBP… are stored in USD, converted at each
+		// day's rate from the same benchmark-service (service/fx.go). Without
+		// it they are stored as the broker reports them, and every such sync
+		// logs an error saying so.
+		if cfg.BenchmarkServiceURL != "" {
+			syncSvc.SetFXSource(benchmarkSvc)
+		}
 		// Journal throttle events (Flex 1018 races, stale-statement skips) to
 		// sync_rate_limit_logs — the table existed since migration 007 but
 		// nothing ever wrote to it (audit 2026-08-01).

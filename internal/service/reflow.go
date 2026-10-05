@@ -51,7 +51,7 @@ func (s *SyncService) ReflowCashflows(ctx context.Context, userUID, exchange, la
 	if err := checkReflowWindow(from, to); err != nil {
 		return nil, err
 	}
-	connMeta, fetcher, err := s.reflowSource(ctx, userUID, exchange, label)
+	connMeta, fetcher, accountCurrency, err := s.reflowSource(ctx, userUID, exchange, label)
 	if err != nil {
 		return nil, err
 	}
@@ -62,6 +62,10 @@ func (s *SyncService) ReflowCashflows(ctx context.Context, userUID, exchange, la
 	flows, err := fetcher.GetCashflows(ctx, reflowSince(rows, from))
 	if err != nil {
 		return nil, fmt.Errorf("read cashflows: %w", err)
+	}
+	// The rows hold USD; flows of an account held in EUR must be too.
+	if flows, err = s.flowsInUSD(ctx, connMeta, accountCurrency, flows); err != nil {
+		return nil, err
 	}
 
 	out, written, err := s.reflowDays(ctx, rows, from, to, earliest, flows, apply)
@@ -119,30 +123,31 @@ func checkReflowWindow(from, to time.Time) error {
 	return nil
 }
 
-// reflowSource returns the connection and its cashflow reader, after a
-// balance read: the classification depends on which wallets the key reads,
-// which only that read establishes.
-func (s *SyncService) reflowSource(ctx context.Context, userUID, exchange, label string) (*repository.ExchangeConnection, connector.CashflowFetcher, error) {
+// reflowSource returns the connection, its cashflow reader and the currency
+// the account is held in, after a balance read: the classification depends
+// on which wallets the key reads, which only that read establishes.
+func (s *SyncService) reflowSource(ctx context.Context, userUID, exchange, label string) (*repository.ExchangeConnection, connector.CashflowFetcher, string, error) {
 	connMeta, err := s.connSvc.GetActiveConnectionByLabel(ctx, userUID, exchange, label)
 	if err != nil {
-		return nil, nil, fmt.Errorf("look up connection: %w", err)
+		return nil, nil, "", fmt.Errorf("look up connection: %w", err)
 	}
 	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, connMeta.Exchange, connMeta.Label)
 	if err != nil {
-		return nil, nil, fmt.Errorf("decrypt credentials: %w", err)
+		return nil, nil, "", fmt.Errorf("decrypt credentials: %w", err)
 	}
 	conn, err := s.getOrCreateConnector(connMeta.Exchange, userUID, connMeta.Label, creds)
 	if err != nil {
-		return nil, nil, fmt.Errorf("build connector: %w", err)
+		return nil, nil, "", fmt.Errorf("build connector: %w", err)
 	}
 	fetcher, ok := conn.(connector.CashflowFetcher)
 	if !ok {
-		return nil, nil, fmt.Errorf("reflow: %s reports no cashflows", connMeta.Exchange)
+		return nil, nil, "", fmt.Errorf("reflow: %s reports no cashflows", connMeta.Exchange)
 	}
-	if _, err := conn.GetBalance(ctx); err != nil {
-		return nil, nil, fmt.Errorf("read balance: %w", err)
+	balance, err := conn.GetBalance(ctx)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("read balance: %w", err)
 	}
-	return connMeta, fetcher, nil
+	return connMeta, fetcher, balance.Currency, nil
 }
 
 // reflowRows returns the connection's snapshots from far enough before from
