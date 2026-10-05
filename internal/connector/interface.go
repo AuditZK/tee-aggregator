@@ -327,6 +327,23 @@ type HistoricalSnapshot struct {
 	LongVolume      float64                   `json:"long_volume"`
 	ShortVolume     float64                   `json:"short_volume"`
 	Breakdown       map[string]*MarketBalance `json:"breakdown,omitempty"` // per-asset breakdown (stocks, options, futures, etc.)
+
+	// Currency is the ISO code the balances and flows above are in, for a
+	// broker that reports an account in its own base currency (IBKR, cTrader).
+	// Empty means USD. The sync converts the row before anything is stored.
+	Currency string `json:"currency,omitempty"`
+	// MeasuredOn is the day whose close TotalEquity describes, when that is
+	// not Date: a cTrader row dated D holds the balance at the midnight that
+	// opens D, so the day before. Zero means Date. It picks the FX rate.
+	MeasuredOn time.Time `json:"measured_on,omitempty"`
+	// Cashflows are the deposits and withdrawals summed into Deposits and
+	// Withdrawals, each in its own currency, for a broker whose flows can be
+	// in another currency than the account (IBKR: USD wired into a EUR
+	// account). When set, the conversion rebuilds the two sums from them.
+	Cashflows []*Cashflow `json:"-"`
+	// FXRateToUSD is the rate the balances were multiplied by, set by the
+	// conversion. Zero on a row that was never converted.
+	FXRateToUSD float64 `json:"fx_rate_to_usd,omitempty"`
 }
 
 // Balance represents account balance data

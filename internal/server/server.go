@@ -145,6 +145,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/admin/raw-statement", s.localhostOnly(s.handleAdminRawStatement))
 	mux.HandleFunc("/api/v1/admin/funding-probe", s.localhostOnly(s.handleAdminFundingProbe))
 	mux.HandleFunc("/api/v1/admin/reflow", s.localhostOnly(s.handleAdminReflow))
+	mux.HandleFunc("/api/v1/admin/convert-to-usd", s.localhostOnly(s.handleAdminConvertToUSD))
 
 	// B2 handoff: deliberately NOT gated by localhostOnly because the
 	// successor enclave runs in a different container with a non-loopback
@@ -828,6 +829,54 @@ func (s *Server) handleAdminReflow(w http.ResponseWriter, r *http.Request) {
 	days, err := reflower.ReflowCashflows(ctx, userUID, exchange, label, from, to, apply)
 	if err != nil {
 		s.log().Error("admin reflow failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "apply": apply, "count": len(days), "days": days})
+}
+
+// handleAdminConvertToUSD converts the days a connection stored before the
+// USD conversion existed, each at its day's rate (service/fx_backfill.go). A
+// dry run unless apply=1. currency is the account's, read off its
+// account_currency warning marker.
+//
+// Usage: POST /api/v1/admin/convert-to-usd?user_uid=X&exchange=ibkr&label=Y&currency=EUR[&apply=1]
+func (s *Server) handleAdminConvertToUSD(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	currency := q.Get("currency")
+	if currency == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "currency is required"})
+		return
+	}
+	apply := q.Get("apply") == "1"
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+	extendWriteDeadline(w, 5*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	days, err := s.handler.syncSvc.ConvertStoredToUSD(ctx, userUID, exchange, label, currency, apply)
+	if err != nil {
+		s.log().Error("admin convert-to-usd failed", zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
 		return
 	}

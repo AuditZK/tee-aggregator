@@ -306,6 +306,10 @@ type SyncService struct {
 
 	// counters is optional; nil when the metrics server is off.
 	counters counterIncrementer
+
+	// fx converts accounts held in another currency than USD (fx.go). Nil =
+	// stored as the connector reports them, with an error logged.
+	fx fxRateSource
 }
 
 // counterIncrementer is the slice of the metrics server the service feeds.
@@ -366,6 +370,11 @@ func (s *SyncService) SetSyncStatusRepo(repo *repository.SyncStatusRepo) {
 // Pass nil or an unconfigured client to disable connection-time rebuilds for
 // non-IBKR exchanges (the enclave then writes nothing for HL, Lighter, … on
 // connect; IBKR's in-enclave Flex rebuild is unaffected).
+// SetFXSource sets where the USD rates of non-USD accounts come from.
+func (s *SyncService) SetFXSource(src fxRateSource) {
+	s.fx = src
+}
+
 func (s *SyncService) SetRebuilderClient(c *rebuilderclient.Client) {
 	s.rebuilder = c
 }
@@ -1067,6 +1076,12 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	// After the cashflow read: Bybit and OKX find their gaps there.
 	s.collectCapabilityWarnings(conn, connMeta, result)
 	s.completeBreakdown(ctx, conn, connMeta, act.breakdown, balance)
+	// Everything below compares with stored rows, which are in USD: convert
+	// first.
+	fx, ok := s.convertLive(ctx, conn, connMeta, balance, &act, startOfDay, result)
+	if !ok {
+		return result
+	}
 
 	deposits, withdrawals := s.reconcileCapitalFlow(ctx, connMeta, startOfDay, act.trades, balance.Equity, balance.UnrealizedPnL, act.fundingCharges, act.deposits, act.withdrawals)
 	// UX-001: the first snapshot of a connection that reported no cashflow
@@ -1097,6 +1112,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		// flips it back to live.
 		IsHistorical: false,
 	}
+	stampFX(result.snapshot.Breakdown, fx.currency, fx.rate)
 	result.TradeCount = len(act.trades)
 	result.SnapshotEquity = balance.Equity
 	result.SnapshotTimestamp = startOfDay
@@ -1183,6 +1199,9 @@ type liveActivity struct {
 	fundingCharges float64
 	deposits       float64
 	withdrawals    float64
+	// cashflows are the flows deposits and withdrawals were summed from,
+	// kept so a non-USD account can convert each at its own day's rate.
+	cashflows []*connector.Cashflow
 }
 
 // readActivity reads the window's trades, funding fees and cashflows. Trades
@@ -1206,21 +1225,21 @@ func (s *SyncService) readActivity(ctx context.Context, conn connector.Connector
 			act.breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = act.fundingCharges
 		}
 	}
-	act.deposits, act.withdrawals = s.readCashflows(ctx, conn, connMeta, from)
+	act.deposits, act.withdrawals, act.cashflows = s.readCashflows(ctx, conn, connMeta, from)
 	return act
 }
 
 // readCashflows sums the window's deposits and withdrawals. A failed read is
 // logged and leaves the window without flows.
-func (s *SyncService) readCashflows(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, from time.Time) (deposits, withdrawals float64) {
+func (s *SyncService) readCashflows(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, from time.Time) (deposits, withdrawals float64, cashflows []*connector.Cashflow) {
 	cfFetcher, ok := conn.(connector.CashflowFetcher)
 	if !ok {
-		return 0, 0
+		return 0, 0, nil
 	}
 	cashflows, err := cfFetcher.GetCashflows(ctx, from)
 	if err != nil {
 		s.warnCashflowFetchFailed(connMeta, err)
-		return 0, 0
+		return 0, 0, nil
 	}
 	for _, cf := range cashflows {
 		if cf.Amount > 0 {
@@ -1229,7 +1248,7 @@ func (s *SyncService) readCashflows(ctx context.Context, conn connector.Connecto
 			withdrawals -= cf.Amount
 		}
 	}
-	return deposits, withdrawals
+	return deposits, withdrawals, cashflows
 }
 
 // completeBreakdown fills each market's equity from the connector when it
@@ -2109,6 +2128,19 @@ func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *
 		return err
 	}
 
+	// In USD before the gate compares it with stored days and anything is
+	// written (fx.go).
+	historicalSnapshots, err = s.convertHistoryToUSD(ctx, connMeta, historicalSnapshots)
+	if err != nil {
+		s.logger.Error("history reconstruction not converted to USD; nothing written",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Error(err),
+		)
+		return err
+	}
+
 	s.persistHistoricalSnapshots(ctx, connMeta, historicalSnapshots, firstSync, sourceInEnclave, opts)
 	return nil
 }
@@ -2705,6 +2737,10 @@ func buildHistoricalSnapshots(
 			ShortTrades:     h.ShortTrades,
 			LongVolume:      h.LongVolume,
 			ShortVolume:     h.ShortVolume,
+		}
+		if h.FXRateToUSD > 0 {
+			currency, _ := fiatToConvert(h.Currency)
+			stampFX(breakdown, currency, h.FXRateToUSD)
 		}
 
 		snapshots = append(snapshots, &repository.Snapshot{
@@ -3351,6 +3387,12 @@ func (a *aggregatedBreakdown) getOrCreateMarket(marketType string) *marketAgg {
 	default:
 		return &a.spot
 	}
+}
+
+// markets returns every market, for the conversions that touch them all.
+func (a *aggregatedBreakdown) markets() []*marketAgg {
+	return []*marketAgg{&a.stocks, &a.spot, &a.swap, &a.futures, &a.options,
+		&a.margin, &a.earn, &a.cfd, &a.forex, &a.commodities}
 }
 
 func (a *aggregatedBreakdown) totalVolume() float64 {
