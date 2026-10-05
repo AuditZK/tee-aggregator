@@ -20,7 +20,8 @@ import (
 // Conversion of accounts a broker reports in another currency than USD.
 //
 // IBKR, cTrader, IG and MetaTrader read an account in its own base currency,
-// and for a long time nothing converted it: a EUR account's equity travelled
+// and for a long time nothing converted it (IG and MetaTrader still are not,
+// see fxConvertedExchanges): a EUR account's equity travelled
 // to the dashboard, the signed report and the "all" aggregate as EUR under a
 // "$". Every balance is now multiplied by the USD rate of the day it was
 // measured on, and every deposit or withdrawal by the rate of its own day,
@@ -47,6 +48,20 @@ var fxConvertible = map[string]bool{
 	"NZD": true, "HKD": true, "SGD": true, "SEK": true, "NOK": true, "DKK": true,
 	"PLN": true, "CZK": true, "HUF": true, "ILS": true, "MXN": true, "ZAR": true,
 	"CNY": true, "TRY": true, "INR": true, "KRW": true, "BRL": true,
+}
+
+// fxConvertedExchanges are the brokers whose non-USD accounts are converted.
+//
+// IG and MetaTrader report an account currency too, but they emit no marker
+// saying which accounts are not in USD, so nobody can tell which stored
+// histories would need converting along with them. Turning them on before
+// that inventory would put a ~10% step between each such account's stored
+// EUR days and its first USD day, read by analytics as a return. They join
+// this list once their accounts are known and backfilled.
+var fxConvertedExchanges = map[string]bool{"ibkr": true, "ctrader": true}
+
+func convertsExchange(exchange string) bool {
+	return fxConvertedExchanges[strings.ToLower(strings.TrimSpace(exchange))]
 }
 
 // fiatToConvert returns the normalized currency and whether amounts in it
@@ -214,7 +229,7 @@ func applyLiveFX(balance *connector.Balance, act *liveActivity, currency string,
 // nothing later corrects. The deferred retry writes it once the rate lands.
 func (s *SyncService) convertLive(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, balance *connector.Balance, act *liveActivity, startOfDay time.Time, result *SyncResult) (liveFX, bool) {
 	currency, convert := fiatToConvert(balance.Currency)
-	if !convert {
+	if !convert || !convertsExchange(connMeta.Exchange) {
 		return liveFX{}, true
 	}
 	if s.fx == nil {
@@ -362,6 +377,9 @@ func historyFXWindow(rows []*connector.HistoricalSnapshot, trusted bool) (curren
 // convertHistoryToUSD converts a reconstruction before the gate and the
 // writes see it.
 func (s *SyncService) convertHistoryToUSD(ctx context.Context, connMeta *repository.ExchangeConnection, rows []*connector.HistoricalSnapshot) ([]*connector.HistoricalSnapshot, error) {
+	if !convertsExchange(connMeta.Exchange) {
+		return rows, nil
+	}
 	trusted := trustsCashflowCurrency(connMeta.Exchange)
 	// Oldest first, so the rows convertHistory may hold back are the newest.
 	rows = append([]*connector.HistoricalSnapshot(nil), rows...)
@@ -403,7 +421,7 @@ func (s *SyncService) convertHistoryToUSD(ctx context.Context, connMeta *reposit
 // are. Without an FX source it refuses rather than write EUR into USD rows.
 func (s *SyncService) flowsInUSD(ctx context.Context, connMeta *repository.ExchangeConnection, accountCurrency string, flows []*connector.Cashflow) ([]*connector.Cashflow, error) {
 	currency, convert := fiatToConvert(accountCurrency)
-	if !convert || len(flows) == 0 {
+	if !convert || len(flows) == 0 || !convertsExchange(connMeta.Exchange) {
 		return flows, nil
 	}
 	if s.fx == nil {

@@ -854,9 +854,9 @@ func (c *CTrader) getAccountBalance(ctx context.Context, accountID int64) (*cTra
 
 	currency := c.resolveAccountCurrency(ctx, accountID, trader.DepositAssetID)
 	if currency != "" && currency != "USD" {
-		// E-C2: no FX conversion is performed anywhere downstream, so a
-		// non-USD account is reported in its own units. Say so instead of
-		// stamping "USD" on EUR figures.
+		// E-C2: the account is reported in its own units, which the sync
+		// converts to USD at each day's rate (service/fx.go). The marker
+		// tells the dashboard which currency it is held in.
 		c.addCapabilityWarning("account_currency_" + strings.ToLower(currency))
 	}
 	if currency == "" {

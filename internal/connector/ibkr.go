@@ -628,8 +628,9 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 		i.cachedBalanceAsOf = d
 	}
 	// Flex reports "in base currency" — the account's denomination, not always
-	// USD. Nothing downstream converts, so a EUR account's figures travel as
-	// EUR under a USD label unless somebody reads this.
+	// USD. Balance.Currency carries it to the sync, which converts to USD at
+	// the statement date's rate (service/fx.go); the marker below tells the
+	// dashboard which currency the account is held in.
 	currency, inferred := accountCurrency(summary.Currency, report)
 	switch {
 	case currency == "":

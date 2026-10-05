@@ -110,6 +110,11 @@ func (s *SyncService) ConvertStoredToUSD(ctx context.Context, userUID, exchange,
 	if s.fx == nil {
 		return nil, errors.New("no FX source configured")
 	}
+	// Converting the stored days of a broker whose live days are not would
+	// mix units the other way round.
+	if !convertsExchange(exchange) {
+		return nil, fmt.Errorf("%s accounts are not converted to USD yet", exchange)
+	}
 
 	all, err := s.snapshotRepo.GetByUserAndDateRange(ctx, userUID, time.Unix(0, 0).UTC(), time.Now().UTC().Add(24*time.Hour))
 	if err != nil {

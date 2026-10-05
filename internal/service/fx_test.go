@@ -315,3 +315,13 @@ func TestStoredMeasuredOnMatchesTheWriters(t *testing.T) {
 		t.Errorf("ctrader measured on %s", got)
 	}
 }
+
+func TestOnlyBrokersWhoseAccountsAreKnownAreConverted(t *testing.T) {
+	// IG and MetaTrader emit no currency marker: their non-USD accounts are
+	// unknown, so their stored history could not be backfilled with them.
+	for ex, want := range map[string]bool{"ibkr": true, "IBKR": true, "ctrader": true, "mt5": false, "ig": false, "binance": false} {
+		if got := convertsExchange(ex); got != want {
+			t.Errorf("convertsExchange(%q) = %v", ex, got)
+		}
+	}
+}
