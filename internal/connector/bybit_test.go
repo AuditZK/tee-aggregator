@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,8 +17,8 @@ import (
 )
 
 type bybitExecRow struct {
-	id, side, execType, fee string
-	at                      time.Time
+	id, side, execType, fee, symbol string
+	at                              time.Time
 }
 
 // bybitExecServer serves the execution list the way the venue does: rows in
@@ -83,8 +84,12 @@ func (s *bybitExecServer) serve(q url.Values) string {
 
 	list := make([]map[string]string, 0, stop-offset)
 	for _, r := range match[min(offset, len(match)):stop] {
+		symbol := r.symbol
+		if symbol == "" {
+			symbol = "BTCUSDT"
+		}
 		list = append(list, map[string]string{
-			"execId": r.id, "symbol": "BTCUSDT", "side": r.side, "execType": r.execType,
+			"execId": r.id, "symbol": symbol, "side": r.side, "execType": r.execType,
 			"execPrice": "100", "execQty": "1", "execFee": r.fee,
 			"execTime": strconv.FormatInt(r.at.UnixMilli(), 10), "closedPnl": "0",
 		})
@@ -272,5 +277,30 @@ func TestBybitExecutions_SplitsWindowsAndDedupesBoundary(t *testing.T) {
 	}
 	if q[1].Get("endTime") != strconv.FormatInt(end.UnixMilli(), 10) {
 		t.Fatalf("last window ends at %s, want the requested end", q[1].Get("endTime"))
+	}
+}
+
+// Two settlements sharing one execId on different symbols are two rows: the
+// dedupe keeps both, and says the venue's id was not unique.
+func TestBybitGetFundingFees_SharedExecIDKeepsBothRows(t *testing.T) {
+	at := time.Now().UTC().Truncate(time.Hour).Add(-8 * time.Hour)
+	s := newBybitExecServer(t, []bybitExecRow{
+		{id: "settle-1", side: "Buy", execType: "Funding", fee: "0.4", symbol: "BTCUSDT", at: at},
+		{id: "settle-1", side: "Sell", execType: "Funding", fee: "0.7", symbol: "ETHUSDT", at: at},
+	}, 0)
+
+	fees, err := s.b.GetFundingFees(context.Background(), nil, at.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("GetFundingFees: %v", err)
+	}
+	if len(fees) != 2 || math.Abs(fees[0].Amount+fees[1].Amount+1.1) > 1e-9 {
+		t.Fatalf("fees = %+v, want both settlements (-1.1)", fees)
+	}
+	warned := false
+	for _, w := range s.b.CapabilityWarnings() {
+		warned = warned || w == "bybit_exec_id_collision"
+	}
+	if !warned {
+		t.Fatalf("warnings = %v, want bybit_exec_id_collision", s.b.CapabilityWarnings())
 	}
 }
