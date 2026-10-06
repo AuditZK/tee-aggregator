@@ -48,8 +48,9 @@ func TestOptionalInterfaces(t *testing.T) {
 		{"MEXC", NewMEXC(&Credentials{APIKey: "k", APISecret: "s"}), true, true, true, false},
 		// Bybit reads its capital flows from the unified transaction log, like
 		// the other crypto venues; without the fetcher every snapshot carried
-		// deposits=0 and a deposit read as performance.
-		{"Bybit", NewBybit(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, false},
+		// deposits=0 and a deposit read as performance. Its funding comes from
+		// the execution list, kept out of the trades it would inflate.
+		{"Bybit", NewBybit(&Credentials{APIKey: "k", APISecret: "s"}), true, false, true, false},
 		// IG funds overnight on CFD positions and books it as its own ledger
 		// row, so the funding fetcher is not swap-only.
 		{"IG", NewIG(&Credentials{APIKey: "k", APISecret: "s", Passphrase: "u"}, false), true, false, true, true},
