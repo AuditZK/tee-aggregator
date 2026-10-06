@@ -716,6 +716,7 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 		StartDate:    req.StartDate,
 		EndDate:      req.EndDate,
 		Benchmark:    req.Benchmark,
+		BaseCurrency: req.BaseCurrency,
 		RiskFreeRate: req.RiskFreeRate,
 	}); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())

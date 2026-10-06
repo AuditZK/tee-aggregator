@@ -175,6 +175,22 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 		return snapshots[i].Timestamp.Before(snapshots[j].Timestamp)
 	})
 
+	// 1b. A report in another currency is computed in it: every amount is
+	// valued at its day's rate before any return is taken.
+	ccy := reportCurrency(req.BaseCurrency)
+	var fx fxRates
+	if ccy != "USD" {
+		if fx, err = s.loadReportRates(ctx, ccy, snapshots, req.StartDate, req.EndDate); err != nil {
+			return nil, err
+		}
+		if snapshots, err = snapshotsInCurrency(snapshots, fx, ccy, time.Now().UTC()); err != nil {
+			return nil, err
+		}
+		if len(snapshots) < 2 {
+			return nil, fmt.Errorf("insufficient data: need at least 2 snapshots with a final %s rate, got %d", ccy, len(snapshots))
+		}
+	}
+
 	// 2. Convert to daily returns (TWR with multi-exchange support)
 	snapshots = dropLeadingDustDays(snapshots)
 	dailyReturns := convertSnapshotsToDailyReturns(snapshots)
@@ -187,7 +203,7 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 	// non-fatal: the series stays at zero, as before.
 	var benchmarkSeries map[string]float64
 	if req.Benchmark != "" && s.benchmarkSvc != nil && len(dailyReturns) > 0 {
-		series, err := s.benchmarkSvc.DailyReturnsByDate(ctx, req.Benchmark, req.StartDate, req.EndDate)
+		series, err := s.benchmarkSvc.DailyReturnsByDateIn(ctx, req.Benchmark, req.StartDate, req.EndDate, fx, ccy)
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Warn("benchmark series fetch failed, continuing without", zap.Error(err))
@@ -244,7 +260,7 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 		WinRate:          metrics.WinRate,
 		ProfitFactor:     metrics.ProfitFactor,
 		DataPoints:       metrics.DataPoints,
-		BaseCurrency:     req.BaseCurrency,
+		BaseCurrency:     ccy,
 		BenchmarkUsed:    req.Benchmark,
 		Exchanges:        exchanges,
 		ExchangeDetails:  s.buildExchangeDetails(ctx, req.UserUID, exchanges),
@@ -256,10 +272,6 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 		input.ReportName = fmt.Sprintf("Performance Report %s to %s",
 			input.PeriodStart.Format(dateFormat),
 			input.PeriodEnd.Format(dateFormat))
-	}
-
-	if input.BaseCurrency == "" {
-		input.BaseCurrency = "USD"
 	}
 
 	// 7. Optional risk metrics
@@ -355,6 +367,10 @@ func (s *ReportService) checkReportCache(ctx context.Context, req *GenerateRepor
 	if req.RiskFreeRate != 0 {
 		return nil
 	}
+	// Nor the currency: only USD reports are cached.
+	if reportCurrency(req.BaseCurrency) != "USD" {
+		return nil
+	}
 
 	cached, err := s.signedReportRepo.GetCached(ctx, req.UserUID, req.StartDate, req.EndDate, req.Benchmark, signing.EnclaveVersion)
 	if err != nil {
@@ -388,6 +404,11 @@ func (s *ReportService) checkReportCache(ctx context.Context, req *GenerateRepor
 		}
 		return nil
 	}
+	// A report cached while the currency was only a label may say EUR over
+	// USD figures; it never answers a USD request.
+	if reportCurrency(report.BaseCurrency) != "USD" {
+		return nil
+	}
 
 	return &report
 }
@@ -403,6 +424,9 @@ func (s *ReportService) cacheReport(ctx context.Context, req *GenerateReportRequ
 	}
 	// Same for custom risk-free rates — the key has no rf dimension.
 	if req.RiskFreeRate != 0 {
+		return
+	}
+	if reportCurrency(req.BaseCurrency) != "USD" {
 		return
 	}
 

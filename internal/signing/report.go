@@ -64,7 +64,10 @@ const (
 	//       Sharpe at 1.4: a signed ratio whose basis sits outside the
 	//       signature can be re-labelled 252 or 365 at will, which rescales
 	//       it by √(365/252) ≈ 1.2 without breaking anything.
-	PayloadVersion = "1.7"
+	// 1.8 = baseCurrency is the currency every figure was computed in, each
+	//       day's amounts valued at that day's final rate before returns are
+	//       taken. Before, it was a label over figures computed in USD.
+	PayloadVersion = "1.8"
 )
 
 // payloadVersionsWithoutAnnualizationDays are the pre-1.7 signed-payload

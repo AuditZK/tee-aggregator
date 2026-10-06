@@ -489,8 +489,8 @@ func TestAnnualizationDaysSignAndVerifyRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
-	if report.PayloadVersion != "1.7" {
-		t.Fatalf("new reports must be issued at payload 1.7, got %q", report.PayloadVersion)
+	if _, legacy := payloadVersionsWithoutAnnualizationDays[report.PayloadVersion]; legacy {
+		t.Fatalf("new reports must sign annualizationDays, issued at payload %q", report.PayloadVersion)
 	}
 	if report.AnnualizationDays != 365 {
 		t.Fatalf("annualization_days = %d, want 365", report.AnnualizationDays)

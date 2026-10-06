@@ -296,6 +296,16 @@ func TestValidateReportRequest(t *testing.T) {
 			true,
 		},
 		{
+			"currency code",
+			&ReportRequest{UserUID: "user_abc1234567890", BaseCurrency: "EUR"},
+			false,
+		},
+		{
+			"currency not an ISO code",
+			&ReportRequest{UserUID: "user_abc1234567890", BaseCurrency: "eur'; --"},
+			true,
+		},
+		{
 			"range too large",
 			&ReportRequest{
 				UserUID: "user_abc1234567890", StartDate: "2020-01-01", EndDate: "2026-01-01",
