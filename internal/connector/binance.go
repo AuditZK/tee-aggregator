@@ -674,35 +674,70 @@ func (b *Binance) getSpotTradesForSymbol(ctx context.Context, symbol string, sta
 	return trades, nil
 }
 
+// userTrades returns at most 1000 fills per call and refuses a range wider
+// than seven days; binanceMinFillSplit is the narrowest range a full page is
+// split into.
+const (
+	binanceFillPageLimit = 1000
+	binanceFillWindow    = 7 * 24 * time.Hour
+	binanceMinFillSplit  = time.Second
+)
+
+type binanceFuturesFill struct {
+	ID              int64  `json:"id"`
+	Symbol          string `json:"symbol"`
+	Price           string `json:"price"`
+	Qty             string `json:"qty"`
+	Commission      string `json:"commission"`
+	CommissionAsset string `json:"commissionAsset"`
+	Time            int64  `json:"time"`
+	Side            string `json:"side"`
+	RealizedPnl     string `json:"realizedPnl"`
+}
+
+// getFuturesTrades reads the UM fills over [start, end], seven days at a time.
+// A page that comes back full is not the whole range: the call has no cursor
+// to continue from, so the range is halved until each half fits, the halves
+// sharing their midpoint and the fill id dropping the overlap.
 func (b *Binance) getFuturesTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
-	params := url.Values{}
-	params.Set("startTime", strconv.FormatInt(start.UnixMilli(), 10))
-	params.Set("endTime", strconv.FormatInt(end.UnixMilli(), 10))
-	params.Set("limit", "1000")
-
-	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v1/userTrades", params, true)
-	if err != nil {
-		return nil, err
+	seen := map[int64]bool{}
+	var fills []binanceFuturesFill
+	var read func(from, to time.Time) error
+	read = func(from, to time.Time) error {
+		page, err := b.futuresFillPage(ctx, from, to)
+		if err != nil {
+			return err
+		}
+		if len(page) >= binanceFillPageLimit && to.Sub(from) > binanceMinFillSplit {
+			mid := from.Add(to.Sub(from) / 2)
+			if err := read(from, mid); err != nil {
+				return err
+			}
+			return read(mid, to)
+		}
+		if len(page) >= binanceFillPageLimit {
+			return fmt.Errorf("read binance futures fills: more than %d in one second", binanceFillPageLimit)
+		}
+		for _, f := range page {
+			if !seen[f.ID] {
+				seen[f.ID] = true
+				fills = append(fills, f)
+			}
+		}
+		return nil
+	}
+	for winStart := start; winStart.Before(end); winStart = winStart.Add(binanceFillWindow) {
+		winEnd := winStart.Add(binanceFillWindow)
+		if winEnd.After(end) {
+			winEnd = end
+		}
+		if err := read(winStart, winEnd); err != nil {
+			return nil, err
+		}
 	}
 
-	var resp []struct {
-		ID              int64  `json:"id"`
-		Symbol          string `json:"symbol"`
-		Price           string `json:"price"`
-		Qty             string `json:"qty"`
-		Commission      string `json:"commission"`
-		CommissionAsset string `json:"commissionAsset"`
-		Time            int64  `json:"time"`
-		Side            string `json:"side"`
-		RealizedPnl     string `json:"realizedPnl"`
-	}
-
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, err
-	}
-
-	var trades []*Trade
-	for _, t := range resp {
+	trades := make([]*Trade, 0, len(fills))
+	for _, t := range fills {
 		price, _ := strconv.ParseFloat(t.Price, 64)
 		qty, _ := strconv.ParseFloat(t.Qty, 64)
 		fee, _ := strconv.ParseFloat(t.Commission, 64)
@@ -711,7 +746,7 @@ func (b *Binance) getFuturesTrades(ctx context.Context, start, end time.Time) ([
 		trades = append(trades, &Trade{
 			ID:          strconv.FormatInt(t.ID, 10),
 			Symbol:      t.Symbol,
-			Side:        t.Side,
+			Side:        strings.ToLower(t.Side),
 			Price:       price,
 			Quantity:    qty,
 			Fee:         fee,
@@ -721,8 +756,24 @@ func (b *Binance) getFuturesTrades(ctx context.Context, start, end time.Time) ([
 			MarketType:  "swap",
 		})
 	}
-
 	return trades, nil
+}
+
+func (b *Binance) futuresFillPage(ctx context.Context, from, to time.Time) ([]binanceFuturesFill, error) {
+	params := url.Values{}
+	params.Set("startTime", strconv.FormatInt(from.UnixMilli(), 10))
+	params.Set("endTime", strconv.FormatInt(to.UnixMilli(), 10))
+	params.Set("limit", strconv.Itoa(binanceFillPageLimit))
+
+	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v1/userTrades", params, true)
+	if err != nil {
+		return nil, err
+	}
+	var page []binanceFuturesFill
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, fmt.Errorf("decode binance futures fills: %w", err)
+	}
+	return page, nil
 }
 
 // binanceTransferWallets maps each universal-transfer type to the wallets it
