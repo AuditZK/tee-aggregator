@@ -1099,6 +1099,20 @@ func (h *Handler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := validation.ValidateReportRequest(&validation.ReportRequest{
+		UserUID:      userUID,
+		StartDate:    req.StartDate,
+		EndDate:      req.EndDate,
+		Benchmark:    req.Benchmark,
+		BaseCurrency: req.BaseCurrency,
+	}); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
 	startDate, err := time.Parse("2006-01-02", req.StartDate)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{

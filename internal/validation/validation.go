@@ -28,6 +28,7 @@ var (
 	// Format check only — the benchmark-service is the authority on which
 	// symbols exist (SPY, QQQ, VTI, BTC-USD, CD20, CD100, ...).
 	benchmarkRegex = regexp.MustCompile(`^[A-Za-z0-9-]{1,16}$`)
+	currencyRegex  = regexp.MustCompile(`^[A-Z]{3}$`)
 )
 
 // ValidateUserUID checks if the UID matches Clerk ID, UUID, or CUID format.
@@ -211,6 +212,7 @@ type ReportRequest struct {
 	StartDate    string
 	EndDate      string
 	Benchmark    string
+	BaseCurrency string // ISO code, empty = USD
 	RiskFreeRate float64 // annual %, e.g. 2.5
 }
 
@@ -249,6 +251,11 @@ func ValidateReportRequest(req *ReportRequest) error {
 	// Benchmark is optional; when provided, only the format is checked here.
 	if req.Benchmark != "" && !benchmarkRegex.MatchString(req.Benchmark) {
 		return fmt.Errorf("invalid benchmark symbol format")
+	}
+
+	// Currency is optional; the service decides which codes it can value in.
+	if req.BaseCurrency != "" && !currencyRegex.MatchString(req.BaseCurrency) {
+		return fmt.Errorf("invalid base_currency: use a three-letter ISO code")
 	}
 
 	// Risk-free rate: annual percent, sane range only (0 = legacy behavior).

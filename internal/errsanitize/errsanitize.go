@@ -105,6 +105,8 @@ var categories = []category{
 	{"connection refused", msgExchangeUnreachable},
 	{"deadline exceeded", msgExchangeTimeout},
 	{"timeout", msgExchangeTimeout},
+	{"report currency not supported", "this currency is not available for reports"},
+	{"no final exchange rate", "the exchange rate for this currency is not available yet for part of the period"},
 	{"validation failed", "validation failed"},
 	{"protocol_error", "protocol error"},
 	{"failed to create connection", "failed to create connection"},

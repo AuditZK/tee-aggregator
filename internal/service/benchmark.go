@@ -68,9 +68,23 @@ func NewBenchmarkService(baseURL, internalToken string) *BenchmarkService {
 // realizes on). Returns are decimals, the same unit as the report's daily
 // netReturn, so callers can enrich per-day data directly.
 func (s *BenchmarkService) DailyReturnsByDate(ctx context.Context, benchmark string, startDate, endDate time.Time) (map[string]float64, error) {
+	return s.dailyReturnsIn(ctx, benchmark, startDate, endDate, nil, "USD")
+}
+
+// DailyReturnsByDateIn is DailyReturnsByDate with the closes valued in ccy, so
+// a report computed in ccy compares its returns with the benchmark's in the
+// same currency rather than mixing a currency move into alpha and beta.
+func (s *BenchmarkService) DailyReturnsByDateIn(ctx context.Context, benchmark string, startDate, endDate time.Time, rates fxRates, ccy string) (map[string]float64, error) {
+	return s.dailyReturnsIn(ctx, benchmark, startDate, endDate, rates, ccy)
+}
+
+func (s *BenchmarkService) dailyReturnsIn(ctx context.Context, benchmark string, startDate, endDate time.Time, rates fxRates, ccy string) (map[string]float64, error) {
 	points, err := s.fetchBenchmarkSeries(ctx, benchmark, startDate, endDate)
 	if err != nil {
 		return nil, fmt.Errorf("fetch benchmark data: %w", err)
+	}
+	if ccy != "USD" {
+		points = benchPointsIn(points, rates, ccy)
 	}
 	if len(points) < 2 {
 		return nil, fmt.Errorf("insufficient benchmark data for %s", benchmark)
