@@ -416,3 +416,41 @@ func (b *Bybit) GetFundingFees(ctx context.Context, _ []string, since time.Time)
 	}
 	return fees, nil
 }
+
+// ProbeFunding lists the account's funding since since as each of Bybit's two
+// sources reports it, the execution list (what GetFundingFees reads) and the
+// transaction log (what the history rebuild reads), for an operator to
+// compare them. Nothing here feeds a snapshot.
+func (b *Bybit) ProbeFunding(ctx context.Context, since time.Time) (*FundingProbe, error) {
+	probe := &FundingProbe{Balances: []map[string]string{}, Bills: []map[string]string{}}
+	now := time.Now().UTC()
+
+	execs, err := b.executions(ctx, since, now, bybitExecFunding)
+	if err != nil {
+		probe.Notes = append(probe.Notes, "execution list unavailable: "+vendorErrorDetail(err.Error()))
+	}
+	for _, e := range execs {
+		if e.ExecType != bybitExecFunding {
+			continue
+		}
+		probe.Bills = append(probe.Bills, map[string]string{
+			"source": "execution", "id": e.ExecID, "time": e.ExecTime,
+			"symbol": e.Symbol, "side": e.Side, "qty": e.ExecQty, "fee": e.ExecFee,
+		})
+	}
+
+	rows, err := b.fetchTransactionLog(ctx, since, now)
+	if err != nil {
+		probe.Notes = append(probe.Notes, "transaction log unavailable: "+vendorErrorDetail(err.Error()))
+	}
+	for _, r := range rows {
+		if r.Funding == 0 {
+			continue
+		}
+		probe.Bills = append(probe.Bills, map[string]string{
+			"source": "transaction_log", "id": r.ID, "time": strconv.FormatInt(r.T.UnixMilli(), 10),
+			"symbol": r.Symbol, "type": r.Type, "funding": strconv.FormatFloat(r.Funding, 'f', -1, 64),
+		})
+	}
+	return probe, nil
+}

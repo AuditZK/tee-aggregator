@@ -50,7 +50,10 @@ type bybitLogRow struct {
 	T        time.Time
 	Coin     string
 	Type     string
+	Symbol   string
 	CashFlow float64
+	// Funding is signed as the log reports it, positive when received.
+	Funding float64
 }
 
 func (b *Bybit) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
@@ -199,6 +202,8 @@ func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, 
 					Currency        string `json:"currency"`
 					Type            string `json:"type"`
 					CashFlow        string `json:"cashFlow"`
+					Funding         string `json:"funding"`
+					Symbol          string `json:"symbol"`
 					CashBalance     string `json:"cashBalance"`
 					TransactionTime string `json:"transactionTime"`
 				} `json:"list"`
@@ -224,12 +229,15 @@ func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, 
 			seen[key] = true
 			added++
 			cashFlow, _ := strconv.ParseFloat(row.CashFlow, 64)
+			funding, _ := strconv.ParseFloat(row.Funding, 64)
 			out = append(out, bybitLogRow{
 				ID:       key,
 				T:        time.UnixMilli(ms).UTC(),
 				Coin:     strings.ToUpper(row.Currency),
 				Type:     strings.ToUpper(row.Type),
+				Symbol:   row.Symbol,
 				CashFlow: cashFlow,
+				Funding:  funding,
 			})
 		}
 

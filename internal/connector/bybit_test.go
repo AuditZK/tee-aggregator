@@ -304,3 +304,29 @@ func TestBybitGetFundingFees_SharedExecIDKeepsBothRows(t *testing.T) {
 		t.Fatalf("warnings = %v, want bybit_exec_id_collision", s.b.CapabilityWarnings())
 	}
 }
+
+// The probe lists the execution list's funding rows as read, trades left out.
+func TestBybitProbeFunding_ListsExecutionFunding(t *testing.T) {
+	at := time.Now().UTC().Add(-time.Hour)
+	s := newBybitExecServer(t, []bybitExecRow{
+		{id: "f1", side: "Buy", execType: "Funding", fee: "0.5", at: at},
+		{id: "t1", side: "Buy", execType: "Trade", fee: "9", at: at},
+	}, 0)
+
+	probe, err := s.b.ProbeFunding(context.Background(), at.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("ProbeFunding: %v", err)
+	}
+	var execRows int
+	for _, bill := range probe.Bills {
+		if bill["source"] == "execution" {
+			execRows++
+			if bill["id"] != "f1" || bill["fee"] != "0.5" {
+				t.Fatalf("bill = %v, want f1 at 0.5", bill)
+			}
+		}
+	}
+	if execRows != 1 {
+		t.Fatalf("execution rows = %d, want 1: %v", execRows, probe.Bills)
+	}
+}
