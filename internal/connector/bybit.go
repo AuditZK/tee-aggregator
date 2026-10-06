@@ -216,17 +216,21 @@ type bybitExecution struct {
 	ClosedPnl string `json:"closedPnl"`
 }
 
+// key identifies a row across overlapping reads. The execId alone is not
+// trusted to be unique: two rows sharing it but differing in time, symbol or
+// type are both kept, and the collision is reported.
 func (e bybitExecution) key() string {
-	if e.ExecID != "" {
-		return e.ExecID
+	if e.ExecID == "" {
+		return e.ExecTime + "|" + e.Symbol + "|" + e.ExecType + "|" + e.Side + "|" + e.ExecQty + "|" + e.ExecFee
 	}
-	return e.ExecTime + "|" + e.Symbol + "|" + e.ExecType + "|" + e.Side + "|" + e.ExecQty + "|" + e.ExecFee
+	return e.ExecID + "|" + e.ExecTime + "|" + e.Symbol + "|" + e.ExecType
 }
 
 type bybitExecReader struct {
 	b        *Bybit
 	execType string
 	seen     map[string]bool
+	ids      map[string]string
 	out      []bybitExecution
 	requests int
 }
@@ -234,7 +238,7 @@ type bybitExecReader struct {
 // executions reads the linear execution list over [start, end], one window of
 // at most seven days at a time. An empty execType reads every type.
 func (b *Bybit) executions(ctx context.Context, start, end time.Time, execType string) ([]bybitExecution, error) {
-	r := &bybitExecReader{b: b, execType: execType, seen: map[string]bool{}}
+	r := &bybitExecReader{b: b, execType: execType, seen: map[string]bool{}, ids: map[string]string{}}
 	for winStart := start; winStart.Before(end); winStart = winStart.Add(bybitExecWindow) {
 		winEnd := winStart.Add(bybitExecWindow)
 		if winEnd.After(end) {
@@ -338,6 +342,12 @@ func (r *bybitExecReader) add(rows []bybitExecution) int {
 			continue
 		}
 		r.seen[k] = true
+		if e.ExecID != "" {
+			if prev, ok := r.ids[e.ExecID]; ok && prev != k {
+				r.b.noteCashflowWarning("bybit_exec_id_collision")
+			}
+			r.ids[e.ExecID] = k
+		}
 		r.out = append(r.out, e)
 		added++
 	}
