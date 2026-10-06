@@ -1222,10 +1222,7 @@ func (s *SyncService) readActivity(ctx context.Context, conn connector.Connector
 
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
 		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, from); err == nil {
-			for _, f := range fees {
-				act.fundingCharges += f.Amount
-			}
-			act.breakdown.getOrCreateMarket(fundingMarketType(connMeta.Exchange)).fundingFees = act.fundingCharges
+			act.fundingCharges = applyFundingFees(act.breakdown, connMeta.Exchange, fees)
 		}
 	}
 	act.deposits, act.withdrawals, act.cashflows = s.readCashflows(ctx, conn, connMeta, from)
@@ -3411,6 +3408,26 @@ func (a *aggregatedBreakdown) totalFees() float64 {
 		a.margin.fees + a.earn.fees + a.cfd.fees + a.forex.fees + a.commodities.fees
 }
 
+func (a *aggregatedBreakdown) totalFundingFees() float64 {
+	return a.stocks.fundingFees + a.spot.fundingFees + a.swap.fundingFees + a.futures.fundingFees + a.options.fundingFees +
+		a.margin.fundingFees + a.earn.fundingFees + a.cfd.fundingFees + a.forex.fundingFees + a.commodities.fundingFees
+}
+
+// applyFundingFees books a window's funding on the breakdown and returns it
+// signed as connectors report it, negative when charged. The breakdown stores
+// it as a cost, positive when paid, the sign of trading_fees and of the
+// rebuilt days: every reader adds the two into the fees it shows.
+func applyFundingFees(agg *aggregatedBreakdown, exchange string, fees []*connector.FundingFee) float64 {
+	charges := 0.0
+	for _, f := range fees {
+		charges += f.Amount
+	}
+	if charges != 0 {
+		agg.getOrCreateMarket(fundingMarketType(exchange)).fundingFees = -charges
+	}
+	return charges
+}
+
 func (a *aggregatedBreakdown) totalLongTrades() int {
 	return a.stocks.longTrades + a.spot.longTrades + a.swap.longTrades + a.futures.longTrades + a.options.longTrades +
 		a.margin.longTrades + a.earn.longTrades + a.cfd.longTrades + a.forex.longTrades + a.commodities.longTrades
@@ -3488,7 +3505,8 @@ func (a *aggregatedBreakdown) toRepo(globalEquity, globalAvailableMargin float64
 			AvailableMargin: clampAvailableMargin(globalAvailableMargin, globalEquity),
 			Volume:          a.totalVolume(),
 			Trades:          totalTrades,
-			TradingFees:     a.totalFees(), // toRepoMetrics splits fees by kind; aggregate only keeps total
+			TradingFees:     a.totalFees(),
+			FundingFees:     a.totalFundingFees(),
 			LongTrades:      a.totalLongTrades(),
 			ShortTrades:     a.totalShortTrades(),
 			LongVolume:      a.totalLongVolume(),
