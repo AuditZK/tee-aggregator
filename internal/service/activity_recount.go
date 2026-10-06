@@ -13,19 +13,25 @@ import (
 	"github.com/trackrecord/enclave/internal/repository"
 )
 
-// activityRecountExchanges are the venues whose GetTrades and GetFundingFees
-// read any past range on request. The others read a fixed recent window or
-// per symbol, and a recount would empty the days they cannot reach.
-var activityRecountExchanges = []string{"bybit"}
+// recountScope is what a venue's connector reads back over a past range: the
+// markets whose fills it returns for any window, and how long the venue keeps
+// them. A recount rewrites those markets only; the others keep what their
+// sync stored.
+type recountScope struct {
+	markets []string
+	horizon time.Duration
+}
 
-func recountsActivity(exchange string) bool {
-	e := strings.ToLower(exchange)
-	for _, x := range activityRecountExchanges {
-		if x == e {
-			return true
-		}
-	}
-	return false
+var activityRecountScopes = map[string]recountScope{
+	"bybit": {markets: []string{connector.MarketSwap}},
+	// Spot reads only the symbols held today, one day per call, so its past
+	// days cannot be read back. UM fills are kept three months.
+	"binance": {markets: []string{connector.MarketSwap}, horizon: 89 * 24 * time.Hour},
+}
+
+func recountScopeFor(exchange string) (recountScope, bool) {
+	sc, ok := activityRecountScopes[strings.ToLower(exchange)]
+	return sc, ok
 }
 
 // RecountDay is one live snapshot's activity, as stored and as the connector
@@ -71,7 +77,8 @@ func (s *SyncService) RecountActivity(ctx context.Context, userUID, exchange, la
 	if err := checkReflowWindow(from, to); err != nil {
 		return nil, err
 	}
-	if !recountsActivity(exchange) {
+	scope, ok := recountScopeFor(exchange)
+	if !ok {
 		return nil, fmt.Errorf("recount: %s cannot read a past range of fills", exchange)
 	}
 	connMeta, conn, err := s.recountSource(ctx, userUID, exchange, label)
@@ -84,12 +91,18 @@ func (s *SyncService) RecountActivity(ctx context.Context, userUID, exchange, la
 	}
 
 	since := reflowSince(rows, from)
+	// A venue asked past its horizon answers with nothing, which would empty
+	// the day rather than fix it.
+	if scope.horizon > 0 && since.Before(time.Now().Add(-scope.horizon)) {
+		return nil, fmt.Errorf("recount: %s keeps fills for %d days", exchange, int(scope.horizon/(24*time.Hour)))
+	}
 	trades, err := conn.GetTrades(ctx, since, to)
 	if err != nil {
 		return nil, fmt.Errorf("read trades: %w", err)
 	}
 	var funding []*connector.FundingFee
-	if ff, ok := conn.(connector.FundingFeesFetcher); ok {
+	ff, readsFunding := conn.(connector.FundingFeesFetcher)
+	if readsFunding {
 		if funding, err = ff.GetFundingFees(ctx, nil, since); err != nil {
 			return nil, fmt.Errorf("read funding: %w", err)
 		}
@@ -101,7 +114,7 @@ func (s *SyncService) RecountActivity(ctx context.Context, userUID, exchange, la
 		if day := r.Timestamp.UTC(); day.Before(from) || day.After(to) {
 			continue
 		}
-		d := s.recountDay(rows, i, connMeta.Exchange, trades, funding)
+		d := s.recountDay(rows, i, connMeta.Exchange, scope.markets, trades, funding, readsFunding)
 		if apply && d.Kept == "" && d.changed() {
 			ok, err := s.snapshotRepo.UpdateActivity(ctx, r.ID, d.OldTrades, d.OldVolume, d.breakdown)
 			if err != nil {
@@ -155,9 +168,12 @@ func (s *SyncService) recountSource(ctx context.Context, userUID, exchange, labe
 	return connMeta, conn, nil
 }
 
-// recountDay rebuilds row i's activity from the fills and funding in its
-// window, kept as stored when the row was reconstructed.
-func (s *SyncService) recountDay(rows []*repository.Snapshot, i int, exchange string, trades []*connector.Trade, funding []*connector.FundingFee) RecountDay {
+// recountDay rebuilds the activity of row i's recounted markets from the fills
+// and funding in its window. The row is kept as stored when it was
+// reconstructed, or when its global entry does not add up to its markets: a
+// row written before the per-market breakdown existed, which a recount would
+// double.
+func (s *SyncService) recountDay(rows []*repository.Snapshot, i int, exchange string, markets []string, trades []*connector.Trade, funding []*connector.FundingFee, readsFunding bool) RecountDay {
 	r := rows[i]
 	day := r.Timestamp.UTC()
 	d := RecountDay{Day: day}
@@ -167,8 +183,13 @@ func (s *SyncService) recountDay(rows []*repository.Snapshot, i int, exchange st
 		d.OldTradingFees, d.OldFundingFees = g.TradingFees, g.FundingFees
 		d.OldLongTrades, d.OldShortTrades = g.LongTrades, g.ShortTrades
 	}
-	if r.FromExternalRebuilder || r.IsHistorical {
+	switch {
+	case r.FromExternalRebuilder || r.IsHistorical:
 		d.Kept = "reconstructed day"
+	case !marketsAddUp(r.Breakdown):
+		d.Kept = "global does not add up to its markets"
+	}
+	if d.Kept != "" {
 		d.NewTrades, d.NewVolume = d.OldTrades, d.OldVolume
 		d.NewTradingFees, d.NewFundingFees = d.OldTradingFees, d.OldFundingFees
 		d.NewLongTrades, d.NewShortTrades = d.OldLongTrades, d.OldShortTrades
@@ -178,20 +199,22 @@ func (s *SyncService) recountDay(rows []*repository.Snapshot, i int, exchange st
 	start := reflowWindowStart(rows, i)
 	var inWindow []*connector.Trade
 	for _, t := range trades {
-		if ts := t.Timestamp.UTC(); !ts.Before(start) && ts.Before(day) {
+		if ts := t.Timestamp.UTC(); !ts.Before(start) && ts.Before(day) && containsMarket(markets, t.MarketType) {
 			inWindow = append(inWindow, t)
 		}
 	}
-	var fees []*connector.FundingFee
-	for _, f := range funding {
-		if ts := f.Timestamp.UTC(); !ts.Before(start) && ts.Before(day) {
-			fees = append(fees, f)
-		}
-	}
 	agg := s.aggregateTrades(inWindow)
-	applyFundingFees(agg, exchange, fees)
+	if readsFunding {
+		var fees []*connector.FundingFee
+		for _, f := range funding {
+			if ts := f.Timestamp.UTC(); !ts.Before(start) && ts.Before(day) {
+				fees = append(fees, f)
+			}
+		}
+		applyFundingFees(agg, exchange, fees)
+	}
 
-	d.breakdown = withActivity(r.Breakdown, agg, len(inWindow), r.TotalEquity)
+	d.breakdown = withActivity(r.Breakdown, agg, markets, readsFunding, r.TotalEquity)
 	g := d.breakdown.Global
 	d.NewTrades, d.NewVolume = g.Trades, g.Volume
 	d.NewTradingFees, d.NewFundingFees = g.TradingFees, g.FundingFees
@@ -199,41 +222,100 @@ func (s *SyncService) recountDay(rows []*repository.Snapshot, i int, exchange st
 	return d
 }
 
-// withActivity returns a copy of stored whose activity fields are agg's, every
-// equity, margin and FX field left as stored.
-func withActivity(stored *repository.MarketBreakdown, agg *aggregatedBreakdown, trades int, equity float64) *repository.MarketBreakdown {
+func containsMarket(markets []string, m string) bool {
+	for _, x := range markets {
+		if x == m {
+			return true
+		}
+	}
+	return false
+}
+
+type marketSlot struct {
+	name string
+	m    **repository.MarketMetrics
+	agg  *marketAgg
+}
+
+func marketSlots(b *repository.MarketBreakdown, agg *aggregatedBreakdown) []marketSlot {
+	return []marketSlot{
+		{connector.MarketStocks, &b.Stocks, &agg.stocks}, {connector.MarketSpot, &b.Spot, &agg.spot},
+		{connector.MarketSwap, &b.Swap, &agg.swap}, {connector.MarketFutures, &b.Futures, &agg.futures},
+		{connector.MarketOptions, &b.Options, &agg.options}, {connector.MarketMargin, &b.Margin, &agg.margin},
+		{connector.MarketEarn, &b.Earn, &agg.earn}, {connector.MarketCFD, &b.CFD, &agg.cfd},
+		{connector.MarketForex, &b.Forex, &agg.forex}, {connector.MarketCommodities, &b.Commodities, &agg.commodities},
+	}
+}
+
+// marketsAddUp reports whether the global entry's trades, volume and fees are
+// the sum of the markets'.
+func marketsAddUp(b *repository.MarketBreakdown) bool {
+	if b == nil || b.Global == nil {
+		return true
+	}
+	trades, volume, fees := 0, 0.0, 0.0
+	for _, sl := range marketSlots(b, &aggregatedBreakdown{}) {
+		if m := *sl.m; m != nil {
+			trades += m.Trades
+			volume += m.Volume
+			fees += m.TradingFees
+		}
+	}
+	g := b.Global
+	return trades == g.Trades &&
+		math.Abs(volume-g.Volume) <= 1e-6*math.Max(1, g.Volume) &&
+		math.Abs(fees-g.TradingFees) <= 1e-6*math.Max(1, math.Abs(g.TradingFees))
+}
+
+// withActivity returns a copy of stored whose recounted markets carry agg's
+// activity, funding included only when the connector read it. Every other
+// market, and every equity, margin and FX field, stays as stored; global's
+// activity is the sum of the markets.
+func withActivity(stored *repository.MarketBreakdown, agg *aggregatedBreakdown, markets []string, withFunding bool, equity float64) *repository.MarketBreakdown {
 	out := &repository.MarketBreakdown{}
 	if stored != nil {
 		*out = *stored
 	}
-	slots := []struct {
-		m   **repository.MarketMetrics
-		agg *marketAgg
-	}{
-		{&out.Stocks, &agg.stocks}, {&out.Spot, &agg.spot}, {&out.Swap, &agg.swap},
-		{&out.Futures, &agg.futures}, {&out.Options, &agg.options}, {&out.Margin, &agg.margin},
-		{&out.Earn, &agg.earn}, {&out.CFD, &agg.cfd}, {&out.Forex, &agg.forex},
-		{&out.Commodities, &agg.commodities},
-	}
+	slots := marketSlots(out, agg)
 	for _, sl := range slots {
-		if *sl.m == nil && sl.agg.trades == 0 && sl.agg.fundingFees == 0 {
+		if !containsMarket(markets, sl.name) {
+			continue
+		}
+		if *sl.m == nil && sl.agg.trades == 0 && (!withFunding || sl.agg.fundingFees == 0) {
 			continue
 		}
 		m := &repository.MarketMetrics{}
 		if *sl.m != nil {
 			*m = **sl.m
 		}
-		setActivity(m, sl.agg.volume, sl.agg.trades, sl.agg.fees, sl.agg.fundingFees,
+		funding := m.FundingFees
+		if withFunding {
+			funding = sl.agg.fundingFees
+		}
+		setActivity(m, sl.agg.volume, sl.agg.trades, sl.agg.fees, funding,
 			sl.agg.longTrades, sl.agg.shortTrades, sl.agg.longVolume, sl.agg.shortVolume)
 		*sl.m = m
 	}
 
+	sum := &repository.MarketMetrics{}
+	for _, sl := range slots {
+		if m := *sl.m; m != nil {
+			sum.Volume += m.Volume
+			sum.Trades += m.Trades
+			sum.TradingFees += m.TradingFees
+			sum.FundingFees += m.FundingFees
+			sum.LongTrades += m.LongTrades
+			sum.ShortTrades += m.ShortTrades
+			sum.LongVolume += m.LongVolume
+			sum.ShortVolume += m.ShortVolume
+		}
+	}
 	g := &repository.MarketMetrics{Equity: equity}
 	if out.Global != nil {
 		*g = *out.Global
 	}
-	setActivity(g, agg.totalVolume(), trades, agg.totalFees(), agg.totalFundingFees(),
-		agg.totalLongTrades(), agg.totalShortTrades(), agg.totalLongVolume(), agg.totalShortVolume())
+	setActivity(g, sum.Volume, sum.Trades, sum.TradingFees, sum.FundingFees,
+		sum.LongTrades, sum.ShortTrades, sum.LongVolume, sum.ShortVolume)
 	out.Global = g
 	return out
 }
