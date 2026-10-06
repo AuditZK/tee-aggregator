@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -188,54 +189,81 @@ func (b *Bybit) GetPositions(ctx context.Context) ([]*Position, error) {
 	return positions, nil
 }
 
+// Bybit caps one execution page at 100 fills, so a busy day spans several
+// pages; the page budget bounds a runaway cursor, not a real account.
+const (
+	bybitFillPageLimit = 100
+	bybitMaxFillPages  = 50
+)
+
 func (b *Bybit) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
-	params := fmt.Sprintf("category=linear&startTime=%d&endTime=%d&limit=100",
-		start.UnixMilli(), end.UnixMilli())
-
-	body, err := b.doRequest(ctx, "GET", "/v5/execution/list", params)
-	if err != nil {
-		return nil, err
-	}
-
-	var resp struct {
-		Result struct {
-			List []struct {
-				ExecId    string `json:"execId"`
-				Symbol    string `json:"symbol"`
-				Side      string `json:"side"`
-				ExecPrice string `json:"execPrice"`
-				ExecQty   string `json:"execQty"`
-				ExecFee   string `json:"execFee"`
-				ExecTime  string `json:"execTime"`
-				ClosedPnl string `json:"closedPnl"`
-			} `json:"list"`
-		} `json:"result"`
-	}
-
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, err
-	}
-
 	var trades []*Trade
-	for _, t := range resp.Result.List {
-		price, _ := strconv.ParseFloat(t.ExecPrice, 64)
-		qty, _ := strconv.ParseFloat(t.ExecQty, 64)
-		fee, _ := strconv.ParseFloat(t.ExecFee, 64)
-		pnl, _ := strconv.ParseFloat(t.ClosedPnl, 64)
-		execTime, _ := strconv.ParseInt(t.ExecTime, 10, 64)
+	cursor := ""
+	for page := 0; page < bybitMaxFillPages; page++ {
+		if page > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(bybitLogPagePace):
+			}
+		}
 
-		trades = append(trades, &Trade{
-			ID:          t.ExecId,
-			Symbol:      t.Symbol,
-			Side:        t.Side,
-			Price:       price,
-			Quantity:    qty,
-			Fee:         fee,
-			FeeCurrency: "USDT",
-			RealizedPnL: pnl,
-			Timestamp:   time.UnixMilli(execTime),
-			MarketType:  "swap",
-		})
+		params := fmt.Sprintf("category=linear&startTime=%d&endTime=%d&limit=%d",
+			start.UnixMilli(), end.UnixMilli(), bybitFillPageLimit)
+		if cursor != "" {
+			params += "&cursor=" + cursor
+		}
+
+		body, err := b.doRequest(ctx, "GET", "/v5/execution/list", params)
+		if err != nil {
+			return nil, err
+		}
+
+		var resp struct {
+			Result struct {
+				NextPageCursor string `json:"nextPageCursor"`
+				List           []struct {
+					ExecId    string `json:"execId"`
+					Symbol    string `json:"symbol"`
+					Side      string `json:"side"`
+					ExecPrice string `json:"execPrice"`
+					ExecQty   string `json:"execQty"`
+					ExecFee   string `json:"execFee"`
+					ExecTime  string `json:"execTime"`
+					ClosedPnl string `json:"closedPnl"`
+				} `json:"list"`
+			} `json:"result"`
+		}
+
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, err
+		}
+
+		for _, t := range resp.Result.List {
+			price, _ := strconv.ParseFloat(t.ExecPrice, 64)
+			qty, _ := strconv.ParseFloat(t.ExecQty, 64)
+			fee, _ := strconv.ParseFloat(t.ExecFee, 64)
+			pnl, _ := strconv.ParseFloat(t.ClosedPnl, 64)
+			execTime, _ := strconv.ParseInt(t.ExecTime, 10, 64)
+
+			trades = append(trades, &Trade{
+				ID:          t.ExecId,
+				Symbol:      t.Symbol,
+				Side:        strings.ToLower(t.Side),
+				Price:       price,
+				Quantity:    qty,
+				Fee:         fee,
+				FeeCurrency: "USDT",
+				RealizedPnL: pnl,
+				Timestamp:   time.UnixMilli(execTime),
+				MarketType:  "swap",
+			})
+		}
+
+		cursor = resp.Result.NextPageCursor
+		if cursor == "" || len(resp.Result.List) == 0 {
+			break
+		}
 	}
 
 	return trades, nil

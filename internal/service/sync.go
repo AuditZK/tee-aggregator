@@ -2973,10 +2973,13 @@ func (s *SyncService) aggregateTrades(trades []*connector.Trade) *aggregatedBrea
 		ma.trades++
 		ma.fees += t.Fee
 
-		if t.Side == "buy" || t.Side == "long" {
+		// Venues spell the side in their own case (Binance futures "BUY",
+		// Bybit "Buy"); an unmatched spelling silently zeroes the split.
+		switch strings.ToLower(t.Side) {
+		case "buy", "long":
 			ma.longTrades++
 			ma.longVolume += volume
-		} else if t.Side == "sell" || t.Side == "short" {
+		case "sell", "short":
 			ma.shortTrades++
 			ma.shortVolume += volume
 		}
