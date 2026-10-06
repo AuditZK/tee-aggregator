@@ -301,6 +301,24 @@ func TestBybitGetCashflows_WindowFailureAbortsTheCall(t *testing.T) {
 	}
 }
 
+// Bybit's cursor can name the page it came with: the rest of the window would
+// go unread and a deposit in it read as performance, so the call fails.
+func TestBybitGetCashflows_StalledCursorAbortsTheCall(t *testing.T) {
+	now := time.Now().UTC()
+	row := bybitRowJSON("t1", now.Add(-time.Hour), "USDT", "TRANSFER_IN", "500")
+	s := newBybitLogServer(t, []string{
+		bybitPageJSON("c1", row),
+		bybitPageJSON("c1", row),
+	}, "")
+
+	if _, err := s.connector().GetCashflows(context.Background(), now.Add(-2*time.Hour)); err == nil {
+		t.Fatal("a stalled cursor returned a partial ledger without error")
+	}
+	if n := len(s.recorded()); n != 2 {
+		t.Fatalf("requests = %d, want 2 (stop at the stall, not loop on it)", n)
+	}
+}
+
 // The perimeter rule, without IO: only the two transfer types cross it.
 func TestBybitClassifyCashflows_OnlyTransfersCrossThePerimeter(t *testing.T) {
 	at := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)

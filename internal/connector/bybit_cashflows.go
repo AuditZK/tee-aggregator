@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -207,6 +208,7 @@ func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, 
 			return nil, fmt.Errorf("decode bybit transaction log: %w", err)
 		}
 
+		added := 0
 		for _, row := range resp.Result.List {
 			ms, perr := strconv.ParseInt(row.TransactionTime, 10, 64)
 			if perr != nil {
@@ -220,6 +222,7 @@ func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, 
 				continue
 			}
 			seen[key] = true
+			added++
 			cashFlow, _ := strconv.ParseFloat(row.CashFlow, 64)
 			out = append(out, bybitLogRow{
 				ID:       key,
@@ -230,7 +233,14 @@ func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, 
 			})
 		}
 
-		cursor = resp.Result.NextPageCursor
+		// Bybit's cursor can point back at the page it came with; the rest
+		// of the window would then go unread and a deposit in it would be
+		// booked as performance.
+		next := resp.Result.NextPageCursor
+		if next != "" && (next == cursor || (added == 0 && len(resp.Result.List) > 0)) {
+			return nil, errors.New("read bybit transaction log: cursor stalled")
+		}
+		cursor = next
 		if cursor == "" || len(resp.Result.List) == 0 {
 			break
 		}

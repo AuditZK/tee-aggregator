@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -189,13 +190,14 @@ func (b *Bybit) GetPositions(ctx context.Context) ([]*Position, error) {
 	return positions, nil
 }
 
-// Bybit caps one execution page at 100 fills, so a busy day spans several
-// pages; the page budget bounds a runaway cursor, not a real account. The
-// endpoint refuses a range wider than seven days.
+// One execution page holds at most 100 rows, and the endpoint refuses a range
+// wider than seven days. bybitMinExecSplit is the narrowest range a full page
+// is split into; below it the cursor is followed, within bybitMaxFillPages.
 const (
 	bybitFillPageLimit = 100
-	bybitMaxFillPages  = 50
 	bybitExecWindow    = 7 * 24 * time.Hour
+	bybitMinExecSplit  = time.Second
+	bybitMaxFillPages  = 50
 )
 
 // bybitExecFunding marks a funding settlement in the execution list: it
@@ -214,70 +216,132 @@ type bybitExecution struct {
 	ClosedPnl string `json:"closedPnl"`
 }
 
+func (e bybitExecution) key() string {
+	if e.ExecID != "" {
+		return e.ExecID
+	}
+	return e.ExecTime + "|" + e.Symbol + "|" + e.ExecType + "|" + e.Side + "|" + e.ExecQty + "|" + e.ExecFee
+}
+
+type bybitExecReader struct {
+	b        *Bybit
+	execType string
+	seen     map[string]bool
+	out      []bybitExecution
+	requests int
+}
+
 // executions reads the linear execution list over [start, end], one window of
-// at most seven days at a time, following each window's cursor. An empty
-// execType reads every type.
+// at most seven days at a time. An empty execType reads every type.
 func (b *Bybit) executions(ctx context.Context, start, end time.Time, execType string) ([]bybitExecution, error) {
-	var out []bybitExecution
-	seen := map[string]bool{}
-	requests := 0
+	r := &bybitExecReader{b: b, execType: execType, seen: map[string]bool{}}
 	for winStart := start; winStart.Before(end); winStart = winStart.Add(bybitExecWindow) {
 		winEnd := winStart.Add(bybitExecWindow)
 		if winEnd.After(end) {
 			winEnd = end
 		}
-
-		cursor := ""
-		for page := 0; page < bybitMaxFillPages; page++ {
-			if requests > 0 {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(bybitLogPagePace):
-				}
-			}
-			requests++
-
-			params := fmt.Sprintf("category=linear&startTime=%d&endTime=%d&limit=%d",
-				winStart.UnixMilli(), winEnd.UnixMilli(), bybitFillPageLimit)
-			if execType != "" {
-				params += "&execType=" + execType
-			}
-			if cursor != "" {
-				params += "&cursor=" + cursor
-			}
-
-			body, err := b.doRequest(ctx, "GET", "/v5/execution/list", params)
-			if err != nil {
-				return nil, err
-			}
-
-			var resp struct {
-				Result struct {
-					NextPageCursor string           `json:"nextPageCursor"`
-					List           []bybitExecution `json:"list"`
-				} `json:"result"`
-			}
-			if err := json.Unmarshal(body, &resp); err != nil {
-				return nil, fmt.Errorf("decode bybit executions: %w", err)
-			}
-
-			// Adjacent windows share their boundary millisecond.
-			for _, e := range resp.Result.List {
-				if e.ExecID != "" && seen[e.ExecID] {
-					continue
-				}
-				seen[e.ExecID] = true
-				out = append(out, e)
-			}
-
-			cursor = resp.Result.NextPageCursor
-			if cursor == "" || len(resp.Result.List) == 0 {
-				break
-			}
+		if err := r.read(ctx, winStart, winEnd); err != nil {
+			return nil, err
 		}
 	}
-	return out, nil
+	return r.out, nil
+}
+
+// read collects [start, end]. A full page is not paged through: Bybit's cursor
+// can point back at the page it came with, and following it lost funding rows
+// that share one settlement millisecond, a different few on every read. The
+// range is halved instead until each half fits in one page; the halves share
+// their midpoint and the dedupe drops the overlap.
+func (r *bybitExecReader) read(ctx context.Context, start, end time.Time) error {
+	rows, cursor, err := r.page(ctx, start, end, "")
+	if err != nil {
+		return err
+	}
+	if cursor == "" || len(rows) < bybitFillPageLimit {
+		r.add(rows)
+		return nil
+	}
+	if end.Sub(start) > bybitMinExecSplit {
+		mid := start.Add(end.Sub(start) / 2)
+		if err := r.read(ctx, start, mid); err != nil {
+			return err
+		}
+		return r.read(ctx, mid, end)
+	}
+	return r.follow(ctx, start, end, rows, cursor)
+}
+
+// follow pages through a range too narrow to split, and fails rather than
+// return part of it when the cursor stops moving.
+func (r *bybitExecReader) follow(ctx context.Context, start, end time.Time, rows []bybitExecution, cursor string) error {
+	r.add(rows)
+	for page := 1; cursor != ""; page++ {
+		if page >= bybitMaxFillPages {
+			return fmt.Errorf("read bybit executions: more than %d pages in one second", bybitMaxFillPages)
+		}
+		next, nextCursor, err := r.page(ctx, start, end, cursor)
+		if err != nil {
+			return err
+		}
+		if len(next) == 0 {
+			return nil
+		}
+		if nextCursor == cursor || (r.add(next) == 0 && nextCursor != "") {
+			return errors.New("read bybit executions: cursor stalled")
+		}
+		cursor = nextCursor
+	}
+	return nil
+}
+
+func (r *bybitExecReader) page(ctx context.Context, start, end time.Time, cursor string) ([]bybitExecution, string, error) {
+	if r.requests > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		case <-time.After(bybitLogPagePace):
+		}
+	}
+	r.requests++
+
+	params := fmt.Sprintf("category=linear&startTime=%d&endTime=%d&limit=%d",
+		start.UnixMilli(), end.UnixMilli(), bybitFillPageLimit)
+	if r.execType != "" {
+		params += "&execType=" + r.execType
+	}
+	if cursor != "" {
+		params += "&cursor=" + cursor
+	}
+
+	body, err := r.b.doRequest(ctx, "GET", "/v5/execution/list", params)
+	if err != nil {
+		return nil, "", err
+	}
+	var resp struct {
+		Result struct {
+			NextPageCursor string           `json:"nextPageCursor"`
+			List           []bybitExecution `json:"list"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, "", fmt.Errorf("decode bybit executions: %w", err)
+	}
+	return resp.Result.List, resp.Result.NextPageCursor, nil
+}
+
+// add keeps the rows not seen yet and returns how many.
+func (r *bybitExecReader) add(rows []bybitExecution) int {
+	added := 0
+	for _, e := range rows {
+		k := e.key()
+		if r.seen[k] {
+			continue
+		}
+		r.seen[k] = true
+		r.out = append(r.out, e)
+		added++
+	}
+	return added
 }
 
 func (b *Bybit) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
