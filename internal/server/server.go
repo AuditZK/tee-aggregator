@@ -53,6 +53,8 @@ type Server struct {
 	// reflowSvc overrides the reflower behind the admin reflow endpoint, for
 	// the same reason as probeSvc.
 	reflowSvc cashflowReflower
+	// recountSvc does the same for the admin recount-activity endpoint.
+	recountSvc activityRecounter
 
 	// handoffHandler, when non-nil, exposes the B2 handoff endpoint
 	// at POST /api/v1/admin/handoff. Successor enclaves use this to
@@ -146,6 +148,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/admin/funding-probe", s.localhostOnly(s.handleAdminFundingProbe))
 	mux.HandleFunc("/api/v1/admin/reflow", s.localhostOnly(s.handleAdminReflow))
 	mux.HandleFunc("/api/v1/admin/convert-to-usd", s.localhostOnly(s.handleAdminConvertToUSD))
+	mux.HandleFunc("/api/v1/admin/recount-activity", s.localhostOnly(s.handleAdminRecountActivity))
 
 	// B2 handoff: deliberately NOT gated by localhostOnly because the
 	// successor enclave runs in a different container with a non-loopback
@@ -877,6 +880,71 @@ func (s *Server) handleAdminConvertToUSD(w http.ResponseWriter, r *http.Request)
 	days, err := s.handler.syncSvc.ConvertStoredToUSD(ctx, userUID, exchange, label, currency, apply)
 	if err != nil {
 		s.log().Error("admin convert-to-usd failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "apply": apply, "count": len(days), "days": days})
+}
+
+// activityRecounter is the slice of the sync service the recount endpoint needs.
+type activityRecounter interface {
+	RecountActivity(ctx context.Context, userUID, exchange, label string, from, to time.Time, apply bool) ([]service.RecountDay, error)
+}
+
+func (s *Server) recounter() activityRecounter {
+	if s.recountSvc != nil {
+		return s.recountSvc
+	}
+	if s.handler == nil || s.handler.syncSvc == nil {
+		return nil
+	}
+	return s.handler.syncSvc
+}
+
+// handleAdminRecountActivity re-derives the trades, volume, fees, funding and
+// buy/sell split of a connection's live days between from and to from the
+// connector's current reading of its fills. Equity and flows are never
+// touched. A dry run unless apply=1.
+//
+// Usage: POST /api/v1/admin/recount-activity?user_uid=X&exchange=bybit&label=Y&from=2026-09-13&to=2026-10-06[&apply=1]
+func (s *Server) handleAdminRecountActivity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	from, ferr := time.Parse("2006-01-02", q.Get("from"))
+	to, terr := time.Parse("2006-01-02", q.Get("to"))
+	if ferr != nil || terr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from and to are required, YYYY-MM-DD"})
+		return
+	}
+	apply := q.Get("apply") == "1"
+
+	recounter := s.recounter()
+	if recounter == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+	extendWriteDeadline(w, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	days, err := recounter.RecountActivity(ctx, userUID, exchange, label, from, to, apply)
+	if err != nil {
+		s.log().Error("admin recount-activity failed", zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
 		return
 	}
