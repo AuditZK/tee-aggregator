@@ -149,3 +149,78 @@ func TestContradictedDay_IgnoresRowsTheExternalRebuilderWrote(t *testing.T) {
 		t.Fatal("a reconstruction was held to a day the previous reconstruction wrote")
 	}
 }
+
+// Synthetic IBKR account in EUR: closes of Thursday, Friday and Monday, each
+// rebuilt at its own date and its own rate. The live rows of Friday and Monday,
+// taken at 00:00 UTC, hold the statement of the business day before, converted
+// at their own date's rate.
+func ibkrLaggedDays() (rebuilt, stored []*repository.Snapshot) {
+	rebuilt = []*repository.Snapshot{
+		storedRow("2026-08-27", 16452.76*1.1650, "EUR", 1.1650),
+		storedRow("2026-08-28", 16663.29*1.1656, "EUR", 1.1656),
+		storedRow("2026-08-31", 16357.00*1.1589, "EUR", 1.1589),
+	}
+	stored = []*repository.Snapshot{
+		storedRow("2026-08-28", 16452.76*1.1656, "EUR", 1.1656),
+		storedRow("2026-08-31", 16663.29*1.1589, "EUR", 1.1589),
+	}
+	return rebuilt, stored
+}
+
+func TestContradictedDayOf_LiveDayHoldingThePreviousStatementReproduces(t *testing.T) {
+	rebuilt, stored := ibkrLaggedDays()
+	if day, eq, bad := contradictedDayOf(rebuilt, stored, true); bad {
+		t.Fatalf("live day %s (%v) holding the statement before was read as another account", day.Timestamp.Format(time.DateOnly), eq)
+	}
+	if _, _, bad := contradictedDayOf(rebuilt, stored, false); !bad {
+		t.Fatal("without the lag the same days passed: the test proves nothing")
+	}
+}
+
+// The rebuilt days may arrive in any order; the day before is by date.
+func TestContradictedDayOf_DayBeforeIsByDate(t *testing.T) {
+	rebuilt, stored := ibkrLaggedDays()
+	rebuilt[0], rebuilt[2] = rebuilt[2], rebuilt[0]
+	if _, _, bad := contradictedDayOf(rebuilt, stored, true); bad {
+		t.Fatal("an unordered reconstruction lost its day before")
+	}
+}
+
+// A row a former reconstruction wrote holds its own date's close: still a match.
+func TestContradictedDayOf_RowHoldingItsOwnStatementStillReproduces(t *testing.T) {
+	rebuilt, _ := ibkrLaggedDays()
+	stored := []*repository.Snapshot{storedRow("2026-08-28", 16663.29*1.1656, "EUR", 1.1656)}
+	if _, _, bad := contradictedDayOf(rebuilt, stored, true); bad {
+		t.Fatal("a day holding its own statement was rejected")
+	}
+}
+
+// The lag is one statement: an account matching neither day is another account,
+// and so is a day two statements old.
+func TestContradictedDayOf_LagStillRejectsAnotherAccount(t *testing.T) {
+	rebuilt, _ := ibkrLaggedDays()
+	other := []*repository.Snapshot{storedRow("2026-08-31", 17100*1.1589, "EUR", 1.1589)}
+	if _, _, bad := contradictedDayOf(rebuilt, other, true); !bad {
+		t.Fatal("a day matching neither statement passed")
+	}
+	twoBack := []*repository.Snapshot{storedRow("2026-08-31", 16452.76*1.1589, "EUR", 1.1589)}
+	if _, _, bad := contradictedDayOf(rebuilt, twoBack, true); !bad {
+		t.Fatal("a day holding the statement two days back passed")
+	}
+}
+
+// Stated in the same currency, two rows are compared in it: Friday's close
+// converted at Monday's rate is still Friday's close.
+func TestContradictedDayOf_ComparesInTheStampedCurrency(t *testing.T) {
+	rebuilt := []*repository.Snapshot{storedRow("2026-08-28", 16663.29*1.1656, "EUR", 1.1656)}
+	stored := []*repository.Snapshot{storedRow("2026-08-28", 16663.29*1.1589, "EUR", 1.1589)}
+	if _, _, bad := contradictedDayOf(rebuilt, stored, false); bad {
+		t.Fatal("one EUR balance at two rates was read as two accounts")
+	}
+}
+
+func TestLiveHoldsPreviousStatementIsIBKROnly(t *testing.T) {
+	if !liveHoldsPreviousStatement("IBKR") || liveHoldsPreviousStatement("ctrader") || liveHoldsPreviousStatement("bybit") {
+		t.Fatal("the lag applies to IBKR and nothing else")
+	}
+}
