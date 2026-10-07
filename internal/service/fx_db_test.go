@@ -141,9 +141,10 @@ func TestDBEURAccountWithoutTodaysRateIsNotWritten(t *testing.T) {
 	}
 }
 
-// A USD account never meets the conversion, and an FX source that knows no
-// rate cannot block it.
-func TestDBUSDAccountIsUntouched(t *testing.T) {
+// A USD account keeps its values, stamped USD so a later change of currency
+// has a unit to compare against, and an FX source that knows no rate cannot
+// block it.
+func TestDBUSDAccountKeepsItsValuesStampedUSD(t *testing.T) {
 	h := newDBHarness(t)
 	h.seedConnection(t, "ctrader", "usd", dbKey, dbSecret)
 	h.sync.SetFXSource(stubFX{})
@@ -156,7 +157,8 @@ func TestDBUSDAccountIsUntouched(t *testing.T) {
 		t.Fatalf("sync: %+v", res)
 	}
 	snap := h.snapshotToday(t, "ctrader", "usd")
-	if snap.TotalEquity != 1000 || snap.Breakdown.Global.NativeCurrency != "" {
-		t.Fatalf("USD day changed: equity %v, global %+v", snap.TotalEquity, snap.Breakdown.Global)
+	g := snap.Breakdown.Global
+	if snap.TotalEquity != 1000 || g.NativeCurrency != "USD" || g.FXRateToUSD != 1 {
+		t.Fatalf("USD day: equity %v, global %+v, want 1000 stamped USD at 1", snap.TotalEquity, g)
 	}
 }
