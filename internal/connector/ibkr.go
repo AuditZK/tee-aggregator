@@ -704,6 +704,7 @@ func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
 		Equity:        total,
 		UnrealizedPnL: unrealized,
 		Currency:      currency,
+		BaseRates:     flexConversionRates(report, currency)[summary.ReportDate],
 	}, nil
 }
 
@@ -1035,6 +1036,7 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 						Type          string `xml:"type,attr"`
 						Amount        string `xml:"amount,attr"`
 						Currency      string `xml:"currency,attr"`
+						FXRateToBase  string `xml:"fxRateToBase,attr"`
 						DateTime      string `xml:"dateTime,attr"`
 						LevelOfDetail string `xml:"levelOfDetail,attr"`
 					} `xml:"CashTransaction"`
@@ -1045,6 +1047,7 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 						Direction    string `xml:"direction,attr"`
 						CashTransfer string `xml:"cashTransfer,attr"`
 						Currency     string `xml:"currency,attr"`
+						FXRateToBase string `xml:"fxRateToBase,attr"`
 						DateTime     string `xml:"dateTime,attr"`
 						Date         string `xml:"date,attr"`
 					} `xml:"Transfer"`
@@ -1068,6 +1071,7 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 	for _, tx := range rows {
 		levels.see(tx.LevelOfDetail, tx.Currency)
 	}
+	base := statementCurrency(report)
 
 	var cashflows []*Cashflow
 	for _, tx := range rows {
@@ -1097,11 +1101,7 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 		if tx.Type == "Withdrawals" && amount > 0 {
 			amount = -amount
 		}
-		cashflows = append(cashflows, &Cashflow{
-			Amount:    amount,
-			Currency:  tx.Currency,
-			Timestamp: ts,
-		})
+		cashflows = append(cashflows, inBaseCurrency(amount, tx.Currency, tx.FXRateToBase, base, ts))
 	}
 
 	// Transfers are the other funding channel: cash moved between accounts
@@ -1136,11 +1136,7 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 			unknownTypes["Transfer:"+tr.Direction]++
 			continue
 		}
-		cashflows = append(cashflows, &Cashflow{
-			Amount:    cash,
-			Currency:  tr.Currency,
-			Timestamp: ts,
-		})
+		cashflows = append(cashflows, inBaseCurrency(cash, tr.Currency, tr.FXRateToBase, base, ts))
 	}
 
 	i.capabilityWarnings = nil
@@ -1235,6 +1231,8 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 		baseCurrency, _ = accountCurrency(summaries[n-1].Currency, report)
 	}
 
+	baseRates := flexConversionRates(report, baseCurrency)
+
 	// Parse cashflows grouped by date for deposit/withdrawal assignment
 	cashflows, _ := i.parseCashflowsFromReport(report, since)
 	type dayFlows struct {
@@ -1325,6 +1323,7 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 			Breakdown:       breakdown,
 			Currency:        baseCurrency,
 			Cashflows:       cf.flows,
+			BaseRates:       baseRates[s.ReportDate],
 		})
 	}
 
@@ -1342,6 +1341,80 @@ func (i *IBKR) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, e
 	}
 
 	return i.parseTradesFromReport(report, start, end)
+}
+
+// inBaseCurrency states a flow in the currency the statement's equity is in,
+// at the rate IBKR itself used (fxRateToBase), so a EUR deposit into an account
+// based in USD moves the deposits by what it moved the equity. Without that
+// rate the flow keeps its own currency and the sync values it.
+func inBaseCurrency(amount float64, currency, fxRateToBase, base string, ts time.Time) *Cashflow {
+	rate, _ := strconv.ParseFloat(fxRateToBase, 64)
+	if base != "" && currency != "" && currency != base && currency != "BASE_SUMMARY" && rate > 0 {
+		return &Cashflow{Amount: amount * rate, Currency: base, Timestamp: ts}
+	}
+	return &Cashflow{Amount: amount, Currency: currency, Timestamp: ts}
+}
+
+// statementCurrency is the denomination of a statement's equity, declared or
+// inferred, empty when neither says.
+func statementCurrency(report []byte) string {
+	var flex struct {
+		FlexStatements struct {
+			FlexStatement struct {
+				EquitySummaryInBase struct {
+					Rows []struct {
+						Currency string `xml:"currency,attr"`
+					} `xml:"EquitySummaryByReportDateInBase"`
+				} `xml:"EquitySummaryInBase"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return ""
+	}
+	declared := ""
+	if rows := flex.FlexStatements.FlexStatement.EquitySummaryInBase.Rows; len(rows) > 0 {
+		declared = rows[len(rows)-1].Currency
+	}
+	ccy, _ := accountCurrency(declared, report)
+	return ccy
+}
+
+// flexConversionRates reads the statement's Conversion Rates section, keyed by
+// report date then currency: units of base per one unit of the currency. A
+// query without the section gives an empty map, and the sync falls back on its
+// own rates.
+func flexConversionRates(report []byte, base string) map[string]map[string]float64 {
+	var flex struct {
+		FlexStatements struct {
+			FlexStatement struct {
+				ConversionRates struct {
+					Rates []struct {
+						ReportDate   string `xml:"reportDate,attr"`
+						FromCurrency string `xml:"fromCurrency,attr"`
+						ToCurrency   string `xml:"toCurrency,attr"`
+						Rate         string `xml:"rate,attr"`
+					} `xml:"ConversionRate"`
+				} `xml:"ConversionRates"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+	out := map[string]map[string]float64{}
+	if err := xml.Unmarshal(report, &flex); err != nil || base == "" {
+		return out
+	}
+	for _, r := range flex.FlexStatements.FlexStatement.ConversionRates.Rates {
+		rate, _ := strconv.ParseFloat(r.Rate, 64)
+		if rate <= 0 || r.ToCurrency != base || r.FromCurrency == "" {
+			continue
+		}
+		day := strings.ReplaceAll(r.ReportDate, "-", "")
+		if out[day] == nil {
+			out[day] = map[string]float64{}
+		}
+		out[day][r.FromCurrency] = rate
+	}
+	return out
 }
 
 // accountCurrency answers what the figures in a statement are denominated in,
