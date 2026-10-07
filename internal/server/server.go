@@ -140,6 +140,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// wrapper inspects r.RemoteAddr (not X-Forwarded-For, which is spoofable
 	// and only set by the front proxy anyway). Non-loopback peers get 403.
 	mux.HandleFunc("/api/v1/admin/sync-now", s.localhostOnly(s.handleAdminSyncNow))
+	mux.HandleFunc("/api/v1/admin/sync-connection", s.localhostOnly(s.handleAdminSyncConnection))
 	mux.HandleFunc("/api/v1/admin/cashflows", s.localhostOnly(s.handleAdminDumpCashflows))
 	mux.HandleFunc("/api/v1/admin/reconstruct", s.localhostOnly(s.handleAdminReconstruct))
 	mux.HandleFunc("/api/v1/admin/balance-probe", s.localhostOnly(s.handleAdminBalanceProbe))
@@ -247,6 +248,59 @@ func (s *Server) handleAdminSyncNow(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("admin sync-now triggered")
 	go s.scheduler.RunNow()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "sync triggered, check logs"})
+}
+
+// handleAdminSyncConnection runs the scheduled sync of one connection now and
+// overwrites today's snapshot. sync-now would sync every user, and the
+// user-facing sync refuses any account that already has a snapshot.
+//
+// Usage: POST /api/v1/admin/sync-connection?user_uid=X&exchange=ibkr&label=Y
+func (s *Server) handleAdminSyncConnection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	s.logger.Info("admin sync-connection triggered",
+		zap.String("user_uid", userUID),
+		zap.String("exchange", exchange),
+		zap.String("label", label),
+	)
+	// Detached from the request: a caller hanging up must not stop a
+	// reconstruction half-way through rewriting the history.
+	extendWriteDeadline(w, adminReconstructTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), adminReconstructTimeout)
+	defer cancel()
+	result := s.handler.syncSvc.SyncConnectionScheduledByLabel(ctx, userUID, exchange, label)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":            result.Success,
+		"skipped":            result.Skipped,
+		"skip_reason":        result.SkipReason,
+		"error":              result.Error,
+		"snapshot_timestamp": result.SnapshotTimestamp,
+	})
 }
 
 // handleAdminReconstruct triggers in-enclave historical reconstruction for an
