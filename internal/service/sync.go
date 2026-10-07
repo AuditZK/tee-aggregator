@@ -2169,6 +2169,20 @@ func (s *SyncService) checkAgainstStoredDays(ctx context.Context, connMeta *repo
 	if rerr != nil {
 		return snapshots, nil
 	}
+	if from, to, ok := rewritesInAnotherCurrency(snapshots, mine, connMeta.Exchange, connMeta.Label); ok {
+		// No stored day can witness it: the old ones are in another unit, and
+		// the few written since the change (an IBKR live day holds the
+		// statement before it) are not the days the reconstruction states.
+		s.logger.Info("reconstruction rewrites a history stored in another currency",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.String("stored", from),
+			zap.String("statement", to),
+			zap.Int("days", len(snapshots)),
+		)
+		return snapshots, nil
+	}
 
 	day, measured, bad := contradictedDay(snapshots, mine)
 	if !bad {
@@ -2514,6 +2528,7 @@ const reproductionTolerance = 0.001
 // 50%.
 func contradictedDay(rebuilt, existing []*repository.Snapshot) (*repository.Snapshot, float64, bool) {
 	measured := make(map[time.Time]float64, len(existing))
+	denomination := make(map[time.Time]string, len(existing))
 	for _, e := range existing {
 		if e.IsHistorical || e.FromExternalRebuilder {
 			// Reconstructed too — nothing independent to check against. The
@@ -2533,10 +2548,19 @@ func contradictedDay(rebuilt, existing []*repository.Snapshot) (*repository.Snap
 			continue
 		}
 		measured[e.Timestamp.UTC().Truncate(24*time.Hour)] = e.TotalEquity
+		denomination[e.Timestamp.UTC().Truncate(24*time.Hour)] = storedDayDenomination(e)
 	}
 	for _, r := range rebuilt {
-		eq, ok := measured[r.Timestamp.UTC().Truncate(24*time.Hour)]
+		day := r.Timestamp.UTC().Truncate(24 * time.Hour)
+		eq, ok := measured[day]
 		if !ok {
+			continue
+		}
+		// A day stored in another currency than the reconstruction's is the
+		// same account in another unit: compared, a rebased IBKR account
+		// failed every rebuild by the gap between two rate sources. It is
+		// rewritten instead of witnessed against.
+		if d := stampedDenomination(r); d != "" && denomination[day] != d {
 			continue
 		}
 		if math.Abs(r.TotalEquity-eq)/math.Abs(eq) > reproductionTolerance {

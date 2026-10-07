@@ -183,10 +183,12 @@ func TestConvertHistoryHoldsBackOnlyTheNewestDays(t *testing.T) {
 	}
 }
 
-func TestConvertHistoryLeavesUSDRowsAlone(t *testing.T) {
+// A USD row keeps its figures and says it is USD, so a backfill run after the
+// account changes currency never reads it as one in the new currency.
+func TestConvertHistoryStampsUSDRowsWithoutChangingThem(t *testing.T) {
 	r := &connector.HistoricalSnapshot{Date: fxDay("2026-09-29"), TotalEquity: 100, Deposits: 10}
 	out, err := convertHistory([]*connector.HistoricalSnapshot{r}, false, fxRates{})
-	if err != nil || len(out) != 1 || r.TotalEquity != 100 || r.FXRateToUSD != 0 {
+	if err != nil || len(out) != 1 || r.TotalEquity != 100 || r.Deposits != 10 || r.FXRateToUSD != 1 || r.Currency != "USD" {
 		t.Fatalf("out=%v err=%v row=%+v", out, err, r)
 	}
 }

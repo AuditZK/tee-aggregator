@@ -175,6 +175,91 @@ func stampFX(b *repository.MarketBreakdown, currency string, rate float64) {
 	b.Global.FXRateToUSD = rate
 }
 
+// denominationOf is what a statement in currency is denominated in for the
+// stored series: the code itself when it converts, USD for USD or no code,
+// false for a currency neither converted nor USD, which stays as reported.
+func denominationOf(currency string) (string, bool) {
+	c, convert := fiatToConvert(currency)
+	switch {
+	case convert:
+		return c, true
+	case c == "" || c == "USD":
+		return "USD", true
+	default:
+		return c, false
+	}
+}
+
+// stampedDenomination is the currency a stored row says it was written in,
+// empty when it carries no stamp.
+func stampedDenomination(r *repository.Snapshot) string {
+	if r == nil || r.Breakdown == nil || r.Breakdown.Global == nil {
+		return ""
+	}
+	return r.Breakdown.Global.NativeCurrency
+}
+
+// storedDayDenomination is the currency a stored day is in. An unstamped day
+// is in dollars: every day stored in another currency was converted, and
+// stamped, before the sync wrote its first converted one.
+func storedDayDenomination(r *repository.Snapshot) string {
+	if d := stampedDenomination(r); d != "" {
+		return d
+	}
+	return "USD"
+}
+
+// storedDenomination is the currency a connection's history is written in:
+// that of its newest stamped row, empty when no row is stamped.
+func (s *SyncService) storedDenomination(ctx context.Context, connMeta *repository.ExchangeConnection) string {
+	if s.snapshotRepo == nil {
+		return ""
+	}
+	rows, err := s.snapshotRepo.GetByUserAndDateRange(ctx, connMeta.UserUID, time.Unix(0, 0).UTC(), time.Now().UTC().Add(24*time.Hour))
+	if err != nil {
+		return ""
+	}
+	return newestDenomination(rows, connMeta.Exchange, connMeta.Label)
+}
+
+func newestDenomination(rows []*repository.Snapshot, exchange, label string) string {
+	var newest *repository.Snapshot
+	for _, r := range rows {
+		if r.Exchange != exchange || r.Label != label || stampedDenomination(r) == "" {
+			continue
+		}
+		if newest == nil || r.Timestamp.After(newest.Timestamp) {
+			newest = r
+		}
+	}
+	return stampedDenomination(newest)
+}
+
+// rewritesInAnotherCurrency reports whether a reconstruction is stated in
+// another currency than the connection's stored history, which happens when
+// the statement changed denomination and carried no rate to state it back.
+func rewritesInAnotherCurrency(rebuilt, stored []*repository.Snapshot, exchange, label string) (from, to string, ok bool) {
+	for _, r := range rebuilt {
+		if d := stampedDenomination(r); d != "" {
+			to = d
+		}
+	}
+	from = newestDenomination(stored, exchange, label)
+	return from, to, from != "" && to != "" && from != to
+}
+
+// restateFlows states the flows in from in to, one unit of to being worth
+// rate units of from, and returns the sums. Flows in any other currency keep
+// theirs.
+func restateFlows(flows []*connector.Cashflow, from, to string, rate float64) {
+	for _, cf := range flows {
+		if cf != nil && cf.Currency == from {
+			cf.Amount /= rate
+			cf.Currency = to
+		}
+	}
+}
+
 // --- live snapshot ----------------------------------------------------------
 
 // liveFX is how a live snapshot was converted. A zero value means it was not.
@@ -228,26 +313,56 @@ func applyLiveFX(balance *connector.Balance, act *liveActivity, currency string,
 // days, or with a provisional rate, would put a step into the curve that
 // nothing later corrects. The deferred retry writes it once the rate lands.
 func (s *SyncService) convertLive(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, balance *connector.Balance, act *liveActivity, startOfDay time.Time, result *SyncResult) (liveFX, bool) {
-	currency, convert := fiatToConvert(balance.Currency)
-	if !convert || !convertsExchange(connMeta.Exchange) {
+	if !convertsExchange(connMeta.Exchange) {
 		return liveFX{}, true
 	}
-	if s.fx == nil {
-		s.logger.Error("account held in a non-USD currency but no FX source is configured; stored unconverted",
-			zap.String("user_uid", connMeta.UserUID),
-			zap.String("exchange", connMeta.Exchange),
-			zap.String("label", connMeta.Label),
-			zap.String("currency", currency),
-		)
+	denom, known := denominationOf(balance.Currency)
+	if !known {
 		return liveFX{}, true
+	}
+
+	// A statement that changed denomination (an IBKR account rebased from EUR
+	// to USD) is stated back in the one its history is written in, at the
+	// venue's own rate. Without that rate the day waits for the reconstruction
+	// that rewrites the history in the new one: a day in another unit than the
+	// days around it is a step that reads as a return.
+	if stored := s.storedDenomination(ctx, connMeta); stored != "" && stored != denom {
+		rate := balance.BaseRates[stored]
+		if rate <= 0 {
+			result.Skipped = true
+			result.SkipReason = "account currency changed from " + stored + " to " + denom + "; waiting for its history to be restated"
+			s.logger.Warn("skipping live snapshot: account currency changed",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.String("stored", stored),
+				zap.String("statement", denom),
+			)
+			return liveFX{}, false
+		}
+		restateLive(balance, act, denom, stored, rate)
+		denom = stored
+	}
+
+	if s.fx == nil {
+		if denom != "USD" {
+			s.logger.Error("account held in a non-USD currency but no FX source is configured; stored unconverted",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.String("currency", denom),
+			)
+			return liveFX{}, true
+		}
+		return liveFX{currency: "USD", rate: 1}, true
 	}
 
 	trusted := trustsCashflowCurrency(connMeta.Exchange)
 	measured := liveMeasuredOn(conn, startOfDay)
-	currencies := map[string]bool{currency: true}
+	currencies := map[string]bool{denom: true}
 	from := measured
 	for _, cf := range act.cashflows {
-		currencies[flowCurrency(cf, currency, trusted)] = true
+		currencies[flowCurrency(cf, denom, trusted)] = true
 		if d := truncDay(cf.Timestamp); d.Before(from) {
 			from = d
 		}
@@ -259,10 +374,12 @@ func (s *SyncService) convertLive(ctx context.Context, conn connector.Connector,
 	switch {
 	case err != nil:
 		reason = err.Error()
+	case denom == "USD":
+		fx, reason = applyLiveUSD(act, trusted, measured, rates)
 	default:
-		if err := s.ensureStoredConverted(ctx, connMeta, currency); err != nil {
+		if err := s.ensureStoredConverted(ctx, connMeta, denom); err != nil {
 			reason = err.Error()
-		} else if fx, reason = applyLiveFX(balance, act, currency, trusted, measured, rates); reason != "" {
+		} else if fx, reason = applyLiveFX(balance, act, denom, trusted, measured, rates); reason != "" {
 			reason = "no final USD rate for " + reason
 		}
 	}
@@ -282,6 +399,41 @@ func (s *SyncService) convertLive(ctx context.Context, conn connector.Connector,
 	return liveFX{}, false
 }
 
+// restateLive states a live reading in to instead of from, one unit of to
+// being worth rate units of from.
+func restateLive(balance *connector.Balance, act *liveActivity, from, to string, rate float64) {
+	balance.Equity /= rate
+	balance.Available /= rate
+	balance.UnrealizedPnL /= rate
+	balance.Currency = to
+	if act.breakdown != nil {
+		for _, m := range act.breakdown.markets() {
+			m.equity /= rate
+			m.availableMargin /= rate
+		}
+	}
+	if act.cashflows == nil {
+		act.deposits /= rate
+		act.withdrawals /= rate
+		return
+	}
+	restateFlows(act.cashflows, from, to, rate)
+}
+
+// applyLiveUSD values the flows of a USD reading that are in another currency,
+// and stamps the row USD so no later backfill mistakes it for one in the
+// account's former currency.
+func applyLiveUSD(act *liveActivity, trusted bool, measured time.Time, rates fxRates) (liveFX, string) {
+	if act.cashflows != nil {
+		deposits, withdrawals, missing := convertFlows(act.cashflows, "USD", trusted, measured, rates)
+		if missing != "" {
+			return liveFX{}, "no final USD rate for " + missing
+		}
+		act.deposits, act.withdrawals = deposits, withdrawals
+	}
+	return liveFX{currency: "USD", rate: 1}, ""
+}
+
 // --- reconstructed history ----------------------------------------------------
 
 // convertHistory converts reconstructed rows in place. Rows in USD (or a
@@ -295,7 +447,8 @@ func convertHistory(rows []*connector.HistoricalSnapshot, trusted bool, rates fx
 	var heldReason string
 	for _, h := range rows {
 		currency, convert := fiatToConvert(h.Currency)
-		if !convert {
+		denom, known := denominationOf(h.Currency)
+		if !convert && !known {
 			if len(held) > 0 {
 				return nil, fmt.Errorf("no final USD rate for %s", heldReason)
 			}
@@ -306,7 +459,12 @@ func convertHistory(rows []*connector.HistoricalSnapshot, trusted bool, rates fx
 		if !h.MeasuredOn.IsZero() {
 			measured = truncDay(h.MeasuredOn)
 		}
-		reason := convertHistoricalRow(h, currency, trusted, measured, rates)
+		var reason string
+		if convert {
+			reason = convertHistoricalRow(h, currency, trusted, measured, rates)
+		} else {
+			reason = stampHistoricalUSD(h, denom, trusted, measured, rates)
+		}
 		if reason != "" {
 			if len(held) == 0 {
 				heldReason = reason
@@ -347,13 +505,29 @@ func convertHistoricalRow(h *connector.HistoricalSnapshot, currency string, trus
 	return ""
 }
 
+// stampHistoricalUSD values the flows of a USD row that are in another
+// currency and stamps it USD, so no later backfill reads it as one in the
+// account's former currency.
+func stampHistoricalUSD(h *connector.HistoricalSnapshot, denom string, trusted bool, measured time.Time, rates fxRates) string {
+	if h.Cashflows != nil {
+		deposits, withdrawals, missing := convertFlows(h.Cashflows, denom, trusted, measured, rates)
+		if missing != "" {
+			return missing
+		}
+		h.Deposits, h.Withdrawals = deposits, withdrawals
+	}
+	h.Currency = denom
+	h.FXRateToUSD = 1
+	return ""
+}
+
 // historyFXWindow returns the currencies a batch needs rates for, and the
 // days to read them over.
 func historyFXWindow(rows []*connector.HistoricalSnapshot, trusted bool) (currencies map[string]bool, from, to time.Time) {
 	currencies = map[string]bool{}
 	for _, h := range rows {
-		currency, convert := fiatToConvert(h.Currency)
-		if !convert {
+		currency, known := denominationOf(h.Currency)
+		if !known {
 			continue
 		}
 		currencies[currency] = true
@@ -379,6 +553,43 @@ func historyFXWindow(rows []*connector.HistoricalSnapshot, trusted bool) (curren
 	return currencies, from, to
 }
 
+// restateHistory states, in place, every row denominated otherwise than the
+// stored history in the stored denomination, at the venue's rate for the
+// row's day. A row without that rate keeps its own denomination: the gate
+// then holds it to nothing stored in another one, and the reconstruction
+// rewrites the history in the new denomination. Returns how many rows were
+// restated and from what.
+func restateHistory(rows []*connector.HistoricalSnapshot, stored string) (int, string) {
+	n, from := 0, ""
+	for _, h := range rows {
+		denom, known := denominationOf(h.Currency)
+		if !known || denom == stored {
+			continue
+		}
+		rate := h.BaseRates[stored]
+		if rate <= 0 {
+			continue
+		}
+		h.TotalEquity /= rate
+		h.RealizedBalance /= rate
+		for _, mb := range h.Breakdown {
+			if mb != nil {
+				mb.Equity /= rate
+				mb.AvailableMargin /= rate
+			}
+		}
+		if h.Cashflows != nil {
+			restateFlows(h.Cashflows, denom, stored, rate)
+		} else {
+			h.Deposits /= rate
+			h.Withdrawals /= rate
+		}
+		h.Currency = stored
+		n, from = n+1, denom
+	}
+	return n, from
+}
+
 // accountCurrencyOf is the convertible currency the rows are held in.
 func accountCurrencyOf(rows []*connector.HistoricalSnapshot) string {
 	for _, h := range rows {
@@ -399,6 +610,18 @@ func (s *SyncService) convertHistoryToUSD(ctx context.Context, connMeta *reposit
 	// Oldest first, so the rows convertHistory may hold back are the newest.
 	rows = append([]*connector.HistoricalSnapshot(nil), rows...)
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Date.Before(rows[j].Date) })
+	if stored := s.storedDenomination(ctx, connMeta); stored != "" {
+		if restated, from := restateHistory(rows, stored); restated > 0 {
+			s.logger.Info("reconstruction stated in the stored currency at the venue's rates",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.String("statement", from),
+				zap.String("stored", stored),
+				zap.Int("days", restated),
+			)
+		}
+	}
 	currencies, from, to := historyFXWindow(rows, trusted)
 	if len(currencies) == 0 {
 		return rows, nil
@@ -417,7 +640,7 @@ func (s *SyncService) convertHistoryToUSD(ctx context.Context, connMeta *reposit
 	}
 	// The gate compares these rows with the stored ones: those must be in
 	// USD too. A reconstruction carries one account currency.
-	if c := accountCurrencyOf(rows); c != "" {
+	if c := accountCurrencyOf(rows); c != "" && backfillsStoredRows(connMeta.Exchange) {
 		if err := s.ensureStoredConverted(ctx, connMeta, c); err != nil {
 			return nil, err
 		}

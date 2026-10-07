@@ -344,6 +344,11 @@ type HistoricalSnapshot struct {
 	// FXRateToUSD is the rate the balances were multiplied by, set by the
 	// conversion. Zero on a row that was never converted.
 	FXRateToUSD float64 `json:"fx_rate_to_usd,omitempty"`
+	// BaseRates are the venue's own rates for the row's day: units of
+	// Currency per one unit of the keyed currency. They let the sync state a
+	// statement in another denomination than the one it arrived in exactly
+	// as the venue valued it.
+	BaseRates map[string]float64 `json:"-"`
 }
 
 // Balance represents account balance data
@@ -352,6 +357,9 @@ type Balance struct {
 	Equity        float64 `json:"equity"`         // Total equity (balance + unrealized)
 	UnrealizedPnL float64 `json:"unrealized_pnl"` // Unrealized P&L
 	Currency      string  `json:"currency"`
+	// BaseRates are the venue's own rates for the balance's day, as on
+	// HistoricalSnapshot.
+	BaseRates map[string]float64 `json:"-"`
 }
 
 // Position represents an open position

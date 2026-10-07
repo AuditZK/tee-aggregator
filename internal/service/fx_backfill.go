@@ -160,6 +160,15 @@ func (s *SyncService) ConvertStoredToUSD(ctx context.Context, userUID, exchange,
 	return days, nil
 }
 
+// backfillsStoredRows reports whether a venue's stored days are converted by
+// the backfill. Not IBKR's: its reconstruction rewrites the whole Flex window
+// every sync, and the backfill reads an unstamped row as one in the account's
+// currency, which multiplied by the rate a dollar row written while the
+// statement was in USD.
+func backfillsStoredRows(exchange string) bool {
+	return !strings.EqualFold(exchange, "ibkr")
+}
+
 // ensureStoredConverted converts a connection's stored days before the sync
 // writes its first converted one.
 //
@@ -172,6 +181,9 @@ func (s *SyncService) ConvertStoredToUSD(ctx context.Context, userUID, exchange,
 // not write until it has. Idempotent through the stamp; remembered per
 // process once every stored day is converted.
 func (s *SyncService) ensureStoredConverted(ctx context.Context, connMeta *repository.ExchangeConnection, currency string) error {
+	if !backfillsStoredRows(connMeta.Exchange) {
+		return nil
+	}
 	key := connMeta.UserUID + "|" + strings.ToLower(connMeta.Exchange) + "|" + connMeta.Label
 	if _, done := s.fxStoredDone.Load(key); done {
 		return nil
