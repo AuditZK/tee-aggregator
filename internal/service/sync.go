@@ -295,6 +295,8 @@ type SyncService struct {
 	// Flex token) doesn't stack overlapping timers. Guarded by deferMu.
 	deferMu         sync.Mutex
 	deferredRetries map[string]bool
+	// deferAfter stands in for time.AfterFunc in tests.
+	deferAfter func(time.Duration, func())
 
 	// connectorGroup collapses concurrent builds of the SAME connector
 	// (E-M1, CONN-11 residue 2). getOrCreateConnector was check-then-create:
@@ -859,6 +861,13 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 // token-level window with margin; 6h was chosen after 3h proved too tight.
 const rateLimitRetryDelay = 6 * time.Hour
 
+// deferredRetrySpacing staggers the retries one pass arms. Armed in the same
+// second, they fired in the same second: of two connections on one Flex token
+// the token's own pacing turned the second away, and a deferred retry never
+// retries, so each kept a day out of two. Five minutes outlasts that pacing
+// after a success and after two failures in a row.
+const deferredRetrySpacing = 5 * time.Minute
+
 // isRateLimitError reports whether a sync result error is one the same day can
 // still recover from: IBKR's token-level rate limit (1018), the local token
 // gate, or a statement IBKR declined to generate.
@@ -983,8 +992,13 @@ func (s *SyncService) scheduleDeferredRetry(conn *repository.ExchangeConnection,
 		s.deferMu.Unlock()
 		return // a retry is already pending for this connection
 	}
+	delay += time.Duration(len(s.deferredRetries)) * deferredRetrySpacing
 	s.deferredRetries[conn.ID] = true
+	after := s.deferAfter
 	s.deferMu.Unlock()
+	if after == nil {
+		after = func(d time.Duration, f func()) { time.AfterFunc(d, f) }
+	}
 
 	s.logger.Info("scheduling deferred sync retry after rate limit",
 		zap.String("user_uid", conn.UserUID),
@@ -993,7 +1007,7 @@ func (s *SyncService) scheduleDeferredRetry(conn *repository.ExchangeConnection,
 		zap.Duration("delay", delay),
 	)
 
-	time.AfterFunc(delay, func() {
+	after(delay, func() {
 		defer func() {
 			s.deferMu.Lock()
 			delete(s.deferredRetries, conn.ID)
