@@ -2198,7 +2198,7 @@ func (s *SyncService) checkAgainstStoredDays(ctx context.Context, connMeta *repo
 		return snapshots, nil
 	}
 
-	day, measured, bad := contradictedDay(snapshots, mine)
+	day, measured, bad := contradictedDayOf(snapshots, mine, liveHoldsPreviousStatement(connMeta.Exchange))
 	if !bad {
 		return snapshots, nil
 	}
@@ -2541,7 +2541,43 @@ const reproductionTolerance = 0.001
 // measured, and the rebuilder's own witness gate passed it, tolerating up to
 // 50%.
 func contradictedDay(rebuilt, existing []*repository.Snapshot) (*repository.Snapshot, float64, bool) {
-	measured := make(map[time.Time]float64, len(existing))
+	return contradictedDayOf(rebuilt, existing, false)
+}
+
+// liveHoldsPreviousStatement reports a venue whose live row and rebuilt row of
+// one date hold different days. An IBKR live row, stamped at 00:00 UTC, holds
+// the statement of the business day before; a rebuilt row holds its own date's.
+// The production schema has no is_historical to tell which kind a stored row
+// is, and a stored history holds both, so the gate rejected every rebuild of
+// an account that moved: the history never filled the days it was missing.
+func liveHoldsPreviousStatement(exchange string) bool {
+	return strings.EqualFold(exchange, "ibkr")
+}
+
+// statesStoredEquity reports whether a rebuilt day states the equity a stored
+// day holds, in their own currency when both carry the same one: a day converted
+// at its date's rate and one converted at the day before's differ by the rate,
+// not by the account.
+func statesStoredEquity(r, e *repository.Snapshot) bool {
+	got, want := r.TotalEquity, e.TotalEquity
+	if rr, er := stampedRate(r), stampedRate(e); rr > 0 && er > 0 && stampedDenomination(r) == stampedDenomination(e) {
+		got, want = got/rr, want/er
+	}
+	return reproduces(got, want)
+}
+
+func stampedRate(r *repository.Snapshot) float64 {
+	if r == nil || r.Breakdown == nil || r.Breakdown.Global == nil {
+		return 0
+	}
+	return r.Breakdown.Global.FXRateToUSD
+}
+
+// contradictedDayOf is contradictedDay for a venue whose stored day may hold
+// the statement before its date (lagged): that day is reproduced by the
+// rebuilt day of its date or by the rebuilt day before it.
+func contradictedDayOf(rebuilt, existing []*repository.Snapshot, lagged bool) (*repository.Snapshot, float64, bool) {
+	measured := make(map[time.Time]*repository.Snapshot, len(existing))
 	denomination := make(map[time.Time]string, len(existing))
 	for _, e := range existing {
 		if e.IsHistorical || e.FromExternalRebuilder {
@@ -2561,12 +2597,14 @@ func contradictedDay(rebuilt, existing []*repository.Snapshot) (*repository.Snap
 			// trusts — observed on the first live run of this gate.
 			continue
 		}
-		measured[e.Timestamp.UTC().Truncate(24*time.Hour)] = e.TotalEquity
+		measured[e.Timestamp.UTC().Truncate(24*time.Hour)] = e
 		denomination[e.Timestamp.UTC().Truncate(24*time.Hour)] = storedDayDenomination(e)
 	}
-	for _, r := range rebuilt {
+	ordered := append([]*repository.Snapshot(nil), rebuilt...)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Timestamp.Before(ordered[j].Timestamp) })
+	for i, r := range ordered {
 		day := r.Timestamp.UTC().Truncate(24 * time.Hour)
-		eq, ok := measured[day]
+		e, ok := measured[day]
 		if !ok {
 			continue
 		}
@@ -2577,9 +2615,13 @@ func contradictedDay(rebuilt, existing []*repository.Snapshot) (*repository.Snap
 		if d := stampedDenomination(r); d != "" && denomination[day] != d {
 			continue
 		}
-		if math.Abs(r.TotalEquity-eq)/math.Abs(eq) > reproductionTolerance {
-			return r, eq, true
+		if statesStoredEquity(r, e) {
+			continue
 		}
+		if lagged && i > 0 && statesStoredEquity(ordered[i-1], e) {
+			continue
+		}
+		return r, e.TotalEquity, true
 	}
 	return nil, 0, false
 }
