@@ -18,6 +18,7 @@ import (
 	"github.com/trackrecord/enclave/internal/config"
 	"github.com/trackrecord/enclave/internal/connector"
 	"github.com/trackrecord/enclave/internal/rebuilderclient"
+	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/service"
 	"github.com/trackrecord/enclave/internal/validation"
 	"go.uber.org/zap"
@@ -395,16 +396,7 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		ctx, cancel := context.WithTimeout(r.Context(), adminReconstructTimeout)
 		defer cancel()
 		days := s.handler.syncSvc.DryRunReconstructRange(ctx, userUID, exchange, label, from, to)
-		rows := make([]map[string]any, 0, len(days))
-		for _, d := range days {
-			rows = append(rows, map[string]any{
-				"day":              d.Timestamp.Format("2006-01-02"),
-				"total_equity":     d.TotalEquity,
-				"realized_balance": d.RealizedBalance,
-				"deposits":         d.Deposits,
-				"withdrawals":      d.Withdrawals,
-			})
-		}
+		rows := dryRunRows(days)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"success": true, "dry_run": true, "count": len(rows), "days": rows,
 		})
@@ -421,6 +413,24 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		s.handler.syncSvc.ReconstructHistoryRange(ctx, userUID, exchange, label, from, to, dryRun)
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "dry_run": dryRun, "message": "reconstruction triggered, check logs"})
+}
+
+// The breakdown carries the per-market free margin, which a stored day can
+// lack while its equity is right: margin used is read from it and applied to
+// the stored equity, never the rebuilt equity itself.
+func dryRunRows(days []*repository.Snapshot) []map[string]any {
+	rows := make([]map[string]any, 0, len(days))
+	for _, d := range days {
+		rows = append(rows, map[string]any{
+			"day":                 d.Timestamp.Format("2006-01-02"),
+			"total_equity":        d.TotalEquity,
+			"realized_balance":    d.RealizedBalance,
+			"deposits":            d.Deposits,
+			"withdrawals":         d.Withdrawals,
+			"breakdown_by_market": d.Breakdown,
+		})
+	}
+	return rows
 }
 
 // handleAdminDumpCashflows dumps all BALANCE deals for a user/exchange/label since a date.
