@@ -2,8 +2,15 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/trackrecord/enclave/internal/repository"
 )
 
 type hookRecorder struct {
@@ -90,4 +97,31 @@ func TestDispatchPostCreateHooks_SyncOnlyDeployment(t *testing.T) {
 // Nothing wired: no goroutine, no panic.
 func TestDispatchPostCreateHooks_NoHooks(t *testing.T) {
 	(&ConnectionService{}).dispatchPostCreateHooks("user-1", "ctrader", "x", true)
+}
+
+// The rebuild request is what tells "the user said no" from "the rebuild
+// failed": it reaches the log, and nothing of the credentials does.
+func TestLogConnectionCreatedRecordsTheRebuildRequest(t *testing.T) {
+	for _, requested := range []bool{true, false} {
+		core, logs := observer.New(zapcore.InfoLevel)
+		svc := &ConnectionService{logger: zap.New(core)}
+		svc.logConnectionCreated(&repository.ExchangeConnection{
+			UserUID: "user-1", Exchange: "binance", Label: "main",
+			EncryptedAPIKey: "ciphertext-key", EncryptedAPISecret: "ciphertext-secret",
+		}, requested)
+
+		entries := logs.FilterMessage("connection created").All()
+		if len(entries) != 1 {
+			t.Fatalf("requested=%v: %d entries, want 1", requested, len(entries))
+		}
+		fields := entries[0].ContextMap()
+		if got, ok := fields["rebuild_history"].(bool); !ok || got != requested {
+			t.Fatalf("rebuild_history = %v, want %v", fields["rebuild_history"], requested)
+		}
+		for k, v := range fields {
+			if s, ok := v.(string); ok && strings.Contains(s, "ciphertext") {
+				t.Fatalf("field %s carries credential material: %q", k, s)
+			}
+		}
+	}
 }
