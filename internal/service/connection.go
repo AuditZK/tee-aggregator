@@ -323,9 +323,25 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 		}
 	}
 
+	s.logConnectionCreated(conn, req.RebuildHistory)
 	s.dispatchPostCreateHooks(conn.UserUID, conn.Exchange, conn.Label, rebuild)
 
 	return nil
+}
+
+// logConnectionCreated records whether the caller asked for the history
+// rebuild. A user who saw "importing" and got no history could not be told
+// whether the request said no or the rebuild failed.
+func (s *ConnectionService) logConnectionCreated(conn *repository.ExchangeConnection, rebuildRequested bool) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.Info("connection created",
+		zap.String("user_uid", conn.UserUID),
+		zap.String("exchange", conn.Exchange),
+		zap.String("label", conn.Label),
+		zap.Bool("rebuild_history", rebuildRequested),
+	)
 }
 
 // dispatchPostCreateHooks runs the post-create work on a detached context —
