@@ -351,9 +351,24 @@ func flexURL(base, token, query string) string {
 	return base + "?" + v.Encode()
 }
 
-func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
-	u := flexURL(ibkrFlexURL, i.token, i.queryID)
+// flexPeriodURL overrides the period saved in the holder's query with fd/td,
+// the only way to reach a statement older than the last 365 days.
+func flexPeriodURL(base, token, query string, from, to time.Time) string {
+	v := url.Values{
+		"t":  {token},
+		"q":  {query},
+		"v":  {"3"},
+		"fd": {from.UTC().Format("20060102")},
+		"td": {to.UTC().Format("20060102")},
+	}
+	return base + "?" + v.Encode()
+}
 
+func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
+	return i.sendFlexRequest(ctx, flexURL(ibkrFlexURL, i.token, i.queryID))
+}
+
+func (i *IBKR) sendFlexRequest(ctx context.Context, u string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return "", err
@@ -851,6 +866,27 @@ func (i *IBKR) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]Ra
 // filter is exactly what this is for.
 func (i *IBKR) GetRawStatement(ctx context.Context) ([]byte, string, error) {
 	report, err := i.fetchFlexReport(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return []byte(scrubSecret(string(report), i.token)), "application/xml", nil
+}
+
+// GetRawStatementForPeriod fetches the statement for [from, to] instead of the
+// query's saved period. It stays out of flexReportCache on purpose: that cache
+// is keyed token:queryID and feeds the daily sync, which must keep reading the
+// saved period, not an old year someone asked for.
+func (i *IBKR) GetRawStatementForPeriod(ctx context.Context, from, to time.Time) ([]byte, string, error) {
+	if retryAt, ok := claimFlexToken(i.token, time.Now()); !ok {
+		return nil, "", fmt.Errorf("%w (retry after ~%s UTC)",
+			ErrFlexTokenBusy, retryAt.UTC().Format("Jan 2 15:04"))
+	}
+	var report []byte
+	refCode, err := i.sendFlexRequest(ctx, flexPeriodURL(ibkrFlexURL, i.token, i.queryID, from, to))
+	if err == nil {
+		report, err = i.getFlexReport(ctx, refCode)
+	}
+	noteFlexOutcome(i.token, time.Now(), err)
 	if err != nil {
 		return nil, "", err
 	}
