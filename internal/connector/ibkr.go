@@ -19,6 +19,12 @@ import (
 const (
 	ibkrFlexURL    = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest"
 	ibkrFlexGetURL = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement"
+
+	// The legacy servlet above accepts fd/td and silently ignores them, serving
+	// the query's saved period; only the documented Flex Web Service honours
+	// a chosen period.
+	ibkrFlexWSSendURL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest"
+	ibkrFlexWSGetURL  = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
 )
 
 // flexReportEntry holds a cached Flex XML report, shared across IBKR connector
@@ -489,7 +495,10 @@ func isTransientFlexErrorCode(code string) bool {
 }
 
 func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error) {
-	u := flexURL(ibkrFlexGetURL, i.token, refCode)
+	return i.pollFlexReport(ctx, flexURL(ibkrFlexGetURL, i.token, refCode))
+}
+
+func (i *IBKR) pollFlexReport(ctx context.Context, u string) ([]byte, error) {
 
 	// Poll with exponential backoff. Small Flex reports (LastBusinessWeek)
 	// are typically ready in 5-10s; 30-day / YTD reports on busy accounts
@@ -882,9 +891,9 @@ func (i *IBKR) GetRawStatementForPeriod(ctx context.Context, from, to time.Time)
 			ErrFlexTokenBusy, retryAt.UTC().Format("Jan 2 15:04"))
 	}
 	var report []byte
-	refCode, err := i.sendFlexRequest(ctx, flexPeriodURL(ibkrFlexURL, i.token, i.queryID, from, to))
+	refCode, err := i.sendFlexRequest(ctx, flexPeriodURL(ibkrFlexWSSendURL, i.token, i.queryID, from, to))
 	if err == nil {
-		report, err = i.getFlexReport(ctx, refCode)
+		report, err = i.pollFlexReport(ctx, flexURL(ibkrFlexWSGetURL, i.token, refCode))
 	}
 	noteFlexOutcome(i.token, time.Now(), err)
 	if err != nil {
