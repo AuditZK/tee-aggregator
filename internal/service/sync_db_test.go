@@ -186,13 +186,24 @@ func (c *scriptedConnector) GetTrades(context.Context, time.Time, time.Time) ([]
 func (c *scriptedConnector) TestConnection(context.Context) error { return nil }
 func (c *scriptedConnector) Exchange() string                     { return c.exchange }
 
-func (c *scriptedConnector) GetCashflows(context.Context, time.Time) ([]*connector.Cashflow, error) {
+// GetCashflows filters on since the way the venues do, so a test can tell
+// which window the sync asked for.
+func (c *scriptedConnector) GetCashflows(_ context.Context, since time.Time) ([]*connector.Cashflow, error) {
 	if c.cashflowWarning != "" {
 		c.mu.Lock()
 		c.warnings = append(c.warnings, c.cashflowWarning)
 		c.mu.Unlock()
 	}
-	return c.cashflows, c.cashflowErr
+	if c.cashflowErr != nil {
+		return nil, c.cashflowErr
+	}
+	var flows []*connector.Cashflow
+	for _, cf := range c.cashflows {
+		if !cf.Timestamp.Before(since) {
+			flows = append(flows, cf)
+		}
+	}
+	return flows, nil
 }
 
 func (c *scriptedConnector) CapabilityWarnings() []string {
@@ -279,6 +290,44 @@ func TestDBFirstSyncWithoutCashflowBooksInceptionDeposit(t *testing.T) {
 			}
 			if snap := h.snapshotToday(t, "binance", "main"); snap.Deposits != 1000 {
 				t.Errorf("deposits = %v, want the 1000 equity booked as inception deposit", snap.Deposits)
+			}
+		})
+	}
+}
+
+// The connect-day row reads every transfer made before connecting; the next
+// pass must not read them again from that row's midnight.
+func TestDBDayAfterConnectDoesNotRebookTheFundingTransfer(t *testing.T) {
+	for _, p := range syncPaths {
+		t.Run(p.name, func(t *testing.T) {
+			h := newDBHarness(t)
+			h.seedConnection(t, "bybit", "main", dbKey, dbSecret)
+			yesterday := startOfTodayUTC().Add(-24 * time.Hour)
+			funded := yesterday.Add(10 * time.Hour)
+			connected := yesterday.Add(10*time.Hour + 40*time.Minute)
+			if err := h.snaps.Upsert(h.ctx, &repository.Snapshot{
+				UserUID: dbUser, Exchange: "bybit", Label: "main", Timestamp: yesterday,
+				TotalEquity: 5000, RealizedBalance: 5000, Deposits: 5000,
+			}); err != nil {
+				t.Fatalf("seed connect-day row: %v", err)
+			}
+			if err := h.statuses.Upsert(h.ctx, &repository.SyncStatus{
+				UserUID: dbUser, Exchange: "bybit", Label: "main",
+				LastSyncTime: &connected, Status: "completed",
+			}); err != nil {
+				t.Fatalf("seed connect-day status: %v", err)
+			}
+			h.plant(dbKey, dbSecret, &scriptedConnector{
+				exchange:  "bybit",
+				balances:  []connector.Balance{{Equity: 4950, Available: 4950}},
+				cashflows: []*connector.Cashflow{{Amount: 5000, Currency: "USDT", Timestamp: funded}},
+			})
+
+			if res := p.run(h, "bybit", "main"); !res.Success {
+				t.Fatalf("sync failed: %+v", res)
+			}
+			if snap := h.snapshotToday(t, "bybit", "main"); snap.Deposits != 0 {
+				t.Errorf("deposits = %v, want 0: the funding transfer was booked on the connect day", snap.Deposits)
 			}
 		})
 	}

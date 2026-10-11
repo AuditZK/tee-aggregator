@@ -943,6 +943,77 @@ func TestResolveActivityWindow(t *testing.T) {
 	}
 }
 
+func TestResumeAfterLastRead(t *testing.T) {
+	startOfDay := time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC)
+	day := func(d int) time.Time { return time.Date(2026, 7, d, 0, 0, 0, 0, time.UTC) }
+	at := func(d, h, m int) *time.Time {
+		v := time.Date(2026, 7, d, h, m, 0, 0, time.UTC)
+		return &v
+	}
+
+	cases := []struct {
+		name  string
+		start time.Time
+		last  time.Time
+		read  *time.Time
+		want  time.Time
+	}{
+		{
+			// The connect day: yesterday's row was written at 10:40 and read
+			// every transfer made before it.
+			name:  "a row written mid-day resumes where its read began",
+			start: day(28), last: day(28), read: at(28, 10, 40),
+			want: *at(28, 10, 40),
+		},
+		{
+			name:  "the midnight pass resumes at its own read, not its stamp",
+			start: day(28), last: day(28), read: at(28, 0, 1),
+			want: *at(28, 0, 1),
+		},
+		{
+			name:  "after a gap the window resumes on the old row's read",
+			start: day(25), last: day(25), read: at(25, 14, 0),
+			want: *at(25, 14, 0),
+		},
+		{
+			name:  "no known read keeps the window",
+			start: day(28), last: day(28), read: nil,
+			want: day(28),
+		},
+		{
+			// Today's row being rewritten: the stamp is its own earlier write,
+			// and the window must still reach back over yesterday.
+			name:  "a read on today's row never narrows the rewrite",
+			start: day(28), last: day(29), read: at(29, 0, 1),
+			want: day(28),
+		},
+		{
+			name:  "a read older than the latest row belongs to another write",
+			start: day(28), last: day(28), read: at(27, 9, 0),
+			want: day(28),
+		},
+		{
+			name:  "a read a day past the latest row belongs to a pass that wrote nothing",
+			start: day(25), last: day(25), read: at(27, 0, 0),
+			want: day(25),
+		},
+		{
+			name:  "a clamped window is never pulled back to an older read",
+			start: startOfDay.Add(-maxActivityLookback), last: day(1).AddDate(0, -6, 0), read: at(1, 9, 0),
+			want: startOfDay.Add(-maxActivityLookback),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resumeAfterLastRead(tc.start, startOfDay, tc.last, tc.read)
+			if !got.Equal(tc.want) {
+				t.Errorf("start = %s, want %s", got.Format(time.RFC3339), tc.want.Format(time.RFC3339))
+			}
+		})
+	}
+}
+
 // A nil snapshot repo (and a nil connection) must not panic — it degrades to
 // the classic window, which is what a first sync and a dev stack both want.
 func TestActivityWindowStart_NoRepoDegradesToClassicWindow(t *testing.T) {
