@@ -343,9 +343,9 @@ sha256sum enclave
 with. It refuses a tree with uncommitted or untracked files: a binary built
 from them matches no commit anyone can check out, and its hash proves nothing.
 
-The toolchain is pinned by `go.mod` (`go 1.26.6`); the `go` command fetches
+The toolchain is pinned by `go.mod` (`go 1.26.9`); the `go` command fetches
 that exact version if the machine has another. The production image builds
-inside `golang:1.26.6-alpine`, pinned by digest, with the same command
+inside `golang:1.26.9-alpine`, pinned by digest, with the same command
 (`Dockerfile.production`). The host OS does not matter, but three things
 could still make identical source produce different bytes, and the build
 removes each. `-trimpath` drops build-host paths. `-buildvcs=false` drops git
