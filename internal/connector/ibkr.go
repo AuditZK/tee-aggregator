@@ -886,8 +886,16 @@ func (i *IBKR) GetRawStatement(ctx context.Context) ([]byte, string, error) {
 // is keyed token:queryID and feeds the daily sync, which must keep reading the
 // saved period, not an old year someone asked for.
 func (i *IBKR) GetRawStatementForPeriod(ctx context.Context, from, to time.Time) ([]byte, string, error) {
+	report, err := i.fetchPeriodStatement(ctx, from, to)
+	if err != nil {
+		return nil, "", err
+	}
+	return []byte(scrubSecret(string(report), i.token)), "application/xml", nil
+}
+
+func (i *IBKR) fetchPeriodStatement(ctx context.Context, from, to time.Time) ([]byte, error) {
 	if retryAt, ok := claimFlexToken(i.token, time.Now()); !ok {
-		return nil, "", fmt.Errorf("%w (retry after ~%s UTC)",
+		return nil, fmt.Errorf("%w (retry after ~%s UTC)",
 			ErrFlexTokenBusy, retryAt.UTC().Format("Jan 2 15:04"))
 	}
 	var report []byte
@@ -896,10 +904,28 @@ func (i *IBKR) GetRawStatementForPeriod(ctx context.Context, from, to time.Time)
 		report, err = i.pollFlexReport(ctx, flexURL(ibkrFlexWSGetURL, i.token, refCode))
 	}
 	noteFlexOutcome(i.token, time.Now(), err)
+	return report, err
+}
+
+// GetHistoricalSnapshotsForPeriod is GetHistoricalSnapshots over [from, to]
+// instead of the query's saved period, which caps out at the last 365 days.
+func (i *IBKR) GetHistoricalSnapshotsForPeriod(ctx context.Context, from, to time.Time) ([]*HistoricalSnapshot, error) {
+	report, err := i.fetchPeriodStatement(ctx, from, to)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	return []byte(scrubSecret(string(report), i.token)), "application/xml", nil
+	single, _ := singleFlexStatement(report)
+	all, err := i.parseHistoricalSnapshotsFromReport(single, from)
+	if err != nil {
+		return nil, err
+	}
+	out := all[:0]
+	for _, sn := range all {
+		if !sn.Date.After(to) {
+			out = append(out, sn)
+		}
+	}
+	return out, nil
 }
 
 func parseRawLedgerFromReport(report []byte, since time.Time) ([]RawBalanceOp, error) {

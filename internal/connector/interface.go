@@ -317,6 +317,13 @@ type HistoricalSnapshotProvider interface {
 	GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*HistoricalSnapshot, error)
 }
 
+// PeriodHistoryProvider reads the daily timeline of a chosen period, for
+// history older than what HistoricalSnapshotProvider's window reaches. One call
+// covers at most 365 days, IBKR's ceiling per statement.
+type PeriodHistoryProvider interface {
+	GetHistoricalSnapshotsForPeriod(ctx context.Context, from, to time.Time) ([]*HistoricalSnapshot, error)
+}
+
 // HistoricalSnapshot represents a historical daily equity snapshot from the exchange.
 type HistoricalSnapshot struct {
 	Date            time.Time                 `json:"date"`
