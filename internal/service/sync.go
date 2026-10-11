@@ -3387,6 +3387,30 @@ func (s *SyncService) DumpRawStatement(ctx context.Context, userUID, exchange, l
 	return provider.GetRawStatement(ctx)
 }
 
+// DumpRawStatementForPeriod is DumpRawStatement over [from, to] instead of the
+// period saved at the venue.
+func (s *SyncService) DumpRawStatementForPeriod(ctx context.Context, userUID, exchange, label string, from, to time.Time) ([]byte, string, error) {
+	if s.connSvc == nil {
+		return nil, "", fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, "", fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, "", fmt.Errorf("build connector: %w", err)
+	}
+
+	provider, ok := conn.(connector.RawStatementPeriodProvider)
+	if !ok {
+		return nil, "", fmt.Errorf("%s: %w", exchange, ErrRawStatementUnsupported)
+	}
+	return provider.GetRawStatementForPeriod(ctx, from, to)
+}
+
 // ExchangeMetadataRefresh reports what one connection's metadata probe stored.
 type ExchangeMetadataRefresh struct {
 	Exchange string `json:"exchange"`

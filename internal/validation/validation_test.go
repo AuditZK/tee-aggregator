@@ -378,3 +378,28 @@ func TestValidateOptionalTimestampMillis(t *testing.T) {
 		})
 	}
 }
+
+func TestParseStatementPeriod(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name, from, to string
+		wantErr        bool
+	}{
+		{"full year", "2023-01-01", "2023-12-31", false},
+		{"single day", "2024-02-29", "2024-02-29", false},
+		{"missing to", "2023-01-01", "", true},
+		{"missing from", "", "2023-12-31", true},
+		{"bad format", "2023/01/01", "2023-12-31", true},
+		{"reversed", "2023-12-31", "2023-01-01", true},
+		{"over a year", "2023-01-01", "2024-01-01", true},
+		{"future", "2026-10-01", "2026-12-31", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := ParseStatementPeriod(tt.from, tt.to, now)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ParseStatementPeriod(%q, %q) err = %v, wantErr %v", tt.from, tt.to, err, tt.wantErr)
+			}
+		})
+	}
+}

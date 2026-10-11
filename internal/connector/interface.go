@@ -99,6 +99,12 @@ type RawStatementProvider interface {
 	GetRawStatement(ctx context.Context) (document []byte, contentType string, err error)
 }
 
+// RawStatementPeriodProvider is RawStatementProvider for a chosen period
+// rather than the one saved at the venue.
+type RawStatementPeriodProvider interface {
+	GetRawStatementForPeriod(ctx context.Context, from, to time.Time) (document []byte, contentType string, err error)
+}
+
 // MarketBalance holds equity data for a specific market type.
 type MarketBalance struct {
 	MarketType      string  `json:"market_type"`

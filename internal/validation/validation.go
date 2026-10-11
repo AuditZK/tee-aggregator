@@ -131,6 +131,32 @@ func ValidateTimestampRange(start, end time.Time) error {
 	return nil
 }
 
+// maxStatementPeriodDays is IBKR's ceiling on one Flex statement's period.
+const maxStatementPeriodDays = 365
+
+// ParseStatementPeriod parses a YYYY-MM-DD pair naming one venue statement.
+func ParseStatementPeriod(fromStr, toStr string, now time.Time) (from, to time.Time, err error) {
+	if fromStr == "" || toStr == "" {
+		return time.Time{}, time.Time{}, fmt.Errorf("from and to are both required")
+	}
+	if from, err = time.Parse("2006-01-02", fromStr); err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid from format: use YYYY-MM-DD")
+	}
+	if to, err = time.Parse("2006-01-02", toStr); err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid to format: use YYYY-MM-DD")
+	}
+	if to.Before(from) {
+		return time.Time{}, time.Time{}, fmt.Errorf("to must not be before from")
+	}
+	if to.After(now.Add(maxFutureTimestampSkew)) {
+		return time.Time{}, time.Time{}, fmt.Errorf("to must not be in the future")
+	}
+	if to.Sub(from) >= maxStatementPeriodDays*24*time.Hour {
+		return time.Time{}, time.Time{}, fmt.Errorf("period too long: max %d days", maxStatementPeriodDays)
+	}
+	return from, to, nil
+}
+
 // ValidateOptionalTimestampMillis validates optional epoch-millisecond timestamps.
 // Zero is treated as "not provided", matching gRPC optional semantics.
 func ValidateOptionalTimestampMillis(ts int64, field string) error {

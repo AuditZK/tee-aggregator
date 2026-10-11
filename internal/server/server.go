@@ -688,7 +688,10 @@ func (s *Server) handleAdminRefreshMetadata(w http.ResponseWriter, r *http.Reque
 // handleAdminRawStatement hands back the venue's own statement document for one
 // connection, unparsed.
 //
-// Usage: GET /api/v1/admin/raw-statement?user_uid=X&exchange=ibkr&label=Y
+// Usage: GET /api/v1/admin/raw-statement?user_uid=X&exchange=ibkr&label=Y[&from=2023-01-01&to=2023-12-31]
+//
+// from/to ask for that period instead of the one saved at the venue (at most
+// 365 days, IBKR's ceiling per statement).
 //
 // It exists because IBKR rations Flex statements to roughly one per token per
 // six hours and counts refusals, so a question our parsed views cannot answer
@@ -728,8 +731,22 @@ func (s *Server) handleAdminRawStatement(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	var (
+		doc         []byte
+		contentType string
+		err         error
+	)
 	extendWriteDeadline(w, 10*time.Minute)
-	doc, contentType, err := s.handler.syncSvc.DumpRawStatement(r.Context(), userUID, exchange, label)
+	if q.Get("from") != "" || q.Get("to") != "" {
+		from, to, perr := validation.ParseStatementPeriod(q.Get("from"), q.Get("to"), time.Now())
+		if perr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": perr.Error()})
+			return
+		}
+		doc, contentType, err = s.handler.syncSvc.DumpRawStatementForPeriod(r.Context(), userUID, exchange, label, from, to)
+	} else {
+		doc, contentType, err = s.handler.syncSvc.DumpRawStatement(r.Context(), userUID, exchange, label)
+	}
 	if err != nil {
 		if errors.Is(err, service.ErrRawStatementUnsupported) {
 			writeJSON(w, http.StatusNotImplemented, map[string]any{
