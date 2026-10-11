@@ -1,7 +1,9 @@
 module github.com/trackrecord/enclave
 
-// SUPPLY-001: pin to 1.26.6 to pick up the stdlib CVEs fixed across the
-// 1.26.x series. Six are reachable at this commit (govulncheck): GO-2026-6090
+// SUPPLY-001: pin to 1.26.9 to pick up the stdlib CVEs fixed across the
+// 1.26.x series. 1.26.6 carried GO-2026-6617, GO-2026-6613, GO-2026-6612 and
+// GO-2026-6611 (net/http, HTTP/2 framing reached from the gRPC server and
+// every exchange call). Earlier, reachable at 1.26.5 (govulncheck): GO-2026-6090
 // (crypto/tls), GO-2026-6089 and GO-2026-5026 (net/http, the second reached
 // from every signed exchange call), GO-2026-6218 (net/url), GO-2026-6088
 // (encoding/xml), GO-2026-6091 (html/template) and GO-2026-5972
@@ -13,9 +15,9 @@ module github.com/trackrecord/enclave
 // name-constraint bypasses, net/url IPv6 host parse, os FileInfo root escape
 // (≤1.26.2), html/template escaper-bypass XSS (GO-2026-4982/4980), net
 // NUL-byte panic (GO-2026-4971) and the net/http HTTP/2 SETTINGS infinite
-// loop (GO-2026-4918) (≤1.26.3). The Docker images pin golang:1.26.6-alpine;
+// loop (GO-2026-4918) (≤1.26.3). The Docker images pin golang:1.26.9-alpine;
 // this makes local developer builds match.
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/google/uuid v1.6.0
@@ -35,7 +37,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	go.uber.org/goleak v1.3.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
-	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
