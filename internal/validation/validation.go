@@ -157,6 +157,28 @@ func ParseStatementPeriod(fromStr, toStr string, now time.Time) (from, to time.T
 	return from, to, nil
 }
 
+// maxHistoryYears caps how far back a deep reconstruction may start. Each year
+// is one statement request against the holder's token, which IBKR rations.
+const maxHistoryYears = 10
+
+// ParseHistoryStart parses the YYYY-MM-DD day a deep reconstruction starts on.
+func ParseHistoryStart(fromStr string, now time.Time) (time.Time, error) {
+	if fromStr == "" {
+		return time.Time{}, fmt.Errorf("from is required")
+	}
+	from, err := time.Parse("2006-01-02", fromStr)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid from format: use YYYY-MM-DD")
+	}
+	if !from.Before(now) {
+		return time.Time{}, fmt.Errorf("from must be in the past")
+	}
+	if from.Before(now.AddDate(-maxHistoryYears, 0, 0)) {
+		return time.Time{}, fmt.Errorf("from too far back: max %d years", maxHistoryYears)
+	}
+	return from, nil
+}
+
 // ValidateOptionalTimestampMillis validates optional epoch-millisecond timestamps.
 // Zero is treated as "not provided", matching gRPC optional semantics.
 func ValidateOptionalTimestampMillis(ts int64, field string) error {

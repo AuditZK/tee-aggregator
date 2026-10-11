@@ -144,6 +144,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/admin/sync-connection", s.localhostOnly(s.handleAdminSyncConnection))
 	mux.HandleFunc("/api/v1/admin/cashflows", s.localhostOnly(s.handleAdminDumpCashflows))
 	mux.HandleFunc("/api/v1/admin/reconstruct", s.localhostOnly(s.handleAdminReconstruct))
+	mux.HandleFunc("/api/v1/admin/reconstruct-deep", s.localhostOnly(s.handleAdminReconstructDeep))
 	mux.HandleFunc("/api/v1/admin/balance-probe", s.localhostOnly(s.handleAdminBalanceProbe))
 	mux.HandleFunc("/api/v1/admin/refresh-metadata", s.localhostOnly(s.handleAdminRefreshMetadata))
 	mux.HandleFunc("/api/v1/admin/raw-statement", s.localhostOnly(s.handleAdminRawStatement))
@@ -413,6 +414,79 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		s.handler.syncSvc.ReconstructHistoryRange(ctx, userUID, exchange, label, from, to, dryRun)
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "dry_run": dryRun, "message": "reconstruction triggered, check logs"})
+}
+
+// handleAdminReconstructDeep extends a connection's history back to a date
+// older than its venue's rolling window, one statement per year.
+//
+// Usage: POST /api/v1/admin/reconstruct-deep?user_uid=X&exchange=ibkr&label=Y&from=2022-10-11[&dry_run=1]
+//
+// A dry run answers with the days instead of writing them, for the same reason
+// as handleAdminReconstruct's.
+func (s *Server) handleAdminReconstructDeep(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	from, err := validation.ParseHistoryStart(q.Get("from"), time.Now())
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	dryRun := q.Get("dry_run") == "1" || q.Get("dry_run") == "true"
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	s.logger.Info("admin deep reconstruct triggered",
+		zap.String("user_uid", userUID),
+		zap.String("exchange", exchange),
+		zap.String("label", label),
+		zap.Time("from", from),
+		zap.Bool("dry_run", dryRun),
+	)
+	if dryRun {
+		extendWriteDeadline(w, adminReconstructTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), adminReconstructTimeout)
+		defer cancel()
+		days, err := s.handler.syncSvc.DryRunDeepHistory(ctx, userUID, exchange, label, from)
+		if err != nil {
+			s.log().Error("deep reconstruct dry run failed", zap.String("exchange", exchange), zap.Error(err))
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+			return
+		}
+		rows := dryRunRows(days)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true, "dry_run": true, "count": len(rows), "days": rows,
+		})
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), adminReconstructTimeout)
+		defer cancel()
+		if err := s.handler.syncSvc.ReconstructDeepHistory(ctx, userUID, exchange, label, from); err != nil {
+			s.log().Error("deep reconstruct failed", zap.String("exchange", exchange), zap.Error(err))
+		}
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "deep reconstruction triggered, check logs"})
 }
 
 // The breakdown carries the per-market free margin, which a stored day can

@@ -403,3 +403,23 @@ func TestParseStatementPeriod(t *testing.T) {
 		})
 	}
 }
+
+func TestParseHistoryStart(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name, from string
+		wantErr    bool
+	}{
+		{"three years back", "2022-10-11", false},
+		{"missing", "", true},
+		{"bad format", "11/10/2022", true},
+		{"future", "2026-12-01", true},
+		{"over ten years", "2016-10-10", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParseHistoryStart(tt.from, now); (err != nil) != tt.wantErr {
+				t.Fatalf("ParseHistoryStart(%q) err = %v, wantErr %v", tt.from, err, tt.wantErr)
+			}
+		})
+	}
+}
