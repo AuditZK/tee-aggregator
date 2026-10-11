@@ -64,9 +64,10 @@ const (
 // Anchoring on the connection's last snapshot makes the window span exactly the
 // unobserved period. Two deliberate bounds:
 //
-//   - Never NARROWER than defaultActivityWindow. A snapshot written mid-day (a
-//     manual re-sync) must not shrink the window and drop activity the previous
-//     snapshot never accounted for.
+//   - Never NARROWER than defaultActivityWindow, except where the previous
+//     snapshot's own read is known to have covered it (resumeAfterLastRead). A
+//     snapshot written mid-day (a manual re-sync) must not shrink the window and
+//     drop activity the previous snapshot never accounted for.
 //   - Never WIDER than maxActivityLookback, so a long-dormant connection cannot
 //     issue an unbounded history request.
 //
@@ -86,6 +87,16 @@ func (s *SyncService) activityWindowStart(ctx context.Context, connMeta *reposit
 	}
 
 	start, widened, clamped := resolveActivityWindow(startOfDay, last)
+	if resumed := resumeAfterLastRead(start, startOfDay, last, s.lastLiveRead(ctx, connMeta)); resumed.After(start) {
+		s.logger.Debug("activity window resumes where the previous live read stopped",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Time("last_snapshot", last),
+			zap.Time("resumed_at", resumed),
+		)
+		return resumed
+	}
 	switch {
 	case clamped:
 		s.logger.Warn("activity window clamped — connection unsynced longer than the lookback cap",
@@ -119,6 +130,60 @@ func resolveActivityWindow(startOfDay, lastSnapshot time.Time) (start time.Time,
 		return floor, true, true
 	}
 	return lastSnapshot, true, false
+}
+
+// instantLedgerExchanges are the venues whose cashflows carry the instant they
+// happened and are filtered by that instant. Only for them can a window start
+// mid-day: a ledger dated by day (IBKR Flex) stamps a flow at midnight, and a
+// window resuming mid-morning would drop it for good.
+var instantLedgerExchanges = map[string]bool{
+	"binance":     true,
+	"bitget":      true,
+	"bybit":       true,
+	"hyperliquid": true,
+	"okx":         true,
+}
+
+// lastLiveRead is when the sync that wrote the connection's latest snapshot
+// began, or nil when that is not known. sync_status keeps one stamp per
+// connection and only a completed sync sets it alongside a written row, so
+// anything else reads as unknown.
+func (s *SyncService) lastLiveRead(ctx context.Context, connMeta *repository.ExchangeConnection) *time.Time {
+	if s.syncStatus == nil || connMeta == nil || !instantLedgerExchanges[normalizeExchange(connMeta.Exchange)] {
+		return nil
+	}
+	st, err := s.syncStatus.GetByUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
+	if err != nil || st.Status != "completed" || st.LastSyncTime == nil {
+		return nil
+	}
+	read := st.LastSyncTime.UTC()
+	return &read
+}
+
+// resumeAfterLastRead moves the window start to where the previous live read
+// began, when that read wrote the latest snapshot. A row lands on its day's
+// midnight but reads activity up to the moment it is built, so the next pass,
+// starting at that midnight, read the same hours twice. On a connect day that
+// is every transfer made before connecting: an account funded in the morning
+// and connected an hour later carried that transfer on its first two days.
+//
+// The read stamp is taken before the read starts, so the windows still touch
+// by the few seconds a build takes rather than leave a gap: a flow nobody
+// reads is booked as performance, which is the worse of the two errors.
+func resumeAfterLastRead(start, startOfDay, lastSnapshot time.Time, lastRead *time.Time) time.Time {
+	if lastRead == nil || lastSnapshot.IsZero() {
+		return start
+	}
+	read := *lastRead
+	// A stamp outside the latest row's own day belongs to some other write: a
+	// sync of today rewriting today's row, or a status left by a skipped pass.
+	if read.Before(lastSnapshot) || !read.Before(lastSnapshot.Add(24*time.Hour)) || !read.Before(startOfDay) {
+		return start
+	}
+	if read.After(start) {
+		return read
+	}
+	return start
 }
 
 // dayWindow restricts which reconstructed days persistHistoricalSnapshots is
@@ -1025,6 +1090,7 @@ func (s *SyncService) retryConnectionDeferred(conn *repository.ExchangeConnectio
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	attempt := time.Now().UTC()
 	result := s.buildConnectionSnapshot(ctx, conn)
 	if result.Error != "" {
 		s.logger.Warn("deferred rate-limit retry still failing",
@@ -1048,7 +1114,7 @@ func (s *SyncService) retryConnectionDeferred(conn *repository.ExchangeConnectio
 		return
 	}
 	result.Success = true
-	s.recordSyncStatus(ctx, conn, result, time.Now().UTC())
+	s.recordSyncStatus(ctx, conn, result, attempt)
 	s.logger.Info("deferred rate-limit retry succeeded",
 		zap.String("user_uid", conn.UserUID),
 		zap.String("exchange", conn.Exchange),
