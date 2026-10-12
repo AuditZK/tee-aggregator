@@ -3,7 +3,10 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
+	"strings"
+	"time"
 )
 
 // bingxVSTAPI serves the demo perpetual account (VST), reachable with the same
@@ -25,6 +28,9 @@ var bingxProbeWallets = []struct{ name, host, path string }{
 	{"demo_swap_v2", bingxVSTAPI, "/openApi/swap/v2/user/balance"},
 	{"demo_positions", bingxVSTAPI, "/openApi/swap/v2/user/positions"},
 	{"demo_income", bingxVSTAPI, "/openApi/swap/v2/user/income"},
+	{"demo_orders", bingxVSTAPI, "/openApi/swap/v2/trade/allOrders"},
+	{"demo_orders_old_path", bingxVSTAPI, "/openApi/swap/v2/user/historyOrders"},
+	{"orders", "", "/openApi/swap/v2/trade/allOrders"},
 }
 
 // bingxProbeDataCap bounds one wallet's payload: a spot account lists every
@@ -42,6 +48,8 @@ func (b *BingX) ProbeBalance(ctx context.Context) (*BalanceProbe, error) {
 		Currencies:  []map[string]string{},
 	}
 
+	now := time.Now()
+	window := fmt.Sprintf("startTime=%d&endTime=%d&limit=1000", now.Add(-bingxOrderWindow).UnixMilli(), now.UnixMilli())
 	for _, w := range bingxProbeWallets {
 		base := b.base
 		if b.base.BaseURL == bingxAPI || b.base.BaseURL == bingxVSTAPI {
@@ -50,7 +58,11 @@ func (b *BingX) ProbeBalance(ctx context.Context) (*BalanceProbe, error) {
 				base.BaseURL = w.host
 			}
 		}
-		body, err := base.signedQueryGET(ctx, "X-BX-APIKEY", w.path, "")
+		params := ""
+		if strings.HasSuffix(w.path, "Orders") {
+			params = window
+		}
+		body, err := base.signedQueryGET(ctx, "X-BX-APIKEY", w.path, params)
 		if err != nil {
 			probe.Notes = append(probe.Notes, w.name+" unavailable: "+vendorErrorDetail(err.Error()))
 			continue
