@@ -23,8 +23,8 @@ func TestBingXGetTrades_ReadsFilledOrders(t *testing.T) {
 			return
 		}
 		_, _ = w.Write([]byte(`{"code":0,"data":{"orders":[
-			{"orderId":"1","symbol":"AAA-USDT","side":"BUY","avgPrice":"2.5","executedQty":"10","commission":"-0.0125","profit":"0","updateTime":1700000000000},
-			{"orderId":"2","symbol":"AAA-USDT","side":"SELL","avgPrice":"0","executedQty":"0","commission":"0","profit":"0","updateTime":1700000000000}]}}`))
+			{"orderId":2109758158311264256,"symbol":"AAA-USDT","side":"BUY","avgPrice":"2.5","executedQty":"10","commission":"-0.0125","profit":"0","updateTime":1700000000000},
+			{"orderId":"2109758158311264257","symbol":"AAA-USDT","side":"SELL","avgPrice":"0","executedQty":"0","commission":"0","profit":"0","updateTime":1700000000000}]}}`))
 	})
 
 	end := time.UnixMilli(1700000000000).Add(time.Hour)
@@ -34,6 +34,9 @@ func TestBingXGetTrades_ReadsFilledOrders(t *testing.T) {
 	}
 	if len(trades) != 1 {
 		t.Fatalf("trades = %d, want the one filled order", len(trades))
+	}
+	if trades[0].ID != "2109758158311264256" {
+		t.Fatalf("order id = %q, want the 19 digits verbatim", trades[0].ID)
 	}
 	if trades[0].Fee != 0.0125 || trades[0].Side != "buy" || trades[0].MarketType != MarketSwap {
 		t.Fatalf("trade = %+v", trades[0])

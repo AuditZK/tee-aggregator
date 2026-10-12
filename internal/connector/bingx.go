@@ -341,14 +341,14 @@ func (b *BingX) filledOrders(ctx context.Context, start, end time.Time) ([]*Trad
 		Code int `json:"code"`
 		Data struct {
 			Orders []struct {
-				OrderID    string `json:"orderId"`
-				Symbol     string `json:"symbol"`
-				Side       string `json:"side"`
-				AvgPrice   string `json:"avgPrice"`
-				Volume     string `json:"executedQty"`
-				Fee        string `json:"commission"`
-				UpdateTime int64  `json:"updateTime"`
-				Profit     string `json:"profit"`
+				OrderID    json.Number `json:"orderId"` // a 19-digit number, not a string
+				Symbol     string      `json:"symbol"`
+				Side       string      `json:"side"`
+				AvgPrice   string      `json:"avgPrice"`
+				Volume     string      `json:"executedQty"`
+				Fee        string      `json:"commission"`
+				UpdateTime int64       `json:"updateTime"`
+				Profit     string      `json:"profit"`
 			} `json:"orders"`
 		} `json:"data"`
 	}
@@ -373,7 +373,7 @@ func (b *BingX) filledOrders(ctx context.Context, start, end time.Time) ([]*Trad
 		pnl, _ := strconv.ParseFloat(t.Profit, 64)
 
 		trades = append(trades, &Trade{
-			ID:          t.OrderID,
+			ID:          t.OrderID.String(),
 			Symbol:      t.Symbol,
 			Side:        strings.ToLower(t.Side),
 			Price:       price,
