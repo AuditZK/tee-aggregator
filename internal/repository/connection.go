@@ -810,32 +810,43 @@ func (r *ConnectionRepo) GetHistoryTarget(ctx context.Context, userUID, exchange
 	return &target, nil
 }
 
+// getByUserExchangeLabelTS also reads "isPaper": on a venue where one key
+// reaches both accounts (BingX), the stored flag picks which one a sync reads.
+func (r *ConnectionRepo) getByUserExchangeLabelTS(ctx context.Context, userUID, exchange, label string) (*ExchangeConnection, error) {
+	_, _, _, _, hasIsPaper := r.getCapabilityFlags(ctx)
+	paperCol := `false`
+	if hasIsPaper {
+		paperCol = `COALESCE("isPaper", false)`
+	}
+	query := `
+		SELECT id, "userUid", exchange, label,
+			"encryptedApiKey", "encryptedApiSecret", "encryptedPassphrase",
+			"isActive", "createdAt", "updatedAt", ` + paperCol + `
+		FROM exchange_connections
+		WHERE "userUid" = $1 AND exchange = $2 AND TRIM(label) = TRIM($3) AND "isActive" = true`
+
+	var conn ExchangeConnection
+	var encPassphrase *string
+	err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(
+		&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
+		&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &encPassphrase,
+		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt, &conn.IsPaper,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if encPassphrase != nil {
+		conn.EncryptedPassphrase = *encPassphrase
+	}
+	return &conn, err
+}
+
 // GetByUserExchangeLabel retrieves a connection by user, exchange, and label
 func (r *ConnectionRepo) GetByUserExchangeLabel(ctx context.Context, userUID, exchange, label string) (*ExchangeConnection, error) {
 	r.getCapabilityFlags(ctx)
 
 	if r.isTSSchema {
-		query := `
-			SELECT id, "userUid", exchange, label,
-				"encryptedApiKey", "encryptedApiSecret", "encryptedPassphrase",
-				"isActive", "createdAt", "updatedAt"
-			FROM exchange_connections
-			WHERE "userUid" = $1 AND exchange = $2 AND TRIM(label) = TRIM($3) AND "isActive" = true`
-
-		var conn ExchangeConnection
-		var encPassphrase *string
-		err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(
-			&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
-			&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &encPassphrase,
-			&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
-		)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		if encPassphrase != nil {
-			conn.EncryptedPassphrase = *encPassphrase
-		}
-		return &conn, err
+		return r.getByUserExchangeLabelTS(ctx, userUID, exchange, label)
 	}
 
 	query := `

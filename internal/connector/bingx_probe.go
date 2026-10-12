@@ -12,7 +12,7 @@ const bingxVSTAPI = "https://open-api-vst.bingx.com"
 
 // bingxProbeWallets are the BingX accounts a key can hold money in. GetBalance
 // reads only the first two, so money parked anywhere else syncs as 0. An empty
-// host means the connector's own API.
+// host means the live API, whichever account the connection tracks.
 var bingxProbeWallets = []struct{ name, host, path string }{
 	{"swap_v2", "", "/openApi/swap/v2/user/balance"},
 	{"spot", "", "/openApi/spot/v1/account/balance"},
@@ -44,8 +44,11 @@ func (b *BingX) ProbeBalance(ctx context.Context) (*BalanceProbe, error) {
 
 	for _, w := range bingxProbeWallets {
 		base := b.base
-		if w.host != "" && b.base.BaseURL == bingxAPI {
-			base.BaseURL = w.host
+		if b.base.BaseURL == bingxAPI || b.base.BaseURL == bingxVSTAPI {
+			base.BaseURL = bingxAPI
+			if w.host != "" {
+				base.BaseURL = w.host
+			}
 		}
 		body, err := base.signedQueryGET(ctx, "X-BX-APIKEY", w.path, "")
 		if err != nil {

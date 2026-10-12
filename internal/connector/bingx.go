@@ -16,13 +16,116 @@ const bingxAPI = "https://open-api.bingx.com"
 // Uses HMAC-SHA256 query-param signing (similar to Binance).
 type BingX struct {
 	base CryptoBase
+	demo bool
 }
 
-// NewBingX creates a new BingX connector.
+// NewBingX creates a new BingX connector. A demo connection reads the VST
+// perpetual account, which BingX serves from its own host for the same key.
 func NewBingX(creds *Credentials) *BingX {
-	return &BingX{
-		base: NewCryptoBase(creds.APIKey, creds.APISecret, bingxAPI),
+	host := bingxAPI
+	if creds.Demo {
+		host = bingxVSTAPI
 	}
+	return &BingX{
+		base: NewCryptoBase(creds.APIKey, creds.APISecret, host),
+		demo: creds.Demo,
+	}
+}
+
+// DetectIsPaper reports a demo connection: every live wallet empty while the
+// demo perpetual account trades. Decided at connect and stored, so a sync
+// never switches a series between the two accounts.
+func (b *BingX) DetectIsPaper(ctx context.Context) (bool, error) {
+	if b.demo {
+		return true, nil
+	}
+	live, err := b.liveHoldsFunds(ctx)
+	if err != nil || live {
+		return false, err
+	}
+	return b.demoTrades(ctx)
+}
+
+func (b *BingX) liveHoldsFunds(ctx context.Context) (bool, error) {
+	body, err := b.signedGET(ctx, "/openApi/account/v1/allAccountBalance", "")
+	if err != nil {
+		return false, fmt.Errorf("read bingx account overview: %w", err)
+	}
+	var overview struct {
+		Code int `json:"code"`
+		Data []struct {
+			USDTBalance string `json:"usdtBalance"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &overview); err != nil {
+		return false, fmt.Errorf("parse bingx account overview: %w", err)
+	}
+	if overview.Code != 0 {
+		return false, fmt.Errorf("read bingx account overview: bingx code %d: %s", overview.Code, vendorErrorDetail(string(body)))
+	}
+	for _, a := range overview.Data {
+		if !isZeroAmount(a.USDTBalance) {
+			return true, nil
+		}
+	}
+
+	// The overview leaves the fund wallet out.
+	body, err = b.signedGET(ctx, "/openApi/fund/v1/account/balance", "")
+	if err != nil {
+		return false, fmt.Errorf("read bingx fund wallet: %w", err)
+	}
+	var fund struct {
+		Code int `json:"code"`
+		Data struct {
+			Assets []struct {
+				Free   string `json:"free"`
+				Locked string `json:"locked"`
+			} `json:"assets"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &fund); err != nil {
+		return false, fmt.Errorf("parse bingx fund wallet: %w", err)
+	}
+	if fund.Code != 0 {
+		return false, fmt.Errorf("read bingx fund wallet: bingx code %d: %s", fund.Code, vendorErrorDetail(string(body)))
+	}
+	for _, a := range fund.Data.Assets {
+		if !isZeroAmount(a.Free) || !isZeroAmount(a.Locked) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// demoTrades reports activity on the demo account beyond the grant BingX
+// credits every user: an open position or any income other than a transfer.
+func (b *BingX) demoTrades(ctx context.Context) (bool, error) {
+	demo := b.base
+	if demo.BaseURL == bingxAPI {
+		demo.BaseURL = bingxVSTAPI
+	}
+	body, err := demo.signedQueryGET(ctx, "X-BX-APIKEY", "/openApi/swap/v2/user/income", "")
+	if err != nil {
+		return false, fmt.Errorf("read bingx demo income: %w", err)
+	}
+	var income struct {
+		Code int `json:"code"`
+		Data []struct {
+			IncomeType string `json:"incomeType"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &income); err != nil {
+		return false, fmt.Errorf("parse bingx demo income: %w", err)
+	}
+	if income.Code != 0 {
+		return false, fmt.Errorf("read bingx demo income: bingx code %d: %s", income.Code, vendorErrorDetail(string(body)))
+	}
+	for _, row := range income.Data {
+		if !strings.EqualFold(row.IncomeType, "TRANSFER") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (b *BingX) Exchange() string { return "bingx" }
@@ -92,6 +195,11 @@ func (b *BingX) GetBalance(ctx context.Context) (*Balance, error) {
 	unrealized, err := parseBingXAmount("unrealizedProfit", resp.Data.Balance.UnrealizedPnL)
 	if err != nil {
 		return nil, err
+	}
+
+	// The demo host has no spot account.
+	if b.demo {
+		return &Balance{Equity: equity, Available: available, UnrealizedPnL: unrealized, Currency: "USDT"}, nil
 	}
 
 	// Spot balance (best effort on the fetch; strict on the valuation).
