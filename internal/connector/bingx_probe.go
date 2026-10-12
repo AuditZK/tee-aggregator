@@ -6,17 +6,25 @@ import (
 	"strconv"
 )
 
+// bingxVSTAPI serves the demo perpetual account (VST), reachable with the same
+// key as the live account.
+const bingxVSTAPI = "https://open-api-vst.bingx.com"
+
 // bingxProbeWallets are the BingX accounts a key can hold money in. GetBalance
-// reads only the first two, so money parked anywhere else syncs as 0.
-var bingxProbeWallets = []struct{ name, path string }{
-	{"swap_v2", "/openApi/swap/v2/user/balance"},
-	{"spot", "/openApi/spot/v1/account/balance"},
-	{"swap_v3", "/openApi/swap/v3/user/balance"},
-	{"overview", "/openApi/account/v1/allAccountBalance"},
-	{"fund", "/openApi/fund/v1/account/balance"},
-	{"standard_futures", "/openApi/contract/v1/balance"},
-	{"coin_m", "/openApi/cswap/v1/user/balance"},
-	{"api_permissions", "/openApi/v1/account/apiPermissions"},
+// reads only the first two, so money parked anywhere else syncs as 0. An empty
+// host means the connector's own API.
+var bingxProbeWallets = []struct{ name, host, path string }{
+	{"swap_v2", "", "/openApi/swap/v2/user/balance"},
+	{"spot", "", "/openApi/spot/v1/account/balance"},
+	{"swap_v3", "", "/openApi/swap/v3/user/balance"},
+	{"overview", "", "/openApi/account/v1/allAccountBalance"},
+	{"fund", "", "/openApi/fund/v1/account/balance"},
+	{"standard_futures", "", "/openApi/contract/v1/balance"},
+	{"coin_m", "", "/openApi/cswap/v1/user/balance"},
+	{"api_permissions", "", "/openApi/v1/account/apiPermissions"},
+	{"demo_swap_v2", bingxVSTAPI, "/openApi/swap/v2/user/balance"},
+	{"demo_positions", bingxVSTAPI, "/openApi/swap/v2/user/positions"},
+	{"demo_income", bingxVSTAPI, "/openApi/swap/v2/user/income"},
 }
 
 // bingxProbeDataCap bounds one wallet's payload: a spot account lists every
@@ -35,7 +43,11 @@ func (b *BingX) ProbeBalance(ctx context.Context) (*BalanceProbe, error) {
 	}
 
 	for _, w := range bingxProbeWallets {
-		body, err := b.signedGET(ctx, w.path, "")
+		base := b.base
+		if w.host != "" && b.base.BaseURL == bingxAPI {
+			base.BaseURL = w.host
+		}
+		body, err := base.signedQueryGET(ctx, "X-BX-APIKEY", w.path, "")
 		if err != nil {
 			probe.Notes = append(probe.Notes, w.name+" unavailable: "+vendorErrorDetail(err.Error()))
 			continue
@@ -59,6 +71,7 @@ func (b *BingX) ProbeBalance(ctx context.Context) (*BalanceProbe, error) {
 		}
 		probe.Currencies = append(probe.Currencies, map[string]string{
 			"wallet": w.name,
+			"host":   w.host,
 			"path":   w.path,
 			"data":   data,
 		})
