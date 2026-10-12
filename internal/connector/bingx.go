@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -305,16 +306,39 @@ func (b *BingX) GetPositions(ctx context.Context) ([]*Position, error) {
 	return positions, nil
 }
 
+// bingxOrderWindow is the widest span allOrders answers for in one call.
+const bingxOrderWindow = 7 * 24 * time.Hour
+
 func (b *BingX) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
+	var trades []*Trade
+	for from := start; from.Before(end); from = from.Add(bingxOrderWindow) {
+		to := from.Add(bingxOrderWindow)
+		if to.After(end) {
+			to = end
+		}
+		page, err := b.filledOrders(ctx, from, to)
+		if err != nil {
+			return nil, err
+		}
+		trades = append(trades, page...)
+	}
+	return trades, nil
+}
+
+// filledOrders reads one window of perpetual orders. The path used to be
+// /user/historyOrders, which BingX does not serve: its refusal parsed as an
+// empty list and every BingX day recorded zero trades.
+func (b *BingX) filledOrders(ctx context.Context, start, end time.Time) ([]*Trade, error) {
 	params := fmt.Sprintf("startTime=%d&endTime=%d&limit=1000",
 		start.UnixMilli(), end.UnixMilli())
 
-	body, err := b.signedGET(ctx, "/openApi/swap/v2/user/historyOrders", params)
+	body, err := b.signedGET(ctx, "/openApi/swap/v2/trade/allOrders", params)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read bingx orders: %w", err)
 	}
 
 	var resp struct {
+		Code int `json:"code"`
 		Data struct {
 			Orders []struct {
 				OrderID    string `json:"orderId"`
@@ -329,7 +353,10 @@ func (b *BingX) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, 
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse bingx orders: %w", err)
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("read bingx orders: bingx code %d: %s", resp.Code, vendorErrorDetail(string(body)))
 	}
 
 	trades := make([]*Trade, 0, len(resp.Data.Orders))
@@ -340,6 +367,9 @@ func (b *BingX) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, 
 			continue // skip unfilled orders
 		}
 		fee, _ := strconv.ParseFloat(t.Fee, 64)
+		// The commission's sign differs between BingX endpoints, and its
+		// perpetuals pay no maker rebate; Trade.Fee books a cost as positive.
+		fee = math.Abs(fee)
 		pnl, _ := strconv.ParseFloat(t.Profit, 64)
 
 		trades = append(trades, &Trade{
