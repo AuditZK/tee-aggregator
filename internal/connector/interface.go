@@ -438,4 +438,8 @@ type Credentials struct {
 	AccessToken  string
 	ClientID     string
 	ClientSecret string
+
+	// Demo is the connection's stored paper flag, for venues where one key
+	// reaches both the live and the demo account (BingX).
+	Demo bool
 }

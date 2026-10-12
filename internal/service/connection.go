@@ -27,6 +27,7 @@ type Credentials struct {
 	APIKey     string
 	APISecret  string
 	Passphrase string
+	Demo       bool
 }
 
 // ExchangeMetadata holds exchange-level report metadata.
@@ -660,6 +661,7 @@ func (s *ConnectionService) decryptConnection(conn *repository.ExchangeConnectio
 		APIKey:     apiKey,
 		APISecret:  apiSecret,
 		Passphrase: passphrase,
+		Demo:       conn.IsPaper,
 	}, legacy, nil
 }
 

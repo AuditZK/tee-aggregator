@@ -3146,10 +3146,20 @@ func (m *marketAgg) toRepoMetrics() *repository.MarketMetrics {
 	}
 }
 
+// connectorCacheHash keys the connector cache. A live connector cached for
+// these keys must never serve a demo row, so the mode is part of the key.
+func connectorCacheHash(creds *Credentials) []byte {
+	passphrase := creds.Passphrase
+	if creds.Demo {
+		passphrase += "\x00demo"
+	}
+	return cache.HashCredentials(creds.APIKey, creds.APISecret, passphrase)
+}
+
 // getOrCreateConnector returns a cached connector or creates a new one.
 // TS parity: UniversalConnectorCache with SHA-256 credentials hash.
 func (s *SyncService) getOrCreateConnector(exchange, userUID, label string, creds *Credentials) (connector.Connector, error) {
-	credsHash := cache.HashCredentials(creds.APIKey, creds.APISecret, creds.Passphrase)
+	credsHash := connectorCacheHash(creds)
 
 	// Check cache first
 	if s.connCache != nil {
@@ -3178,6 +3188,7 @@ func (s *SyncService) getOrCreateConnector(exchange, userUID, label string, cred
 			APIKey:     creds.APIKey,
 			APISecret:  creds.APISecret,
 			Passphrase: creds.Passphrase,
+			Demo:       creds.Demo,
 		})
 		if err != nil {
 			return nil, err
