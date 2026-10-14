@@ -2,7 +2,9 @@ package grpc
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -16,6 +18,7 @@ import (
 	"github.com/trackrecord/enclave/internal/errsanitize"
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/service"
+	"github.com/trackrecord/enclave/internal/signing"
 	"github.com/trackrecord/enclave/internal/validation"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -811,6 +814,7 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 		AnnualizationDays:  int32(report.AnnualizationDays),
 	}
 	resp.ExchangeDetails = mapExchangeDetails(report.ExchangeDetails, report.Exchanges)
+	resp.SignedPayload = s.signedPayload(report)
 
 	// SEC-107: resp.Measurement is deliberately left empty. The previous code
 	// attached the current measurement OUTSIDE the signed payload, which let
@@ -879,6 +883,24 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 	}
 
 	return resp, nil
+}
+
+// signedPayload returns empty rather than bytes that would fail their own
+// hash check: a cached report is read back from a database outside the enclave.
+func (s *Server) signedPayload(report *signing.SignedReport) string {
+	payload, err := signing.CanonicalPayload(report)
+	if err != nil {
+		s.logger.Error("rebuild signed payload failed", zap.Error(err))
+		return ""
+	}
+	sum := sha256.Sum256(payload)
+	if hex.EncodeToString(sum[:]) != report.ReportHash {
+		s.logger.Error("signed payload does not match report hash",
+			zap.String("report_id", report.ReportID),
+		)
+		return ""
+	}
+	return string(payload)
 }
 
 // VerifyReportSignature implements EnclaveService.

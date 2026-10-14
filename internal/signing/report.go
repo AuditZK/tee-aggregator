@@ -483,8 +483,7 @@ func (s *ReportSigner) Sign(input *ReportInput) (*SignedReport, error) {
 		PayloadVersion:     PayloadVersion,
 	}
 
-	financialPayload := buildFinancialPayload(report)
-	financialJSON, err := marshalSortedJSON(financialPayload)
+	financialJSON, err := CanonicalPayload(report)
 	if err != nil {
 		return nil, fmt.Errorf("serialize financial payload: %w", err)
 	}
@@ -500,6 +499,11 @@ func (s *ReportSigner) Sign(input *ReportInput) (*SignedReport, error) {
 	report.Signature = base64.StdEncoding.EncodeToString(signatureDER)
 
 	return report, nil
+}
+
+// CanonicalPayload returns the bytes ReportHash is the SHA-256 of.
+func CanonicalPayload(report *SignedReport) ([]byte, error) {
+	return marshalSortedJSON(buildFinancialPayload(report))
 }
 
 func formatISO8601(t time.Time) string {
@@ -842,8 +846,7 @@ func VerifyReport(report *SignedReport) (bool, error) {
 		return false, fmt.Errorf("nil report")
 	}
 
-	payload := buildFinancialPayload(report)
-	canonical, err := marshalSortedJSON(payload)
+	canonical, err := CanonicalPayload(report)
 	if err != nil {
 		return false, fmt.Errorf("rebuild canonical payload: %w", err)
 	}

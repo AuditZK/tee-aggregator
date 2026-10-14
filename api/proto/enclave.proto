@@ -315,6 +315,11 @@ message SignedReportResponse {
   // every observation is a calendar day. Stated rather than assumed, so a
   // consumer never has to guess between a 365-day and a 252-day year.
   int32 annualization_days = 91;
+
+  // The canonical JSON report_hash is the SHA-256 of, byte for byte. The
+  // fields above are a convenience copy; a verifier hashes this string,
+  // checks the signature over the hash, then reads the figures from it.
+  string signed_payload = 92;
 }
 
 // Exchange info with KYC and paper status
