@@ -1573,8 +1573,12 @@ type SignedReportResponse struct {
 	// every observation is a calendar day. Stated rather than assumed, so a
 	// consumer never has to guess between a 365-day and a 252-day year.
 	AnnualizationDays int32 `protobuf:"varint,91,opt,name=annualization_days,json=annualizationDays,proto3" json:"annualization_days,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// The canonical JSON report_hash is the SHA-256 of, byte for byte. The
+	// fields above are a convenience copy; a verifier hashes this string,
+	// checks the signature over the hash, then reads the figures from it.
+	SignedPayload string `protobuf:"bytes,92,opt,name=signed_payload,json=signedPayload,proto3" json:"signed_payload,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SignedReportResponse) Reset() {
@@ -1920,6 +1924,13 @@ func (x *SignedReportResponse) GetAnnualizationDays() int32 {
 		return x.AnnualizationDays
 	}
 	return 0
+}
+
+func (x *SignedReportResponse) GetSignedPayload() string {
+	if x != nil {
+		return x.SignedPayload
+	}
+	return ""
 }
 
 // Exchange info with KYC and paper status
@@ -2541,7 +2552,7 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\vreport_name\x18\a \x01(\tR\n" +
 	"reportName\x12#\n" +
 	"\rbase_currency\x18\b \x01(\tR\fbaseCurrency\x12$\n" +
-	"\x0erisk_free_rate\x18\t \x01(\x01R\friskFreeRate\"\x9f\r\n" +
+	"\x0erisk_free_rate\x18\t \x01(\x01R\friskFreeRate\"\xc6\r\n" +
 	"\x14SignedReportResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x1b\n" +
@@ -2595,7 +2606,8 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\x0eattestation_id\x18Q \x01(\tR\rattestationId\x12!\n" +
 	"\fenclave_mode\x18R \x01(\tR\venclaveMode\x12 \n" +
 	"\vmeasurement\x18S \x01(\tR\vmeasurement\x12-\n" +
-	"\x12annualization_days\x18[ \x01(\x05R\x11annualizationDays\"Z\n" +
+	"\x12annualization_days\x18[ \x01(\x05R\x11annualizationDays\x12%\n" +
+	"\x0esigned_payload\x18\\ \x01(\tR\rsignedPayload\"Z\n" +
 	"\fExchangeInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\tkyc_level\x18\x02 \x01(\tR\bkycLevel\x12\x19\n" +
