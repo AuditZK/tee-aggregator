@@ -193,7 +193,9 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 			// holder off to regenerate a key that was never the problem, and
 			// the replacement fails identically.
 			return fmt.Errorf("%w: %w", connector.ErrIPRestricted, err)
-		} else if kind := connector.ClassifyConnectFailure(err); kind != connector.ConnectFailureCredentials {
+		} else if kind := connector.ClassifyConnectFailure(err); kind == connector.ConnectFailureUnknownServer {
+			return fmt.Errorf("%w: %w", connector.ErrUnknownServer, err)
+		} else if kind != connector.ConnectFailureCredentials {
 			// G-H4: same reasoning, generalised. "invalid credentials: " is
 			// the FIRST entry of the errsanitize table, so prefixing it onto
 			// a Spotware outage, a missing CTRADER_CLIENT_ID, a login with no

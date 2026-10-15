@@ -38,6 +38,9 @@ const (
 	// MsgNoTradingAccount is a successful login that owns no tradable
 	// account — again, nothing the user can fix by re-entering credentials.
 	MsgNoTradingAccount = "no trading account found for this broker login"
+	// MsgUnknownServer is a broker server name the MT bridge cannot place: a
+	// typo or an unsupported broker, which only the holder can correct.
+	MsgUnknownServer = "broker server name not recognized"
 )
 
 type category struct {
@@ -52,6 +55,10 @@ type category struct {
 // tcp internal-db:5432: connect: connection refused" matches "connection
 // refused"). First match wins, so more specific substrings come first.
 var categories = []category{
+	// Ahead of everything: the bridge message quotes the server name as the
+	// holder typed it, so any later substring could be sitting inside it.
+	{"unknown_server", MsgUnknownServer},
+	{MsgUnknownServer, MsgUnknownServer},
 	// Rate limiting first: "cTrader token refresh rate-limited (429)" is a
 	// throttle, not a dead authorization, and the reauth patterns below would
 	// otherwise claim it.

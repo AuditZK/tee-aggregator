@@ -1,6 +1,16 @@
 package connector
 
-import "strings"
+import (
+	"errors"
+	"strings"
+
+	"github.com/trackrecord/enclave/internal/errsanitize"
+)
+
+// ErrUnknownServer marks a connect refused because the MT bridge could not
+// place the broker server name. Its text is what the frontend matches on to
+// ask for the exact server name.
+var ErrUnknownServer = errors.New(errsanitize.MsgUnknownServer)
 
 // ConnectFailure is why a credential test failed at connection time.
 //
@@ -28,6 +38,9 @@ const (
 	ConnectFailureNotConfigured
 	// ConnectFailureNoAccount — the login is valid and owns nothing tradable.
 	ConnectFailureNoAccount
+	// ConnectFailureUnknownServer — the MT bridge could not place the server
+	// name, so no broker ever saw the credentials.
+	ConnectFailureUnknownServer
 )
 
 // connectFailureMarkers maps a lowercase substring to its class. First match
@@ -36,6 +49,10 @@ var connectFailureMarkers = []struct {
 	substr string
 	kind   ConnectFailure
 }{
+	// The bridge's code, first: its message quotes the server name as typed,
+	// which can contain any marker below.
+	{"unknown_server", ConnectFailureUnknownServer},
+
 	// Enclave-side configuration, not the user's secret.
 	{"ctrader_client_id", ConnectFailureNotConfigured},
 	{"ctrader client credentials", ConnectFailureNotConfigured},
