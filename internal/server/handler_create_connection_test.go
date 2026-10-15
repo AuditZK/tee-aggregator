@@ -166,6 +166,12 @@ func TestConnectCreateFailure_Mapping(t *testing.T) {
 			wantMessage: "ip not whitelisted",
 		},
 		{
+			name:        "unknown MT server",
+			err:         fmt.Errorf("%w: %s", connector.ErrUnknownServer, `mt-bridge status 422: {"error":{"code":"UNKNOWN_SERVER"}}`),
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "broker server name not recognized",
+		},
+		{
 			name:        "rejected key",
 			err:         errors.New("invalid credentials: bitget API error: Apikey does not exist (code 40037)"),
 			wantStatus:  http.StatusBadRequest,

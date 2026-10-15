@@ -50,6 +50,8 @@ func resolveUserUID(ctx context.Context, bodyUID string) string {
 // (broker-error-messages.ts) matches on.
 func connectCreateFailure(err error) (int, string) {
 	switch {
+	case errors.Is(err, connector.ErrUnknownServer):
+		return http.StatusBadRequest, connector.ErrUnknownServer.Error()
 	case connector.IsIPRestriction(err):
 		return http.StatusBadRequest, connector.ErrIPRestricted.Error()
 	case strings.Contains(err.Error(), "invalid credentials"):

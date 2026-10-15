@@ -7,6 +7,8 @@ import (
 	"github.com/trackrecord/enclave/internal/errsanitize"
 )
 
+const unknownServerBridgeErr = `mt-bridge status 422: {"success":false,"error":{"code":"UNKNOWN_SERVER","message":"unknown server: cannot resolve MT5 server \"Broker-Timeout 3\": no discovery, hardcoded mapping, or hostname found"}}`
+
 // G-H4: every one of these used to reach the user as a 400
 // "invalid credentials" — for cTrader, right after a successful Spotware
 // login, about a secret the user does not possess.
@@ -35,6 +37,10 @@ func TestClassifyConnectFailure(t *testing.T) {
 		{"token refresh rejected: invalid_grant - already used", ConnectFailureCredentials},
 		{"binance: invalid api key", ConnectFailureCredentials},
 
+		// The bridge could not place the server name. The quoted name carries
+		// "timeout", which must not drag it into the upstream class.
+		{unknownServerBridgeErr, ConnectFailureUnknownServer},
+
 		// Unknown stays conservative: refuse the connection.
 		{"something nobody has characterised", ConnectFailureCredentials},
 	}
@@ -58,6 +64,8 @@ func TestConnectFailureCategoriesReachTheClient(t *testing.T) {
 		// Even with the historical prefix still attached, the specific
 		// category must win — it is placed ahead of "invalid credentials".
 		{"invalid credentials: cTrader error ACCESS_DENIED: token is not valid", errsanitize.MsgBrokerReauthRequired},
+		{unknownServerBridgeErr, errsanitize.MsgUnknownServer},
+		{ErrUnknownServer.Error() + ": " + unknownServerBridgeErr, errsanitize.MsgUnknownServer},
 	}
 	for _, tc := range cases {
 		if got := errsanitize.Category(tc.err); got != tc.want {
