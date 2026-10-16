@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +11,8 @@ import (
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/service"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type fakeConnectionService struct {
@@ -194,5 +197,56 @@ func TestCreateUserConnection_ProductionPassesUserFacingError(t *testing.T) {
 	}
 	if resp.Error != "invalid credentials" {
 		t.Fatalf("expected the fixed user-facing category message in prod, got %q", resp.Error)
+	}
+}
+
+// syntheticOAuthToken is shaped like a JWT access token, with synthetic
+// content, n characters long.
+func syntheticOAuthToken(n int) string {
+	const head = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9."
+	body := strings.Repeat("c3ludGhldGlj", n/12+1)
+	return (head + body)[:n-45] + "." + strings.Repeat("U0lH", 11)
+}
+
+// The OAuth callback reaches the enclave over gRPC with the access token as
+// api_key and the refresh token as api_secret. A Saxo access token is a JWT
+// longer than the 500 characters the trust boundary used to allow; it must
+// reach the service whole.
+func TestCreateUserConnection_AcceptsAnOAuthAccessToken(t *testing.T) {
+	fake := &fakeConnectionService{}
+	srv := NewServer(zap.NewNop(), Services{ConnSvc: fake}, ServerOptions{})
+	client, cleanup := newBufconnClient(t, srv)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	access := syntheticOAuthToken(1500)
+	refresh := syntheticOAuthToken(1100)
+	resp, err := client.CreateUserConnection(ctx, &pb.CreateUserConnectionRequest{
+		UserUid:   "user_abc1234567890",
+		Exchange:  "saxo_sim",
+		Label:     "Saxo Account",
+		ApiKey:    access,
+		ApiSecret: refresh,
+	})
+	if err != nil {
+		t.Fatalf("CreateUserConnection() error = %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("a %d-char access token was refused: %q", len(access), resp.Error)
+	}
+	if fake.lastReq == nil || fake.lastReq.APIKey != access || fake.lastReq.APISecret != refresh {
+		t.Fatal("the tokens did not reach the service whole")
+	}
+
+	_, err = client.CreateUserConnection(ctx, &pb.CreateUserConnectionRequest{
+		UserUid:  "user_abc1234567890",
+		Exchange: "saxo_sim",
+		Label:    "Saxo Account",
+		ApiKey:   strings.Repeat("x", 4097),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("a 4097-char api_key: err = %v, want InvalidArgument", err)
 	}
 }

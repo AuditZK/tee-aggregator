@@ -56,6 +56,7 @@ var connectFailureMarkers = []struct {
 	// Enclave-side configuration, not the user's secret.
 	{"ctrader_client_id", ConnectFailureNotConfigured},
 	{"ctrader client credentials", ConnectFailureNotConfigured},
+	{"saxo_app_key", ConnectFailureNotConfigured},
 
 	// A valid login with nothing behind it.
 	{"no ctrader accounts found", ConnectFailureNoAccount},

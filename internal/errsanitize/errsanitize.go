@@ -95,6 +95,7 @@ var categories = []category{
 	// credentials" for the same reason (G-H4).
 	{"ctrader_client_id", MsgExchangeNotConfigured},
 	{"ctrader client credentials", MsgExchangeNotConfigured},
+	{"saxo_app_key", MsgExchangeNotConfigured},
 	{"no ctrader accounts found", MsgNoTradingAccount},
 	{"no trading account", MsgNoTradingAccount},
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/trackrecord/enclave/internal/connector"
@@ -51,6 +52,11 @@ type ConnectionService struct {
 	postCreateRebuildHook func(ctx context.Context, userUID, exchange, label string)
 	// logger is optional; when nil, transient-validation warnings are silent.
 	logger *zap.Logger
+
+	// oauth holds the per-connection refresh slots of tokenGuardedExchanges,
+	// shared by connect, re-authorization, every sync path and the keep-alive.
+	oauth     *oauthTokenLocks
+	oauthOnce sync.Once
 }
 
 // NewConnectionService creates a new connection service
@@ -123,6 +129,26 @@ type CreateConnectionRequest struct {
 
 // Create encrypts and stores a new exchange connection
 func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionRequest) error {
+	exchange := normalizeExchange(req.Exchange)
+	if !isTokenGuarded(exchange) {
+		return s.create(ctx, req)
+	}
+
+	// Validation can refresh, and storing the new pair races the keep-alive
+	// refreshing the old one on the same row: the slot is held throughout.
+	slot, release, err := s.oauthLocks().acquire(ctx, oauthSlotKey(req.UserUID, exchange, req.Label))
+	if err != nil {
+		return fmt.Errorf("hold the token refresh slot: %w", err)
+	}
+	defer release()
+	if err := s.create(ctx, req); err != nil {
+		return err
+	}
+	slot.freshAuthorization(time.Now())
+	return nil
+}
+
+func (s *ConnectionService) create(ctx context.Context, req *CreateConnectionRequest) error {
 	if s.repo == nil || s.encryption == nil {
 		return fmt.Errorf("connection service not configured")
 	}
@@ -698,6 +724,13 @@ func (s *ConnectionService) ListUnfinalizedExternalRebuilds(ctx context.Context,
 	return s.repo.ListUnfinalizedExternalRebuilds(ctx, beforeCutoff, createdAfter, exchanges)
 }
 
+func (s *ConnectionService) listActiveTokenGuarded(ctx context.Context) ([]*repository.ExchangeConnection, error) {
+	if s.repo == nil {
+		return nil, errors.New("connection service not configured")
+	}
+	return s.repo.ListActiveByExchanges(ctx, tokenGuardedExchanges, keepAliveMaxRows)
+}
+
 // MarkRebuildFinalized passes through to ConnectionRepo. Stamps the connection
 // once its rebuilt history has been recalibrated against the midnight snapshot,
 // so subsequent nightly ticks skip it.
@@ -805,7 +838,7 @@ func normalizeSyncIntervalMinutes(value int) int {
 // typed. Re-running that flow is expensive enough that an upstream outage at
 // connect should not throw the tokens away.
 func isOAuthExchange(exchange string) bool {
-	return exchange == "ctrader"
+	return exchange == "ctrader" || isTokenGuarded(exchange)
 }
 
 func normalizeExchange(exchange string) string {

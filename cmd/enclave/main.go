@@ -428,6 +428,17 @@ func main() {
 		)
 	}
 
+	// Same stance as cTrader: not fatal, but loud. Without the app credentials
+	// every Saxo connect is refused and every stored Saxo connection dies with
+	// its refresh token, within the hour.
+	if cfg.SaxoAppKey == "" || cfg.SaxoAppSecret == "" {
+		logger.Error("Saxo is not configured; every Saxo connect will be refused and stored Saxo connections will expire",
+			zap.Bool("app_key_set", cfg.SaxoAppKey != ""),
+			zap.Bool("app_secret_set", cfg.SaxoAppSecret != ""),
+			zap.String("hint", "set SAXO_APP_KEY and SAXO_APP_SECRET (and SAXO_REDIRECT_URI if the Saxo app requires it) in the enclave environment, or ignore this if Saxo is not offered"),
+		)
+	}
+
 	// 11c. Wire HTTP proxy for geo-restricted exchanges (e.g. Binance from EU).
 	// Set EXCHANGE_HTTP_PROXY=socks5://user:pass@host:port (or http://)
 	// and PROXY_EXCHANGES=binance (comma-separated, default: binance).
@@ -674,6 +685,15 @@ func main() {
 		}
 	}
 
+	// 18b. OAuth keep-alive. Not tied to ENABLE_DAILY_SYNC: a Saxo refresh
+	// token lives about 40 minutes, so without this pass a Saxo connection is
+	// dead long before any sync, scheduled or manual, comes round.
+	var keepAlive *service.OAuthKeepAlive
+	if syncSvc != nil && connSvc != nil {
+		keepAlive = service.NewOAuthKeepAlive(connSvc, syncSvc, logger)
+		keepAlive.Start()
+	}
+
 	logger.Info("enclave worker ready",
 		zap.Int("grpc_port", cfg.GRPCPort),
 		zap.Int("rest_port", cfg.RESTPort),
@@ -696,6 +716,9 @@ func main() {
 
 	if syncScheduler != nil {
 		syncScheduler.Stop()
+	}
+	if keepAlive != nil {
+		keepAlive.Stop()
 	}
 	grpcServer.Stop()
 	if logStreamServer != nil {

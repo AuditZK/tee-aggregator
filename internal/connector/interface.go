@@ -311,6 +311,44 @@ type OAuthCredentialSource interface {
 	CurrentCredentials() (accessToken, refreshToken string)
 }
 
+// ErrRefreshRefused marks a refresh the broker refused on the grant itself: the
+// refresh token is dead and only re-running the OAuth flow brings the
+// connection back. Its text is what errsanitize maps to the reauth category.
+var ErrRefreshRefused = errors.New("token refresh rejected")
+
+// OAuthTokens is one access/refresh pair.
+type OAuthTokens struct {
+	AccessToken  string
+	RefreshToken string
+}
+
+// TokenGuard serialises the refreshes of one OAuth connection across every
+// connector instance and code path holding its tokens. A broker that rotates
+// the refresh token on each use (Saxo) leaves whichever of two concurrent
+// refreshes comes second holding a dead pair.
+type TokenGuard interface {
+	// Rotate runs fn while holding the connection's refresh slot. fn receives
+	// the newest pair known for the connection, which another holder may have
+	// rotated since the caller was built, and when it was last rotated (zero
+	// when unknown). It returns a new pair, or nil to keep the one it was
+	// given. A new pair is stored before Rotate returns it; when it cannot be,
+	// Rotate fails and the pair must not be used.
+	Rotate(ctx context.Context, fn func(current OAuthTokens, rotatedAt time.Time) (*OAuthTokens, error)) (OAuthTokens, error)
+}
+
+// RefreshGuarded is implemented by connectors that take their refresh slot
+// from a TokenGuard shared with the rest of the process.
+type RefreshGuarded interface {
+	SetRefreshGuard(guard TokenGuard)
+}
+
+// OAuthKeepAliver is implemented by connectors whose refresh token expires
+// unless it is used. KeepAlive rotates the pair unless it was rotated less than
+// minAge ago.
+type OAuthKeepAliver interface {
+	KeepAlive(ctx context.Context, minAge time.Duration) error
+}
+
 // HistoricalSnapshotProvider optionally provides historical daily snapshots.
 // Used by IBKR Flex for 365-day backfill on first sync.
 type HistoricalSnapshotProvider interface {
