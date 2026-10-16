@@ -1,6 +1,9 @@
 package validation
 
 import (
+	"bytes"
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -92,8 +95,39 @@ func TestValidateAPIKey(t *testing.T) {
 	if err := ValidateAPIKey("normal-key"); err != nil {
 		t.Error("normal key should be valid")
 	}
-	if err := ValidateAPIKey(strings.Repeat("x", 501)); err == nil {
-		t.Error("key > 500 chars should be invalid")
+	if err := ValidateAPIKey(strings.Repeat("x", 4097)); err == nil {
+		t.Error("key > 4096 chars should be invalid")
+	}
+}
+
+// syntheticJWT builds a token shaped like an OAuth access token, with
+// synthetic claims, about n characters long.
+func syntheticJWT(n int) string {
+	enc := base64.RawURLEncoding
+	header := enc.EncodeToString([]byte(`{"alg":"ES256","typ":"JWT","x5t":"synthetic-thumbprint"}`))
+	signature := enc.EncodeToString(bytes.Repeat([]byte{0x5a}, 64))
+	pad := n - len(header) - len(signature) - 2
+	claims := fmt.Sprintf(`{"sub":"synthetic-subject","exp":1900000000,"pad":%q}`, strings.Repeat("s", pad))
+	payload := enc.EncodeToString([]byte(claims))[:pad]
+	return header + "." + payload + "." + signature
+}
+
+// The OAuth connect path carries the access token as api_key and the refresh
+// token as api_secret; a 500-character cap refused every Saxo connect.
+func TestValidateCreateConnectionAcceptsAnOAuthJWT(t *testing.T) {
+	token := syntheticJWT(1500)
+	if len(token) < 1400 {
+		t.Fatalf("synthetic token is %d chars, want about 1500", len(token))
+	}
+	err := ValidateCreateConnection(&CreateConnectionRequest{
+		UserUID:   "user_abc1234567890",
+		Exchange:  "saxo",
+		Label:     "Saxo Account",
+		APIKey:    token,
+		APISecret: syntheticJWT(1200),
+	})
+	if err != nil {
+		t.Fatalf("a %d-char JWT was refused: %v", len(token), err)
 	}
 }
 
@@ -104,8 +138,8 @@ func TestValidateAPISecret(t *testing.T) {
 	if err := ValidateAPISecret("normal-secret"); err != nil {
 		t.Error("normal secret should be valid")
 	}
-	if err := ValidateAPISecret(strings.Repeat("x", 501)); err == nil {
-		t.Error("secret > 500 chars should be invalid")
+	if err := ValidateAPISecret(strings.Repeat("x", 4097)); err == nil {
+		t.Error("secret > 4096 chars should be invalid")
 	}
 }
 
@@ -209,7 +243,7 @@ func TestValidateCreateConnection(t *testing.T) {
 				UserUID: "user_abc1234567890", Exchange: "binance",
 				Label:     "main",
 				APIKey:    "key",
-				APISecret: strings.Repeat("x", 501),
+				APISecret: strings.Repeat("x", 4097),
 			},
 			true,
 		},
