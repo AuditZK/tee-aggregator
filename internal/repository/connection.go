@@ -1133,6 +1133,56 @@ func (r *ConnectionRepo) ListUnfinalizedExternalRebuilds(ctx context.Context, be
 	return out, nil
 }
 
+// activeByExchangesQuery builds the SELECT of ListActiveByExchanges. Params:
+// $1 = lowercase exchanges, $2 = row cap.
+func activeByExchangesQuery(uid, isAct, createdAt string) string {
+	return `
+		SELECT id, ` + uid + `, exchange, label
+		FROM exchange_connections
+		WHERE ` + isAct + ` = true
+		  AND lower(exchange) = ANY($1)
+		ORDER BY ` + createdAt + ` ASC
+		LIMIT $2
+	`
+}
+
+// ListActiveByExchanges returns the identity (id, user, exchange, label) of up
+// to limit active connections on the given exchanges, across all users. No
+// credential column is read.
+func (r *ConnectionRepo) ListActiveByExchanges(ctx context.Context, exchanges []string, limit int) ([]*ExchangeConnection, error) {
+	if len(exchanges) == 0 || limit <= 0 {
+		return nil, nil
+	}
+	r.getCapabilityFlags(ctx)
+	lowered := make([]string, 0, len(exchanges))
+	for _, e := range exchanges {
+		lowered = append(lowered, strings.ToLower(strings.TrimSpace(e)))
+	}
+
+	rows, err := r.pool.Query(ctx, activeByExchangesQuery(r.qcol("user_uid"), r.qcol("is_active"), r.qcol("created_at")), lowered, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list active connections by exchange: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*ExchangeConnection
+	for rows.Next() {
+		conn := &ExchangeConnection{IsActive: true}
+		var label *string
+		if err := rows.Scan(&conn.ID, &conn.UserUID, &conn.Exchange, &label); err != nil {
+			return nil, fmt.Errorf("scan active connection: %w", err)
+		}
+		if label != nil {
+			conn.Label = *label
+		}
+		out = append(out, conn)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active connections: %w", err)
+	}
+	return out, nil
+}
+
 // MarkRebuildFinalized stamps rebuild_finalized_at = at on the given
 // connection. Called after the midnight UTC recalibration rebuild succeeds.
 // No-op if the column doesn't exist (migration not applied). Idempotent:

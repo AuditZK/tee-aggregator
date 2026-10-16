@@ -75,6 +75,11 @@ services:
     #     must still boot) but the boot logs an Error and every cTrader connect
     #     is refused with "not configured on the enclave" instead of the
     #     "invalid credentials" it used to blame the user for (G-M7).
+    #   SAXO_APP_KEY / SAXO_APP_SECRET (+ SAXO_REDIRECT_URI if the Saxo app
+    #     requires it on refresh) — the Saxo application credentials. Same
+    #     stance as cTrader: the boot logs an Error when missing, connects are
+    #     refused as not configured, and stored Saxo connections expire with
+    #     their ~40 min refresh token since the keep-alive cannot refresh them.
     #   HISTORY_SYNC_NOTIFY_URL / HISTORY_SYNC_NOTIFY_TOKEN — the post-rebuild
     #     ping to analytics (<url>/<userUid>). The token is sent as
     #     X-Internal-Token; set the SAME value on the receiving service. Leave

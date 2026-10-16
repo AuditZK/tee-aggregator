@@ -724,6 +724,13 @@ func (s *ConnectionService) ListUnfinalizedExternalRebuilds(ctx context.Context,
 	return s.repo.ListUnfinalizedExternalRebuilds(ctx, beforeCutoff, createdAfter, exchanges)
 }
 
+func (s *ConnectionService) listActiveTokenGuarded(ctx context.Context) ([]*repository.ExchangeConnection, error) {
+	if s.repo == nil {
+		return nil, errors.New("connection service not configured")
+	}
+	return s.repo.ListActiveByExchanges(ctx, tokenGuardedExchanges, keepAliveMaxRows)
+}
+
 // MarkRebuildFinalized passes through to ConnectionRepo. Stamps the connection
 // once its rebuilt history has been recalibrated against the midnight snapshot,
 // so subsequent nightly ticks skip it.
