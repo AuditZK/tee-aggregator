@@ -6,7 +6,7 @@
 # reachable at this commit — are picked up deterministically. Pinned by digest
 # (SUP-02); bump it when bumping the tag via
 # `docker buildx imagetools inspect golang:1.26.4-alpine`.
-FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS builder
+FROM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS builder
 
 WORKDIR /app
 
