@@ -490,9 +490,19 @@ func dropLeadingDustDays(snapshots []*repository.Snapshot) []*repository.Snapsho
 	return snapshots[i:]
 }
 
+// staleConnectionDays is how long a connection may stay silent before it is
+// taken out of the multi-connection TWR. Same threshold as the analytics'
+// consolidated view (STALE_CONNECTION_DAYS), so a signed report and the
+// dashboard agree on when an account has left.
+const staleConnectionDays = 5
+
 // convertSnapshotsToDailyReturns implements TWR with multi-connection support.
 // Groups snapshots by date and connection key (exchange/label), handles virtual
-// deposits when new connections appear, and forward-fills missing connection data.
+// deposits when new connections appear, and forward-fills a connection missing
+// for a few days. One silent for longer than staleConnectionDays leaves on its
+// first silent day at its last equity, booked as a withdrawal: held at that
+// value forever, an account that never comes back kept money nobody sees in
+// the report. If it reports again it rejoins as a new connection.
 func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyReturn {
 	if len(snapshots) == 0 {
 		return nil
@@ -529,6 +539,15 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 		return nil
 	}
 
+	connDays := make(map[string][]string)
+	for _, dateStr := range dateOrder {
+		for ex := range dateMap[dateStr].exchanges {
+			connDays[ex] = append(connDays[ex], dateStr)
+		}
+	}
+	lastSeen := make(map[string]string)
+	seriesEnd := dateOrder[len(dateOrder)-1]
+
 	// Track known connection keys and their last known equity.
 	knownExchanges := make(map[string]float64) // connection key -> last equity
 	var returns []dailyReturn
@@ -542,6 +561,7 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 			// Initialize known exchanges with first day's data
 			for ex, snap := range dg.exchanges {
 				knownExchanges[ex] = snap.TotalEquity
+				lastSeen[ex] = dateStr
 			}
 			continue
 		}
@@ -556,6 +576,7 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 			// Update known exchanges
 			for ex, snap := range dg.exchanges {
 				knownExchanges[ex] = snap.TotalEquity
+				lastSeen[ex] = dateStr
 			}
 			continue
 		}
@@ -576,6 +597,12 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 				dayDeposits += math.Abs(snap.Deposits)
 				dayWithdrawals += math.Abs(snap.Withdrawals)
 				knownExchanges[ex] = snap.TotalEquity
+				lastSeen[ex] = dateStr
+			} else if silentDays(lastSeen[ex], dateStr, connDays[ex], seriesEnd) > staleConnectionDays {
+				// Leaves at its last equity, withdrawn: the exit scores nothing.
+				totalCurrentEquity += lastEq
+				dayWithdrawals += lastEq
+				delete(knownExchanges, ex)
 			} else {
 				// Forward-fill: use last known equity
 				totalCurrentEquity += lastEq
@@ -590,6 +617,7 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 				virtualDeposits += snap.TotalEquity
 				closeEquity += snap.TotalEquity
 				knownExchanges[ex] = snap.TotalEquity
+				lastSeen[ex] = dateStr
 			}
 		}
 
@@ -633,6 +661,19 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 	}
 
 	return returns
+}
+
+// silentDays is the length in calendar days of the silence a connection is in
+// on day: from its last snapshot to its next one, or to the end of the series
+// when none follows. days holds the connection's own dates, sorted.
+func silentDays(last, day string, days []string, seriesEnd string) int {
+	until := seriesEnd
+	if i := sort.SearchStrings(days, day); i < len(days) {
+		until = days[i]
+	}
+	from, _ := time.Parse("2006-01-02", last)
+	to, _ := time.Parse("2006-01-02", until)
+	return int(to.Sub(from).Hours() / 24)
 }
 
 // aggregateToMonthlyReturns groups daily returns by month and compounds them
