@@ -226,6 +226,26 @@ type reconstructOpts struct {
 	// examined and stays. Zero means the rebuilder stated no horizon, and the
 	// prune falls back to owning the whole rebuilt history.
 	coveredFrom time.Time
+	// written receives the days a real run upserted, without the connect-time
+	// row it superseded.
+	written func([]*repository.Snapshot)
+}
+
+// rebuiltDays are the dates, UTC midnight, a reconstruction wrote in this pass.
+type rebuiltDays map[time.Time]bool
+
+func (d rebuiltDays) add(days []*repository.Snapshot) {
+	for _, sn := range days {
+		d[calendarDay(sn.Timestamp)] = true
+	}
+}
+
+func (d rebuiltDays) has(t time.Time) bool { return d[calendarDay(t)] }
+
+// calendarDay keys t by its own calendar date, the way the IBKR reconstruction
+// files a trade or a cash flow under a day.
+func calendarDay(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 // contains reports whether dayKey (a UTC midnight) falls inside the window.
@@ -1140,7 +1160,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	if !ok {
 		return result
 	}
-	s.reconstructIfEverySync(ctx, connMeta, conn, result)
+	rebuilt := s.reconstructIfEverySync(ctx, connMeta, conn, result)
 	balance, ok := s.liveBalance(ctx, conn, connMeta, result, start)
 	if !ok {
 		return result
@@ -1155,7 +1175,13 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		return result
 	}
 
-	act := s.readActivity(ctx, conn, connMeta, s.activityWindowStart(ctx, connMeta, startOfDay), now)
+	// An IBKR live row restates the statement this pass just rebuilt day by
+	// day: a flow or a trade filed under one of those days is already booked
+	// there, and booking it again here reads as a loss or a gain of its size.
+	if !liveHoldsPreviousStatement(connMeta.Exchange) {
+		rebuilt = nil
+	}
+	act := s.readActivity(ctx, conn, connMeta, s.activityWindowStart(ctx, connMeta, startOfDay), now, rebuilt)
 	// After the cashflow read: Bybit and OKX find their gaps there.
 	s.collectCapabilityWarnings(conn, connMeta, result)
 	s.completeBreakdown(ctx, conn, connMeta, act.breakdown, balance)
@@ -1229,13 +1255,16 @@ func (s *SyncService) connectorFor(ctx context.Context, connMeta *repository.Exc
 // that do it on every sync. IBKR re-emits its full Flex window cheaply;
 // cTrader re-runs a bounded recent window (everySyncReconstructSince) to heal
 // the live/reconstruction boundary deposit double-count. Every other venue
-// reconstructs once, at connect (ReconstructHistoryOnConnect).
-func (s *SyncService) reconstructIfEverySync(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, result *SyncResult) {
+// reconstructs once, at connect (ReconstructHistoryOnConnect). Returns the
+// days it wrote; none when it failed, was refused or did not run.
+func (s *SyncService) reconstructIfEverySync(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, result *SyncResult) rebuiltDays {
 	hsp, ok := conn.(connector.HistoricalSnapshotProvider)
 	if !ok || !reconstructsEverySync(connMeta.Exchange) {
-		return
+		return nil
 	}
-	noteReconstructionFailure(result, s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange), reconstructOpts{}))
+	written := rebuiltDays{}
+	noteReconstructionFailure(result, s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange), reconstructOpts{written: written.add}))
+	return written
 }
 
 // liveBalance reads the balance through the collapse guard, or records the
@@ -1287,12 +1316,14 @@ type liveActivity struct {
 	cashflows []*connector.Cashflow
 }
 
-// readActivity reads the window's trades, funding fees and cashflows. Trades
-// and funding fees are best-effort.
-func (s *SyncService) readActivity(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, from, now time.Time) liveActivity {
+// readActivity reads the window's trades, funding fees and cashflows, leaving
+// out those filed under a day in booked. Trades and funding fees are
+// best-effort.
+func (s *SyncService) readActivity(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, from, now time.Time, booked rebuiltDays) liveActivity {
 	var act liveActivity
 	var swapSymbols []string
 	act.trades, _ = conn.GetTrades(ctx, from, now)
+	act.trades = slices.DeleteFunc(act.trades, func(t *connector.Trade) bool { return booked.has(t.Timestamp) })
 	for _, t := range act.trades {
 		if t.MarketType == connector.MarketSwap {
 			swapSymbols = appendUnique(swapSymbols, t.Symbol)
@@ -1305,13 +1336,14 @@ func (s *SyncService) readActivity(ctx context.Context, conn connector.Connector
 			act.fundingCharges = applyFundingFees(act.breakdown, connMeta.Exchange, fees)
 		}
 	}
-	act.deposits, act.withdrawals, act.cashflows = s.readCashflows(ctx, conn, connMeta, from)
+	act.deposits, act.withdrawals, act.cashflows = s.readCashflows(ctx, conn, connMeta, from, booked)
 	return act
 }
 
-// readCashflows sums the window's deposits and withdrawals. A failed read is
-// logged and leaves the window without flows.
-func (s *SyncService) readCashflows(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, from time.Time) (deposits, withdrawals float64, cashflows []*connector.Cashflow) {
+// readCashflows sums the window's deposits and withdrawals, those filed under
+// a day in booked left out. A failed read is logged and leaves the window
+// without flows.
+func (s *SyncService) readCashflows(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, from time.Time, booked rebuiltDays) (deposits, withdrawals float64, cashflows []*connector.Cashflow) {
 	cfFetcher, ok := conn.(connector.CashflowFetcher)
 	if !ok {
 		return 0, 0, nil
@@ -1321,6 +1353,7 @@ func (s *SyncService) readCashflows(ctx context.Context, conn connector.Connecto
 		s.warnCashflowFetchFailed(connMeta, err)
 		return 0, 0, nil
 	}
+	cashflows = slices.DeleteFunc(cashflows, func(cf *connector.Cashflow) bool { return booked.has(cf.Timestamp) })
 	for _, cf := range cashflows {
 		if cf.Amount > 0 {
 			deposits += cf.Amount
@@ -2479,6 +2512,9 @@ func (s *SyncService) persistHistoricalSnapshots(
 			zap.Error(err),
 		)
 		return err
+	}
+	if opts.written != nil {
+		opts.written(slices.DeleteFunc(slices.Clone(snapshots), func(sn *repository.Snapshot) bool { return sn == superseded }))
 	}
 
 	// A reconstruction that moves dates leaves its own previous output behind:
