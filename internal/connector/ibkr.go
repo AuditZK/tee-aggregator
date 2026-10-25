@@ -167,6 +167,9 @@ func noteFlexOutcome(token string, now time.Time, err error) {
 		st.failures = 0
 		return
 	}
+	// The wait counts from the failure, not the claim: a statement that took
+	// minutes to fail must not reopen the token for the same sync's next read.
+	st.lastReq = now
 	st.failures++
 	st.budgetSpent++
 	if errors.Is(err, ErrFlexConfigLocked) {
@@ -218,8 +221,8 @@ func NewIBKR(creds *Credentials) *IBKR {
 		token:   creds.APIKey,
 		queryID: creds.APISecret,
 		// 5min per HTTP call — large Flex reports (YTD, 30 days) occasionally
-		// take 1-2min to respond; with poll retries the total budget reaches
-		// ~4min so no individual request should ever hit this ceiling.
+		// take 1-2min to respond; the poll retries (FlexPollBudget) carry the
+		// longer waits, so no individual request should ever hit this ceiling.
 		client: &http.Client{Timeout: 5 * time.Minute},
 	}
 }
@@ -498,16 +501,30 @@ func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error
 	return i.pollFlexReport(ctx, flexURL(ibkrFlexGetURL, i.token, refCode))
 }
 
-func (i *IBKR) pollFlexReport(ctx context.Context, u string) ([]byte, error) {
+// flexPollDelays is the wait between GetStatement polls. Small reports are
+// ready in 5-10s and a year on a busy account in 1-3 minutes, but during IBKR's
+// overnight batch, where the 6h deferred retry lands, a year-long statement
+// was still generating after the four minutes this budget used to stop at,
+// and the retry lost its day. About ten minutes now.
+var flexPollDelays = []time.Duration{
+	3 * time.Second, 5 * time.Second, 5 * time.Second, 10 * time.Second, 10 * time.Second,
+	15 * time.Second, 15 * time.Second, 20 * time.Second, 30 * time.Second, 30 * time.Second,
+	30 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second,
+	time.Minute, time.Minute, time.Minute, time.Minute, time.Minute, time.Minute,
+}
 
-	// Poll with exponential backoff. Small Flex reports (LastBusinessWeek)
-	// are typically ready in 5-10s; 30-day / YTD reports on busy accounts
-	// can take 1-3 minutes. Total budget here: ~4 minutes.
-	delays := []time.Duration{
-		3 * time.Second, 5 * time.Second, 5 * time.Second, 10 * time.Second, 10 * time.Second,
-		15 * time.Second, 15 * time.Second, 20 * time.Second, 30 * time.Second, 30 * time.Second,
-		30 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second,
+// FlexPollBudget is the longest a statement may take to come out before the
+// poll gives up. A caller's deadline shorter than this cuts the poll instead.
+func FlexPollBudget() time.Duration {
+	var total time.Duration
+	for _, d := range flexPollDelays {
+		total += d
 	}
+	return total
+}
+
+func (i *IBKR) pollFlexReport(ctx context.Context, u string) ([]byte, error) {
+	delays := flexPollDelays
 	for _, sleep := range delays {
 		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 		if err != nil {
@@ -553,7 +570,9 @@ func (i *IBKR) pollFlexReport(ctx context.Context, u string) ([]byte, error) {
 		return nil, fmt.Errorf("unexpected flex response: %s", preview(scrubSecret(trimmed, i.token), 300))
 	}
 
-	return nil, fmt.Errorf("flex report timeout after %d attempts", len(delays))
+	// IBKR answered "in progress" every time: the same condition as 1019,
+	// transient by its own account.
+	return nil, fmt.Errorf("%w: flex statement still generating after %d polls", ErrTransient, len(delays))
 }
 
 // preview returns the first n chars of s with an ellipsis when truncated.

@@ -202,3 +202,24 @@ func TestFlexTokenWait_CapsAtTheCeiling(t *testing.T) {
 		t.Fatalf("a long run of failures must not overflow into a negative wait: got %v want %v", got, flexTokenMaxBackoff)
 	}
 }
+
+// A statement that fails only after minutes of polling must not reopen the
+// token for the read that follows in the same sync: that second request is a
+// second failure IBKR counts, and it ran into the sync's deadline.
+func TestNoteFlexOutcome_WaitCountsFromTheFailure(t *testing.T) {
+	token := "gate-test-token-H"
+	claim := time.Date(2026, 9, 17, 6, 0, 0, 0, time.UTC)
+
+	if _, ok := claimFlexToken(token, claim); !ok {
+		t.Fatal("first claim must be granted")
+	}
+	failed := claim.Add(10 * time.Minute)
+	noteFlexOutcome(token, failed, fmt.Errorf("%w: flex statement still generating after 20 polls", ErrTransient))
+
+	if _, ok := claimFlexToken(token, failed.Add(time.Second)); ok {
+		t.Fatal("a claim right after a slow failure must be denied")
+	}
+	if _, ok := claimFlexToken(token, failed.Add(2*time.Minute+time.Second)); !ok {
+		t.Fatal("the back-off after one failure must reopen two minutes after the failure")
+	}
+}

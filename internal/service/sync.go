@@ -793,8 +793,9 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 	// PERF-005: four connectors in parallel peak around 20 MB of heap and
 	// divide a user's worst-case wall time by about four.
 	connSem := make(chan struct{}, 4)
-	// 5min matches the IBKR Flex poll budget (~4min for 30-day/YTD reports) with
-	// a safety margin; other connectors are sub-second so the ceiling never hits.
+	// 5min bounds a user's slot in the midnight pass. An IBKR statement slower
+	// than that is cut here and waited for by the deferred retry
+	// (deferredRetryTimeout); other connectors are sub-second.
 	const connTimeout = 5 * time.Minute
 
 	// Most-stale-first, with a short launch stagger. Correctness against the
@@ -1102,12 +1103,17 @@ func (s *SyncService) scheduleDeferredRetry(conn *repository.ExchangeConnection,
 	})
 }
 
+// deferredRetryTimeout holds the whole Flex poll plus the rest of the sync. The
+// retry lands in IBKR's overnight batch, where a statement can need most of
+// that poll; at five minutes flat the poll was cut and the day lost.
+var deferredRetryTimeout = connector.FlexPollBudget() + 5*time.Minute
+
 // retryConnectionDeferred re-syncs one connection out-of-band and saves its
 // snapshot independently of the daily batch. It never schedules another deferral:
 // one retry per daily cycle bounds the work, and if it still fails the next daily
 // pass picks the connection up.
 func (s *SyncService) retryConnectionDeferred(conn *repository.ExchangeConnection) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), deferredRetryTimeout)
 	defer cancel()
 
 	attempt := time.Now().UTC()
