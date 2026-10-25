@@ -933,7 +933,10 @@ func (i *IBKR) GetHistoricalSnapshotsForPeriod(ctx context.Context, from, to tim
 	if err != nil {
 		return nil, err
 	}
-	single, _ := singleFlexStatement(report)
+	single, _, err := singleFlexStatement(report)
+	if err != nil {
+		return nil, err
+	}
 	all, err := i.parseHistoricalSnapshotsFromReport(single, from)
 	if err != nil {
 		return nil, err
@@ -1142,6 +1145,9 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 						Date         string `xml:"date,attr"`
 					} `xml:"Transfer"`
 				} `xml:"Transfers"`
+				CashReport struct {
+					Rows []flexCashReportRow `xml:"CashReportCurrency"`
+				} `xml:"CashReport"`
 			} `xml:"FlexStatement"`
 		} `xml:"FlexStatements"`
 	}
@@ -1149,6 +1155,7 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 	if err := xml.Unmarshal(report, &flex); err != nil {
 		return nil, fmt.Errorf("parse flex cashflows: %w", err)
 	}
+	reportTransfers := dailyCashReportTransfers(flex.FlexStatements.FlexStatement.CashReport.Rows)
 
 	// Statement-shape diagnostic: types and counts ONLY, never amounts. A
 	// type in neither list above is money whose meaning we cannot state —
@@ -1209,6 +1216,9 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 		if !ok || ts.Before(since) {
 			continue
 		}
+		if _, covered := reportTransfers[ts.Format("20060102")]; covered {
+			continue
+		}
 		cash, _ := strconv.ParseFloat(tr.CashTransfer, 64)
 		if cash == 0 {
 			continue
@@ -1228,6 +1238,8 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 		}
 		cashflows = append(cashflows, inBaseCurrency(cash, tr.Currency, tr.FXRateToBase, base, ts))
 	}
+
+	cashflows = append(cashflows, reportTransfers.flows(since)...)
 
 	i.capabilityWarnings = nil
 	for typ, n := range unknownTypes {
