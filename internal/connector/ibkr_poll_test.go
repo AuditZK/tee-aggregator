@@ -27,7 +27,7 @@ func TestPollFlexReport_StatementStillGeneratingIsTransient(t *testing.T) {
 	stub := &flexInProgressTransport{}
 	i := &IBKR{token: "SYNTHETICPOLLTOKEN0001", queryID: "123456", client: &http.Client{Transport: stub}}
 
-	_, err := i.pollFlexReport(context.Background(), flexURL(ibkrFlexWSGetURL, i.token, "REF42"))
+	_, err := i.pollFlexReport(context.Background(), flexURL(ibkrFlexGetURL, i.token, "REF42"))
 	if err == nil {
 		t.Fatal("a statement never ready must fail the poll")
 	}

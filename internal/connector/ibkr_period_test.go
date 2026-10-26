@@ -27,34 +27,6 @@ func (f *flexStubTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
 }
 
-// The legacy servlet answered 1001 to any query with Breakout by Day, so the
-// daily statement goes to the Flex Web Service too, on the query's own period.
-func TestDailyStatementGoesToTheFlexWebServiceOnTheSavedPeriod(t *testing.T) {
-	const token = "SYNTHETICSAVEDPERIOD0001"
-	stub := &flexStubTransport{doc: `<FlexQueryResponse queryName="q"><FlexStatements count="1"/></FlexQueryResponse>`}
-	i := &IBKR{token: token, queryID: "123457", client: &http.Client{Transport: stub}}
-	t.Cleanup(func() {
-		flexReportCacheMu.Lock()
-		delete(flexReportCache, token+":123457")
-		flexReportCacheMu.Unlock()
-	})
-
-	if _, err := i.fetchFlexReport(context.Background()); err != nil {
-		t.Fatalf("fetch: %v", err)
-	}
-	if len(stub.urls) < 2 {
-		t.Fatalf("want a send and a poll, got %v", stub.urls)
-	}
-	for _, u := range stub.urls {
-		if !strings.HasPrefix(u, "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/") {
-			t.Fatalf("daily statement request went to %s", u)
-		}
-	}
-	if strings.Contains(stub.urls[0], "fd=") || strings.Contains(stub.urls[0], "td=") {
-		t.Fatalf("the daily request must keep the query's saved period: %s", stub.urls[0])
-	}
-}
-
 func TestGetRawStatementForPeriodSendsDatesAndSkipsSharedCache(t *testing.T) {
 	const token = "SYNTHETICPERIODTOKEN0001"
 	stub := &flexStubTransport{doc: `<FlexQueryResponse queryName="q" echo="` + token + `"><FlexStatements count="1"/></FlexQueryResponse>`}

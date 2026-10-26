@@ -16,10 +16,13 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// The documented Flex Web Service serves both the query's saved period and a
-// chosen one (fd/td). The legacy gdcdyn servlet it replaces ignored fd/td and
-// answered 1001 to every query with "Breakout by Day" on.
 const (
+	ibkrFlexURL    = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest"
+	ibkrFlexGetURL = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement"
+
+	// The legacy servlet above accepts fd/td and silently ignores them, serving
+	// the query's saved period; only the documented Flex Web Service honours
+	// a chosen period.
 	ibkrFlexWSSendURL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest"
 	ibkrFlexWSGetURL  = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
 )
@@ -371,7 +374,7 @@ func flexPeriodURL(base, token, query string, from, to time.Time) string {
 }
 
 func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
-	return i.sendFlexRequest(ctx, flexURL(ibkrFlexWSSendURL, i.token, i.queryID))
+	return i.sendFlexRequest(ctx, flexURL(ibkrFlexURL, i.token, i.queryID))
 }
 
 func (i *IBKR) sendFlexRequest(ctx context.Context, u string) (string, error) {
@@ -495,7 +498,7 @@ func isTransientFlexErrorCode(code string) bool {
 }
 
 func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error) {
-	return i.pollFlexReport(ctx, flexURL(ibkrFlexWSGetURL, i.token, refCode))
+	return i.pollFlexReport(ctx, flexURL(ibkrFlexGetURL, i.token, refCode))
 }
 
 // flexPollDelays is the wait between GetStatement polls. Small reports are

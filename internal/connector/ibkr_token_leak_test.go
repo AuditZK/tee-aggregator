@@ -48,7 +48,7 @@ func TestFlexTransportErrorHidesToken(t *testing.T) {
 // not passing because the URL never carried the token.
 func TestFlexTransportErrorWouldLeakUnscrubbed(t *testing.T) {
 	i := newLeakProbeIBKR()
-	req, err := http.NewRequest("GET", flexURL(ibkrFlexWSSendURL, i.token, i.queryID), nil)
+	req, err := http.NewRequest("GET", flexURL(ibkrFlexURL, i.token, i.queryID), nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
