@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -32,8 +33,8 @@ func TestGetRawStatementForPeriodSendsDatesAndSkipsSharedCache(t *testing.T) {
 	stub := &flexStubTransport{doc: `<FlexQueryResponse queryName="q" echo="` + token + `"><FlexStatements count="1"/></FlexQueryResponse>`}
 	i := &IBKR{token: token, queryID: "123456", client: &http.Client{Transport: stub}}
 
-	from := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
-	to := time.Date(2023, 12, 31, 0, 0, 0, 0, time.UTC)
+	from := time.Date(2023, 1, 2, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2023, 12, 29, 0, 0, 0, 0, time.UTC)
 	doc, ct, err := i.GetRawStatementForPeriod(context.Background(), from, to)
 	if err != nil {
 		t.Fatalf("GetRawStatementForPeriod: %v", err)
@@ -45,7 +46,7 @@ func TestGetRawStatementForPeriodSendsDatesAndSkipsSharedCache(t *testing.T) {
 		t.Fatal("token echoed by the venue reached the caller")
 	}
 
-	if len(stub.urls) < 1 || !strings.Contains(stub.urls[0], "fd=20230101") || !strings.Contains(stub.urls[0], "td=20231231") {
+	if len(stub.urls) < 1 || !strings.Contains(stub.urls[0], "fd=20230102") || !strings.Contains(stub.urls[0], "td=20231229") {
 		t.Fatalf("SendRequest did not carry the period: %v", stub.urls)
 	}
 	// Only the Flex Web Service honours a chosen period.
@@ -101,7 +102,34 @@ func TestGetHistoricalSnapshotsForPeriodKeepsOnlyThePeriod(t *testing.T) {
 	if len(got) != 2 || got[0].Date.Format("20060102") != "20230102" || got[1].Date.Format("20060102") != "20231229" {
 		t.Fatalf("days outside the period leaked in: %+v", got)
 	}
-	if !strings.Contains(stub.urls[0], "fd=20230101") || !strings.Contains(stub.urls[0], "td=20231231") {
-		t.Fatalf("period not sent: %v", stub.urls)
+	if !strings.Contains(stub.urls[0], "fd=20230102") || !strings.Contains(stub.urls[0], "td=20231229") {
+		t.Fatalf("period not sent, pulled in to weekdays: %v", stub.urls)
+	}
+}
+
+// IBKR answers 1003 to a period ending on a Saturday, as if none of its days
+// had a statement. A period goes out weekday to weekday, and one with no
+// weekday left does not go out, nor spend the token.
+func TestPeriodStatementRunsWeekdayToWeekday(t *testing.T) {
+	const token = "SYNTHETICPERIODTOKEN0004"
+	stub := &flexStubTransport{doc: `<FlexQueryResponse><FlexStatements count="1"/></FlexQueryResponse>`}
+	i := &IBKR{token: token, queryID: "123456", client: &http.Client{Transport: stub}}
+	sunday := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
+	saturday := time.Date(2026, 5, 30, 0, 0, 0, 0, time.UTC)
+
+	if _, _, err := i.GetRawStatementForPeriod(context.Background(), sunday, saturday); err != nil {
+		t.Fatalf("GetRawStatementForPeriod: %v", err)
+	}
+	if len(stub.urls) < 1 || !strings.Contains(stub.urls[0], "fd=20260504") || !strings.Contains(stub.urls[0], "td=20260529") {
+		t.Fatalf("Sunday to Saturday went out as %v, want Monday to Friday", stub.urls)
+	}
+
+	sent := len(stub.urls)
+	_, _, err := i.GetRawStatementForPeriod(context.Background(), saturday, saturday.AddDate(0, 0, 1))
+	if !errors.Is(err, ErrStatementUnavailable) {
+		t.Fatalf("a weekend: %v, want ErrStatementUnavailable before the token gate", err)
+	}
+	if len(stub.urls) != sent {
+		t.Fatal("a weekend went out to IBKR")
 	}
 }

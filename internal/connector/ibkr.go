@@ -49,6 +49,20 @@ func LastStatementDay(now time.Time) time.Time {
 	return d
 }
 
+// statementPeriod pulls [from, to] in to weekdays. IBKR answers 1003,
+// "Statement is not available", to a period ending on a Saturday, as if none of
+// its days had a statement (seen 2026-10-27); a weekend holds no statement day,
+// so nothing is lost. ok is false when no weekday is left.
+func statementPeriod(from, to time.Time) (time.Time, time.Time, bool) {
+	f := from.UTC()
+	from = time.Date(f.Year(), f.Month(), f.Day(), 0, 0, 0, 0, time.UTC)
+	for from.Weekday() == time.Saturday || from.Weekday() == time.Sunday {
+		from = from.AddDate(0, 0, 1)
+	}
+	to = LastStatementDay(to.AddDate(0, 0, 1))
+	return from, to, !from.After(to)
+}
+
 // flexReportEntry holds a cached Flex XML report, shared across IBKR connector
 // instances that use the same token:queryId. Required because IBKR enforces a
 // token-level rate limit (error 1018) and users who link the same Flex
@@ -473,6 +487,10 @@ func flexPeriodURL(base, token, query string, from, to time.Time) string {
 // requestStatement asks IBKR for the statement of [from, to] and polls until
 // it is generated. Pacing is the caller's (claimFlexToken).
 func (i *IBKR) requestStatement(ctx context.Context, from, to time.Time) ([]byte, error) {
+	from, to, ok := statementPeriod(from, to)
+	if !ok {
+		return nil, ErrStatementUnavailable
+	}
 	refCode, err := i.sendFlexRequest(ctx, flexPeriodURL(ibkrFlexWSSendURL, i.token, i.queryID, from, to))
 	if err != nil {
 		return nil, err
@@ -1000,6 +1018,10 @@ func (i *IBKR) GetRawStatementForPeriod(ctx context.Context, from, to time.Time)
 }
 
 func (i *IBKR) fetchPeriodStatement(ctx context.Context, from, to time.Time) ([]byte, error) {
+	// Before the claim: a weekend has no statement to spend the token on.
+	if _, _, ok := statementPeriod(from, to); !ok {
+		return nil, ErrStatementUnavailable
+	}
 	if err := claimFlexTokenWaiting(ctx, i.token); err != nil {
 		return nil, err
 	}
