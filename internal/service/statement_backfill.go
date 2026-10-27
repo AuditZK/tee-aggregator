@@ -116,6 +116,16 @@ func (s *SyncService) releaseBackfill(connMeta *repository.ExchangeConnection) {
 	s.backfillMu.Unlock()
 }
 
+// startBackfillIfDue starts the statement backfill a sync found due, once the
+// sync has saved its live row: the backfill clears that row's inception stamp,
+// and cannot clear one not written yet. After the live read, too, whose token
+// the backfill's first statement would otherwise take.
+func (s *SyncService) startBackfillIfDue(connMeta *repository.ExchangeConnection, result *SyncResult) {
+	if result != nil && result.backfillDue {
+		s.startStatementBackfill(connMeta)
+	}
+}
+
 // startStatementBackfill reads the connection's year in the background. It
 // shares the cached connector with the daily syncs: its period reads write
 // nothing on it.

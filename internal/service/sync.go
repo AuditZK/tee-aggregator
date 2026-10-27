@@ -581,6 +581,10 @@ type SyncResult struct {
 
 	// snapshot is the built snapshot for atomic batch saves (not serialized).
 	snapshot *repository.Snapshot
+	// backfillDue marks a connection whose statement backfill is still to
+	// run; the caller starts it once the snapshot is saved
+	// (startBackfillIfDue).
+	backfillDue bool
 }
 
 // SyncUser synchronizes all exchanges for a user (manual sync).
@@ -754,6 +758,7 @@ func (s *SyncService) getConnectionsByExchange(ctx context.Context, userUID, exc
 func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.ExchangeConnection) *SyncResult {
 	lastAttempt := time.Now().UTC()
 	result := s.buildConnectionSnapshot(ctx, connMeta)
+	defer s.startBackfillIfDue(connMeta, result)
 	defer s.recordSyncStatus(ctx, connMeta, result, lastAttempt)
 	if result.Error != "" || result.snapshot == nil {
 		return result
@@ -931,6 +936,7 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		conn := findConnection(connections, r.Exchange, r.Label)
 		if conn != nil {
 			s.recordSyncStatus(ctx, conn, r, now)
+			s.startBackfillIfDue(conn, r)
 		}
 	}
 
@@ -1125,6 +1131,7 @@ func (s *SyncService) retryConnectionDeferred(conn *repository.ExchangeConnectio
 
 	attempt := time.Now().UTC()
 	result := s.buildConnectionSnapshot(ctx, conn)
+	defer s.startBackfillIfDue(conn, result)
 	if result.Error != "" {
 		s.logger.Warn("deferred rate-limit retry still failing",
 			zap.String("user_uid", conn.UserUID),
@@ -1174,11 +1181,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		return result
 	}
 	rebuilt, backfill, rerr := s.reconstructIfEverySync(ctx, connMeta, conn, result)
-	if backfill {
-		// After the live read: the backfill's first statement would otherwise
-		// take the token the live read needs.
-		defer s.startStatementBackfill(connMeta)
-	}
+	result.backfillDue = backfill
 	if errors.Is(rerr, connector.ErrStatementNotPublished) {
 		s.deferStatement(ctx, conn, connMeta, result, statementNotPublishedReason())
 		return result
