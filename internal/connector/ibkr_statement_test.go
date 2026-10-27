@@ -108,15 +108,7 @@ func TestSingleFlexStatement_LargestAccountIsKept(t *testing.T) {
 // accounts is the kind of gap CapabilityWarnings exists to surface.
 func TestStatementReport_MultiAccountRaisesAWarning(t *testing.T) {
 	i := &IBKR{token: "synthetic-token-multi", queryID: "000001"}
-	key := i.token + ":" + i.queryID
-	flexReportCacheMu.Lock()
-	flexReportCache[key] = &flexReportEntry{xml: []byte(multiAccountReport), fetchedAt: time.Now()}
-	flexReportCacheMu.Unlock()
-	t.Cleanup(func() {
-		flexReportCacheMu.Lock()
-		delete(flexReportCache, key)
-		flexReportCacheMu.Unlock()
-	})
+	plantDailyStatement(t, i, []byte(multiAccountReport))
 
 	flows, err := i.GetCashflows(context.Background(), time.Time{})
 	if err != nil {
@@ -224,18 +216,10 @@ func TestSingleFlexStatement_DailyStatementsAreMergedBack(t *testing.T) {
 
 func TestStatementReport_DailyStatementsRaiseNoMultiAccountWarning(t *testing.T) {
 	i := &IBKR{token: "synthetic-token-daily", queryID: "000002"}
-	key := i.token + ":" + i.queryID
-	flexReportCacheMu.Lock()
-	flexReportCache[key] = &flexReportEntry{xml: dailyReport(
+	plantDailyStatement(t, i, dailyReport(
 		dailyBlock("U0000001", "20260601", "20260529", "1000", "1000", quietDay),
 		dailyBlock("U0000001", "20260602", "20260601", "1000", "1500", sweepIn),
-	), fetchedAt: time.Now()}
-	flexReportCacheMu.Unlock()
-	t.Cleanup(func() {
-		flexReportCacheMu.Lock()
-		delete(flexReportCache, key)
-		flexReportCacheMu.Unlock()
-	})
+	))
 
 	flows, err := i.GetCashflows(context.Background(), time.Time{})
 	if err != nil {
@@ -367,4 +351,20 @@ func TestCashReport_OutgoingSweepIsAWithdrawal(t *testing.T) {
 	if len(flows) != 1 || flows[0].Amount != -750 || flows[0].Timestamp.Format("20060102") != "20260602" {
 		t.Fatalf("flows %+v, want -750 on 2026-06-02", flows)
 	}
+}
+
+// plantDailyStatement caches report as the connection's daily statement, wide
+// enough to answer every read.
+func plantDailyStatement(t *testing.T, i *IBKR, report []byte) {
+	t.Helper()
+	key := i.token + ":" + i.queryID
+	to := LastStatementDay(time.Now())
+	flexReportCacheMu.Lock()
+	flexReportCache[key] = &flexReportEntry{xml: report, from: to.AddDate(-5, 0, 0), to: to, fetchedAt: time.Now()}
+	flexReportCacheMu.Unlock()
+	t.Cleanup(func() {
+		flexReportCacheMu.Lock()
+		delete(flexReportCache, key)
+		flexReportCacheMu.Unlock()
+	})
 }

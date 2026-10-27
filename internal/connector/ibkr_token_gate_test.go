@@ -60,8 +60,8 @@ func TestClaimFlexToken_ReopensAfterCooldown(t *testing.T) {
 }
 
 func TestErrFlexTokenBusy_IsTransientAndMatchesRateLimitPredicate(t *testing.T) {
-	// Shaped exactly as fetchFlexReport emits it.
-	err := fmt.Errorf("%w (retry after ~Sep 16 03:00 UTC)", ErrFlexTokenBusy)
+	retryAt := time.Date(2026, 9, 16, 3, 0, 0, 0, time.UTC)
+	err := fmt.Errorf("read statement: %w", &flexBusyError{retryAt: retryAt})
 
 	if !errors.Is(err, ErrTransient) {
 		t.Fatal("token-busy must be transient — it is pacing, not a credential failure")
@@ -74,6 +74,9 @@ func TestErrFlexTokenBusy_IsTransientAndMatchesRateLimitPredicate(t *testing.T) 
 	// silently disarms both — this test is the tripwire.
 	if !strings.Contains(err.Error(), "shared flex token cooling down") {
 		t.Fatalf("error text must carry the machine-readable marker, got: %s", err.Error())
+	}
+	if got, ok := FlexRetryAt(err); !ok || !got.Equal(retryAt) {
+		t.Fatalf("FlexRetryAt = %v, %v, want %v", got, ok, retryAt)
 	}
 }
 

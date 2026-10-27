@@ -705,6 +705,20 @@ func (s *ConnectionService) MarkRebuildFinalized(ctx context.Context, connID str
 	return s.repo.MarkRebuildFinalized(ctx, connID, at)
 }
 
+// HistoryBackfilled reports whether the connection's statement backfill has
+// completed. A schema without the column cannot record it, and reads as done so
+// the backfill does not run on every sync.
+func (s *ConnectionService) HistoryBackfilled(ctx context.Context, connID string) (bool, error) {
+	if !s.repo.HasRebuildFinalizedAtCol(ctx) {
+		return true, nil
+	}
+	at, err := s.repo.RebuildFinalizedAt(ctx, connID)
+	if err != nil {
+		return false, err
+	}
+	return at != nil, nil
+}
+
 // ClearRebuildConsent passes through to ConnectionRepo.
 func (s *ConnectionService) ClearRebuildConsent(ctx context.Context, connID string) error {
 	return s.repo.ClearRebuildConsent(ctx, connID)

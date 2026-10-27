@@ -300,11 +300,12 @@ var collapseGuardDelay = 2 * time.Minute
 const ctraderRecurringReconstructDays = 14
 
 // reconstructsEverySync reports whether an exchange's in-enclave history
-// provider is re-run on every sync (not just at connect). IBKR's Flex is a
-// single cheap call; cTrader re-runs a bounded recent window (see
-// everySyncReconstructSince): the ledger's calendar-day flows see through a
-// demo reset the live cash-flow read books at its raw size, and replace the
-// mid-day measurement a connect or a manual re-sync leaves behind.
+// provider is re-run on every sync (not just at connect), over a bounded recent
+// window (see everySyncReconstructSince). IBKR's statement states each day's
+// close and flows, which the live row, holding the day before, cannot;
+// cTrader's ledger's calendar-day flows see through a demo reset the live
+// cash-flow read books at its raw size, and replace the mid-day measurement a
+// connect or a manual re-sync leaves behind.
 //
 // IMPORTANT: only ever consulted INSIDE a conn.(connector.HistoricalSnapshotProvider)
 // type assertion. Non-reconstructed exchanges (Hyperliquid/MEXC/Lighter) never
@@ -337,13 +338,17 @@ func isBalanceReconciled(exchange string) bool {
 }
 
 // everySyncReconstructSince returns the lookback for an every-sync
-// reconstruction. IBKR re-emits its full Flex window cheaply (zero = full);
-// cTrader's walk is expensive (paginated deals + weekly cash-flow chunks), so
-// the recurring re-run is bounded — the deep backfill happens once at connect
-// or via the admin reconstruct endpoint (both pass since=zero).
-func everySyncReconstructSince(exchange string) time.Time {
-	if strings.EqualFold(exchange, "ctrader") {
-		return time.Now().UTC().AddDate(0, 0, -ctraderRecurringReconstructDays)
+// reconstruction. Both venues bound it and read their history once, at connect
+// or via the admin reconstruct endpoint: cTrader's walk is expensive (paginated
+// deals + weekly cash-flow chunks), and an IBKR statement's generation time
+// grows with its period (statementWindowStart, the statement backfill).
+func (s *SyncService) everySyncReconstructSince(ctx context.Context, connMeta *repository.ExchangeConnection) time.Time {
+	now := time.Now().UTC()
+	switch strings.ToLower(connMeta.Exchange) {
+	case "ctrader":
+		return now.AddDate(0, 0, -ctraderRecurringReconstructDays)
+	case "ibkr":
+		return s.statementWindowStart(ctx, connMeta, now)
 	}
 	return time.Time{}
 }
@@ -382,6 +387,12 @@ type SyncService struct {
 	deferredRetries map[string]bool
 	// deferAfter stands in for time.AfterFunc in tests.
 	deferAfter func(time.Duration, func())
+
+	// backfills holds the connections whose statement backfill is running,
+	// keyed user|exchange|label, so a sync and an admin call never read the
+	// same year twice at once. Guarded by backfillMu.
+	backfillMu sync.Mutex
+	backfills  map[string]bool
 
 	// connectorGroup collapses concurrent builds of the SAME connector
 	// (E-M1, CONN-11 residue 2). getOrCreateConnector was check-then-create:
@@ -570,6 +581,10 @@ type SyncResult struct {
 
 	// snapshot is the built snapshot for atomic batch saves (not serialized).
 	snapshot *repository.Snapshot
+	// backfillDue marks a connection whose statement backfill is still to
+	// run; the caller starts it once the snapshot is saved
+	// (startBackfillIfDue).
+	backfillDue bool
 }
 
 // SyncUser synchronizes all exchanges for a user (manual sync).
@@ -743,6 +758,7 @@ func (s *SyncService) getConnectionsByExchange(ctx context.Context, userUID, exc
 func (s *SyncService) syncConnection(ctx context.Context, connMeta *repository.ExchangeConnection) *SyncResult {
 	lastAttempt := time.Now().UTC()
 	result := s.buildConnectionSnapshot(ctx, connMeta)
+	defer s.startBackfillIfDue(connMeta, result)
 	defer s.recordSyncStatus(ctx, connMeta, result, lastAttempt)
 	if result.Error != "" || result.snapshot == nil {
 		return result
@@ -920,6 +936,7 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		conn := findConnection(connections, r.Exchange, r.Label)
 		if conn != nil {
 			s.recordSyncStatus(ctx, conn, r, now)
+			s.startBackfillIfDue(conn, r)
 		}
 	}
 
@@ -991,11 +1008,7 @@ func (r *SyncResult) rateLimited() bool {
 // Holidays are not modelled; the guard then skips one extra day, which the
 // nightly reconstruction fills — a conservative, self-healing miss.
 func lastExpectedStatementDate(startOfDay time.Time) time.Time {
-	d := startOfDay.AddDate(0, 0, -1)
-	for d.Weekday() == time.Saturday || d.Weekday() == time.Sunday {
-		d = d.AddDate(0, 0, -1)
-	}
-	return d
+	return connector.LastStatementDay(startOfDay)
 }
 
 // staleBalanceSkipReason returns a non-empty human-readable reason when conn's
@@ -1118,6 +1131,7 @@ func (s *SyncService) retryConnectionDeferred(conn *repository.ExchangeConnectio
 
 	attempt := time.Now().UTC()
 	result := s.buildConnectionSnapshot(ctx, conn)
+	defer s.startBackfillIfDue(conn, result)
 	if result.Error != "" {
 		s.logger.Warn("deferred rate-limit retry still failing",
 			zap.String("user_uid", conn.UserUID),
@@ -1166,7 +1180,12 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	if !ok {
 		return result
 	}
-	rebuilt := s.reconstructIfEverySync(ctx, connMeta, conn, result)
+	rebuilt, backfill, rerr := s.reconstructIfEverySync(ctx, connMeta, conn, result)
+	result.backfillDue = backfill
+	if errors.Is(rerr, connector.ErrStatementNotPublished) {
+		s.deferStatement(ctx, conn, connMeta, result, statementNotPublishedReason())
+		return result
+	}
 	balance, ok := s.liveBalance(ctx, conn, connMeta, result, start)
 	if !ok {
 		return result
@@ -1258,25 +1277,37 @@ func (s *SyncService) connectorFor(ctx context.Context, connMeta *repository.Exc
 }
 
 // reconstructIfEverySync re-runs the history reconstruction of the venues
-// that do it on every sync. IBKR re-emits its full Flex window cheaply;
-// cTrader re-runs a bounded recent window (everySyncReconstructSince) to heal
-// the live/reconstruction boundary deposit double-count. Every other venue
-// reconstructs once, at connect (ReconstructHistoryOnConnect). Returns the
-// days it wrote; none when it failed, was refused or did not run.
-func (s *SyncService) reconstructIfEverySync(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, result *SyncResult) rebuiltDays {
+// that do it on every sync, over a bounded recent window
+// (everySyncReconstructSince): IBKR to state each day from its statement,
+// cTrader to heal the live/reconstruction boundary deposit double-count. Every
+// other venue reconstructs once, at connect (ReconstructHistoryOnConnect).
+// Returns the days it wrote (none when it failed, was refused or did not run),
+// whether the connection's statement backfill is still to run, which replaces
+// the window until it has, and the reconstruction's error.
+func (s *SyncService) reconstructIfEverySync(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, result *SyncResult) (rebuiltDays, bool, error) {
 	hsp, ok := conn.(connector.HistoricalSnapshotProvider)
 	if !ok || !reconstructsEverySync(connMeta.Exchange) {
-		return nil
+		return nil, false, nil
+	}
+	if _, periodic := conn.(connector.PeriodHistoryProvider); periodic && !s.historyBackfilled(ctx, connMeta) {
+		return nil, true, nil
 	}
 	written := rebuiltDays{}
-	noteReconstructionFailure(result, s.syncFromHistoricalProvider(ctx, connMeta, hsp, everySyncReconstructSince(connMeta.Exchange), reconstructOpts{written: written.add}))
-	return written
+	err := s.syncFromHistoricalProvider(ctx, connMeta, hsp, s.everySyncReconstructSince(ctx, connMeta), reconstructOpts{written: written.add})
+	if !errors.Is(err, connector.ErrStatementNotPublished) {
+		noteReconstructionFailure(result, err)
+	}
+	return written, false, err
 }
 
 // liveBalance reads the balance through the collapse guard, or records the
 // failure on result.
 func (s *SyncService) liveBalance(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, result *SyncResult, start time.Time) (*connector.Balance, bool) {
 	balance, err := s.fetchBalanceWithCollapseGuard(ctx, conn, connMeta)
+	if errors.Is(err, connector.ErrStatementNotPublished) {
+		s.deferStatement(ctx, conn, connMeta, result, statementNotPublishedReason())
+		return nil, false
+	}
 	if err != nil {
 		result.Error = egressSyncError("get balance", err)
 		result.RateLimited = isRateLimitError(err.Error())
@@ -1296,6 +1327,13 @@ func (s *SyncService) skipStaleStatement(ctx context.Context, conn connector.Con
 	if reason == "" {
 		return false
 	}
+	s.deferStatement(ctx, conn, connMeta, result, reason)
+	return true
+}
+
+// deferStatement skips the live snapshot of a statement that does not hold the
+// last business day yet, and arms the retry that will find it published.
+func (s *SyncService) deferStatement(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, result *SyncResult, reason string) {
 	result.Skipped = true
 	result.SkipReason = reason
 	s.logger.Warn("skipping live snapshot: stale statement",
@@ -1307,7 +1345,13 @@ func (s *SyncService) skipStaleStatement(ctx context.Context, conn connector.Con
 	s.collectCapabilityWarnings(conn, connMeta, result)
 	s.recordRateLimitHit(ctx, connMeta)
 	s.scheduleDeferredRetry(connMeta, rateLimitRetryDelay)
-	return true
+}
+
+// statementNotPublishedReason states, for sync_statuses, the statement IBKR
+// has not published yet. IBKR's own wording stays in the log.
+func statementNotPublishedReason() string {
+	return fmt.Sprintf("stale statement: statement for %s not published yet",
+		connector.LastStatementDay(time.Now()).Format("2006-01-02"))
 }
 
 // liveActivity is what a sync reads over its activity window.
@@ -1736,6 +1780,12 @@ func (s *SyncService) reconstructHistoryFor(ctx context.Context, userUID, exchan
 // the decision that governs whether credentials leave the enclave — is
 // unit-testable without a DB-backed ConnectionService.
 func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, creds *Credentials, opts reconstructOpts) {
+	if pp, ok := conn.(connector.PeriodHistoryProvider); ok {
+		// A statement broker reads its year a month at a time (the statement
+		// backfill); a window reads only its own days.
+		s.reconstructFromStatements(ctx, connMeta, pp, opts)
+		return
+	}
 	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
 		// IBKR (and any future ZK-native provider) keeps the in-enclave path:
 		// signed by the report chain, stays inside the SEV-SNP perimeter.
@@ -2200,11 +2250,10 @@ func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.Excha
 // distinguish reconstructed days (daily summary, no per-trade detail) from
 // live days (full trade breakdown).
 //
-// The Query period is configured user-side (LastBusinessWeek, YTD, custom
-// range…), so we trust whatever window Flex hands back. A user who widens
-// their Flex query (e.g. 30d → 365d) sees the new earlier days flow into
-// the DB on the next sync — we log "history reconstruction detected" the
-// first time we see Flex go further back than what we already have.
+// The period is the sync's, not the one saved in the user's Flex Query: since
+// to the last published business day. We log "history reconstruction
+// detected" the first time the provider goes further back than what we
+// already have.
 func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.HistoricalSnapshotProvider, since time.Time, opts reconstructOpts) error {
 	firstSync := s.isFirstSync(ctx, connMeta)
 	if firstSync {
@@ -2233,6 +2282,16 @@ func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *
 				zap.Error(err),
 			)
 			return nil
+		}
+		if errors.Is(err, connector.ErrStatementNotPublished) {
+			// Every midnight: the business day that just closed comes out
+			// during IBKR's night. The caller defers the whole sync.
+			s.logger.Info("historical snapshots deferred (statement not published yet)",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+			)
+			return err
 		}
 		s.logger.Error("historical snapshots fetch failed",
 			zap.String("user_uid", connMeta.UserUID),

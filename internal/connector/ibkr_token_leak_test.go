@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // SEC-11: the Flex endpoint accepts no auth header, so flexURL puts the token
@@ -31,16 +32,17 @@ func newLeakProbeIBKR() *IBKR {
 func TestFlexTransportErrorHidesToken(t *testing.T) {
 	i := newLeakProbeIBKR()
 
-	if _, err := i.requestFlexReport(context.Background()); err == nil {
-		t.Fatal("requestFlexReport: want transport error, got nil")
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	if _, err := i.requestStatement(context.Background(), day, day); err == nil {
+		t.Fatal("requestStatement: want transport error, got nil")
 	} else if strings.Contains(err.Error(), auditFlexToken) {
-		t.Fatalf("flex token leaked through requestFlexReport: %s", err)
+		t.Fatalf("flex token leaked through requestStatement: %s", err)
 	}
 
-	if _, err := i.getFlexReport(context.Background(), "REF123"); err == nil {
-		t.Fatal("getFlexReport: want transport error, got nil")
+	if _, err := i.pollFlexReport(context.Background(), flexURL(ibkrFlexWSGetURL, i.token, "REF123")); err == nil {
+		t.Fatal("pollFlexReport: want transport error, got nil")
 	} else if strings.Contains(err.Error(), auditFlexToken) {
-		t.Fatalf("flex token leaked through getFlexReport: %s", err)
+		t.Fatalf("flex token leaked through pollFlexReport: %s", err)
 	}
 }
 
@@ -48,7 +50,7 @@ func TestFlexTransportErrorHidesToken(t *testing.T) {
 // not passing because the URL never carried the token.
 func TestFlexTransportErrorWouldLeakUnscrubbed(t *testing.T) {
 	i := newLeakProbeIBKR()
-	req, err := http.NewRequest("GET", flexURL(ibkrFlexURL, i.token, i.queryID), nil)
+	req, err := http.NewRequest("GET", flexURL(ibkrFlexWSSendURL, i.token, i.queryID), nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}

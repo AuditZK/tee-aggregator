@@ -48,7 +48,7 @@ func TestGetRawStatementForPeriodSendsDatesAndSkipsSharedCache(t *testing.T) {
 	if len(stub.urls) < 1 || !strings.Contains(stub.urls[0], "fd=20230101") || !strings.Contains(stub.urls[0], "td=20231231") {
 		t.Fatalf("SendRequest did not carry the period: %v", stub.urls)
 	}
-	// The legacy servlet ignores fd/td; the period must go to the Flex Web Service.
+	// Only the Flex Web Service honours a chosen period.
 	for _, u := range stub.urls {
 		if !strings.HasPrefix(u, "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/") {
 			t.Fatalf("chosen-period request went to %s", u)
