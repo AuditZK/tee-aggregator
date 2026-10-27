@@ -328,7 +328,8 @@ func TestBinance_Cashflows_SubToMasterUniversalTransferIsADeposit(t *testing.T) 
 }
 
 // A Binance Pay receipt leaves no deposit record: read from the Pay ledger,
-// it is booked as an inflow, and a payment out as an outflow.
+// it is booked as an inflow, and a payment out as an outflow. A payment drawn
+// from the funding wallet or paid by card moved nothing the equity measures.
 func TestBinance_Cashflows_PayTransfersAreFlows(t *testing.T) {
 	stamp := time.Now().UTC().Add(-time.Hour).UnixMilli()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -337,7 +338,7 @@ func TestBinance_Cashflows_PayTransfersAreFlows(t *testing.T) {
 		case strings.Contains(r.URL.Path, "/capital/"):
 			_, _ = w.Write([]byte(`[]`))
 		case strings.Contains(r.URL.Path, "/pay/transactions"):
-			_, _ = fmt.Fprintf(w, `{"code":"000000","data":[{"amount":"300","currency":"USDT","transactionTime":%d},{"amount":"-20","currency":"USDT","transactionTime":%d}]}`, stamp, stamp)
+			_, _ = fmt.Fprintf(w, `{"code":"000000","data":[{"amount":"300","currency":"USDT","transactionTime":%d,"walletType":2},{"amount":"-20","currency":"USDT","transactionTime":%d},{"amount":"-75","currency":"USDT","transactionTime":%d,"walletType":1},{"amount":"-40","currency":"USDT","transactionTime":%d,"walletType":4}]}`, stamp, stamp, stamp, stamp)
 		case strings.Contains(r.URL.Path, "/sub-account/"):
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`{"code":-12022,"msg":"not a master"}`))
