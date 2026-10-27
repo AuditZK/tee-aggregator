@@ -280,6 +280,26 @@ func TestBinance_Cashflows_FundingWalletOnChainFlowsStayOutside(t *testing.T) {
 	}
 }
 
+// The raw dump books the same flows as GetCashflows, each named by its ledger
+// and asset, so a flow the equity never showed can be traced.
+func TestBinance_RawCashflowEntries_NameTheirSource(t *testing.T) {
+	b, since := masterAccountServer(t, 0)
+	ops, err := b.GetRawCashflowEntries(context.Background(), since)
+	if err != nil {
+		t.Fatalf("GetRawCashflowEntries: %v", err)
+	}
+	got := map[string]float64{}
+	for _, op := range ops {
+		if op.Currency != "USDC" {
+			t.Fatalf("want the moved asset on every entry, got %+v", op)
+		}
+		got[op.Label] += op.Delta
+	}
+	if len(got) != 2 || got["master_sub"] != -100 || got["stray_um"] != -134 {
+		t.Fatalf("want master_sub -100 and stray_um -134, got %v", got)
+	}
+}
+
 func TestBinance_Cashflows_BankWithdrawalIsAWithdrawal(t *testing.T) {
 	stamp := time.Now().UTC().Add(-time.Hour).UnixMilli()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

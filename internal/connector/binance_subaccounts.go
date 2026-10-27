@@ -44,7 +44,7 @@ const binanceCounterpartWindow = 10 * time.Minute
 // and its whole track record read as a total loss). Best-effort throughout: a
 // key that is not a master reads no sub-account list, a key without futures
 // reads no income, and neither touches the flows already collected.
-func (b *Binance) fetchSubAccountAndStrayFlows(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) {
+func (b *Binance) fetchSubAccountAndStrayFlows(ctx context.Context, since, now time.Time, bind func(string) func(time.Time, float64), usdValue func(string, float64) float64) {
 	master := b.masterSubMoves(ctx, since, now, b.subAccountEmails(ctx))
 	sub := b.subUserMoves(ctx, since, now)
 
@@ -58,15 +58,19 @@ func (b *Binance) fetchSubAccountAndStrayFlows(ctx context.Context, since, now t
 		sub = orientBinanceSubMoves(sub, moves, counterparts)
 	}
 
-	booked := append(master, sub...)
-	for _, m := range booked {
-		add(m.t, usdValue(m.coin, m.qty))
+	addMaster, addSub, addStray := bind("master_sub"), bind("sub_user"), bind("stray_um")
+	for _, m := range master {
+		addMaster(m.t, usdValue(m.coin, m.qty))
+	}
+	for _, m := range sub {
+		addSub(m.t, usdValue(m.coin, m.qty))
 	}
 	if !ok {
 		return
 	}
+	booked := append(master, sub...)
 	for _, m := range strayBinanceMoves(moves, append(counterparts, booked...)) {
-		add(m.t, usdValue(m.coin, m.qty))
+		addStray(m.t, usdValue(m.coin, m.qty))
 	}
 }
 
