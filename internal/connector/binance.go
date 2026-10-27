@@ -946,6 +946,7 @@ func (b *Binance) collectCashflows(ctx context.Context, since time.Time, sink fu
 	b.fetchExternalTransfers(ctx, since, now, measured, bind, usdValue)
 	b.fetchSubAccountAndStrayFlows(ctx, since, now, bind, usdValue)
 	b.fetchFiatFlows(ctx, since, now, bind("fiat"), usdValue)
+	b.fetchPayFlows(ctx, since, now, bind("pay"), usdValue)
 	return nil
 }
 

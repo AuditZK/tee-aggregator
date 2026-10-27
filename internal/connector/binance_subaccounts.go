@@ -403,6 +403,40 @@ func binanceTransferKey(kind string, id json.RawMessage, t int64, asset, qty str
 	return kind + ":" + strconv.FormatInt(t, 10) + ":" + asset + ":" + qty
 }
 
+// fetchPayFlows books Binance Pay transfers between users. They land in the
+// account with no deposit record and no universal transfer, and the history
+// rebuilder already books them: without them here a Pay receipt paid out the
+// same day read as a gain the size of the payout. Amounts are signed by the
+// venue (+ received, − paid). Best-effort: a key without the Pay permission
+// adds nothing.
+func (b *Binance) fetchPayFlows(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) {
+	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, "/sapi/v1/pay/transactions", url.Values{
+		"startTime": {strconv.FormatInt(since.UnixMilli(), 10)},
+		"endTime":   {strconv.FormatInt(now.UnixMilli(), 10)},
+		"limit":     {"100"},
+	}, true)
+	if err != nil {
+		return
+	}
+	var resp struct {
+		Data []struct {
+			Amount          string `json:"amount"`
+			Currency        string `json:"currency"`
+			TransactionTime int64  `json:"transactionTime"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &resp) != nil {
+		return
+	}
+	for _, row := range resp.Data {
+		amt, _ := strconv.ParseFloat(row.Amount, 64)
+		if amt == 0 || row.Currency == "" || row.TransactionTime == 0 {
+			continue
+		}
+		add(time.UnixMilli(row.TransactionTime).UTC(), usdValue(row.Currency, amt))
+	}
+}
+
 // fetchFiatFlows books bank transfers (fiat orders) and card purchases and
 // sales (fiat payments). Neither shows in the crypto deposit or withdrawal
 // history, so an account used as an off-ramp (crypto in, converted to EUR,
