@@ -327,6 +327,45 @@ func TestBinance_Cashflows_SubToMasterUniversalTransferIsADeposit(t *testing.T) 
 	}
 }
 
+// A Binance Pay receipt leaves no deposit record: read from the Pay ledger,
+// it is booked as an inflow, and a payment out as an outflow.
+func TestBinance_Cashflows_PayTransfersAreFlows(t *testing.T) {
+	stamp := time.Now().UTC().Add(-time.Hour).UnixMilli()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/capital/"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/pay/transactions"):
+			_, _ = fmt.Fprintf(w, `{"code":"000000","data":[{"amount":"300","currency":"USDT","transactionTime":%d},{"amount":"-20","currency":"USDT","transactionTime":%d}]}`, stamp, stamp)
+		case strings.Contains(r.URL.Path, "/sub-account/"):
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":-12022,"msg":"not a master"}`))
+		case strings.Contains(r.URL.Path, "/fapi/v1/income"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/asset/transfer"):
+			_, _ = w.Write([]byte(`{"total":0,"rows":[]}`))
+		case strings.Contains(r.URL.Path, "/fiat/"):
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: hostRewriter{base: http.DefaultTransport, target: target}}
+	b := NewBinanceWithClient(&Credentials{APIKey: "k", APISecret: "s"}, client)
+
+	flows, err := b.GetCashflows(context.Background(), time.Now().UTC().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	got := cashflowAmounts(flows)
+	if len(got) != 2 || got[0] != -20 || got[1] != 300 {
+		t.Fatalf("want the payment out [-20] and the receipt [300], got %v", got)
+	}
+}
+
 // The raw dump books the same flows as GetCashflows, each named by its ledger
 // and asset, so a flow the equity never showed can be traced.
 func TestBinance_RawCashflowEntries_NameTheirSource(t *testing.T) {
