@@ -407,9 +407,10 @@ func binanceTransferKey(kind string, id json.RawMessage, t int64, asset, qty str
 // account with no deposit record and no universal transfer, and the history
 // rebuilder already books them: without them here a Pay receipt paid out the
 // same day read as a gain the size of the payout. Amounts are signed by the
-// venue (+ received, − paid). Best-effort: a key without the Pay permission
-// adds nothing.
-func (b *Binance) fetchPayFlows(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) {
+// venue (+ received, − paid). A row is booked only when it moved a wallet the
+// equity measures: a payment can still be drawn from the funding wallet.
+// Best-effort: a key without the Pay permission adds nothing.
+func (b *Binance) fetchPayFlows(ctx context.Context, since, now time.Time, measured map[string]bool, add func(time.Time, float64), usdValue func(string, float64) float64) {
 	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, "/sapi/v1/pay/transactions", url.Values{
 		"startTime": {strconv.FormatInt(since.UnixMilli(), 10)},
 		"endTime":   {strconv.FormatInt(now.UnixMilli(), 10)},
@@ -423,6 +424,7 @@ func (b *Binance) fetchPayFlows(ctx context.Context, since, now time.Time, add f
 			Amount          string `json:"amount"`
 			Currency        string `json:"currency"`
 			TransactionTime int64  `json:"transactionTime"`
+			WalletType      int    `json:"walletType"`
 		} `json:"data"`
 	}
 	if json.Unmarshal(body, &resp) != nil {
@@ -430,11 +432,24 @@ func (b *Binance) fetchPayFlows(ctx context.Context, since, now time.Time, add f
 	}
 	for _, row := range resp.Data {
 		amt, _ := strconv.ParseFloat(row.Amount, 64)
-		if amt == 0 || row.Currency == "" || row.TransactionTime == 0 {
+		if amt == 0 || row.Currency == "" || row.TransactionTime == 0 || !measured[binancePayWallet(row.WalletType)] {
 			continue
 		}
 		add(time.UnixMilli(row.TransactionTime).UTC(), usdValue(row.Currency, amt))
 	}
+}
+
+// binancePayWallet names the wallet a Pay row moved: 1 funding, 2 spot,
+// 3 the fiat balance (held in spot), 5 earn. 4 and 6 are card payments and
+// move no Binance wallet. A row without the field predates it and is spot.
+func binancePayWallet(walletType int) string {
+	switch walletType {
+	case 0, 2, 3:
+		return binanceWalletSpot
+	case 1:
+		return binanceWalletFunding
+	}
+	return ""
 }
 
 // fetchFiatFlows books bank transfers (fiat orders) and card purchases and
