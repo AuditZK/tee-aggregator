@@ -280,6 +280,53 @@ func TestBinance_Cashflows_FundingWalletOnChainFlowsStayOutside(t *testing.T) {
 	}
 }
 
+// The universal transfer history answers only what the master sent unless it
+// is asked by sub-account email: money a sub-account sends back to its master
+// is an inflow, read under the sub's email, and booked once.
+func TestBinance_Cashflows_SubToMasterUniversalTransferIsADeposit(t *testing.T) {
+	stamp := time.Now().UTC().Add(-time.Hour).UnixMilli()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		q := r.URL.Query()
+		switch {
+		case strings.Contains(r.URL.Path, "/capital/"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/sub-account/list"):
+			_, _ = w.Write([]byte(`{"subAccounts":[{"email":"` + testSubEmail + `"}]}`))
+		case strings.Contains(r.URL.Path, "/sub-account/sub/transfer/history"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/sub-account/universalTransfer") && q.Get("fromEmail") == testSubEmail:
+			_, _ = fmt.Fprintf(w, `{"result":[{"tranId":9,"fromEmail":"%s","toEmail":"%s","asset":"USDT","amount":"250","status":"SUCCESS","createTimeStamp":%d}]}`, testSubEmail, testMasterEmail, stamp)
+		case strings.Contains(r.URL.Path, "/sub-account/universalTransfer"):
+			_, _ = fmt.Fprintf(w, `{"result":[{"tranId":8,"fromEmail":"%s","toEmail":"%s","asset":"USDT","amount":"100","status":"SUCCESS","createTimeStamp":%d}]}`, testMasterEmail, testSubEmail, stamp)
+		case strings.Contains(r.URL.Path, "/sub-account/transfer/subUserHistory"):
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":-12022,"msg":"not a sub-account"}`))
+		case strings.Contains(r.URL.Path, "/fapi/v1/income"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/asset/transfer"):
+			_, _ = w.Write([]byte(`{"total":0,"rows":[]}`))
+		case strings.Contains(r.URL.Path, "/fiat/"):
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: hostRewriter{base: http.DefaultTransport, target: target}}
+	b := NewBinanceWithClient(&Credentials{APIKey: "k", APISecret: "s"}, client)
+
+	flows, err := b.GetCashflows(context.Background(), time.Now().UTC().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	got := cashflowAmounts(flows)
+	if len(got) != 2 || got[0] != -100 || got[1] != 250 {
+		t.Fatalf("want the master's transfer out [-100] and the sub's transfer back [250], got %v", got)
+	}
+}
+
 // The raw dump books the same flows as GetCashflows, each named by its ledger
 // and asset, so a flow the equity never showed can be traced.
 func TestBinance_RawCashflowEntries_NameTheirSource(t *testing.T) {
