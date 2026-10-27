@@ -37,6 +37,18 @@ func TestStatementBackfillRange(t *testing.T) {
 	}
 }
 
+// The rest of a month after a cut may come back empty when it is a holiday or
+// two IBKR wrote no day for; three weeks of it may not.
+func TestHolidayTail(t *testing.T) {
+	end := isoDay("2026-05-29")
+	if !holidayTail(isoDay("2026-05-27"), end) {
+		t.Fatal("three days before the month's end read as days IBKR kept")
+	}
+	if holidayTail(isoDay("2026-05-08"), end) {
+		t.Fatal("three weeks read as a holiday")
+	}
+}
+
 func TestNextBackfillCursor(t *testing.T) {
 	days := func(dates ...string) []*connector.HistoricalSnapshot {
 		var out []*connector.HistoricalSnapshot

@@ -15,7 +15,8 @@ import (
 
 // periodicStatementConnector is a statement venue that also reads a chosen
 // period, and cuts each statement after maxDays days the way IBKR does under
-// load: the oldest kept, nothing said.
+// load: the oldest kept, nothing said. A period without a day is answered
+// 1003, as IBKR answers one before the account's first statement.
 type periodicStatementConnector struct {
 	*statementConnector
 	maxDays      int
@@ -43,10 +44,23 @@ func (c *periodicStatementConnector) GetHistoricalSnapshotsForPeriod(_ context.C
 	c.periods = append(c.periods, dayWindow{from: from, to: to})
 	c.mu.Unlock()
 	out := c.days(from, to)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: synthetic", connector.ErrStatementUnavailable)
+	}
 	if c.maxDays > 0 && len(out) > c.maxDays {
 		out = out[:c.maxDays]
 	}
 	return out, nil
+}
+
+func (c *periodicStatementConnector) firstDay() time.Time {
+	var first time.Time
+	for d := range c.closes {
+		if first.IsZero() || d.Before(first) {
+			first = d
+		}
+	}
+	return first
 }
 
 func (c *periodicStatementConnector) GetHistoricalSnapshots(_ context.Context, since time.Time) ([]*connector.HistoricalSnapshot, error) {
@@ -104,7 +118,9 @@ func withoutBackfillSpacing(t *testing.T) {
 }
 
 // Every statement comes back cut after a week: the backfill follows each cut
-// with a statement for the rest of its month, and writes every day.
+// with a statement for the rest of its month, and writes every day. It reads
+// newest first and asks once for a month before the account's first day: each
+// such request is a 1003, a failure on the token's daily budget.
 func TestDBStatementBackfillFollowsCutStatements(t *testing.T) {
 	withoutBackfillSpacing(t)
 	h := newDBHarness(t)
@@ -135,10 +151,75 @@ func TestDBStatementBackfillFollowsCutStatements(t *testing.T) {
 	if done, err := h.connSvc.HistoryBackfilled(h.ctx, connMeta.ID); err != nil || !done {
 		t.Fatalf("backfill not recorded as done (%v, %v)", done, err)
 	}
-	for i, p := range acct.periods[1:] {
-		if prev := acct.periods[i]; !p.from.After(prev.from) {
-			t.Fatalf("statement %d starts %s, not after the previous %s", i+1, p.from.Format(time.DateOnly), prev.from.Format(time.DateOnly))
+	if !acct.periods[0].to.Equal(to) {
+		t.Fatalf("first statement ends %s, want the newest month's end %s", acct.periods[0].to.Format(time.DateOnly), to.Format(time.DateOnly))
+	}
+	before := 0
+	for _, p := range acct.periods {
+		if p.to.Before(acct.firstDay()) {
+			before++
 		}
+	}
+	if before != 1 {
+		t.Fatalf("%d statements before the account's first day, want 1", before)
+	}
+}
+
+// A month without a statement while older days are stored is a hole, not the
+// account's start: the backfill fails, writes nothing and stays to be done.
+func TestDBStatementBackfillFailsOnAHoleInTheHistory(t *testing.T) {
+	withoutBackfillSpacing(t)
+	h := newDBHarness(t)
+	h.seedConnection(t, "ibkr", "main", dbKey, dbSecret)
+	h.sync.SetFXSource(stubFX{})
+	connMeta := h.connection(t, "ibkr", "main")
+
+	from, to := statementBackfillRange(time.Now())
+	acct := newPeriodicAccount(to.AddDate(0, 0, -60), to)
+	stored := to.AddDate(0, 0, -200)
+	if err := h.snaps.Upsert(h.ctx, &repository.Snapshot{
+		UserUID: dbUser, Exchange: "ibkr", Label: "main", Timestamp: stored,
+		TotalEquity: 900, RealizedBalance: 900,
+	}); err != nil {
+		t.Fatalf("store an older day: %v", err)
+	}
+
+	err := h.sync.backfillStatements(h.ctx, connMeta, acct, from, to, reconstructOpts{})
+	if err == nil || !strings.Contains(err.Error(), "are stored") {
+		t.Fatalf("backfill over a hole: %v, want a failure naming the stored days", err)
+	}
+	rows, rerr := h.snaps.GetByUserAndDateRange(h.ctx, dbUser, stored.Add(time.Hour), to.Add(time.Hour))
+	if rerr != nil {
+		t.Fatalf("read back: %v", rerr)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("%d days written by a failed backfill", len(rows))
+	}
+	if done, derr := h.connSvc.HistoryBackfilled(h.ctx, connMeta.ID); derr != nil || done {
+		t.Fatalf("failed backfill recorded as done (%v, %v)", done, derr)
+	}
+}
+
+// No statement in the newest month is an account with none yet, or one IBKR
+// failed to serve: not a history to record as read.
+func TestDBStatementBackfillNeedsTheNewestMonth(t *testing.T) {
+	withoutBackfillSpacing(t)
+	h := newDBHarness(t)
+	h.seedConnection(t, "ibkr", "main", dbKey, dbSecret)
+	connMeta := h.connection(t, "ibkr", "main")
+
+	from, to := statementBackfillRange(time.Now())
+	acct := newPeriodicAccount(to.AddDate(0, 0, -120), to.AddDate(0, 0, -60))
+
+	err := h.sync.backfillStatements(h.ctx, connMeta, acct, from, to, reconstructOpts{})
+	if err == nil || !strings.Contains(err.Error(), "newest month") {
+		t.Fatalf("backfill with nothing in the newest month: %v", err)
+	}
+	if len(acct.periods) != 1 {
+		t.Fatalf("%d statements asked, want the newest month's alone", len(acct.periods))
+	}
+	if done, derr := h.connSvc.HistoryBackfilled(h.ctx, connMeta.ID); derr != nil || done {
+		t.Fatalf("empty backfill recorded as done (%v, %v)", done, derr)
 	}
 }
 

@@ -176,51 +176,36 @@ func (s *SyncService) startStatementBackfill(connMeta *repository.ExchangeConnec
 	}()
 }
 
-// backfillStatements reads [from, to] a month per statement, oldest first, and
-// writes the series once all of it has been read. A statement IBKR cut short
-// is followed by one for the rest of its month: the cut keeps the oldest days
-// and says nothing, and a month missing its end is a hole the TWR walks
-// straight through. A month with no statement, or no day, before the account's
-// first is skipped. Any failure writes nothing. A full run, neither dry nor
-// windowed, records the backfill as done. The caller holds claimBackfill.
+// backfillStatements reads [from, to] a month per statement, newest first, and
+// writes the series once all of it has been read. It stops at the first month
+// without a statement, the one before the account's first: IBKR answers it with
+// 1003, a failure that doubles the token's back-off, and one per month the
+// account did not exist would fail the backfill of any account younger than the
+// year. A statement IBKR cut short is followed by one for the rest of its
+// month: the cut keeps the oldest days and says nothing, and a month missing its
+// end is a hole the TWR walks straight through. Any failure writes nothing. A
+// full run, neither dry nor windowed, records the backfill as done. The caller
+// holds claimBackfill.
 func (s *SyncService) backfillStatements(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.PeriodHistoryProvider, from, to time.Time, opts reconstructOpts) error {
+	r := &statementReader{s: s, provider: provider}
 	var read [][]*connector.HistoricalSnapshot
-	reads := 0
-	for cursor := from; !cursor.After(to); reads++ {
-		if reads == statementBackfillMaxReads {
-			return fmt.Errorf("history not read to %s in %d statements", to.Format("2006-01-02"), reads)
+	for end := to; !end.Before(from); {
+		m := dayWindow{from: end.AddDate(0, 0, -(statementBackfillPeriodDays - 1)), to: end}
+		if m.from.Before(from) {
+			m.from = from
 		}
-		if reads > 0 {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(statementBackfillSpacing):
+		month, err := r.month(ctx, m)
+		if err != nil {
+			return err
+		}
+		if len(month) == 0 {
+			if err := s.historyStartsAfter(ctx, connMeta, m, len(read) == 0); err != nil {
+				return err
 			}
+			break
 		}
-		end := cursor.AddDate(0, 0, statementBackfillPeriodDays-1)
-		if end.After(to) {
-			end = to
-		}
-		days, err := s.readStatementPeriod(ctx, provider, dayWindow{from: cursor, to: end})
-		if err != nil && !errors.Is(err, connector.ErrStatementUnavailable) {
-			return fmt.Errorf("read statement %s..%s: %w", cursor.Format("2006-01-02"), end.Format("2006-01-02"), err)
-		}
-		if len(days) == 0 {
-			if len(read) > 0 {
-				// A holiday closing a period, or a hole worth a look.
-				s.logger.Info("statement backfill: a period inside the history has no day",
-					zap.String("user_uid", connMeta.UserUID),
-					zap.String("exchange", connMeta.Exchange),
-					zap.String("label", connMeta.Label),
-					zap.Time("period_from", cursor),
-					zap.Time("period_to", end),
-				)
-			}
-			cursor = end.AddDate(0, 0, 1)
-			continue
-		}
-		read = append(read, days)
-		cursor = nextBackfillCursor(days, end)
+		read = append(month, read...)
+		end = m.from.AddDate(0, 0, -1)
 	}
 
 	series, err := s.convertHistoryToUSD(ctx, connMeta, mergePeriodSnapshots(read))
@@ -241,9 +226,91 @@ func (s *SyncService) backfillStatements(ctx context.Context, connMeta *reposito
 		zap.String("exchange", connMeta.Exchange),
 		zap.String("label", connMeta.Label),
 		zap.Int("days", len(series)),
-		zap.Int("statements", reads),
+		zap.Int("statements", r.reads),
 	)
 	return nil
+}
+
+// historyStartsAfter reads a month without a statement as the account's start,
+// unless days on or before it are stored: then it is a hole IBKR left, and the
+// backfill fails rather than write around it. The newest month without one is
+// an account with no statement yet, which the next sync asks about again.
+func (s *SyncService) historyStartsAfter(ctx context.Context, connMeta *repository.ExchangeConnection, m dayWindow, newest bool) error {
+	if newest {
+		return fmt.Errorf("no statement for %s..%s, the newest month", m.from.Format(time.DateOnly), m.to.Format(time.DateOnly))
+	}
+	earliest, err := s.snapshotRepo.GetEarliestTimestamp(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
+	switch {
+	case errors.Is(err, repository.ErrNotFound):
+	case err != nil:
+		return fmt.Errorf("read earliest stored day: %w", err)
+	case !earliest.After(m.to):
+		return fmt.Errorf("no statement for %s..%s, yet days from %s are stored", m.from.Format(time.DateOnly), m.to.Format(time.DateOnly), earliest.Format(time.DateOnly))
+	}
+	s.logger.Info("statement backfill reached the account's first statement",
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("label", connMeta.Label),
+		zap.Time("no_statement_to", m.to),
+	)
+	return nil
+}
+
+// statementReader reads a backfill's statements, spaced and bounded.
+type statementReader struct {
+	s        *SyncService
+	provider connector.PeriodHistoryProvider
+	reads    int
+}
+
+// month reads one month, following a statement IBKR cut short with one for the
+// rest of the month. Nothing back means the month has no statement.
+func (r *statementReader) month(ctx context.Context, m dayWindow) ([][]*connector.HistoricalSnapshot, error) {
+	var out [][]*connector.HistoricalSnapshot
+	for cursor := m.from; !cursor.After(m.to); {
+		days, err := r.read(ctx, dayWindow{from: cursor, to: m.to})
+		if err != nil {
+			return nil, err
+		}
+		if len(days) == 0 {
+			if len(out) > 0 && !holidayTail(cursor, m.to) {
+				return nil, fmt.Errorf("statement %s..%s has no day, after the first days of its month", cursor.Format(time.DateOnly), m.to.Format(time.DateOnly))
+			}
+			return out, nil
+		}
+		out = append(out, days)
+		cursor = nextBackfillCursor(days, m.to)
+	}
+	return out, nil
+}
+
+func (r *statementReader) read(ctx context.Context, p dayWindow) ([]*connector.HistoricalSnapshot, error) {
+	if r.reads == statementBackfillMaxReads {
+		return nil, fmt.Errorf("history not read in %d statements", r.reads)
+	}
+	if r.reads > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(statementBackfillSpacing):
+		}
+	}
+	r.reads++
+	days, err := r.s.readStatementPeriod(ctx, r.provider, p)
+	if err != nil && !errors.Is(err, connector.ErrStatementUnavailable) {
+		return nil, fmt.Errorf("read statement %s..%s: %w", p.from.Format(time.DateOnly), p.to.Format(time.DateOnly), err)
+	}
+	return days, nil
+}
+
+// statementHolidayTailDays is how short a month's rest may be and still come
+// back empty: a statement stopping on the eve of a holiday IBKR wrote no day
+// for reads as a cut, and the read for the rest finds nothing. Longer, it is
+// days IBKR has and did not serve.
+const statementHolidayTailDays = 3
+
+func holidayTail(cursor, end time.Time) bool {
+	return cursor.AddDate(0, 0, statementHolidayTailDays).After(end)
 }
 
 // nextBackfillCursor is where the next statement starts: after the period when
