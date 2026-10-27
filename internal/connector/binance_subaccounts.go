@@ -235,11 +235,27 @@ func (b *Binance) masterSubMoves(ctx context.Context, since, now time.Time, subs
 		}
 	}
 
-	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, "/sapi/v1/sub-account/universalTransfer", url.Values{
-		"startTime": {ms(since)}, "endTime": {ms(now)}, "limit": {"500"},
-	}, true)
+	// Without an email the endpoint answers only the transfers the master
+	// sent, so a sub-account sending money back to its master is asked for
+	// by its own email (field case: a master paid out what its sub sent it,
+	// and with the inflow unread the payout read as a gain).
+	queries := []url.Values{{}}
+	for email := range subs {
+		queries = append(queries, url.Values{"fromEmail": {email}})
+	}
+	for _, q := range queries {
+		q.Set("startTime", ms(since))
+		q.Set("endTime", ms(now))
+		q.Set("limit", "500")
+		out = append(out, b.universalSubMoves(ctx, q, subs, seen)...)
+	}
+	return out
+}
+
+func (b *Binance) universalSubMoves(ctx context.Context, q url.Values, subs, seen map[string]bool) []binanceMove {
+	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, "/sapi/v1/sub-account/universalTransfer", q, true)
 	if err != nil {
-		return out
+		return nil
 	}
 	var resp struct {
 		Result []struct {
@@ -253,8 +269,9 @@ func (b *Binance) masterSubMoves(ctx context.Context, since, now time.Time, subs
 		} `json:"result"`
 	}
 	if json.Unmarshal(body, &resp) != nil {
-		return out
+		return nil
 	}
+	var out []binanceMove
 	for _, r := range resp.Result {
 		sign := binanceMasterSubSign(r.FromEmail, r.ToEmail, subs)
 		key := binanceTransferKey("universal", r.TranID, r.CreateTimeStamp, r.Asset, r.Amount)
