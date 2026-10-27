@@ -114,6 +114,69 @@ func TestBinance_Cashflows_UnreadableCounterpartsSkipStrayRows(t *testing.T) {
 	}
 }
 
+// subAccountServer answers a sub-account key whose master topped up its
+// futures wallet: subUserHistory reports the transfer as type 2, the sub's
+// USDⓈ-M income ledger shows the money arriving.
+func subAccountServer(t *testing.T) (*Binance, time.Time) {
+	t.Helper()
+	day := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Minute)
+	ms := day.UnixMilli()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/capital/deposit/hisrec"), strings.Contains(r.URL.Path, "/capital/withdraw/history"):
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/sub-account/list"):
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":-12022,"msg":"not a master"}`))
+		case strings.Contains(r.URL.Path, "/sub-account/transfer/subUserHistory"):
+			_, _ = fmt.Fprintf(w, `[{"counterParty":"master","email":"%s","type":2,"asset":"USDT","qty":"500","status":"SUCCESS","time":%d}]`, testMasterEmail, ms)
+		case strings.Contains(r.URL.Path, "/fapi/v1/income"):
+			if r.URL.Query().Get("incomeType") == "TRANSFER" {
+				_, _ = fmt.Fprintf(w, `[{"asset":"USDT","income":"500","time":%d}]`, ms+1000)
+				return
+			}
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/asset/transfer"):
+			_, _ = w.Write([]byte(`{"total":0,"rows":[]}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: hostRewriter{base: http.DefaultTransport, target: target}}
+	return NewBinanceWithClient(&Credentials{APIKey: "k", APISecret: "s"}, client), day.Add(-time.Hour)
+}
+
+// The master's top-up of the sub's futures wallet is a deposit: the sub's own
+// ledger wins over subUserHistory's type, and the row is booked once.
+func TestBinance_Cashflows_MasterFundingOfSubFuturesIsADeposit(t *testing.T) {
+	b, since := subAccountServer(t)
+	flows, err := b.GetCashflows(context.Background(), since)
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	got := cashflowAmounts(flows)
+	if len(got) != 1 || got[0] != 500 {
+		t.Fatalf("want one deposit [500], got %v", got)
+	}
+}
+
+// Received in spot then shuttled to futures: the universal transfer explains
+// the income row, so the sub-account transfer keeps its read.
+func TestOrientBinanceSubMoves_ShuttleKeepsTheRead(t *testing.T) {
+	at := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
+	read := binanceMove{t: at, coin: "USDT", qty: 500}
+	out := orientBinanceSubMoves(
+		[]binanceMove{read},
+		[]binanceMove{{t: at.Add(2 * time.Minute), coin: "USDT", qty: 500}},
+		[]binanceMove{{t: at.Add(2 * time.Minute), coin: "USDT", qty: 500}})
+	if len(out) != 1 || out[0] != read {
+		t.Fatalf("a shuttled transfer must stay as read, got %+v", out)
+	}
+}
+
 func TestStrayBinanceMoves(t *testing.T) {
 	at := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
 	moves := []binanceMove{
