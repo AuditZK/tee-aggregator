@@ -45,17 +45,23 @@ const binanceCounterpartWindow = 10 * time.Minute
 // key that is not a master reads no sub-account list, a key without futures
 // reads no income, and neither touches the flows already collected.
 func (b *Binance) fetchSubAccountAndStrayFlows(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) {
-	booked := b.masterSubMoves(ctx, since, now, b.subAccountEmails(ctx))
-	booked = append(booked, b.subUserMoves(ctx, since, now)...)
+	master := b.masterSubMoves(ctx, since, now, b.subAccountEmails(ctx))
+	sub := b.subUserMoves(ctx, since, now)
+
+	moves, err := b.umTransferRows(ctx, since, now)
+	var counterparts []binanceMove
+	ok := false
+	if err == nil && len(moves) > 0 {
+		counterparts, ok = b.umCounterparts(ctx, since, now)
+	}
+	if ok {
+		sub = orientBinanceSubMoves(sub, moves, counterparts)
+	}
+
+	booked := append(master, sub...)
 	for _, m := range booked {
 		add(m.t, usdValue(m.coin, m.qty))
 	}
-
-	moves, err := b.umTransferRows(ctx, since, now)
-	if err != nil || len(moves) == 0 {
-		return
-	}
-	counterparts, ok := b.umCounterparts(ctx, since, now)
 	if !ok {
 		return
 	}
@@ -75,10 +81,7 @@ func strayBinanceMoves(moves, counterparts []binanceMove) []binanceMove {
 		}
 		matched := false
 		for i, p := range counterparts {
-			if used[i] || p.coin != m.coin || !binanceSameAmount(p.qty, m.qty) {
-				continue
-			}
-			if d := p.t.Sub(m.t); d < -binanceCounterpartWindow || d > binanceCounterpartWindow {
+			if used[i] || !binanceSameTransfer(m, p) {
 				continue
 			}
 			used[i] = true
@@ -90,6 +93,47 @@ func strayBinanceMoves(moves, counterparts []binanceMove) []binanceMove {
 		}
 	}
 	return out
+}
+
+// orientBinanceSubMoves takes the direction of a sub-account's transfer with
+// its master from the sub's own USDⓈ-M ledger whenever the transfer moved that
+// wallet. subUserHistory's type cannot be trusted for such a leg (field case:
+// a master funding its sub's futures wallet came back as type 2, so every
+// top-up read as a withdrawal). Universal spot↔USDⓈ-M transfers claim their
+// rows first: a transfer received in spot then shuttled to futures keeps its
+// read. Mirrors the history rebuilder's orientSubFlows.
+func orientBinanceSubMoves(sub, moves, counterparts []binanceMove) []binanceMove {
+	claimed := make([]bool, len(moves))
+	cpUsed := make([]bool, len(counterparts))
+	for i, m := range moves {
+		for j, p := range counterparts {
+			if !cpUsed[j] && binanceSameTransfer(m, p) {
+				cpUsed[j], claimed[i] = true, true
+				break
+			}
+		}
+	}
+	out := make([]binanceMove, 0, len(sub))
+	for _, s := range sub {
+		for i, m := range moves {
+			if claimed[i] || m.qty == 0 || !binanceSameTransfer(m, s) {
+				continue
+			}
+			claimed[i] = true
+			s.qty = m.qty
+			break
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func binanceSameTransfer(m, p binanceMove) bool {
+	if p.coin != m.coin || !binanceSameAmount(p.qty, m.qty) {
+		return false
+	}
+	d := p.t.Sub(m.t)
+	return d >= -binanceCounterpartWindow && d <= binanceCounterpartWindow
 }
 
 func binanceSameAmount(a, b float64) bool {
