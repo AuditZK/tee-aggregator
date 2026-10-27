@@ -13,7 +13,7 @@ import (
 )
 
 // statementPeriodDays is IBKR's ceiling on one statement's period.
-const statementPeriodDays = 365
+const statementPeriodDays = connector.IBKRStatementMaxDays
 
 // deepHistoryPeriodSpacing paces the statements of one deep reconstruction.
 // It clears the per-token cooldown claimFlexToken enforces after a success, so
@@ -27,9 +27,15 @@ var ErrDeepHistoryUnsupported = errors.New("connector cannot read history for a 
 // statementPeriods splits [from, to] into consecutive periods of at most
 // statementPeriodDays days, oldest first.
 func statementPeriods(from, to time.Time) []dayWindow {
+	return periodsOf(from, to, statementPeriodDays)
+}
+
+// periodsOf splits [from, to] into consecutive periods of at most days days,
+// oldest first.
+func periodsOf(from, to time.Time, days int) []dayWindow {
 	var out []dayWindow
 	for start := from; !start.After(to); {
-		end := start.AddDate(0, 0, statementPeriodDays-1)
+		end := start.AddDate(0, 0, days-1)
 		if end.After(to) {
 			end = to
 		}

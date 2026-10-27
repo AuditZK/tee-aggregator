@@ -47,11 +47,11 @@ type ExchangeConnection struct {
 	UpdatedAt           time.Time `json:"updated_at"`
 	// RebuildFinalizedAt: set by the midnight UTC recalibration pass once the
 	// connection's rebuilt history has been re-anchored on the exact midnight
-	// snapshot equity. NULL = still calibrated to the imprecise connect-time
-	// live value, OR the connection's history wasn't produced by the external
-	// rebuilder (IBKR Flex / MT5 paths skip this). Only populated by
-	// ListUnfinalizedExternalRebuilds + MarkRebuildFinalized; other scan
-	// paths leave it nil.
+	// snapshot equity, and for IBKR once its year of statements has been read
+	// (the statement backfill). NULL = still calibrated to the imprecise
+	// connect-time live value, the IBKR backfill still to run, OR a path that
+	// never sets it (MT5). Only populated by ListUnfinalizedExternalRebuilds +
+	// MarkRebuildFinalized; other scan paths leave it nil.
 	RebuildFinalizedAt *time.Time `json:"rebuild_finalized_at,omitempty"`
 	// RebuildRequestedAt records when the user explicitly opted into external
 	// history reconstruction (rebuild_history=true at create). NULL = no opt-in
@@ -1151,6 +1151,25 @@ func (r *ConnectionRepo) MarkRebuildFinalized(ctx context.Context, connID string
 		return ErrNotFound
 	}
 	return nil
+}
+
+// RebuildFinalizedAt reads rebuild_finalized_at for one connection: nil when
+// the history has not been finalized yet. ErrNotFound when the connection does
+// not exist; nil, nil when the schema has no such column (callers check
+// HasRebuildFinalizedAtCol first to tell the two apart).
+func (r *ConnectionRepo) RebuildFinalizedAt(ctx context.Context, connID string) (*time.Time, error) {
+	if !r.HasRebuildFinalizedAtCol(ctx) {
+		return nil, nil
+	}
+	query := `SELECT ` + r.qcol("rebuild_finalized_at") + ` FROM exchange_connections WHERE id = $1`
+	var at *time.Time
+	if err := r.pool.QueryRow(ctx, query, connID).Scan(&at); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("read rebuild finalized: %w", err)
+	}
+	return at, nil
 }
 
 // MarkRebuildRequested stamps rebuild_requested_at = at, recording the user's

@@ -16,23 +16,47 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// Every statement is asked for a chosen period on the documented Flex Web
+// Service. The legacy servlet (gdcdyn …/FlexStatementService) only serves the
+// query's saved period, ignoring fd/td, and answers 1001 at once to a query
+// broken out by day.
 const (
-	ibkrFlexURL    = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest"
-	ibkrFlexGetURL = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement"
-
-	// The legacy servlet above accepts fd/td and silently ignores them, serving
-	// the query's saved period; only the documented Flex Web Service honours
-	// a chosen period.
 	ibkrFlexWSSendURL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest"
 	ibkrFlexWSGetURL  = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
 )
 
+// IBKRStatementWindowDays is the shortest period the daily statement covers,
+// ending on LastStatementDay: the business days a sync needs, a weekend
+// included. A statement broken out by day is generated one day at a time, from
+// a tenth of a second to seven seconds a day depending on IBKR's load, and
+// under load it came back cut after about seven days, the oldest kept and no
+// error said. A year of it was still generating after ten minutes. The year is
+// read once, a month at a time (the sync layer's backfill).
+const IBKRStatementWindowDays = 5
+
+// IBKRStatementMaxDays is IBKR's ceiling on one statement's period.
+const IBKRStatementMaxDays = 365
+
+// LastStatementDay is the newest business day IBKR can have published a
+// statement for at now: the weekday before now's UTC date. Saturday, Sunday and
+// Monday all give Friday. Holidays are not modelled.
+func LastStatementDay(now time.Time) time.Time {
+	t := now.UTC()
+	d := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -1)
+	for d.Weekday() == time.Saturday || d.Weekday() == time.Sunday {
+		d = d.AddDate(0, 0, -1)
+	}
+	return d
+}
+
 // flexReportEntry holds a cached Flex XML report, shared across IBKR connector
 // instances that use the same token:queryId. Required because IBKR enforces a
 // token-level rate limit (error 1018) and users who link the same Flex
-// credentials would otherwise hammer each other out.
+// credentials would otherwise hammer each other out. from and to are the
+// period it was asked for.
 type flexReportEntry struct {
 	xml       []byte
+	from, to  time.Time
 	fetchedAt time.Time
 }
 
@@ -108,6 +132,37 @@ const flexStaleReuseWindow = 3 * time.Hour
 // isRateLimitError, which arms the deferred retry.
 var ErrFlexTokenBusy = fmt.Errorf("%w: shared flex token cooling down", ErrTransient)
 
+// flexBusyError is ErrFlexTokenBusy with the time the token reopens, for a
+// caller that can afford to wait for it (FlexRetryAt).
+type flexBusyError struct{ retryAt time.Time }
+
+func (e *flexBusyError) Error() string {
+	return fmt.Sprintf("%s (retry after ~%s UTC)", ErrFlexTokenBusy, e.retryAt.UTC().Format("Jan 2 15:04"))
+}
+
+func (e *flexBusyError) Is(target error) bool { return errors.Is(ErrFlexTokenBusy, target) }
+
+// FlexRetryAt reports when a token err found busy reopens.
+func FlexRetryAt(err error) (time.Time, bool) {
+	var busy *flexBusyError
+	if errors.As(err, &busy) {
+		return busy.retryAt, true
+	}
+	return time.Time{}, false
+}
+
+// ErrStatementNotPublished marks a daily statement IBKR has not published yet:
+// the business day it ends on closes in the US evening and comes out during
+// the night. It is the stale statement of the sync layer in another form, and
+// is retried the same way.
+var ErrStatementNotPublished = fmt.Errorf("%w: flex statement not published yet", ErrTransient)
+
+// ErrStatementUnavailable is IBKR's 1003, "Statement is not available": no
+// statement exists for the period asked, either not yet or not at all.
+var ErrStatementUnavailable = errors.New("flex statement not available")
+
+const flexUnavailableCode = "1003"
+
 // claimFlexToken reports whether the token may go to the network now, and
 // claims it when allowed. The claim is taken BEFORE the request is sent and
 // kept even if the request then fails: a failed send still spent IBKR-side
@@ -177,6 +232,34 @@ func noteFlexOutcome(token string, now time.Time, err error) {
 	}
 }
 
+// flexTokenWaitMax is how long a read waits for the token another read holds
+// before failing busy: the minute a success holds it, the two minutes after a
+// failure. Two accounts on one token, or a backfill beside a daily read, then
+// take turns instead of one of them losing its day.
+const flexTokenWaitMax = 2 * time.Minute
+
+// claimFlexTokenWaiting is claimFlexToken for a caller that can wait up to
+// flexTokenWaitMax, and no later than its context's deadline. A caller without
+// a deadline, a request someone is waiting on, is answered at once.
+func claimFlexTokenWaiting(ctx context.Context, token string) error {
+	for {
+		retryAt, ok := claimFlexToken(token, time.Now())
+		if ok {
+			return nil
+		}
+		wait := time.Until(retryAt) + time.Second
+		deadline, has := ctx.Deadline()
+		if !has || wait > flexTokenWaitMax || time.Now().Add(wait).After(deadline) {
+			return &flexBusyError{retryAt: retryAt}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
 func nextUTCDay(now time.Time) time.Time {
 	t := now.UTC()
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour)
@@ -227,63 +310,67 @@ func NewIBKR(creds *Credentials) *IBKR {
 	}
 }
 
-// fetchFlexReport returns the raw Flex XML, reusing a cached copy if it is
-// younger than flexReportCacheTTL. Callers that need fresh data across syncs
-// rely on the daily sync cadence (24h apart, well beyond the cache TTL).
-func (i *IBKR) fetchFlexReport(ctx context.Context) ([]byte, error) {
-	key := i.token + ":" + i.queryID
+// dailyStatement returns the raw statement the daily figures are read from:
+// the period from `from` to LastStatementDay, never shorter than
+// IBKRStatementWindowDays nor longer than IBKRStatementMaxDays. A zero from
+// asks for the window alone.
+func (i *IBKR) dailyStatement(ctx context.Context, from time.Time) ([]byte, error) {
+	to := LastStatementDay(time.Now())
+	from = dailyStatementFrom(from, to)
+	report, err := i.statement(ctx, from, to)
+	if errors.Is(err, ErrStatementUnavailable) {
+		return nil, fmt.Errorf("%w: statement to %s: %w", ErrStatementNotPublished, to.Format("2006-01-02"), err)
+	}
+	return report, err
+}
 
-	// Fast path: fresh cache hit.
-	flexReportCacheMu.Lock()
-	if entry, ok := flexReportCache[key]; ok && time.Since(entry.fetchedAt) < flexReportCacheTTL {
-		xml := entry.xml
-		flexReportCacheMu.Unlock()
+func dailyStatementFrom(from, to time.Time) time.Time {
+	if earliest := to.AddDate(0, 0, -(IBKRStatementWindowDays - 1)); from.IsZero() || from.After(earliest) {
+		from = earliest
+	}
+	if floor := to.AddDate(0, 0, -(IBKRStatementMaxDays - 1)); from.Before(floor) {
+		from = floor
+	}
+	return time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// statement returns the raw statement for [from, to], or a cached one that
+// covers it: same last day, first day no later. A wider statement answers
+// every question a narrower one does, so the live reads that follow a sync's
+// reconstruction spend no second request.
+func (i *IBKR) statement(ctx context.Context, from, to time.Time) ([]byte, error) {
+	key := i.token + ":" + i.queryID
+	if xml, ok := cachedStatement(key, from, to, flexReportCacheTTL); ok {
 		return xml, nil
 	}
-	flexReportCacheMu.Unlock()
 
-	// Slow path: coalesce concurrent fetches for the same token so parallel
-	// user syncs share one Flex API round-trip.
-	v, err, _ := flexSingleflight.Do(key, func() (interface{}, error) {
-		// Re-check the cache inside the flight in case another goroutine won
-		// the singleflight race and already populated it.
-		flexReportCacheMu.Lock()
-		if entry, ok := flexReportCache[key]; ok && time.Since(entry.fetchedAt) < flexReportCacheTTL {
-			xml := entry.xml
-			flexReportCacheMu.Unlock()
+	// Coalesce concurrent fetches of the same statement so parallel syncs
+	// share one Flex round-trip.
+	flight := key + ":" + from.Format("20060102") + ":" + to.Format("20060102")
+	v, err, _ := flexSingleflight.Do(flight, func() (interface{}, error) {
+		if xml, ok := cachedStatement(key, from, to, flexReportCacheTTL); ok {
 			return xml, nil
 		}
-		flexReportCacheMu.Unlock()
-
-		if retryAt, ok := claimFlexToken(i.token, time.Now()); !ok {
-			// Our own report from earlier in this window is still usable —
-			// a slow sync whose 5-minute cache lapsed mid-cycle, or an admin
-			// re-parse after a deploy, keeps working on the same-day XML.
-			flexReportCacheMu.Lock()
-			if entry, ok2 := flexReportCache[key]; ok2 && time.Since(entry.fetchedAt) < flexStaleReuseWindow {
-				xml := entry.xml
-				flexReportCacheMu.Unlock()
-				return xml, nil
+		// Our own statement from earlier in this window is still usable when
+		// the token is not — a slow sync whose 5-minute cache lapsed mid-cycle,
+		// or an admin re-parse after a deploy, keeps working on the same-day
+		// XML. Without one, the read waits its turn on the token.
+		if stale, ok := cachedStatement(key, from, to, flexStaleReuseWindow); ok {
+			if _, free := claimFlexToken(i.token, time.Now()); !free {
+				return stale, nil
 			}
-			flexReportCacheMu.Unlock()
-			return nil, fmt.Errorf("%w (retry after ~%s UTC)",
-				ErrFlexTokenBusy, retryAt.UTC().Format("Jan 2 15:04"))
+		} else if err := claimFlexTokenWaiting(ctx, i.token); err != nil {
+			return nil, err
 		}
 
-		refCode, err := i.requestFlexReport(ctx)
+		report, err := i.requestStatement(ctx, from, to)
+		noteFlexOutcome(i.token, time.Now(), err)
 		if err != nil {
-			noteFlexOutcome(i.token, time.Now(), err)
 			return nil, err
 		}
-		report, err := i.getFlexReport(ctx, refCode)
-		if err != nil {
-			noteFlexOutcome(i.token, time.Now(), err)
-			return nil, err
-		}
-		noteFlexOutcome(i.token, time.Now(), nil)
 
 		flexReportCacheMu.Lock()
-		flexReportCache[key] = &flexReportEntry{xml: report, fetchedAt: time.Now()}
+		flexReportCache[key] = &flexReportEntry{xml: report, from: from, to: to, fetchedAt: time.Now()}
 		evictFlexReportCache(time.Now())
 		flexReportCacheMu.Unlock()
 		return report, nil
@@ -292,6 +379,16 @@ func (i *IBKR) fetchFlexReport(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	return v.([]byte), nil
+}
+
+func cachedStatement(key string, from, to time.Time, maxAge time.Duration) ([]byte, bool) {
+	flexReportCacheMu.Lock()
+	defer flexReportCacheMu.Unlock()
+	entry, ok := flexReportCache[key]
+	if !ok || time.Since(entry.fetchedAt) >= maxAge || !entry.to.Equal(to) || entry.from.After(from) {
+		return nil, false
+	}
+	return entry.xml, true
 }
 
 // flexReportCacheMaxEntries caps the process-wide Flex cache. Each entry can
@@ -373,8 +470,14 @@ func flexPeriodURL(base, token, query string, from, to time.Time) string {
 	return base + "?" + v.Encode()
 }
 
-func (i *IBKR) requestFlexReport(ctx context.Context) (string, error) {
-	return i.sendFlexRequest(ctx, flexURL(ibkrFlexURL, i.token, i.queryID))
+// requestStatement asks IBKR for the statement of [from, to] and polls until
+// it is generated. Pacing is the caller's (claimFlexToken).
+func (i *IBKR) requestStatement(ctx context.Context, from, to time.Time) ([]byte, error) {
+	refCode, err := i.sendFlexRequest(ctx, flexPeriodURL(ibkrFlexWSSendURL, i.token, i.queryID, from, to))
+	if err != nil {
+		return nil, err
+	}
+	return i.pollFlexReport(ctx, flexURL(ibkrFlexWSGetURL, i.token, refCode))
 }
 
 func (i *IBKR) sendFlexRequest(ctx context.Context, u string) (string, error) {
@@ -425,6 +528,9 @@ func (i *IBKR) sendFlexRequest(ctx context.Context, u string) (string, error) {
 		}
 		if result.ErrorCode == flexRepeatedFailureCode {
 			return "", fmt.Errorf("%w: %w", ErrFlexConfigLocked, base)
+		}
+		if result.ErrorCode == flexUnavailableCode {
+			return "", fmt.Errorf("%w: %w", ErrStatementUnavailable, base)
 		}
 		if isTransientFlexErrorCode(result.ErrorCode) {
 			return "", fmt.Errorf("%w: %w", ErrTransient, base)
@@ -495,10 +601,6 @@ var ErrFlexConfigLocked = fmt.Errorf("%w: flex token locked after repeated failu
 func isTransientFlexErrorCode(code string) bool {
 	_, ok := transientFlexErrorCodes[code]
 	return ok
-}
-
-func (i *IBKR) getFlexReport(ctx context.Context, refCode string) ([]byte, error) {
-	return i.pollFlexReport(ctx, flexURL(ibkrFlexGetURL, i.token, refCode))
 }
 
 // flexPollDelays is the wait between GetStatement polls. Small reports are
@@ -610,15 +712,10 @@ func scrubSecret(s, secret string) string {
 }
 
 func (i *IBKR) GetBalance(ctx context.Context) (*Balance, error) {
-	report, err := i.statementReport(ctx)
+	report, err := i.statementReport(ctx, time.Time{})
 	if err != nil {
 		return nil, err
 	}
-
-	if err != nil {
-		return nil, err
-	}
-
 	return i.parseBalanceFromReport(report)
 }
 
@@ -766,15 +863,10 @@ func (i *IBKR) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
 }
 
 func (i *IBKR) GetPositions(ctx context.Context) ([]*Position, error) {
-	report, err := i.statementReport(ctx)
+	report, err := i.statementReport(ctx, time.Time{})
 	if err != nil {
 		return nil, err
 	}
-
-	if err != nil {
-		return nil, err
-	}
-
 	return i.parsePositionsFromReport(report)
 }
 
@@ -864,15 +956,10 @@ func (i *IBKR) parsePositionsFromReport(report []byte) ([]*Position, error) {
 // GetCashflows returns deposits and withdrawals since the given date.
 // Uses IBKR Flex CashTransactions.
 func (i *IBKR) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
-	report, err := i.statementReport(ctx)
+	report, err := i.statementReport(ctx, since)
 	if err != nil {
 		return nil, err
 	}
-
-	if err != nil {
-		return nil, err
-	}
-
 	return i.parseCashflowsFromReport(report, since)
 }
 
@@ -882,7 +969,7 @@ func (i *IBKR) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, 
 // cannot tell it from a trading gain: the market value lands in equity and
 // scores as performance. This is the view that separates the two.
 func (i *IBKR) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error) {
-	report, err := i.fetchFlexReport(ctx)
+	report, err := i.dailyStatement(ctx, since)
 	if err != nil {
 		return nil, err
 	}
@@ -893,7 +980,7 @@ func (i *IBKR) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]Ra
 // in case it was echoed back (CONN-002); nothing else is filtered, because a
 // filter is exactly what this is for.
 func (i *IBKR) GetRawStatement(ctx context.Context) ([]byte, string, error) {
-	report, err := i.fetchFlexReport(ctx)
+	report, err := i.dailyStatement(ctx, time.Time{})
 	if err != nil {
 		return nil, "", err
 	}
@@ -901,9 +988,9 @@ func (i *IBKR) GetRawStatement(ctx context.Context) ([]byte, string, error) {
 }
 
 // GetRawStatementForPeriod fetches the statement for [from, to] instead of the
-// query's saved period. It stays out of flexReportCache on purpose: that cache
-// is keyed token:queryID and feeds the daily sync, which must keep reading the
-// saved period, not an old year someone asked for.
+// daily one. It stays out of flexReportCache on purpose: that cache feeds the
+// daily sync, and an old year someone asked for must not take the place of its
+// statement.
 func (i *IBKR) GetRawStatementForPeriod(ctx context.Context, from, to time.Time) ([]byte, string, error) {
 	report, err := i.fetchPeriodStatement(ctx, from, to)
 	if err != nil {
@@ -913,21 +1000,16 @@ func (i *IBKR) GetRawStatementForPeriod(ctx context.Context, from, to time.Time)
 }
 
 func (i *IBKR) fetchPeriodStatement(ctx context.Context, from, to time.Time) ([]byte, error) {
-	if retryAt, ok := claimFlexToken(i.token, time.Now()); !ok {
-		return nil, fmt.Errorf("%w (retry after ~%s UTC)",
-			ErrFlexTokenBusy, retryAt.UTC().Format("Jan 2 15:04"))
+	if err := claimFlexTokenWaiting(ctx, i.token); err != nil {
+		return nil, err
 	}
-	var report []byte
-	refCode, err := i.sendFlexRequest(ctx, flexPeriodURL(ibkrFlexWSSendURL, i.token, i.queryID, from, to))
-	if err == nil {
-		report, err = i.pollFlexReport(ctx, flexURL(ibkrFlexWSGetURL, i.token, refCode))
-	}
+	report, err := i.requestStatement(ctx, from, to)
 	noteFlexOutcome(i.token, time.Now(), err)
 	return report, err
 }
 
-// GetHistoricalSnapshotsForPeriod is GetHistoricalSnapshots over [from, to]
-// instead of the query's saved period, which caps out at the last 365 days.
+// GetHistoricalSnapshotsForPeriod is GetHistoricalSnapshots over [from, to],
+// any year back, uncached.
 func (i *IBKR) GetHistoricalSnapshotsForPeriod(ctx context.Context, from, to time.Time) ([]*HistoricalSnapshot, error) {
 	report, err := i.fetchPeriodStatement(ctx, from, to)
 	if err != nil {
@@ -937,7 +1019,9 @@ func (i *IBKR) GetHistoricalSnapshotsForPeriod(ctx context.Context, from, to tim
 	if err != nil {
 		return nil, err
 	}
-	all, err := i.parseHistoricalSnapshotsFromReport(single, from)
+	// Shared with the daily syncs when a backfill runs beside them, so it
+	// leaves the connector's warnings to them.
+	all, _, err := i.historicalSnapshotsFromReport(single, from)
 	if err != nil {
 		return nil, err
 	}
@@ -1120,6 +1204,18 @@ func (i *IBKR) CapabilityWarnings() []string {
 }
 
 func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, error) {
+	flows, warnings, err := cashflowsFromReport(report, since)
+	if err != nil {
+		return nil, err
+	}
+	i.capabilityWarnings = warnings
+	return flows, nil
+}
+
+// cashflowsFromReport reads the statement's capital flows since since, and the
+// cash types it could not classify as capability warnings. It writes nothing
+// on the connector, so a backfill can share it with the daily syncs.
+func cashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, []string, error) {
 	var flex struct {
 		XMLName        xml.Name `xml:"FlexQueryResponse"`
 		FlexStatements struct {
@@ -1153,7 +1249,7 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 	}
 
 	if err := xml.Unmarshal(report, &flex); err != nil {
-		return nil, fmt.Errorf("parse flex cashflows: %w", err)
+		return nil, nil, fmt.Errorf("parse flex cashflows: %w", err)
 	}
 	reportTransfers := dailyCashReportTransfers(flex.FlexStatements.FlexStatement.CashReport.Rows)
 
@@ -1241,20 +1337,23 @@ func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cash
 
 	cashflows = append(cashflows, reportTransfers.flows(since)...)
 
-	i.capabilityWarnings = nil
+	var warnings []string
 	for typ, n := range unknownTypes {
-		i.capabilityWarnings = append(i.capabilityWarnings,
-			fmt.Sprintf("ibkr_unclassified_cash_type:%s(x%d)", typ, n))
+		warnings = append(warnings, fmt.Sprintf("ibkr_unclassified_cash_type:%s(x%d)", typ, n))
 	}
-	sort.Strings(i.capabilityWarnings)
+	sort.Strings(warnings)
 
-	return cashflows, nil
+	return cashflows, warnings, nil
 }
 
-// GetHistoricalSnapshots returns daily equity snapshots from IBKR Flex (up to 365 days).
-// Used for backfill on first sync.
+// GetHistoricalSnapshots returns the daily equity snapshots from since to
+// LastStatementDay, at least the daily window and at most a year, in one
+// statement. A zero since asks for the whole year.
 func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*HistoricalSnapshot, error) {
-	report, err := i.statementReport(ctx)
+	if since.IsZero() {
+		since = LastStatementDay(time.Now()).AddDate(0, 0, -(IBKRStatementMaxDays - 1))
+	}
+	report, err := i.statementReport(ctx, since)
 	if err != nil {
 		return nil, err
 	}
@@ -1299,6 +1398,17 @@ func aggregateFlexTradesByDate(trades []*Trade) map[string]flexDayTrades {
 }
 
 func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time) ([]*HistoricalSnapshot, error) {
+	snapshots, warnings, err := i.historicalSnapshotsFromReport(report, since)
+	if err != nil {
+		return nil, err
+	}
+	i.capabilityWarnings = warnings
+	return snapshots, nil
+}
+
+// historicalSnapshotsFromReport is parseHistoricalSnapshotsFromReport without
+// recording the capability warnings on the connector.
+func (i *IBKR) historicalSnapshotsFromReport(report []byte, since time.Time) ([]*HistoricalSnapshot, []string, error) {
 	// Parse all daily equity summaries with per-asset breakdown
 	var flex struct {
 		XMLName        xml.Name `xml:"FlexQueryResponse"`
@@ -1321,7 +1431,7 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 	}
 
 	if err := xml.Unmarshal(report, &flex); err != nil {
-		return nil, fmt.Errorf("parse flex historical: %w", err)
+		return nil, nil, fmt.Errorf("parse flex historical: %w", err)
 	}
 
 	// The NAVs below are in the account's base currency, which the sync
@@ -1336,7 +1446,7 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 	baseRates := flexConversionRates(report, baseCurrency)
 
 	// Parse cashflows grouped by date for deposit/withdrawal assignment
-	cashflows, _ := i.parseCashflowsFromReport(report, since)
+	cashflows, warnings, _ := cashflowsFromReport(report, since)
 	type dayFlows struct {
 		deposits, withdrawals float64
 		flows                 []*Cashflow
@@ -1429,19 +1539,14 @@ func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time
 		})
 	}
 
-	return snapshots, nil
+	return snapshots, warnings, nil
 }
 
 func (i *IBKR) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
-	report, err := i.statementReport(ctx)
+	report, err := i.statementReport(ctx, start)
 	if err != nil {
 		return nil, err
 	}
-
-	if err != nil {
-		return nil, err
-	}
-
 	return i.parseTradesFromReport(report, start, end)
 }
 

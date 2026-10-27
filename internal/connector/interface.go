@@ -311,15 +311,16 @@ type OAuthCredentialSource interface {
 	CurrentCredentials() (accessToken, refreshToken string)
 }
 
-// HistoricalSnapshotProvider optionally provides historical daily snapshots.
-// Used by IBKR Flex for 365-day backfill on first sync.
+// HistoricalSnapshotProvider optionally provides historical daily snapshots
+// since a date, for the reconstruction every sync of IBKR and cTrader re-runs.
 type HistoricalSnapshotProvider interface {
 	GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*HistoricalSnapshot, error)
 }
 
-// PeriodHistoryProvider reads the daily timeline of a chosen period, for
-// history older than what HistoricalSnapshotProvider's window reaches. One call
-// covers at most 365 days, IBKR's ceiling per statement.
+// PeriodHistoryProvider reads the daily timeline of a chosen period: a
+// connection's year a month at a time (the statement backfill), and history
+// older than a year (the deep reconstruction). One call covers at most 365
+// days, IBKR's ceiling per statement.
 type PeriodHistoryProvider interface {
 	GetHistoricalSnapshotsForPeriod(ctx context.Context, from, to time.Time) ([]*HistoricalSnapshot, error)
 }

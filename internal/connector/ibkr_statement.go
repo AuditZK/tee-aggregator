@@ -394,11 +394,12 @@ func (c cashReportTransfers) flows(since time.Time) []*Cashflow {
 	return out
 }
 
-// statementReport is the Flex report every figure is read from: the cached
-// document narrowed to the one account this connection measures. The raw
-// views (GetRawStatement, GetRawCashflowEntries) keep the whole document.
-func (i *IBKR) statementReport(ctx context.Context) ([]byte, error) {
-	report, err := i.fetchFlexReport(ctx)
+// statementReport is the Flex report every figure is read from: the daily
+// statement reaching back to from, narrowed to the one account this connection
+// measures. The raw views (GetRawStatement, GetRawCashflowEntries) keep the
+// whole document.
+func (i *IBKR) statementReport(ctx context.Context, from time.Time) ([]byte, error) {
+	report, err := i.dailyStatement(ctx, from)
 	if err != nil {
 		return nil, err
 	}
