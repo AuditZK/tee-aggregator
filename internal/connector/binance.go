@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -857,12 +858,48 @@ func (b *Binance) measuredWallets() map[string]bool {
 }
 
 func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
-	now := time.Now().UTC()
-
 	var flows []*Cashflow
-	add := func(t time.Time, usd float64) {
-		if usd != 0 {
+	err := b.collectCashflows(ctx, since, func(string) func(time.Time, float64) {
+		return func(t time.Time, usd float64) {
 			flows = append(flows, &Cashflow{Amount: usd, Currency: "USDT", Timestamp: t})
+		}
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return flows, nil
+}
+
+// GetRawCashflowEntries returns the flows GetCashflows books, each labelled
+// with the ledger it came from and the asset it moved. A flow the equity never
+// showed can then be traced to its source instead of deduced from amounts.
+func (b *Binance) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error) {
+	var ops []RawBalanceOp
+	var coin string
+	err := b.collectCashflows(ctx, since, func(source string) func(time.Time, float64) {
+		return func(t time.Time, usd float64) {
+			ops = append(ops, RawBalanceOp{Label: source, Delta: usd, Currency: coin, Timestamp: t})
+		}
+	}, func(c string) { coin = strings.ToUpper(c) })
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(ops, func(i, j int) bool { return ops[i].Timestamp.Before(ops[j].Timestamp) })
+	return ops, nil
+}
+
+// collectCashflows reads every ledger that books a Binance cashflow and hands
+// each non-zero flow to sink(source). valued, when set, sees the asset of each
+// flow just before its sink runs: every fetcher values the flow inline in the
+// call that books it.
+func (b *Binance) collectCashflows(ctx context.Context, since time.Time, sink func(source string) func(time.Time, float64), valued func(coin string)) error {
+	now := time.Now().UTC()
+	bind := func(source string) func(time.Time, float64) {
+		emit := sink(source)
+		return func(t time.Time, usd float64) {
+			if usd != 0 {
+				emit(t, usd)
+			}
 		}
 	}
 
@@ -872,6 +909,9 @@ func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflo
 	var priceMap map[string]float64
 	unpriced := unpricedAssets{}
 	usdValue := func(coin string, qty float64) float64 {
+		if valued != nil {
+			valued(coin)
+		}
 		if IsStablecoinUSD(coin) {
 			return qty
 		}
@@ -895,19 +935,18 @@ func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflo
 	measured := b.measuredWallets()
 	// On-chain flows are load-bearing: a broken deposit feed silently books
 	// every inflow as trading gain, so their errors fail the fetch.
-	if err := b.fetchOnChainDeposits(ctx, since, now, measured, add, usdValue); err != nil {
-		return nil, err
+	if err := b.fetchOnChainDeposits(ctx, since, now, measured, bind("onchain_deposit"), usdValue); err != nil {
+		return err
 	}
-	if err := b.fetchOnChainWithdrawals(ctx, since, now, measured, add, usdValue); err != nil {
-		return nil, err
+	if err := b.fetchOnChainWithdrawals(ctx, since, now, measured, bind("onchain_withdrawal"), usdValue); err != nil {
+		return err
 	}
 	// Universal transfers are best-effort per type: a key without a given
 	// wallet product errors for that type, which must not zero the flows above.
-	b.fetchExternalTransfers(ctx, since, now, measured, add, usdValue)
-	b.fetchSubAccountAndStrayFlows(ctx, since, now, add, usdValue)
-	b.fetchFiatFlows(ctx, since, now, add, usdValue)
-
-	return flows, nil
+	b.fetchExternalTransfers(ctx, since, now, measured, bind, usdValue)
+	b.fetchSubAccountAndStrayFlows(ctx, since, now, bind, usdValue)
+	b.fetchFiatFlows(ctx, since, now, bind("fiat"), usdValue)
+	return nil
 }
 
 func (b *Binance) fetchOnChainDeposits(ctx context.Context, since, now time.Time, measured map[string]bool, add func(time.Time, float64), usdValue func(string, float64) float64) error {
@@ -987,12 +1026,13 @@ func (b *Binance) fetchOnChainWithdrawals(ctx context.Context, since, now time.T
 	return nil
 }
 
-func (b *Binance) fetchExternalTransfers(ctx context.Context, since, now time.Time, measured map[string]bool, add func(time.Time, float64), usdValue func(string, float64) float64) {
+func (b *Binance) fetchExternalTransfers(ctx context.Context, since, now time.Time, measured map[string]bool, bind func(string) func(time.Time, float64), usdValue func(string, float64) float64) {
 	for typ := range binanceTransferWallets {
 		sign := binanceTransferSign(typ, measured)
 		if sign == 0 {
 			continue
 		}
+		add := bind("transfer:" + typ)
 		params := url.Values{}
 		params.Set("type", typ)
 		params.Set("startTime", strconv.FormatInt(since.UnixMilli(), 10))
