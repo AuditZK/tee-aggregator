@@ -230,6 +230,56 @@ func TestIsBinanceRefusal(t *testing.T) {
 
 // A bank withdrawal is a cashflow: an account used as an off-ramp (crypto in,
 // converted to EUR, EUR wired out) must not read the wire as a trading loss.
+// The funding wallet sits outside the equity: an on-chain payout from it, or a
+// deposit landing in it, moves nothing the equity measures. The deposit enters
+// the equity later, when FUNDING_MAIN moves it to spot. Spot-side on-chain
+// flows are booked as before.
+func TestBinance_Cashflows_FundingWalletOnChainFlowsStayOutside(t *testing.T) {
+	stamp := time.Now().UTC().Add(-time.Hour)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/capital/deposit/hisrec"):
+			_, _ = fmt.Fprintf(w, `[{"coin":"USDT","amount":"40","insertTime":%d,"walletType":0},{"coin":"USDT","amount":"500","insertTime":%d,"walletType":1}]`, stamp.UnixMilli(), stamp.UnixMilli())
+		case strings.Contains(r.URL.Path, "/capital/withdraw/history"):
+			at := stamp.Format("2006-01-02 15:04:05")
+			_, _ = fmt.Fprintf(w, `[{"coin":"USDT","amount":"9","transactionFee":"1","completeTime":"%s","walletType":0},{"coin":"USDT","amount":"299","transactionFee":"1","completeTime":"%s","walletType":1}]`, at, at)
+		case strings.Contains(r.URL.Path, "/asset/transfer") && r.URL.Query().Get("type") == "FUNDING_MAIN":
+			_, _ = fmt.Fprintf(w, `{"total":1,"rows":[{"asset":"USDT","amount":"200","timestamp":%d,"status":"CONFIRMED"}]}`, stamp.UnixMilli())
+		case strings.Contains(r.URL.Path, "/asset/transfer"):
+			_, _ = w.Write([]byte(`{"total":0,"rows":[]}`))
+		case strings.Contains(r.URL.Path, "/fiat/"):
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		case strings.Contains(r.URL.Path, "/sub-account/"):
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":-12022,"msg":"not a master"}`))
+		case strings.Contains(r.URL.Path, "/fapi/v1/income"):
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: hostRewriter{base: http.DefaultTransport, target: target}}
+	b := NewBinanceWithClient(&Credentials{APIKey: "k", APISecret: "s"}, client)
+
+	flows, err := b.GetCashflows(context.Background(), stamp.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	got := cashflowAmounts(flows)
+	want := []float64{-10, 40, 200}
+	if len(got) != len(want) {
+		t.Fatalf("want %v, got %v", want, got)
+	}
+	for i := range want {
+		if math.Abs(got[i]-want[i]) > 1e-9 {
+			t.Fatalf("want %v, got %v", want, got)
+		}
+	}
+}
+
 func TestBinance_Cashflows_BankWithdrawalIsAWithdrawal(t *testing.T) {
 	stamp := time.Now().UTC().Add(-time.Hour).UnixMilli()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

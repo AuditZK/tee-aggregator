@@ -892,24 +892,25 @@ func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflo
 	}
 	defer func() { b.cashflowNotes.set(unpriced.markers("binance")) }()
 
+	measured := b.measuredWallets()
 	// On-chain flows are load-bearing: a broken deposit feed silently books
 	// every inflow as trading gain, so their errors fail the fetch.
-	if err := b.fetchOnChainDeposits(ctx, since, now, add, usdValue); err != nil {
+	if err := b.fetchOnChainDeposits(ctx, since, now, measured, add, usdValue); err != nil {
 		return nil, err
 	}
-	if err := b.fetchOnChainWithdrawals(ctx, since, now, add, usdValue); err != nil {
+	if err := b.fetchOnChainWithdrawals(ctx, since, now, measured, add, usdValue); err != nil {
 		return nil, err
 	}
 	// Universal transfers are best-effort per type: a key without a given
 	// wallet product errors for that type, which must not zero the flows above.
-	b.fetchExternalTransfers(ctx, since, now, b.measuredWallets(), add, usdValue)
+	b.fetchExternalTransfers(ctx, since, now, measured, add, usdValue)
 	b.fetchSubAccountAndStrayFlows(ctx, since, now, add, usdValue)
 	b.fetchFiatFlows(ctx, since, now, add, usdValue)
 
 	return flows, nil
 }
 
-func (b *Binance) fetchOnChainDeposits(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) error {
+func (b *Binance) fetchOnChainDeposits(ctx context.Context, since, now time.Time, measured map[string]bool, add func(time.Time, float64), usdValue func(string, float64) float64) error {
 	params := url.Values{}
 	params.Set("startTime", strconv.FormatInt(since.UnixMilli(), 10))
 	params.Set("endTime", strconv.FormatInt(now.UnixMilli(), 10))
@@ -923,18 +924,34 @@ func (b *Binance) fetchOnChainDeposits(ctx context.Context, since, now time.Time
 		Coin       string `json:"coin"`
 		Amount     string `json:"amount"`
 		InsertTime int64  `json:"insertTime"`
+		WalletType int    `json:"walletType"`
 	}
 	if err := json.Unmarshal(body, &deps); err != nil {
 		return fmt.Errorf("parse deposit history: %w", err)
 	}
 	for _, d := range deps {
+		if !measured[binanceOnChainWallet(d.WalletType)] {
+			continue
+		}
 		amt, _ := strconv.ParseFloat(d.Amount, 64)
 		add(time.UnixMilli(d.InsertTime).UTC(), usdValue(d.Coin, amt))
 	}
 	return nil
 }
 
-func (b *Binance) fetchOnChainWithdrawals(ctx context.Context, since, now time.Time, add func(time.Time, float64), usdValue func(string, float64) float64) error {
+// binanceOnChainWallet names the wallet an on-chain deposit landed in or a
+// withdrawal left from. Money withdrawn from the funding wallet never sat in
+// the equity, and money deposited there enters it through FUNDING_MAIN,
+// which fetchExternalTransfers books (field case: an account topped up in
+// funding and paid out from it read the payout as a gain the size of it).
+func binanceOnChainWallet(walletType int) string {
+	if walletType == 1 {
+		return binanceWalletFunding
+	}
+	return binanceWalletSpot
+}
+
+func (b *Binance) fetchOnChainWithdrawals(ctx context.Context, since, now time.Time, measured map[string]bool, add func(time.Time, float64), usdValue func(string, float64) float64) error {
 	params := url.Values{}
 	params.Set("startTime", strconv.FormatInt(since.UnixMilli(), 10))
 	params.Set("endTime", strconv.FormatInt(now.UnixMilli(), 10))
@@ -949,11 +966,15 @@ func (b *Binance) fetchOnChainWithdrawals(ctx context.Context, since, now time.T
 		Amount         string `json:"amount"`
 		TransactionFee string `json:"transactionFee"`
 		CompleteTime   string `json:"completeTime"` // "2026-07-01 12:34:56" UTC
+		WalletType     int    `json:"walletType"`
 	}
 	if err := json.Unmarshal(body, &wds); err != nil {
 		return fmt.Errorf("parse withdraw history: %w", err)
 	}
 	for _, w := range wds {
+		if !measured[binanceOnChainWallet(w.WalletType)] {
+			continue
+		}
 		t, terr := time.Parse("2006-01-02 15:04:05", w.CompleteTime)
 		if terr != nil {
 			continue
