@@ -320,6 +320,13 @@ message SignedReportResponse {
   // fields above are a convenience copy; a verifier hashes this string,
   // checks the signature over the hash, then reads the figures from it.
   string signed_payload = 92;
+
+  // The same payload with every amount withheld (no daily nav, no monthly
+  // aum), hashed and signed on its own by the same key. A report shared in
+  // percentages ships these three instead and stays verifiable.
+  string percent_signed_payload = 93;
+  string percent_report_hash = 94;
+  string percent_signature = 95;
 }
 
 // Exchange info with KYC and paper status

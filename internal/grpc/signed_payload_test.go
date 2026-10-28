@@ -68,3 +68,41 @@ func TestSignedPayloadEmptyWhenReportWasAltered(t *testing.T) {
 		t.Fatal("a payload that no longer matches its hash was served")
 	}
 }
+
+func TestPercentSignedPayloadHashesToPercentHash(t *testing.T) {
+	s := &Server{logger: zap.NewNop()}
+	report := signedTestReport(t)
+
+	payload := s.percentSignedPayload(report)
+	if payload == "" {
+		t.Fatal("percent payload is empty")
+	}
+	sum := sha256.Sum256([]byte(payload))
+	if got := hex.EncodeToString(sum[:]); got != report.PercentReportHash {
+		t.Fatalf("sha256(percent payload) = %s, percent hash %s", got, report.PercentReportHash)
+	}
+	ok, err := signing.Verify(report.PercentReportHash, report.PercentSignature, report.PublicKey, report.SignatureAlgorithm)
+	if err != nil || !ok {
+		t.Fatalf("percent signature does not verify: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestPercentSignedPayloadEmptyWhenReportWasAltered(t *testing.T) {
+	s := &Server{logger: zap.NewNop()}
+	report := signedTestReport(t)
+	report.TotalReturn = 0.5
+
+	if payload := s.percentSignedPayload(report); payload != "" {
+		t.Fatal("a percent payload that no longer matches its hash was served")
+	}
+}
+
+func TestPercentSignedPayloadEmptyForReportSignedBeforeIt(t *testing.T) {
+	s := &Server{logger: zap.NewNop()}
+	report := signedTestReport(t)
+	report.PercentReportHash, report.PercentSignature = "", ""
+
+	if payload := s.percentSignedPayload(report); payload != "" {
+		t.Fatal("a percent payload was served without a percent signature")
+	}
+}
