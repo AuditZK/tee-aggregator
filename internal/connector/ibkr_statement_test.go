@@ -368,3 +368,70 @@ func plantDailyStatement(t *testing.T, i *IBKR, report []byte) {
 		flexReportCacheMu.Unlock()
 	})
 }
+
+// A wire is dated when it was initiated, and shows in the statement of the day
+// it reaches the account. Booked on its own date, the deposit lands days before
+// the equity it brings, so the arrival reads as a gain and the booking day as a
+// loss.
+func TestCashReport_DepositIsBookedOnTheDayItReachesTheAccount(t *testing.T) {
+	arrival := `
+      <CashTransactions>
+        <CashTransaction type="Deposits/Withdrawals" amount="9000" currency="USD" dateTime="20260526"/>
+      </CashTransactions>
+      <CashReport>
+        <CashReportCurrency currency="BASE_SUMMARY" depositWithdrawals="9000" internalTransfers="0" accountTransfers="0"/>
+      </CashReport>`
+	report := dailyReport(
+		dailyBlock("U0000001", "20260601", "20260529", "1000", "1000", quietDay),
+		dailyBlock("U0000001", "20260602", "20260601", "1000", "10010", arrival),
+	)
+	single, _, err := singleFlexStatement(report)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	snaps, err := (&IBKR{}).parseHistoricalSnapshotsFromReport(single, time.Time{})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, s := range snaps {
+		want := 0.0
+		if s.Date.Format("20060102") == "20260602" {
+			want = 9000
+		}
+		if s.Deposits != want {
+			t.Fatalf("%s deposits = %v, want %v", s.Date.Format("2006-01-02"), s.Deposits, want)
+		}
+	}
+}
+
+// A deposit advance cancelled when the wire arrives is backdated to the
+// advance; the day's Cash Report nets the two on the arrival day.
+func TestCashReport_CancelledAdvanceNetsOnTheArrivalDay(t *testing.T) {
+	flows, _ := parseFlows(t, `
+      <CashTransactions>
+        <CashTransaction type="Deposits/Withdrawals" amount="-1000" currency="USD" dateTime="20260601"/>
+        <CashTransaction type="Deposits/Withdrawals" amount="5000" currency="USD" dateTime="20260601"/>
+      </CashTransactions>
+      <CashReport>
+        <CashReportCurrency currency="BASE_SUMMARY" fromDate="20260601" toDate="20260601" depositWithdrawals="0" internalTransfers="0" accountTransfers="0"/>
+        <CashReportCurrency currency="BASE_SUMMARY" fromDate="20260604" toDate="20260604" depositWithdrawals="4000" internalTransfers="0" accountTransfers="0"/>
+      </CashReport>`)
+	if len(flows) != 1 || flows[0].Amount != 4000 || flows[0].Timestamp.Format("20060102") != "20260604" {
+		t.Fatalf("flows %+v, want 4000 on 2026-06-04", flows)
+	}
+}
+
+// A query whose Cash Report has no deposit column still takes its deposits
+// from Cash Transactions.
+func TestCashReport_WithoutDepositColumnCashTransactionsCount(t *testing.T) {
+	flows, _ := parseFlows(t, `
+      <CashTransactions>
+        <CashTransaction type="Deposits/Withdrawals" amount="2500" currency="USD" dateTime="20260602"/>
+      </CashTransactions>
+      <CashReport>
+        <CashReportCurrency currency="BASE_SUMMARY" fromDate="20260602" toDate="20260602" internalTransfers="0" accountTransfers="0"/>
+      </CashReport>`)
+	if len(flows) != 1 || flows[0].Amount != 2500 {
+		t.Fatalf("flows %+v, want the 2500 deposit", flows)
+	}
+}

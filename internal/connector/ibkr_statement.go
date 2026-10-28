@@ -344,11 +344,18 @@ type flexCashReportRow struct {
 	ToDate            string `xml:"toDate,attr"`
 	InternalTransfers string `xml:"internalTransfers,attr"`
 	AccountTransfers  string `xml:"accountTransfers,attr"`
+	// nil when the query has no such column: the day's deposits then come
+	// from Cash Transactions.
+	DepositWithdrawals *string `xml:"depositWithdrawals,attr"`
 }
 
 // cashReportTransfers is, per day, the cash a Cash Report broken out by day
-// shows moving in (+) or out (-) by transfer.
-type cashReportTransfers map[string]float64
+// shows moving in (+) or out (-) by transfer, and by deposit when
+// datesDeposits.
+type cashReportTransfers struct {
+	days          map[string]float64
+	datesDeposits bool
+}
 
 // dailyCashReportTransfers reads the base-currency summary rows that cover a
 // single day. Internal transfers include the sweeps between an account's own
@@ -356,8 +363,13 @@ type cashReportTransfers map[string]float64
 // the Transfers section: without them the cash a sweep brings in reads as
 // performance. A row over several days cannot be placed on one, and is left
 // out rather than guessed.
+//
+// Deposits are read here too when the rows carry them. A Cash Transaction is
+// dated when the wire was initiated, up to a week before the cash reaches the
+// account, and a deposit advance cancelled on arrival is backdated the same
+// way; the day's Cash Report books each one on the day it moved the equity.
 func dailyCashReportTransfers(rows []flexCashReportRow) cashReportTransfers {
-	out := cashReportTransfers{}
+	out := cashReportTransfers{days: map[string]float64{}}
 	for _, r := range rows {
 		if r.Currency != "BASE_SUMMARY" {
 			continue
@@ -369,15 +381,25 @@ func dailyCashReportTransfers(rows []flexCashReportRow) cashReportTransfers {
 		}
 		internal, _ := strconv.ParseFloat(r.InternalTransfers, 64)
 		account, _ := strconv.ParseFloat(r.AccountTransfers, 64)
-		out[from] += internal + account
+		out.days[from] += internal + account
+		if r.DepositWithdrawals != nil {
+			deposits, _ := strconv.ParseFloat(*r.DepositWithdrawals, 64)
+			out.days[from] += deposits
+			out.datesDeposits = true
+		}
 	}
 	return out
 }
 
+func (c cashReportTransfers) covers(day string) bool {
+	_, ok := c.days[day]
+	return ok
+}
+
 // flows states the transfers as cash flows in the account's base currency.
 func (c cashReportTransfers) flows(since time.Time) []*Cashflow {
-	days := make([]string, 0, len(c))
-	for day, amount := range c {
+	days := make([]string, 0, len(c.days))
+	for day, amount := range c.days {
 		if amount != 0 {
 			days = append(days, day)
 		}
@@ -389,7 +411,7 @@ func (c cashReportTransfers) flows(since time.Time) []*Cashflow {
 		if err != nil || ts.Before(since) {
 			continue
 		}
-		out = append(out, &Cashflow{Amount: c[day], Currency: "BASE_SUMMARY", Timestamp: ts})
+		out = append(out, &Cashflow{Amount: c.days[day], Currency: "BASE_SUMMARY", Timestamp: ts})
 	}
 	return out
 }

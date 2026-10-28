@@ -1307,6 +1307,9 @@ func cashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, []string,
 			}
 			continue
 		}
+		if reportTransfers.datesDeposits {
+			continue
+		}
 		// The singular spellings are directional by name; the umbrella
 		// spellings sign by amount. Either way the sign convention out of
 		// here is positive=deposit, negative=withdrawal.
@@ -1334,7 +1337,7 @@ func cashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, []string,
 		if !ok || ts.Before(since) {
 			continue
 		}
-		if _, covered := reportTransfers[ts.Format("20060102")]; covered {
+		if reportTransfers.covers(ts.Format("20060102")) {
 			continue
 		}
 		cash, _ := strconv.ParseFloat(tr.CashTransfer, 64)
