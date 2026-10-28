@@ -20,13 +20,14 @@ import (
 // and every timeout cost the day.
 const statementBackfillPeriodDays = 31
 
-// statementBackfillMaxReads bounds the statements of one backfill. A year is
-// twelve; a statement IBKR cuts short under load is followed by one for the
-// rest of its month, and at seven days a statement that is about fifty.
+// statementBackfillMaxReads bounds the statements of one backfill per year it
+// reads. A year is twelve; a statement IBKR cuts short under load is followed
+// by one for the rest of its month, and at seven days a statement that is
+// about fifty.
 const statementBackfillMaxReads = 80
 
-// statementBackfillTimeout bounds one backfill: up to statementBackfillMaxReads
-// statements and the spacing between them.
+// statementBackfillTimeout bounds one backfill's year: up to
+// statementBackfillMaxReads statements and the spacing between them.
 const statementBackfillTimeout = 2 * time.Hour
 
 // statementBackfillSpacing paces a backfill's statements like a deep
@@ -187,7 +188,7 @@ func (s *SyncService) startStatementBackfill(connMeta *repository.ExchangeConnec
 // full run, neither dry nor windowed, records the backfill as done. The caller
 // holds claimBackfill.
 func (s *SyncService) backfillStatements(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.PeriodHistoryProvider, from, to time.Time, opts reconstructOpts) error {
-	r := &statementReader{s: s, provider: provider}
+	r := &statementReader{s: s, provider: provider, maxReads: statementBackfillMaxReads * historyYears(from, to)}
 	var read [][]*connector.HistoricalSnapshot
 	for end := to; !end.Before(from); {
 		m := dayWindow{from: end.AddDate(0, 0, -(statementBackfillPeriodDays - 1)), to: end}
@@ -260,6 +261,7 @@ func (s *SyncService) historyStartsAfter(ctx context.Context, connMeta *reposito
 type statementReader struct {
 	s        *SyncService
 	provider connector.PeriodHistoryProvider
+	maxReads int
 	reads    int
 }
 
@@ -285,7 +287,7 @@ func (r *statementReader) month(ctx context.Context, m dayWindow) ([][]*connecto
 }
 
 func (r *statementReader) read(ctx context.Context, p dayWindow) ([]*connector.HistoricalSnapshot, error) {
-	if r.reads == statementBackfillMaxReads {
+	if r.reads == r.maxReads {
 		return nil, fmt.Errorf("history not read in %d statements", r.reads)
 	}
 	if r.reads > 0 {

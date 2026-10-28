@@ -223,6 +223,83 @@ func TestDBStatementBackfillNeedsTheNewestMonth(t *testing.T) {
 	}
 }
 
+// A deep reconstruction reads month by month like the backfill: it follows
+// every statement cut short, writes each day before the stored year down to the
+// account's first, and asks once for a month before it. Some twenty months
+// cut after a week each take more statements than one year's budget.
+func TestDBDeepHistoryFollowsCutStatementsToTheAccountStart(t *testing.T) {
+	withoutBackfillSpacing(t)
+	h := newDBHarness(t)
+	h.seedConnection(t, "ibkr", "main", dbKey, dbSecret)
+	h.sync.SetFXSource(stubFX{})
+	connMeta := h.connection(t, "ibkr", "main")
+
+	_, to := statementBackfillRange(time.Now())
+	acct := newPeriodicAccount(to.AddDate(0, 0, -1000), to)
+	acct.maxDays = 5
+	h.sync.reconstructFromStatements(h.ctx, connMeta, acct, reconstructOpts{})
+	earliest, err := h.snaps.GetEarliestTimestamp(h.ctx, dbUser, "ibkr", "main")
+	if err != nil {
+		t.Fatalf("read the stored year: %v", err)
+	}
+	if !earliest.After(acct.firstDay()) {
+		t.Fatal("the year's backfill already reached the account's first day")
+	}
+
+	acct.periods = nil
+	if err := h.sync.deepHistoryFrom(h.ctx, connMeta, acct, to.AddDate(-4, 0, 0), reconstructOpts{}); err != nil {
+		t.Fatalf("deep reconstruction: %v", err)
+	}
+
+	rows, err := h.snaps.GetByUserAndDateRange(h.ctx, dbUser, acct.firstDay(), to.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	stored := map[time.Time]float64{}
+	for _, r := range rows {
+		stored[r.Timestamp.UTC()] = r.TotalEquity
+	}
+	for day, eq := range acct.closes {
+		if got, ok := stored[day]; !ok || got != eq {
+			t.Fatalf("%s: stored %v (present %v), want %v", day.Format(time.DateOnly), got, ok, eq)
+		}
+	}
+	if len(acct.periods) <= statementBackfillMaxReads {
+		t.Fatalf("%d statements read, the case needs more than one year's budget of %d", len(acct.periods), statementBackfillMaxReads)
+	}
+	before := 0
+	for _, p := range acct.periods {
+		if p.to.Before(acct.firstDay()) {
+			before++
+		}
+	}
+	if before != 1 {
+		t.Fatalf("%d statements before the account's first day, want 1", before)
+	}
+}
+
+// A deep reconstruction never reads beside a running backfill: both would
+// share the token, and the last one to write would win.
+func TestDBDeepHistoryWaitsForNoBackfill(t *testing.T) {
+	h := newDBHarness(t)
+	h.seedConnection(t, "ibkr", "main", dbKey, dbSecret)
+	connMeta := h.connection(t, "ibkr", "main")
+	_, to := statementBackfillRange(time.Now())
+	acct := newPeriodicAccount(to.AddDate(0, 0, -60), to)
+
+	if !h.sync.claimBackfill(connMeta) {
+		t.Fatal("claim the backfill")
+	}
+	defer h.sync.releaseBackfill(connMeta)
+
+	if err := h.sync.deepHistoryFrom(h.ctx, connMeta, acct, to.AddDate(-2, 0, 0), reconstructOpts{}); err == nil {
+		t.Fatal("deep reconstruction ran beside a backfill")
+	}
+	if len(acct.periods) != 0 {
+		t.Fatalf("%d statements read beside a backfill", len(acct.periods))
+	}
+}
+
 // waitBackfilled waits for the backfill a sync started in the background.
 func (h *dbHarness) waitBackfilled(t *testing.T, exchange, label string) {
 	t.Helper()

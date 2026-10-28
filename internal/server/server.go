@@ -417,7 +417,7 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleAdminReconstructDeep extends a connection's history back to a date
-// older than its venue's rolling window, one statement per year.
+// older than its venue's rolling window, a month per statement.
 //
 // Usage: POST /api/v1/admin/reconstruct-deep?user_uid=X&exchange=ibkr&label=Y&from=2022-10-11[&dry_run=1]
 //
@@ -462,9 +462,10 @@ func (s *Server) handleAdminReconstructDeep(w http.ResponseWriter, r *http.Reque
 		zap.Time("from", from),
 		zap.Bool("dry_run", dryRun),
 	)
+	timeout := service.DeepHistoryTimeout(from, time.Now())
 	if dryRun {
-		extendWriteDeadline(w, adminReconstructTimeout)
-		ctx, cancel := context.WithTimeout(r.Context(), adminReconstructTimeout)
+		extendWriteDeadline(w, timeout)
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 		days, err := s.handler.syncSvc.DryRunDeepHistory(ctx, userUID, exchange, label, from)
 		if err != nil {
@@ -480,7 +481,7 @@ func (s *Server) handleAdminReconstructDeep(w http.ResponseWriter, r *http.Reque
 	}
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), adminReconstructTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		if err := s.handler.syncSvc.ReconstructDeepHistory(ctx, userUID, exchange, label, from); err != nil {
 			s.log().Error("deep reconstruct failed", zap.String("exchange", exchange), zap.Error(err))
