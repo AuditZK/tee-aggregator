@@ -145,6 +145,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/admin/cashflows", s.localhostOnly(s.handleAdminDumpCashflows))
 	mux.HandleFunc("/api/v1/admin/reconstruct", s.localhostOnly(s.handleAdminReconstruct))
 	mux.HandleFunc("/api/v1/admin/reconstruct-deep", s.localhostOnly(s.handleAdminReconstructDeep))
+	mux.HandleFunc("/api/v1/admin/unpin-broker-accounts", s.localhostOnly(s.handleAdminUnpinBrokerAccounts))
 	mux.HandleFunc("/api/v1/admin/balance-probe", s.localhostOnly(s.handleAdminBalanceProbe))
 	mux.HandleFunc("/api/v1/admin/refresh-metadata", s.localhostOnly(s.handleAdminRefreshMetadata))
 	mux.HandleFunc("/api/v1/admin/raw-statement", s.localhostOnly(s.handleAdminRawStatement))
@@ -419,10 +420,12 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 // handleAdminReconstructDeep extends a connection's history back to a date
 // older than its venue's rolling window, a month per statement.
 //
-// Usage: POST /api/v1/admin/reconstruct-deep?user_uid=X&exchange=ibkr&label=Y&from=2022-10-11[&dry_run=1]
+// Usage: POST /api/v1/admin/reconstruct-deep?user_uid=X&exchange=ibkr&label=Y&from=2022-10-11[&dry_run=1][&rewrite=1]
 //
 // A dry run answers with the days instead of writing them, for the same reason
-// as handleAdminReconstruct's.
+// as handleAdminReconstruct's. rewrite reads through yesterday, over the
+// stored days: for a connection whose accounts changed (an IB-UKL segment
+// added to the query), after unpin-broker-accounts.
 func (s *Server) handleAdminReconstructDeep(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
@@ -449,6 +452,7 @@ func (s *Server) handleAdminReconstructDeep(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	dryRun := q.Get("dry_run") == "1" || q.Get("dry_run") == "true"
+	rewrite := q.Get("rewrite") == "1" || q.Get("rewrite") == "true"
 
 	if s.handler == nil || s.handler.syncSvc == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
@@ -461,13 +465,14 @@ func (s *Server) handleAdminReconstructDeep(w http.ResponseWriter, r *http.Reque
 		zap.String("label", label),
 		zap.Time("from", from),
 		zap.Bool("dry_run", dryRun),
+		zap.Bool("rewrite", rewrite),
 	)
 	timeout := service.DeepHistoryTimeout(from, time.Now())
 	if dryRun {
 		extendWriteDeadline(w, timeout)
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
-		days, err := s.handler.syncSvc.DryRunDeepHistory(ctx, userUID, exchange, label, from)
+		days, err := s.handler.syncSvc.DryRunDeepHistory(ctx, userUID, exchange, label, from, rewrite)
 		if err != nil {
 			s.log().Error("deep reconstruct dry run failed", zap.String("exchange", exchange), zap.Error(err))
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
@@ -483,11 +488,52 @@ func (s *Server) handleAdminReconstructDeep(w http.ResponseWriter, r *http.Reque
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		if err := s.handler.syncSvc.ReconstructDeepHistory(ctx, userUID, exchange, label, from); err != nil {
+		if err := s.handler.syncSvc.ReconstructDeepHistory(ctx, userUID, exchange, label, from, rewrite); err != nil {
 			s.log().Error("deep reconstruct failed", zap.String("exchange", exchange), zap.Error(err))
 		}
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "deep reconstruction triggered, check logs"})
+}
+
+// handleAdminUnpinBrokerAccounts clears the accounts a connection is pinned
+// to, so its next statement pins the ones it then measures. Run before a
+// reconstruct-deep rewrite when a holder adds an IB-UKL segment to the query.
+//
+// Usage: POST /api/v1/admin/unpin-broker-accounts?user_uid=X&exchange=ibkr&label=Y
+func (s *Server) handleAdminUnpinBrokerAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+	if err := s.handler.syncSvc.UnpinBrokerAccounts(r.Context(), userUID, exchange, label); err != nil {
+		s.log().Error("unpin broker accounts failed", zap.String("exchange", exchange), zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+	s.logger.Info("admin broker accounts unpinned",
+		zap.String("user_uid", userUID),
+		zap.String("exchange", exchange),
+		zap.String("label", label),
+	)
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
 // The breakdown carries the per-market free margin, which a stored day can

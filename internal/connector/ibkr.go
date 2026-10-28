@@ -303,6 +303,12 @@ type IBKR struct {
 	// (statementReport); kept apart for the same reason as currencyWarning.
 	statementWarning string
 
+	// accountGuard, when set, vets the accounts every statement is narrowed
+	// to before any figure is read from it; measuredAccounts are the last
+	// daily statement's.
+	accountGuard     func(accounts []string, past bool) error
+	measuredAccounts []string
+
 	// Cached from last GetBalance call (avoids extra Flex requests)
 	cachedBreakdown []*MarketBalance
 	cachedIsPaper   *bool
@@ -1037,13 +1043,13 @@ func (i *IBKR) GetHistoricalSnapshotsForPeriod(ctx context.Context, from, to tim
 	if err != nil {
 		return nil, err
 	}
-	single, _, err := singleFlexStatement(report)
+	n, err := i.narrow(report, true)
 	if err != nil {
 		return nil, err
 	}
 	// Shared with the daily syncs when a backfill runs beside them, so it
 	// leaves the connector's warnings to them.
-	all, _, err := i.historicalSnapshotsFromReport(single, from)
+	all, _, err := i.historicalSnapshotsFromReport(n.report, from)
 	if err != nil {
 		return nil, err
 	}

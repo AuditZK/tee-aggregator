@@ -55,9 +55,10 @@ func mergePeriodSnapshots(periods [][]*connector.HistoricalSnapshot) []*connecto
 // ReconstructDeepHistory extends a connection's history back to from, up to
 // and including the earliest stored day. That overlapping day is what clears
 // the inception deposit the stored history was stamped with: left alone, it
-// would read as the whole balance arriving mid-series.
-func (s *SyncService) ReconstructDeepHistory(ctx context.Context, userUID, exchange, label string, from time.Time) error {
-	if err := s.reconstructDeepHistory(ctx, userUID, exchange, label, from, reconstructOpts{}); err != nil {
+// would read as the whole balance arriving mid-series. rewrite reads on
+// through yesterday, over the stored days.
+func (s *SyncService) ReconstructDeepHistory(ctx context.Context, userUID, exchange, label string, from time.Time, rewrite bool) error {
+	if err := s.reconstructDeepHistory(ctx, userUID, exchange, label, from, reconstructOpts{rewrite: rewrite}); err != nil {
 		return err
 	}
 	s.notifyHistoryRebuilt(ctx, userUID)
@@ -97,6 +98,10 @@ func (s *SyncService) deepHistoryFrom(ctx context.Context, connMeta *repository.
 	if err != nil {
 		return err
 	}
+	if opts.rewrite {
+		now := time.Now().UTC()
+		to = time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, time.UTC)
+	}
 	if !from.Before(to) {
 		return fmt.Errorf("stored history already starts on %s", to.Format("2006-01-02"))
 	}
@@ -123,9 +128,10 @@ func (s *SyncService) deepHistoryEnd(ctx context.Context, connMeta *repository.E
 
 // DryRunDeepHistory runs ReconstructDeepHistory without writing and hands back
 // the days it would have persisted.
-func (s *SyncService) DryRunDeepHistory(ctx context.Context, userUID, exchange, label string, from time.Time) ([]*repository.Snapshot, error) {
+func (s *SyncService) DryRunDeepHistory(ctx context.Context, userUID, exchange, label string, from time.Time, rewrite bool) ([]*repository.Snapshot, error) {
 	var out []*repository.Snapshot
 	err := s.reconstructDeepHistory(ctx, userUID, exchange, label, from, reconstructOpts{
+		rewrite: rewrite,
 		dryRun:  true,
 		collect: func(sn []*repository.Snapshot) { out = sn },
 	})

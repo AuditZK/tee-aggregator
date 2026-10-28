@@ -35,7 +35,8 @@ CREATE TABLE public.exchange_connections (
     "isPaper" boolean,
     "kycLevel" text,
     "rebuildFinalizedAt" timestamp with time zone,
-    "rebuildRequestedAt" timestamp with time zone
+    "rebuildRequestedAt" timestamp with time zone,
+    "brokerAccounts" text
 );
 
 CREATE TABLE public.migrations (

@@ -181,6 +181,20 @@ type BalanceFreshnessProvider interface {
 	BalanceAsOf() time.Time
 }
 
+// AccountScoped is implemented by connectors whose credentials can reach
+// several broker accounts (an IBKR Flex query ticks any number). The sync
+// layer pins the accounts a connection measures, so a query edited to cover
+// other accounts cannot splice their balance into the stored history.
+type AccountScoped interface {
+	// SetAccountGuard installs a check every statement must pass, with the
+	// broker account ids it measures, before any figure is read from it. past
+	// marks a statement over a chosen past period, which may predate one of
+	// the accounts.
+	SetAccountGuard(guard func(accounts []string, past bool) error)
+	// MeasuredAccounts returns the account ids the last balance read measured.
+	MeasuredAccounts() []string
+}
+
 // CapabilityWarner is implemented by connectors that can discover, during a
 // balance fetch, that the stored API key cannot read part of the account —
 // e.g. a Binance key without the Futures scope answering -2015 on every fapi

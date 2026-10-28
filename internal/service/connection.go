@@ -232,6 +232,11 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 	// refresh token every time it does — storing the request's pair wrote a
 	// refresh token the broker had already invalidated, so the connection was
 	// born dead and failed its first nightly sync with ACCESS_DENIED.
+	pinnedAccounts, err := s.brokerAccountsAtConnect(ctx, testConn, req.UserUID, normalizedExchange, normalizedLabel)
+	if err != nil {
+		return err
+	}
+
 	storedAPIKey, storedAPISecret := effectiveOAuthCredentials(testConn, req.APIKey, req.APISecret)
 	if storedAPIKey != req.APIKey || storedAPISecret != req.APISecret {
 		credentialsHash = hashCredentials(storedAPIKey, storedAPISecret, req.Passphrase)
@@ -291,6 +296,17 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 			return fmt.Errorf("%w: %s", ErrConnectionAlreadyExists, ExistingConnectionNoopMessage)
 		}
 		return err
+	}
+	if pinnedAccounts != "" {
+		if err := s.repo.SetBrokerAccounts(ctx, conn.ID, pinnedAccounts); err != nil && s.logger != nil {
+			// The first statement pins it instead.
+			s.logger.Warn("pin broker accounts at connect failed",
+				zap.String("user_uid", req.UserUID),
+				zap.String("exchange", normalizedExchange),
+				zap.String("label", normalizedLabel),
+				zap.Error(err),
+			)
+		}
 	}
 
 	// TS parity: capture exchange metadata (KYC level + paper/live status)
