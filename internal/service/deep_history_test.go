@@ -15,29 +15,19 @@ func isoDay(s string) time.Time {
 	return t
 }
 
-func TestStatementPeriodsCoverRangeWithinIBKRCeiling(t *testing.T) {
-	from, to := isoDay("2022-10-11"), isoDay("2025-10-09")
-	periods := statementPeriods(from, to)
-	if len(periods) != 3 {
-		t.Fatalf("got %d periods, want 3: %v", len(periods), periods)
-	}
-	if !periods[0].from.Equal(from) || !periods[len(periods)-1].to.Equal(to) {
-		t.Fatalf("periods do not span [%s, %s]: %v", from, to, periods)
-	}
-	for n, p := range periods {
-		if days := int(p.to.Sub(p.from).Hours()/24) + 1; days > statementPeriodDays {
-			t.Fatalf("period %d covers %d days, over IBKR's %d", n, days, statementPeriodDays)
+func TestHistoryYears(t *testing.T) {
+	for _, c := range []struct {
+		from, to string
+		want     int
+	}{
+		{"2025-10-24", "2025-10-24", 1},
+		{"2024-10-25", "2025-10-24", 1},
+		{"2024-10-24", "2025-10-24", 2},
+		{"2022-10-11", "2025-10-09", 3},
+	} {
+		if got := historyYears(isoDay(c.from), isoDay(c.to)); got != c.want {
+			t.Errorf("historyYears(%s, %s) = %d, want %d", c.from, c.to, got, c.want)
 		}
-		if n > 0 && !p.from.Equal(periods[n-1].to.AddDate(0, 0, 1)) {
-			t.Fatalf("period %d does not start the day after period %d ends: %v", n, n-1, periods)
-		}
-	}
-}
-
-func TestStatementPeriodsSingleDay(t *testing.T) {
-	periods := statementPeriods(isoDay("2024-02-29"), isoDay("2024-02-29"))
-	if len(periods) != 1 || !periods[0].from.Equal(periods[0].to) {
-		t.Fatalf("got %v", periods)
 	}
 }
 
