@@ -22,7 +22,7 @@ import (
 
 const (
 	SignatureAlgorithm = "ECDSA-P256-SHA256"
-	EnclaveVersion     = "1.1.2-go"
+	EnclaveVersion     = "1.1.3-go"
 
 	// AnnualizationDays is the one year length every annualised figure the
 	// enclave produces is computed on: volatility, Sharpe, Sortino and the
@@ -437,6 +437,11 @@ type SignedReport struct {
 	ReportHash         string `json:"report_hash"`
 	EnclaveVersion     string `json:"enclave_version"`
 	PayloadVersion     string `json:"payload_version"`
+
+	// The same report with every amount withheld, signed on its own so a
+	// report shared in percentages stays verifiable. See PercentPayload.
+	PercentReportHash string `json:"percent_report_hash,omitempty"`
+	PercentSignature  string `json:"percent_signature,omitempty"`
 }
 
 // Sign creates a signed report from input.
@@ -487,23 +492,54 @@ func (s *ReportSigner) Sign(input *ReportInput) (*SignedReport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("serialize financial payload: %w", err)
 	}
-
-	hash := sha256.Sum256(financialJSON)
-	report.ReportHash = hex.EncodeToString(hash[:])
-
-	reportHashDigest := sha256.Sum256([]byte(report.ReportHash))
-	signatureDER, err := ecdsa.SignASN1(rand.Reader, s.privateKey, reportHashDigest[:])
-	if err != nil {
+	if report.ReportHash, report.Signature, err = s.signPayload(financialJSON); err != nil {
 		return nil, fmt.Errorf("sign report hash: %w", err)
 	}
-	report.Signature = base64.StdEncoding.EncodeToString(signatureDER)
+
+	percentJSON, err := PercentPayload(report)
+	if err != nil {
+		return nil, fmt.Errorf("serialize percent payload: %w", err)
+	}
+	if report.PercentReportHash, report.PercentSignature, err = s.signPayload(percentJSON); err != nil {
+		return nil, fmt.Errorf("sign percent report hash: %w", err)
+	}
 
 	return report, nil
+}
+
+// signPayload returns hex(SHA-256(payload)) and the ECDSA signature over that
+// hex string, the scheme every verifier of a report hash already implements.
+func (s *ReportSigner) signPayload(payload []byte) (hash, signature string, err error) {
+	sum := sha256.Sum256(payload)
+	hash = hex.EncodeToString(sum[:])
+	digest := sha256.Sum256([]byte(hash))
+	signatureDER, err := ecdsa.SignASN1(rand.Reader, s.privateKey, digest[:])
+	if err != nil {
+		return "", "", err
+	}
+	return hash, base64.StdEncoding.EncodeToString(signatureDER), nil
 }
 
 // CanonicalPayload returns the bytes ReportHash is the SHA-256 of.
 func CanonicalPayload(report *SignedReport) ([]byte, error) {
 	return marshalSortedJSON(buildFinancialPayload(report))
+}
+
+// PercentPayload returns the bytes PercentReportHash is the SHA-256 of: the
+// canonical payload without its only amounts, each day's nav and each month's
+// aum. A report shared in percentages must not publish them, and removing them
+// from the canonical payload would break its hash, so this view is signed on
+// its own. amountsWithheld tells a verifier the omission is deliberate.
+func PercentPayload(report *SignedReport) ([]byte, error) {
+	payload := buildFinancialPayload(report)
+	for _, day := range payload["dailyReturns"].([]map[string]any) {
+		delete(day, "nav")
+	}
+	for _, month := range payload["monthlyReturns"].([]map[string]any) {
+		delete(month, "aum")
+	}
+	payload["amountsWithheld"] = true
+	return marshalSortedJSON(payload)
 }
 
 func formatISO8601(t time.Time) string {
@@ -857,6 +893,29 @@ func VerifyReport(report *SignedReport) (bool, error) {
 	}
 
 	return Verify(report.ReportHash, report.Signature, report.PublicKey, report.SignatureAlgorithm)
+}
+
+// VerifyPercentReport is VerifyReport for the amounts-withheld view: it
+// rebuilds PercentPayload and checks PercentReportHash and PercentSignature.
+func VerifyPercentReport(report *SignedReport) (bool, error) {
+	if report == nil {
+		return false, fmt.Errorf("nil report")
+	}
+	if report.PercentReportHash == "" || report.PercentSignature == "" {
+		return false, nil
+	}
+
+	payload, err := PercentPayload(report)
+	if err != nil {
+		return false, fmt.Errorf("rebuild percent payload: %w", err)
+	}
+
+	recomputed := sha256.Sum256(payload)
+	if hex.EncodeToString(recomputed[:]) != report.PercentReportHash {
+		return false, nil
+	}
+
+	return Verify(report.PercentReportHash, report.PercentSignature, report.PublicKey, report.SignatureAlgorithm)
 }
 
 // Errors surfaced by the strict verifier helpers.

@@ -31,7 +31,7 @@ import (
 
 var startTime = time.Now()
 
-const version = "1.1.2-go"
+const version = "1.1.3-go"
 const genericInternalError = "Internal server error"
 
 // msgDatabaseNotConfigured is the canonical error string returned when an
@@ -815,6 +815,11 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 	}
 	resp.ExchangeDetails = mapExchangeDetails(report.ExchangeDetails, report.Exchanges)
 	resp.SignedPayload = s.signedPayload(report)
+	if payload := s.percentSignedPayload(report); payload != "" {
+		resp.PercentSignedPayload = payload
+		resp.PercentReportHash = report.PercentReportHash
+		resp.PercentSignature = report.PercentSignature
+	}
 
 	// SEC-107: resp.Measurement is deliberately left empty. The previous code
 	// attached the current measurement OUTSIDE the signed payload, which let
@@ -896,6 +901,26 @@ func (s *Server) signedPayload(report *signing.SignedReport) string {
 	sum := sha256.Sum256(payload)
 	if hex.EncodeToString(sum[:]) != report.ReportHash {
 		s.logger.Error("signed payload does not match report hash",
+			zap.String("report_id", report.ReportID),
+		)
+		return ""
+	}
+	return string(payload)
+}
+
+// percentSignedPayload is signedPayload for the amounts-withheld view.
+func (s *Server) percentSignedPayload(report *signing.SignedReport) string {
+	if report.PercentReportHash == "" {
+		return ""
+	}
+	payload, err := signing.PercentPayload(report)
+	if err != nil {
+		s.logger.Error("rebuild percent payload failed", zap.Error(err))
+		return ""
+	}
+	sum := sha256.Sum256(payload)
+	if hex.EncodeToString(sum[:]) != report.PercentReportHash {
+		s.logger.Error("percent payload does not match percent report hash",
 			zap.String("report_id", report.ReportID),
 		)
 		return ""

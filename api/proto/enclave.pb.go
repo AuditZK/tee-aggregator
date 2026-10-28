@@ -1577,8 +1577,14 @@ type SignedReportResponse struct {
 	// fields above are a convenience copy; a verifier hashes this string,
 	// checks the signature over the hash, then reads the figures from it.
 	SignedPayload string `protobuf:"bytes,92,opt,name=signed_payload,json=signedPayload,proto3" json:"signed_payload,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// The same payload with every amount withheld (no daily nav, no monthly
+	// aum), hashed and signed on its own by the same key. A report shared in
+	// percentages ships these three instead and stays verifiable.
+	PercentSignedPayload string `protobuf:"bytes,93,opt,name=percent_signed_payload,json=percentSignedPayload,proto3" json:"percent_signed_payload,omitempty"`
+	PercentReportHash    string `protobuf:"bytes,94,opt,name=percent_report_hash,json=percentReportHash,proto3" json:"percent_report_hash,omitempty"`
+	PercentSignature     string `protobuf:"bytes,95,opt,name=percent_signature,json=percentSignature,proto3" json:"percent_signature,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *SignedReportResponse) Reset() {
@@ -1929,6 +1935,27 @@ func (x *SignedReportResponse) GetAnnualizationDays() int32 {
 func (x *SignedReportResponse) GetSignedPayload() string {
 	if x != nil {
 		return x.SignedPayload
+	}
+	return ""
+}
+
+func (x *SignedReportResponse) GetPercentSignedPayload() string {
+	if x != nil {
+		return x.PercentSignedPayload
+	}
+	return ""
+}
+
+func (x *SignedReportResponse) GetPercentReportHash() string {
+	if x != nil {
+		return x.PercentReportHash
+	}
+	return ""
+}
+
+func (x *SignedReportResponse) GetPercentSignature() string {
+	if x != nil {
+		return x.PercentSignature
 	}
 	return ""
 }
@@ -2552,7 +2579,7 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\vreport_name\x18\a \x01(\tR\n" +
 	"reportName\x12#\n" +
 	"\rbase_currency\x18\b \x01(\tR\fbaseCurrency\x12$\n" +
-	"\x0erisk_free_rate\x18\t \x01(\x01R\friskFreeRate\"\xc6\r\n" +
+	"\x0erisk_free_rate\x18\t \x01(\x01R\friskFreeRate\"\xd9\x0e\n" +
 	"\x14SignedReportResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x1b\n" +
@@ -2607,7 +2634,10 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\fenclave_mode\x18R \x01(\tR\venclaveMode\x12 \n" +
 	"\vmeasurement\x18S \x01(\tR\vmeasurement\x12-\n" +
 	"\x12annualization_days\x18[ \x01(\x05R\x11annualizationDays\x12%\n" +
-	"\x0esigned_payload\x18\\ \x01(\tR\rsignedPayload\"Z\n" +
+	"\x0esigned_payload\x18\\ \x01(\tR\rsignedPayload\x124\n" +
+	"\x16percent_signed_payload\x18] \x01(\tR\x14percentSignedPayload\x12.\n" +
+	"\x13percent_report_hash\x18^ \x01(\tR\x11percentReportHash\x12+\n" +
+	"\x11percent_signature\x18_ \x01(\tR\x10percentSignature\"Z\n" +
 	"\fExchangeInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\tkyc_level\x18\x02 \x01(\tR\bkycLevel\x12\x19\n" +
