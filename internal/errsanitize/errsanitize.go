@@ -41,6 +41,12 @@ const (
 	// MsgUnknownServer is a broker server name the MT bridge cannot place: a
 	// typo or an unsupported broker, which only the holder can correct.
 	MsgUnknownServer = "broker server name not recognized"
+	// MsgBrokerAccountsChanged is a broker report edited to cover other
+	// accounts than the connection measures; the stored history is kept.
+	MsgBrokerAccountsChanged = "the broker report now covers different accounts than this connection, contact support to include them"
+	// MsgBrokerAccountMeasured is an account another connection already
+	// measures: counted in both, it would count twice.
+	MsgBrokerAccountMeasured = "an account in this broker report is already connected, untick it in the report or add the others to the existing connection"
 )
 
 type category struct {
@@ -59,6 +65,10 @@ var categories = []category{
 	// holder typed it, so any later substring could be sitting inside it.
 	{"unknown_server", MsgUnknownServer},
 	{MsgUnknownServer, MsgUnknownServer},
+	// Ahead of "already exists": an account already measured is not the same
+	// connection twice, and the holder fixes it in the broker's query.
+	{"broker_accounts_changed", MsgBrokerAccountsChanged},
+	{"broker_account_already_connected", MsgBrokerAccountMeasured},
 	// Rate limiting first: "cTrader token refresh rate-limited (429)" is a
 	// throttle, not a dead authorization, and the reauth patterns below would
 	// otherwise claim it.

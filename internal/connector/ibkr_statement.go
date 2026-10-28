@@ -57,8 +57,24 @@ func accountEquity(blocks []*flexStatementBlock) float64 {
 	return total
 }
 
+// narrowedStatement is a Flex report cut down to what one connection
+// measures: accounts names the accounts it covers, carried how many the
+// report held.
+type narrowedStatement struct {
+	report   []byte
+	accounts []string
+	carried  int
+}
+
 // singleFlexStatement narrows a Flex report to one account and returns how
 // many accounts it carried.
+func singleFlexStatement(report []byte) ([]byte, int, error) {
+	n, err := narrowFlexStatement(report)
+	return n.report, n.carried, err
+}
+
+// narrowFlexStatement narrows a Flex report to the one account a connection
+// measures.
 //
 // A query run over several accounts (an advisor or organization master with
 // its sub-accounts, or two accounts ticked together) returns one
@@ -70,12 +86,18 @@ func accountEquity(blocks []*flexStatementBlock) float64 {
 // equity is kept: the largest balance on its latest report date, the first
 // one on a tie.
 //
+// An account and its IB-UKL segment (U1234567 and U1234567F) are one account
+// to the holder and to PortfolioAnalyst: money sweeps between them daily. Kept
+// alone, either one reads every sweep as a deposit or a withdrawal and misses
+// what the other half earned, so the pair is consolidated
+// (consolidateSegments) and weighed as one.
+//
 // "Breakout by Day" also returns one <FlexStatement> per day, all for the
 // same account. Narrowing those to one would keep a single day of history, so
 // an account's daily statements are merged back into one (mergeDailyStatements).
 // A report that cannot be read is returned as it came, for the parser to
 // reject with its own error.
-func singleFlexStatement(report []byte) ([]byte, int, error) {
+func narrowFlexStatement(report []byte) (narrowedStatement, error) {
 	var flex struct {
 		XMLName        xml.Name `xml:"FlexQueryResponse"`
 		FlexStatements struct {
@@ -83,11 +105,14 @@ func singleFlexStatement(report []byte) ([]byte, int, error) {
 		} `xml:"FlexStatements"`
 	}
 	if err := xml.Unmarshal(report, &flex); err != nil {
-		return report, 0, nil
+		return narrowedStatement{report: report}, nil
 	}
 	blocks := flex.FlexStatements.FlexStatement
-	if len(blocks) < 2 {
-		return report, len(blocks), nil
+	if len(blocks) == 0 {
+		return narrowedStatement{report: report}, nil
+	}
+	if len(blocks) == 1 {
+		return narrowedStatement{report: report, accounts: namedAccounts([]string{blocks[0].attr("accountId")}), carried: 1}, nil
 	}
 
 	var order []string
@@ -99,26 +124,288 @@ func singleFlexStatement(report []byte) ([]byte, int, error) {
 		}
 		byAccount[id] = append(byAccount[id], &blocks[n])
 	}
-	keep := order[0]
-	for _, id := range order[1:] {
-		if accountEquity(byAccount[id]) > accountEquity(byAccount[keep]) {
-			keep = id
+	groups := segmentGroups(order)
+	groupEquity := func(g []string) float64 {
+		total := 0.0
+		for _, id := range g {
+			total += accountEquity(byAccount[id])
+		}
+		return total
+	}
+	keep := groups[0]
+	for _, g := range groups[1:] {
+		if groupEquity(g) > groupEquity(keep) {
+			keep = g
 		}
 	}
 
-	kept := byAccount[keep]
-	if len(kept) == 1 {
-		var b bytes.Buffer
-		writeFlexOpen(&b, "FlexStatement", kept[0].Attrs)
-		b.Write(kept[0].Inner)
-		b.WriteString("</FlexStatement>")
-		return wrapFlexStatement(b.Bytes()), len(order), nil
+	stmts := make([][]byte, 0, len(keep))
+	for _, id := range keep {
+		stmt, err := accountStatement(byAccount[id])
+		if err != nil {
+			return narrowedStatement{carried: len(order)}, err
+		}
+		stmts = append(stmts, stmt)
 	}
-	merged, err := mergeDailyStatements(kept)
-	if err != nil {
-		return nil, len(order), err
+	stmt := stmts[0]
+	if len(stmts) > 1 {
+		var err error
+		if stmt, err = consolidateSegments(stmts); err != nil {
+			return narrowedStatement{carried: len(order)}, err
+		}
 	}
-	return wrapFlexStatement(merged), len(order), nil
+	return narrowedStatement{report: wrapFlexStatement(stmt), accounts: namedAccounts(keep), carried: len(order)}, nil
+}
+
+// namedAccounts drops statements that name no account: nothing can be pinned
+// to them.
+func namedAccounts(ids []string) []string {
+	var out []string
+	for _, id := range ids {
+		if strings.TrimSpace(id) != "" {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// segmentGroups groups the report's accounts into what a connection can
+// measure: an account with its IB-UKL segment (the same id plus "F"), every
+// other account alone. Each group lists its base account first.
+func segmentGroups(order []string) [][]string {
+	present := make(map[string]bool, len(order))
+	for _, id := range order {
+		present[strings.ToUpper(id)] = true
+	}
+	segmentOf := func(id string) (string, bool) {
+		up := strings.ToUpper(id)
+		if len(up) < 2 || !strings.HasSuffix(up, "F") {
+			return "", false
+		}
+		base := up[:len(up)-1]
+		return base, present[base]
+	}
+	var groups [][]string
+	index := map[string]int{}
+	for _, id := range order {
+		if _, ok := segmentOf(id); ok {
+			continue
+		}
+		index[strings.ToUpper(id)] = len(groups)
+		groups = append(groups, []string{id})
+	}
+	for _, id := range order {
+		if base, ok := segmentOf(id); ok {
+			groups[index[base]] = append(groups[index[base]], id)
+		}
+	}
+	return groups
+}
+
+// accountStatement is one account's statement, its daily ones merged.
+func accountStatement(blocks []*flexStatementBlock) ([]byte, error) {
+	if len(blocks) > 1 {
+		return mergeDailyStatements(blocks)
+	}
+	var b bytes.Buffer
+	writeFlexOpen(&b, "FlexStatement", blocks[0].Attrs)
+	b.Write(blocks[0].Inner)
+	b.WriteString("</FlexStatement>")
+	return b.Bytes(), nil
+}
+
+// segmentRowSections hold one row per event: the consolidated statement
+// carries both segments' rows. A sweep between the segments shows in each
+// one's Cash Report, out of one and into the other on the same day, so the
+// pair's sum nets it to nothing.
+var segmentRowSections = map[string]bool{
+	"Trades":           true,
+	"OpenPositions":    true,
+	"CashTransactions": true,
+	"Transfers":        true,
+	"CashReport":       true,
+}
+
+type flexStatementDoc struct {
+	Attrs    []xml.Attr    `xml:",any,attr"`
+	Sections []flexSection `xml:",any"`
+}
+
+func (d *flexStatementDoc) attr(name string) string {
+	for _, a := range d.Attrs {
+		if a.Name.Local == name {
+			return a.Value
+		}
+	}
+	return ""
+}
+
+// consolidateSegments folds an account's statement and its segment's into one
+// statement under the base account: NAV summed day by day, every event row
+// kept, every other section (rates, account information) taken from the base.
+func consolidateSegments(stmts [][]byte) ([]byte, error) {
+	docs := make([]flexStatementDoc, len(stmts))
+	for n, s := range stmts {
+		if err := xml.Unmarshal(s, &docs[n]); err != nil {
+			return nil, fmt.Errorf("consolidate segment statements: read statement: %w", err)
+		}
+	}
+
+	var order []string
+	byName := map[string][]*flexSection{}
+	for n := range docs {
+		for k := range docs[n].Sections {
+			name := docs[n].Sections[k].XMLName.Local
+			if _, seen := byName[name]; !seen {
+				order = append(order, name)
+			}
+			byName[name] = append(byName[name], &docs[n].Sections[k])
+		}
+	}
+
+	from, to := "", ""
+	for n := range docs {
+		if f, ok := flexDay(docs[n].attr("fromDate")); ok && (from == "" || f < from) {
+			from = f
+		}
+		if t, ok := flexDay(docs[n].attr("toDate")); ok && t > to {
+			to = t
+		}
+	}
+	attrs := make([]xml.Attr, 0, len(docs[0].Attrs))
+	for _, a := range docs[0].Attrs {
+		switch {
+		case a.Name.Local == "fromDate" && from != "":
+			a.Value = from
+		case a.Name.Local == "toDate" && to != "":
+			a.Value = to
+		}
+		attrs = append(attrs, a)
+	}
+
+	var b bytes.Buffer
+	writeFlexOpen(&b, "FlexStatement", attrs)
+	for _, name := range order {
+		secs := byName[name]
+		out := flexSection{XMLName: secs[0].XMLName, Attrs: secs[0].Attrs}
+		switch {
+		case name == "EquitySummaryInBase":
+			rows, err := sumSegmentNAV(secs)
+			if err != nil {
+				return nil, err
+			}
+			out.Rows = rows
+		case segmentRowSections[name]:
+			for _, s := range secs {
+				out.Rows = append(out.Rows, s.Rows...)
+			}
+		default:
+			out.Rows = secs[0].Rows
+		}
+		writeFlexOpen(&b, name, out.Attrs)
+		for _, r := range out.Rows {
+			writeFlexOpen(&b, r.XMLName.Local, r.Attrs)
+			b.Write(r.Inner)
+			b.WriteString("</" + r.XMLName.Local + ">")
+		}
+		b.WriteString("</" + name + ">")
+	}
+	b.WriteString("</FlexStatement>")
+	return b.Bytes(), nil
+}
+
+// navTextAttrs are the NAV row attributes that are not amounts.
+var navTextAttrs = map[string]bool{
+	"reportDate": true, "currency": true, "accountId": true, "acctAlias": true, "model": true,
+}
+
+// sumSegmentNAV adds the segments' NAV rows date by date. A segment without a
+// row on a date counts its last known one, so a day it skips does not read as
+// its balance leaving; before its first row it counts nothing.
+func sumSegmentNAV(secs []*flexSection) ([]flexRow, error) {
+	sides := make([][]flexRow, len(secs))
+	dateSet := map[string]bool{}
+	for n, s := range secs {
+		for _, r := range s.Rows {
+			if d := r.attr("reportDate"); d != "" {
+				sides[n] = append(sides[n], r)
+				dateSet[d] = true
+			}
+		}
+		sort.SliceStable(sides[n], func(a, b int) bool {
+			return sides[n][a].attr("reportDate") < sides[n][b].attr("reportDate")
+		})
+	}
+	dates := make([]string, 0, len(dateSet))
+	for d := range dateSet {
+		dates = append(dates, d)
+	}
+	sort.Strings(dates)
+
+	next := make([]int, len(sides))
+	carried := make([]*flexRow, len(sides))
+	out := make([]flexRow, 0, len(dates))
+	for _, date := range dates {
+		var rows []*flexRow
+		for n := range sides {
+			for next[n] < len(sides[n]) && sides[n][next[n]].attr("reportDate") <= date {
+				carried[n] = &sides[n][next[n]]
+				next[n]++
+			}
+			if carried[n] != nil {
+				rows = append(rows, carried[n])
+			}
+		}
+		row, err := sumNAVRows(date, rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+// sumNAVRows adds the amounts of one date's rows and keeps the first row's
+// text. Segments in two base currencies cannot be added.
+func sumNAVRows(date string, rows []*flexRow) (flexRow, error) {
+	var names []string
+	first := map[string]string{}
+	sums := map[string]float64{}
+	text := map[string]bool{}
+	for _, r := range rows {
+		for _, a := range r.Attrs {
+			name := a.Name.Local
+			if _, seen := first[name]; !seen {
+				names = append(names, name)
+				first[name] = a.Value
+				text[name] = navTextAttrs[name]
+			}
+			if name == "currency" && a.Value != "" && first[name] != "" && a.Value != first[name] {
+				return flexRow{}, fmt.Errorf("consolidate segment statements: NAV in %s and %s on %s", first[name], a.Value, date)
+			}
+			if text[name] || a.Value == "" {
+				continue
+			}
+			v, err := strconv.ParseFloat(a.Value, 64)
+			if err != nil {
+				text[name] = true
+				continue
+			}
+			sums[name] += v
+		}
+	}
+	row := flexRow{XMLName: rows[0].XMLName}
+	for _, name := range names {
+		value := first[name]
+		switch {
+		case name == "reportDate":
+			value = date
+		case !text[name]:
+			value = strconv.FormatFloat(sums[name], 'f', -1, 64)
+		}
+		row.Attrs = append(row.Attrs, xml.Attr{Name: xml.Name{Local: name}, Value: value})
+	}
+	return row, nil
 }
 
 func wrapFlexStatement(stmt []byte) []byte {
@@ -425,13 +712,41 @@ func (i *IBKR) statementReport(ctx context.Context, from time.Time) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	single, n, err := singleFlexStatement(report)
+	n, err := i.narrow(report, false)
 	if err != nil {
 		return nil, err
 	}
+	i.measuredAccounts = n.accounts
 	i.statementWarning = ""
-	if n > 1 {
-		i.statementWarning = fmt.Sprintf("ibkr_multi_account_statement(x%d)", n)
+	if n.carried > len(n.accounts) {
+		i.statementWarning = fmt.Sprintf("ibkr_multi_account_statement(x%d)", n.carried)
 	}
-	return single, nil
+	return n.report, nil
+}
+
+// narrow cuts a report down to the accounts this connection measures and
+// hands them to the account guard, which refuses a report that measures
+// other accounts than the stored history.
+func (i *IBKR) narrow(report []byte, past bool) (narrowedStatement, error) {
+	n, err := narrowFlexStatement(report)
+	if err != nil {
+		return narrowedStatement{}, err
+	}
+	if i.accountGuard != nil && len(n.accounts) > 0 {
+		if err := i.accountGuard(n.accounts, past); err != nil {
+			return narrowedStatement{}, err
+		}
+	}
+	return n, nil
+}
+
+// SetAccountGuard implements AccountScoped.
+func (i *IBKR) SetAccountGuard(guard func(accounts []string, past bool) error) {
+	i.accountGuard = guard
+}
+
+// MeasuredAccounts implements AccountScoped: the accounts the last daily
+// statement was narrowed to.
+func (i *IBKR) MeasuredAccounts() []string {
+	return append([]string(nil), i.measuredAccounts...)
 }

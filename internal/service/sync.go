@@ -220,6 +220,10 @@ type reconstructOpts struct {
 	// the loopback caller that asked for them instead, the same channel the
 	// raw-statement dump uses and for the same reason.
 	collect func([]*repository.Snapshot)
+	// rewrite carries a deep reconstruction through yesterday instead of
+	// stopping at the earliest stored day: the stored days are read again,
+	// for a connection whose accounts changed.
+	rewrite bool
 	// coveredFrom is the earliest instant the rebuild that produced these days
 	// could see. It is the floor of the prune: a stored day above it that the
 	// rebuild no longer produces is stale and goes, one below it was never
@@ -3301,6 +3305,13 @@ func (s *SyncService) getOrCreateConnector(exchange, userUID, label string, cred
 		if tr, ok := conn.(connector.TokenRefreshable); ok && s.connSvc != nil {
 			tr.SetTokenPersister(func(ctx context.Context, accessToken, refreshToken string) error {
 				return s.connSvc.PersistOAuthTokens(ctx, userUID, exchange, label, accessToken, refreshToken)
+			})
+		}
+		if scoped, ok := conn.(connector.AccountScoped); ok && s.connSvc != nil {
+			scoped.SetAccountGuard(func(accounts []string, past bool) error {
+				ctx, cancel := context.WithTimeout(context.Background(), brokerAccountGuardTimeout)
+				defer cancel()
+				return s.connSvc.GuardBrokerAccounts(ctx, userUID, exchange, label, accounts, past)
 			})
 		}
 

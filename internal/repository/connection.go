@@ -75,6 +75,7 @@ type ConnectionRepo struct {
 	hasIsPaperCol             bool
 	hasRebuildFinalizedAtCol  bool
 	hasRebuildRequestedAtCol  bool
+	hasBrokerAccountsCol      bool
 	isTSSchema                bool // true = TS Prisma camelCase columns
 }
 
@@ -961,6 +962,7 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 	isPaperCol := probe(r.colName("is_paper"))
 	rebuildFinalizedCol := probe(r.colName("rebuild_finalized_at"))
 	rebuildRequestedCol := probe(r.colName("rebuild_requested_at"))
+	brokerAccountsCol := probe(r.colName("broker_accounts"))
 
 	r.hasCredentialsHashCol = credHashCol
 	r.hasSyncIntervalMinsCol = syncIntervalCol
@@ -969,6 +971,7 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 	r.hasIsPaperCol = isPaperCol
 	r.hasRebuildFinalizedAtCol = rebuildFinalizedCol
 	r.hasRebuildRequestedAtCol = rebuildRequestedCol
+	r.hasBrokerAccountsCol = brokerAccountsCol
 	r.capabilitiesLoaded = !probeFailed
 
 	return r.hasCredentialsHashCol, r.hasSyncIntervalMinsCol, r.hasExcludeFromReportCol, r.hasKYCLevelCol, r.hasIsPaperCol
@@ -1043,6 +1046,7 @@ var tsColumnMap = map[string]string{
 	"updated_at":            "updatedAt",
 	"rebuild_finalized_at":  "rebuildFinalizedAt",
 	"rebuild_requested_at":  "rebuildRequestedAt",
+	"broker_accounts":       "brokerAccounts",
 }
 
 // unfinalizedExternalRebuildsQuery builds the SELECT used by
@@ -1240,6 +1244,77 @@ func (r *ConnectionRepo) ClearRebuildConsent(ctx context.Context, connID string)
 		return ErrNotFound
 	}
 	return nil
+}
+
+// HasBrokerAccountsCol reports whether the schema includes the
+// broker_accounts column (migration 019). Without it no connection is pinned
+// to its accounts and the guard lets every statement through.
+func (r *ConnectionRepo) HasBrokerAccountsCol(ctx context.Context) bool {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.hasBrokerAccountsCol
+}
+
+// BrokerAccounts reads the account fingerprints a connection is pinned to:
+// empty when it is not pinned yet or the schema has no such column.
+func (r *ConnectionRepo) BrokerAccounts(ctx context.Context, connID string) (string, error) {
+	if !r.HasBrokerAccountsCol(ctx) {
+		return "", nil
+	}
+	query := `SELECT COALESCE(` + r.qcol("broker_accounts") + `, '') FROM exchange_connections WHERE id = $1`
+	var pinned string
+	if err := r.pool.QueryRow(ctx, query, connID).Scan(&pinned); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("read broker accounts: %w", err)
+	}
+	return pinned, nil
+}
+
+// SetBrokerAccounts pins a connection to account fingerprints; an empty value
+// unpins it. No-op when the column is absent.
+func (r *ConnectionRepo) SetBrokerAccounts(ctx context.Context, connID, pinned string) error {
+	if !r.HasBrokerAccountsCol(ctx) {
+		return nil
+	}
+	query := `UPDATE exchange_connections SET ` + r.qcol("broker_accounts") + ` = NULLIF($1, '') WHERE id = $2`
+	tag, err := r.pool.Exec(ctx, query, pinned, connID)
+	if err != nil {
+		return fmt.Errorf("set broker accounts: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// BrokerAccountsByUser returns, for each active pinned connection of a user on
+// an exchange, its label and account fingerprints.
+func (r *ConnectionRepo) BrokerAccountsByUser(ctx context.Context, userUID, exchange string) (map[string]string, error) {
+	out := map[string]string{}
+	if !r.HasBrokerAccountsCol(ctx) {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx, brokerAccountsByUserQuery(r.qcol("user_uid"), r.qcol("is_active"), r.qcol("broker_accounts")), userUID, exchange)
+	if err != nil {
+		return nil, fmt.Errorf("list broker accounts: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var label, pinned string
+		if err := rows.Scan(&label, &pinned); err != nil {
+			return nil, fmt.Errorf("scan broker accounts: %w", err)
+		}
+		out[label] = pinned
+	}
+	return out, rows.Err()
+}
+
+func brokerAccountsByUserQuery(userUID, isActive, brokerAccounts string) string {
+	return `SELECT TRIM(label), ` + brokerAccounts + ` FROM exchange_connections
+		WHERE ` + userUID + ` = $1 AND exchange = $2 AND ` + isActive + ` = true AND ` + brokerAccounts + ` IS NOT NULL`
 }
 
 // qcol returns the schema-aware, double-quoted column name suitable for
