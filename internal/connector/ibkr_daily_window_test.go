@@ -82,10 +82,11 @@ func TestDailyStatement_LiveReadsReuseTheWiderStatement(t *testing.T) {
 	if len(sends) != 1 {
 		t.Fatalf("%d statements requested, want the reconstruction's alone: %v", len(sends), sends)
 	}
+	from, _, _ := statementPeriod(since, to)
 	if !strings.HasPrefix(sends[0], ibkrFlexWSSendURL) ||
-		!strings.Contains(sends[0], "fd="+since.Format("20060102")) ||
+		!strings.Contains(sends[0], "fd="+from.Format("20060102")) ||
 		!strings.Contains(sends[0], "td="+to.Format("20060102")) {
-		t.Fatalf("statement requested as %s, want the Flex Web Service from %s to %s", sends[0], since.Format("20060102"), to.Format("20060102"))
+		t.Fatalf("statement requested as %s, want the Flex Web Service from %s to %s", sends[0], from.Format("20060102"), to.Format("20060102"))
 	}
 }
 
