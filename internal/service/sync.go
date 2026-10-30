@@ -2365,6 +2365,24 @@ func (s *SyncService) checkAgainstStoredDays(ctx context.Context, connMeta *repo
 		)
 		return snapshots, nil
 	}
+	if opts.rewrite {
+		repin, err := s.connSvc.awaitsRepin(ctx, connMeta.ID)
+		if err != nil {
+			return nil, err
+		}
+		if repin {
+			// Every stored day measured the accounts the connection was pinned
+			// to before the operator cleared it: an added IB-UKL segment
+			// contradicts all of them from the day it first held anything.
+			s.logger.Info("reconstruction rewrites a history measured on another account set",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.Int("days", len(snapshots)),
+			)
+			return snapshots, nil
+		}
+	}
 
 	day, measured, bad := contradictedDayOf(snapshots, mine, liveHoldsPreviousStatement(connMeta.Exchange))
 	if !bad {

@@ -425,7 +425,8 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 // A dry run answers with the days instead of writing them, for the same reason
 // as handleAdminReconstruct's. rewrite reads through yesterday, over the
 // stored days: for a connection whose accounts changed (an IB-UKL segment
-// added to the query), after unpin-broker-accounts.
+// added to the query), after unpin-broker-accounts. While the pin is cleared
+// the stored days, measured on the old accounts, do not witness the rewrite.
 func (s *Server) handleAdminReconstructDeep(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
