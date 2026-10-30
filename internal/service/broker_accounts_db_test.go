@@ -4,8 +4,10 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/repository"
 )
 
 func (h *dbHarness) pinnedOf(t *testing.T, label string) string {
@@ -131,5 +133,55 @@ func TestDBUnpinBrokerAccounts_NextStatementRepins(t *testing.T) {
 	}
 	if err := h.connSvc.GuardBrokerAccounts(h.ctx, dbUser, "ibkr", "main", []string{"U0000001"}, false); !errors.Is(err, ErrBrokerAccountsChanged) {
 		t.Fatalf("error %v, want the new pin to hold", err)
+	}
+}
+
+// A segment added to the query lifts every day from the one it first held
+// anything: the stored days, measured without it, cannot witness the rewrite
+// once the operator has cleared the pin, and still refuse any other rebuild.
+func TestDBRewriteAfterUnpinIsNotWitnessedByTheOldAccountSet(t *testing.T) {
+	h := newDBHarness(t)
+	h.seedConnection(t, "ibkr", "main", dbKey, dbSecret)
+	if err := h.connSvc.GuardBrokerAccounts(h.ctx, dbUser, "ibkr", "main", []string{"U0000001"}, false); err != nil {
+		t.Fatalf("pin: %v", err)
+	}
+	connMeta := h.connection(t, "ibkr", "main")
+
+	today := startOfTodayUTC()
+	d := func(n int) time.Time { return today.AddDate(0, 0, -10+n) }
+	var stored []*repository.Snapshot
+	var rebuilt []*connector.HistoricalSnapshot
+	for n := 1; n <= 5; n++ {
+		stored = append(stored, &repository.Snapshot{
+			UserUID: dbUser, Exchange: "ibkr", Label: "main", Timestamp: d(n),
+			TotalEquity: 1000, RealizedBalance: 1000,
+			Breakdown: &repository.MarketBreakdown{Global: &repository.MarketMetrics{Equity: 1000}},
+		})
+		rebuilt = append(rebuilt, &connector.HistoricalSnapshot{Date: d(n), TotalEquity: 1500, RealizedBalance: 1500})
+	}
+	if err := h.snaps.UpsertBatch(h.ctx, stored); err != nil {
+		t.Fatalf("seed history: %v", err)
+	}
+
+	persist := func(opts reconstructOpts) error {
+		return h.sync.persistHistoricalSnapshots(h.ctx, connMeta, rebuilt, false, sourceInEnclave, opts)
+	}
+	if err := persist(reconstructOpts{rewrite: true}); err == nil {
+		t.Fatal("a rewrite of a pinned connection must stay witnessed by its stored days")
+	}
+	if err := h.sync.UnpinBrokerAccounts(h.ctx, dbUser, "ibkr", "main"); err != nil {
+		t.Fatalf("unpin: %v", err)
+	}
+	if err := persist(reconstructOpts{}); err == nil {
+		t.Fatal("a rebuild that is not a rewrite must stay witnessed after unpin")
+	}
+	if err := persist(reconstructOpts{rewrite: true}); err != nil {
+		t.Fatalf("rewrite after unpin: %v", err)
+	}
+	for n := 1; n <= 5; n++ {
+		got, err := h.snaps.GetByUserExchangeLabelAndDate(h.ctx, dbUser, "ibkr", "main", d(n))
+		if err != nil || got.TotalEquity != 1500 {
+			t.Fatalf("%s = %+v (err %v), want the new account set's 1500", d(n).Format(time.DateOnly), got, err)
+		}
 	}
 }

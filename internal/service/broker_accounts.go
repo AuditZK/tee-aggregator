@@ -153,6 +153,20 @@ func (s *ConnectionService) UnpinBrokerAccounts(ctx context.Context, userUID, ex
 	return s.repo.SetBrokerAccounts(ctx, conn.ID, "")
 }
 
+// awaitsRepin reports whether the connection's pin is cleared, as
+// UnpinBrokerAccounts leaves it until the next daily statement pins the new
+// account set.
+func (s *ConnectionService) awaitsRepin(ctx context.Context, connID string) (bool, error) {
+	if s == nil || s.repo == nil || !s.repo.HasBrokerAccountsCol(ctx) {
+		return false, nil
+	}
+	pinned, err := s.repo.BrokerAccounts(ctx, connID)
+	if err != nil {
+		return false, fmt.Errorf("read pinned accounts: %w", err)
+	}
+	return pinned == "", nil
+}
+
 // UnpinBrokerAccounts is ConnectionService.UnpinBrokerAccounts for the admin
 // routes, which reach connections through the sync service.
 func (s *SyncService) UnpinBrokerAccounts(ctx context.Context, userUID, exchange, label string) error {
