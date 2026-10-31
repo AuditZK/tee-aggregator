@@ -435,3 +435,30 @@ func TestCashReport_WithoutDepositColumnCashTransactionsCount(t *testing.T) {
 		t.Fatalf("flows %+v, want the 2500 deposit", flows)
 	}
 }
+
+// The daily window's Cash Report covers several days and cannot date a wire.
+// The Cash Transaction is dated the day it was initiated and reported the day
+// the cash reached the account; booked on the first, the deposit lands a day
+// before the equity it brings.
+func TestCashTransaction_DepositIsBookedOnItsReportDate(t *testing.T) {
+	flows, _ := parseFlows(t, `
+      <CashTransactions>
+        <CashTransaction type="Deposits/Withdrawals" amount="7000" currency="USD" dateTime="20260602;220000" reportDate="20260603" levelOfDetail="DETAIL"/>
+      </CashTransactions>
+      <CashReport>
+        <CashReportCurrency currency="BASE_SUMMARY" fromDate="20260601" toDate="20260605" depositWithdrawals="7000" internalTransfers="0" accountTransfers="0"/>
+      </CashReport>`)
+	if len(flows) != 1 || flows[0].Amount != 7000 || flows[0].Timestamp.Format("20060102") != "20260603" {
+		t.Fatalf("flows %+v, want 7000 on 2026-06-03", flows)
+	}
+}
+
+func TestCashTransaction_WithoutReportDateKeepsItsDateTime(t *testing.T) {
+	flows, _ := parseFlows(t, `
+      <CashTransactions>
+        <CashTransaction type="Deposits/Withdrawals" amount="7000" currency="USD" dateTime="20260602"/>
+      </CashTransactions>`)
+	if len(flows) != 1 || flows[0].Timestamp.Format("20060102") != "20260602" {
+		t.Fatalf("flows %+v, want the deposit on 2026-06-02", flows)
+	}
+}
