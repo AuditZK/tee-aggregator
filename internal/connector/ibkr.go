@@ -1216,6 +1216,16 @@ func parseFlexTimestamp(v string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// capitalFlowDate is the day a deposit or withdrawal enters the statement:
+// its reportDate, the day the equity moves. dateTime is when the wire was
+// initiated, a day or more before; it stands in for a query without the column.
+func capitalFlowDate(dateTime, reportDate string) string {
+	if reportDate != "" {
+		return reportDate
+	}
+	return dateTime
+}
+
 // CapabilityWarnings implements CapabilityWarner with the statement-shape
 // gaps found by the last Flex parse.
 func (i *IBKR) CapabilityWarnings() []string {
@@ -1255,6 +1265,7 @@ func cashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, []string,
 						Currency      string `xml:"currency,attr"`
 						FXRateToBase  string `xml:"fxRateToBase,attr"`
 						DateTime      string `xml:"dateTime,attr"`
+						ReportDate    string `xml:"reportDate,attr"`
 						LevelOfDetail string `xml:"levelOfDetail,attr"`
 					} `xml:"CashTransaction"`
 				} `xml:"CashTransactions"`
@@ -1299,7 +1310,7 @@ func cashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, []string,
 		if levels.restates(tx.LevelOfDetail, tx.Currency) {
 			continue
 		}
-		ts, ok := parseFlexTimestamp(tx.DateTime)
+		ts, ok := parseFlexTimestamp(capitalFlowDate(tx.DateTime, tx.ReportDate))
 		if !ok || ts.Before(since) {
 			continue
 		}
