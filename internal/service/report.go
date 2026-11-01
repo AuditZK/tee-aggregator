@@ -25,6 +25,12 @@ const (
 	flowDominanceRatio = 10.0
 )
 
+// withdrawalsAtOpen lists the venues whose daily close already excludes the
+// day's withdrawals, so the money left before that day's market moved: the
+// withdrawal comes out of the day's base, as IBKR's PortfolioAnalyst counts it.
+// Mirrored in the analytics daily aggregation.
+var withdrawalsAtOpen = map[string]bool{"ibkr": true}
+
 // ReportService generates signed performance reports.
 type ReportService struct {
 	metricsSvc       *MetricsService
@@ -586,6 +592,7 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 		closeEquity := 0.0
 		dayDeposits := 0.0
 		dayWithdrawals := 0.0
+		openWithdrawals := 0.0
 		virtualDeposits := 0.0
 
 		for ex, lastEq := range knownExchanges {
@@ -596,6 +603,9 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 				closeEquity += snap.TotalEquity
 				dayDeposits += math.Abs(snap.Deposits)
 				dayWithdrawals += math.Abs(snap.Withdrawals)
+				if withdrawalsAtOpen[snap.Exchange] {
+					openWithdrawals += math.Abs(snap.Withdrawals)
+				}
 				knownExchanges[ex] = snap.TotalEquity
 				lastSeen[ex] = dateStr
 			} else if silentDays(lastSeen[ex], dateStr, connDays[ex], seriesEnd) > staleConnectionDays {
@@ -636,13 +646,16 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 		//   - otherwise Modified Dietz: money deposited during the day was at
 		//     risk that day, so it belongs in the base. The open-only base
 		//     turns "deposit 67 onto 201 and blow the lot" into -133%, which
-		//     pins the compounded series at -100% forever.
+		//     pins the compounded series at -100% forever. A withdrawal from
+		//     a withdrawalsAtOpen venue leaves the base the same way;
+		//   - a base left below minTWRBaseUSD by those withdrawals — 0%.
+		base := adjustedPrev + dayDeposits - openWithdrawals
 		var dayReturn float64
 		switch {
 		case netFlow > 0 && netFlow >= closeEquity:
 			dayReturn = 0
-		case adjustedPrev >= minTWRBaseUSD && dayDeposits+dayWithdrawals <= flowDominanceRatio*adjustedPrev:
-			dayReturn = (totalCurrentEquity + virtualDeposits - adjustedPrev) / (adjustedPrev + dayDeposits)
+		case adjustedPrev >= minTWRBaseUSD && base >= minTWRBaseUSD && dayDeposits+dayWithdrawals <= flowDominanceRatio*adjustedPrev:
+			dayReturn = (totalCurrentEquity + virtualDeposits - adjustedPrev) / base
 		default:
 			dayReturn = 0
 		}

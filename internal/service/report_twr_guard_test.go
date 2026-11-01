@@ -126,3 +126,36 @@ func TestTWR_WithdrawalDay(t *testing.T) {
 		t.Fatalf("pure withdrawal day: got %v want 0", r["2026-01-02"].netReturn)
 	}
 }
+
+// An IBKR close already excludes the day's withdrawal, so the money was not at
+// risk that day: the day is scored on the base left after it, as
+// PortfolioAnalyst does. 1000 withdrawn from 3000, the remaining 2000 gains 1%.
+func TestTWR_IBKRWithdrawalLeavesTheDaysBase(t *testing.T) {
+	day := func(d string, equity, withdrawals float64) *repository.Snapshot {
+		s := twrDay(d, equity, 0, withdrawals)
+		s.Exchange = "ibkr"
+		return s
+	}
+	r := twrByDate(t, []*repository.Snapshot{day("2026-01-01", 3000, 0), day("2026-01-02", 2020, 1000)})
+	if !near(r["2026-01-02"].netReturn, 0.01, 1e-12) {
+		t.Fatalf("IBKR withdrawal day: got %v want 0.01", r["2026-01-02"].netReturn)
+	}
+
+	r = twrByDate(t, []*repository.Snapshot{twrDay("2026-01-01", 3000, 0, 0), twrDay("2026-01-02", 2020, 0, 1000)})
+	if !near(r["2026-01-02"].netReturn, 20.0/3000, 1e-12) {
+		t.Fatalf("other venues keep the withdrawal in the base: got %v want %v", r["2026-01-02"].netReturn, 20.0/3000)
+	}
+}
+
+// Withdrawing the whole IBKR account leaves no base to score the day on.
+func TestTWR_IBKRFullWithdrawalIsNotScored(t *testing.T) {
+	day := func(d string, equity, withdrawals float64) *repository.Snapshot {
+		s := twrDay(d, equity, 0, withdrawals)
+		s.Exchange = "ibkr"
+		return s
+	}
+	r := twrByDate(t, []*repository.Snapshot{day("2026-01-01", 3000, 0), day("2026-01-02", 0.4, 3000)})
+	if r["2026-01-02"].netReturn != 0 {
+		t.Fatalf("full withdrawal must score 0, got %v", r["2026-01-02"].netReturn)
+	}
+}
