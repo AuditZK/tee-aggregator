@@ -59,6 +59,7 @@ const (
 	binanceWalletCoinM    = "coinm_futures"
 	binanceWalletCross    = "cross_margin"
 	binanceWalletIsolated = "isolated_margin"
+	binanceWalletEarn     = "simple_earn"
 
 	// Wallets GetBalance does not read: a transfer to one leaves the equity.
 	binanceWalletFunding = "funding"
@@ -171,7 +172,12 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 
 	b.cachedBreakdown = nil
 
-	spotBalance, err := b.getSpotBalance(ctx, priceMap)
+	earn, earnErr := b.getSimpleEarn(ctx)
+	if errors.Is(earnErr, ErrTransient) {
+		return nil, fmt.Errorf("simple earn balance: %w", earnErr)
+	}
+
+	spotBalance, err := b.getSpotBalance(ctx, priceMap, earn.flexibleAssets)
 	if err != nil {
 		return nil, fmt.Errorf("spot balance: %w", err)
 	}
@@ -252,6 +258,16 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 		b.noteWallet(binanceWalletIsolated, ierr)
 	}
 
+	if earnErr == nil {
+		eq := ValueSpotHoldingsUSD(earn.positions, priceMap)
+		total.Equity += eq
+		nonUM += eq
+		b.noteWallet(binanceWalletEarn, nil)
+	} else {
+		b.capabilityWarnings = append(b.capabilityWarnings, "simple_earn_unreadable")
+		b.noteWallet(binanceWalletEarn, earnErr)
+	}
+
 	// Per-market split, matching the history rebuilder's two-bucket convention
 	// (its "spot" carries everything non-UM — spot, COIN-M, cross+iso margin —
 	// with available=equity; "swap" is UM futures with the true free margin).
@@ -298,7 +314,10 @@ func (b *Binance) CapabilityWarnings() []string {
 	return append(out, b.cashflowNotes.get()...)
 }
 
-func (b *Binance) getSpotBalance(ctx context.Context, priceMap map[string]float64) (*Balance, error) {
+// getSpotBalance values the spot wallet. A flexible Earn position also shows
+// in it as "LD" + its asset (LDUSDT); that line is left to the Earn read, which
+// counts the position once. "LD" alone proves nothing: LDO is Lido's own coin.
+func (b *Binance) getSpotBalance(ctx context.Context, priceMap map[string]float64, earnFlexible map[string]bool) (*Balance, error) {
 	params := url.Values{}
 	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, binancePathAccount, params, true)
 	if err != nil {
@@ -328,6 +347,9 @@ func (b *Binance) getSpotBalance(ctx context.Context, priceMap map[string]float6
 		locked, _ := strconv.ParseFloat(bal.Locked, 64)
 		total := free + locked
 		if total <= 0 {
+			continue
+		}
+		if a := strings.ToUpper(bal.Asset); strings.HasPrefix(a, "LD") && earnFlexible[a[2:]] {
 			continue
 		}
 		holdings = append(holdings, SpotHolding{Asset: bal.Asset, Amount: total})
@@ -373,6 +395,75 @@ func (b *Binance) getCoinMFuturesEquity(ctx context.Context, priceMap map[string
 		}
 	}
 	return ValueSpotHoldingsUSD(holdings, priceMap), nil
+}
+
+// binanceEarnMaxPages bounds the Simple Earn position pages one balance read
+// follows, at binanceEarnPageSize positions each.
+const (
+	binanceEarnPageSize = 100
+	binanceEarnMaxPages = 20
+)
+
+// binanceEarn is the Simple Earn wallet: its flexible and locked positions,
+// each in its own asset, and the assets held flexibly.
+type binanceEarn struct {
+	positions      []SpotHolding
+	flexibleAssets map[string]bool
+}
+
+// getSimpleEarn reads the Simple Earn wallet. Money moved from spot into Earn
+// is not a withdrawal: left out, an account parked in Earn read as empty.
+func (b *Binance) getSimpleEarn(ctx context.Context) (binanceEarn, error) {
+	flexible, err := b.simpleEarnPositions(ctx, "/sapi/v1/simple-earn/flexible/position")
+	if err != nil {
+		return binanceEarn{}, err
+	}
+	locked, err := b.simpleEarnPositions(ctx, "/sapi/v1/simple-earn/locked/position")
+	if err != nil {
+		return binanceEarn{}, err
+	}
+	out := binanceEarn{positions: append(flexible, locked...), flexibleAssets: map[string]bool{}}
+	for _, h := range flexible {
+		out.flexibleAssets[strings.ToUpper(h.Asset)] = true
+	}
+	return out, nil
+}
+
+// simpleEarnPositions reads every page of one Simple Earn position list. The
+// flexible list states totalAmount, the locked one amount.
+func (b *Binance) simpleEarnPositions(ctx context.Context, path string) ([]SpotHolding, error) {
+	var out []SpotHolding
+	for page := 1; page <= binanceEarnMaxPages; page++ {
+		params := url.Values{"current": {strconv.Itoa(page)}, "size": {strconv.Itoa(binanceEarnPageSize)}}
+		body, err := b.doRequest(ctx, "GET", binanceSpotAPI, path, params, true)
+		if err != nil {
+			return nil, err
+		}
+		var resp struct {
+			Rows []struct {
+				Asset       string `json:"asset"`
+				TotalAmount string `json:"totalAmount"`
+				Amount      string `json:"amount"`
+			} `json:"rows"`
+			Total int `json:"total"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", path, err)
+		}
+		for _, r := range resp.Rows {
+			qty := r.TotalAmount
+			if qty == "" {
+				qty = r.Amount
+			}
+			if v, _ := strconv.ParseFloat(qty, 64); v > 0 {
+				out = append(out, SpotHolding{Asset: r.Asset, Amount: v})
+			}
+		}
+		if len(resp.Rows) < binanceEarnPageSize || page*binanceEarnPageSize >= resp.Total {
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("%s: more than %d positions", path, binanceEarnPageSize*binanceEarnMaxPages)
 }
 
 // getCrossMarginEquity returns the cross margin wallet's net equity in USD:
