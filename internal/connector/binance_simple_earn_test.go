@@ -103,3 +103,22 @@ func TestBinance_SimpleEarnRefusedIsAWarning(t *testing.T) {
 		t.Fatalf("warnings %v, want simple_earn_unreadable", b.CapabilityWarnings())
 	}
 }
+
+// The probe states the Simple Earn wallet on its own, so a balance that would
+// grow once Earn counts can be told apart from a market move.
+func TestBinance_ProbeBalanceStatesSimpleEarn(t *testing.T) {
+	b := newBinanceEarnTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/flexible/") {
+			_, _ = w.Write([]byte(`{"rows":[{"asset":"USDT","totalAmount":"1500"}],"total":1}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"rows":[{"asset":"ZEC","amount":"2"}],"total":1}`))
+	})
+	probe, err := b.ProbeBalance(context.Background())
+	if err != nil {
+		t.Fatalf("ProbeBalance: %v", err)
+	}
+	if got := probe.Account["probe.simple_earn_usd"]; got != "1600.00" {
+		t.Fatalf("simple earn %q, want 1500 USDT + 2 ZEC at 50 = 1600.00", got)
+	}
+}
