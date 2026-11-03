@@ -60,7 +60,7 @@ func binanceMarginAssetUSD(asset, qty string, priceMap map[string]float64) float
 func (b *Binance) ProbeBalance(ctx context.Context) (*BalanceProbe, error) {
 	probe := &BalanceProbe{
 		Exchange:    b.Exchange(),
-		MarginBasis: "fapi/v2/account totalMarginBalance + spot + coin-m + cross + isolated margin",
+		MarginBasis: "fapi/v2/account totalMarginBalance + spot + coin-m + cross + isolated margin + simple earn",
 		Account:     map[string]string{},
 		Currencies:  []map[string]string{},
 	}
@@ -118,6 +118,14 @@ func (b *Binance) ProbeBalance(ctx context.Context) (*BalanceProbe, error) {
 			probe.Account["probe.totals_cover_usdt_only"] = strconv.FormatBool(usdtOnly)
 			probe.Account["probe.collateral_outside_totals_usd"] = strconv.FormatFloat(outside, 'f', 2, 64)
 		}
+	}
+
+	if earn, err := b.getSimpleEarn(ctx); err != nil {
+		probe.Notes = append(probe.Notes, "simple earn unavailable: "+vendorErrorDetail(err.Error()))
+	} else if priceMap, perr := FetchBinanceStylePriceMap(ctx, b.client, binanceSpotAPI); perr != nil {
+		probe.Notes = append(probe.Notes, "spot prices unavailable: simple earn not valued")
+	} else {
+		probe.Account["probe.simple_earn_usd"] = strconv.FormatFloat(ValueSpotHoldingsUSD(earn.positions, priceMap), 'f', 2, 64)
 	}
 
 	derived, err := b.GetBalance(ctx)
