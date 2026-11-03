@@ -174,6 +174,19 @@ func okxMillisToISO(ms string) string {
 // performance, while the reverse only understates the record.
 var fundingInternalTypes = map[string]bool{"130": true, "131": true}
 
+// fundingIncomeTypes are interest the funding wallet earns: the account's own
+// yield, already in its balance, never capital it put in.
+//
+//	400  Auto lend interest
+//	408  Auto earn USDG interest
+//	523  Auto earn RLUSD interest
+var fundingIncomeTypes = map[string]bool{"400": true, "408": true, "523": true}
+
+// okxStrategyTransferType is the trading-ledger type for money moved into or
+// out of a trading bot. The bot's strategy account is not in the equity this
+// connector reads, so each move crosses the perimeter.
+const okxStrategyTransferType = "12"
+
 // okxTransferMatchWindow is how far apart the two legs of one trading↔funding
 // move may be booked and still pair. Observed: under a second, both ways.
 const okxTransferMatchWindow = 10 * time.Minute

@@ -124,9 +124,10 @@ func okxClassifyCashflows(bills, funding []okxBill, prices map[string]float64) (
 			continue
 		}
 		switch b.Type {
-		case "1":
+		case "1", okxStrategyTransferType:
 			// Paired with a funding leg: one move between two wallets that are
-			// both inside, and the holding stays valued on the other side.
+			// both inside, and the holding stays valued on the other side. A
+			// strategy transfer never pairs: the bot's account is outside.
 			if internal[i] {
 				continue
 			}
@@ -149,7 +150,7 @@ func okxClassifyCashflows(bills, funding []okxBill, prices map[string]float64) (
 	// 130/131 is the trading account either way, and its trading twin may fall
 	// outside the window. Everything else there crossed OKX itself.
 	for _, b := range funding {
-		if b.BalChg == 0 || fundingInternalTypes[b.Type] {
+		if b.BalChg == 0 || fundingInternalTypes[b.Type] || fundingIncomeTypes[b.Type] {
 			continue
 		}
 		usd, ok := okxValueUSD(b.Ccy, math.Abs(b.BalChg), prices)
@@ -197,7 +198,7 @@ func okxNonStableTransferCcys(bills, funding []okxBill) []string {
 		ccys = append(ccys, ccy)
 	}
 	for _, b := range bills {
-		if b.Type == "1" && b.BalChg != 0 {
+		if (b.Type == "1" || b.Type == okxStrategyTransferType) && b.BalChg != 0 {
 			add(b.Ccy)
 		}
 	}
