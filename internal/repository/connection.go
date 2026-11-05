@@ -619,6 +619,10 @@ func (r *ConnectionRepo) GetExcludedExchangesByUser(ctx context.Context, userUID
 
 // GetExcludedConnectionKeysByUser returns excluded connection keys.
 // Key format is "exchange" or "exchange/label" (lowercase).
+//
+// A paused connection stays excluded: its snapshots are still read into the
+// report, so reading active rows only put a paused account's whole history
+// back in (a free-plan downgrade pauses connections with no user action).
 func (r *ConnectionRepo) GetExcludedConnectionKeysByUser(ctx context.Context, userUID string) (map[string]struct{}, error) {
 	_, _, hasExclude, _, _ := r.getCapabilityFlags(ctx)
 	excluded := make(map[string]struct{})
@@ -631,12 +635,12 @@ func (r *ConnectionRepo) GetExcludedConnectionKeysByUser(ctx context.Context, us
 		query = `
 			SELECT DISTINCT exchange, COALESCE(label, '')
 			FROM exchange_connections
-			WHERE "userUid" = $1 AND "isActive" = true AND "excludeFromReport" = true`
+			WHERE "userUid" = $1 AND "excludeFromReport" = true`
 	} else {
 		query = `
 			SELECT DISTINCT exchange, COALESCE(label, '')
 			FROM exchange_connections
-			WHERE user_uid = $1 AND is_active = true AND exclude_from_report = true`
+			WHERE user_uid = $1 AND exclude_from_report = true`
 	}
 
 	rows, err := r.pool.Query(ctx, query, userUID)
