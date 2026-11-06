@@ -20,6 +20,10 @@ func (s stubConnections) GetActiveConnections(context.Context, string) ([]*repos
 	return s.rows, nil
 }
 
+func (s stubConnections) CountConnections(context.Context, string) (int, error) {
+	return len(s.rows), nil
+}
+
 func portfolioFixture(t *testing.T) (*PortfolioService, context.Context) {
 	t.Helper()
 	pool := testdb.New(t)

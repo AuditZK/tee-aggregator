@@ -67,8 +67,45 @@ const (
 	// 1.8 = baseCurrency is the currency every figure was computed in, each
 	//       day's amounts valued at that day's final rate before returns are
 	//       taken. Before, it was a label over figures computed in USD.
-	PayloadVersion = "1.8"
+	// 1.9 = adds verifiedFrom, the first day past anything rebuilt outside the
+	//       enclave, and portfolio on a report scoped to one: its name, how many
+	//       of the user's connections it holds and the dated stays by venue. A
+	//       report's scope has to sit under the signature, or a chosen subset of
+	//       accounts reads as the whole record.
+	PayloadVersion = "1.9"
 )
+
+// payloadVersionsWithoutVerifiedHistory are the pre-1.9 signed-payload shapes,
+// with neither verifiedFrom nor portfolio. Older reports keep their original
+// shape so VerifyReport reproduces their hash.
+var payloadVersionsWithoutVerifiedHistory = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+	"1.2": {},
+	"1.3": {},
+	"1.4": {},
+	"1.5": {},
+	"1.6": {},
+	"1.7": {},
+	"1.8": {},
+}
+
+// PortfolioStay is one dated stay of a connection in a portfolio, by venue: the
+// label the owner chose can name a person or a strategy, so it is not signed.
+type PortfolioStay struct {
+	Exchange  string `json:"exchange"`
+	AddedAt   string `json:"added_at"`
+	RemovedAt string `json:"removed_at,omitempty"`
+}
+
+// PortfolioComposition is what a report scoped to a portfolio says of its scope.
+type PortfolioComposition struct {
+	Name                string          `json:"name"`
+	ConnectionsIncluded int             `json:"connections_included"`
+	ConnectionsTotal    int             `json:"connections_total"`
+	Stays               []PortfolioStay `json:"stays"`
+}
 
 // payloadVersionsWithoutAnnualizationDays are the pre-1.7 signed-payload
 // shapes whose metrics block carries no annualizationDays. Older reports keep
@@ -344,8 +381,12 @@ type ExchangeInfo struct {
 
 // ReportInput contains the data to include in a signed report.
 type ReportInput struct {
-	UserUID     string
-	ReportName  string
+	UserUID    string
+	ReportName string
+	// VerifiedFrom is the first day past anything unverified, empty when none is.
+	VerifiedFrom string
+	// Portfolio is set on a report scoped to one.
+	Portfolio   *PortfolioComposition
 	PeriodStart time.Time
 	PeriodEnd   time.Time
 
@@ -438,6 +479,9 @@ type SignedReport struct {
 	EnclaveVersion     string `json:"enclave_version"`
 	PayloadVersion     string `json:"payload_version"`
 
+	VerifiedFrom string                `json:"verified_from,omitempty"` // signed at PayloadVersion >= 1.9
+	Portfolio    *PortfolioComposition `json:"portfolio,omitempty"`     // signed at PayloadVersion >= 1.9
+
 	// The same report with every amount withheld, signed on its own so a
 	// report shared in percentages stays verifiable. See PercentPayload.
 	PercentReportHash string `json:"percent_report_hash,omitempty"`
@@ -486,6 +530,8 @@ func (s *ReportSigner) Sign(input *ReportInput) (*SignedReport, error) {
 		SignatureAlgorithm: SignatureAlgorithm,
 		EnclaveVersion:     EnclaveVersion,
 		PayloadVersion:     PayloadVersion,
+		VerifiedFrom:       input.VerifiedFrom,
+		Portfolio:          input.Portfolio,
 	}
 
 	financialJSON, err := CanonicalPayload(report)
@@ -613,6 +659,28 @@ func buildFinancialPayload(report *SignedReport) map[string]any {
 	// report must break its signature. Entered the signed payload at 1.5.
 	if _, legacy := payloadVersionsWithoutReportName[report.PayloadVersion]; !legacy {
 		payload["reportName"] = report.ReportName
+	}
+
+	// A report's scope and where its verified history starts are what a reader
+	// weighs its figures by. Entered the signed payload at 1.9.
+	if _, legacy := payloadVersionsWithoutVerifiedHistory[report.PayloadVersion]; !legacy {
+		payload["verifiedFrom"] = report.VerifiedFrom
+		if report.Portfolio != nil {
+			stays := make([]map[string]any, 0, len(report.Portfolio.Stays))
+			for _, stay := range report.Portfolio.Stays {
+				stays = append(stays, map[string]any{
+					"exchange":  stay.Exchange,
+					"addedAt":   stay.AddedAt,
+					"removedAt": stay.RemovedAt,
+				})
+			}
+			payload["portfolio"] = map[string]any{
+				"name":                report.Portfolio.Name,
+				"connectionsIncluded": report.Portfolio.ConnectionsIncluded,
+				"connectionsTotal":    report.Portfolio.ConnectionsTotal,
+				"stays":               stays,
+			}
+		}
 	}
 
 	// enclaveAttestation binds the signed report to a specific SEV-SNP

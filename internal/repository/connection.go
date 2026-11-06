@@ -1327,3 +1327,18 @@ func brokerAccountsByUserQuery(userUID, isActive, brokerAccounts string) string 
 func (r *ConnectionRepo) qcol(snakeName string) string {
 	return `"` + r.colName(snakeName) + `"`
 }
+
+// CountByUser counts the user's connections, paused ones included: the figure a
+// report scoped to a portfolio sets its own count against.
+func (r *ConnectionRepo) CountByUser(ctx context.Context, userUID string) (int, error) {
+	r.getCapabilityFlags(ctx) // primes isTSSchema
+	query := `SELECT count(*) FROM exchange_connections WHERE user_uid = $1`
+	if r.isTSSchema {
+		query = `SELECT count(*) FROM exchange_connections WHERE "userUid" = $1`
+	}
+	var count int
+	if err := r.pool.QueryRow(ctx, query, userUID).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}

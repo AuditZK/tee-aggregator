@@ -32,6 +32,7 @@ type portfolioStore interface {
 
 type portfolioConnections interface {
 	GetActiveConnections(ctx context.Context, userUID string) ([]*repository.ExchangeConnection, error)
+	CountConnections(ctx context.Context, userUID string) (int, error)
 }
 
 // PortfolioService applies what a portfolio may contain. The plan's limit on how
