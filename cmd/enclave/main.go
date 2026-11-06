@@ -587,6 +587,12 @@ func main() {
 	}()
 	logger.Info("gRPC server started", zap.Int("port", cfg.GRPCPort))
 
+	// Portfolios need the database and the connections it checks members against.
+	var portfolioSvc *service.PortfolioService
+	if pool != nil && connSvc != nil {
+		portfolioSvc = service.NewPortfolioService(repository.NewPortfolioRepo(pool), connSvc)
+	}
+
 	// 15. Start REST server (with TLS, attestation, ECIES, CORS, rate limiting)
 	restServer := server.New(cfg, logger, pool)
 	// SEC-002: share the same HS256 secret with the REST surface so sensitive
@@ -601,6 +607,7 @@ func main() {
 		ReportSvc:    reportSvc,
 		SnapshotRepo: snapshotRepo,
 		UserRepo:     userRepo,
+		PortfolioSvc: portfolioSvc,
 		TLSKeygen:    tlsKeygen,
 		AttestSvc:    attestSvc,
 		ECIESSvc:     eciesSvc,
