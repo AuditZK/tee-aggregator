@@ -87,6 +87,7 @@ type GenerateReportRequest struct {
 	IncludeRiskMetrics bool
 	IncludeDrawdown    bool
 	ExcludedExchanges  map[string]struct{} // keys: "exchange" or "exchange/label"
+	Portfolio          *ReportPortfolio    // nil = every reported connection
 	// Display params (NOT signed, applied per request)
 	Manager string
 	Firm    string
@@ -171,6 +172,14 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 	}
 
 	snapshots = filterSnapshotsByExcludedExchanges(snapshots, req.ExcludedExchanges)
+
+	if req.Portfolio != nil {
+		snapshots = snapshotsInPortfolio(snapshots, req.Portfolio.Stays)
+		if externalRebuilderDays, err = s.portfolioRebuilderDays(ctx, req); err != nil {
+			// SEC-09, as above: no labels nothing backs.
+			return nil, fmt.Errorf("resolve portfolio external-rebuilder day set: %w", err)
+		}
+	}
 
 	if len(snapshots) < 2 {
 		return nil, fmt.Errorf("insufficient data: need at least 2 snapshots, got %d", len(snapshots))
@@ -272,6 +281,10 @@ func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportR
 		ExchangeDetails:  s.buildExchangeDetails(ctx, req.UserUID, exchanges),
 		DailyReturns:     toSigningDailyReturns(dailyReturns, snapshots, externalRebuilderDays),
 		MonthlyReturns:   toSigningMonthlyReturns(monthlyReturns),
+		VerifiedFrom:     verifiedFromOf(snapshots, externalRebuilderDays),
+	}
+	if req.Portfolio != nil {
+		input.Portfolio = portfolioComposition(req.Portfolio)
 	}
 
 	if input.ReportName == "" {
@@ -365,7 +378,7 @@ func (s *ReportService) checkReportCache(ctx context.Context, req *GenerateRepor
 		return nil
 	}
 	// Current cache key does not include exclusions; skip cache for filtered reports.
-	if len(req.ExcludedExchanges) > 0 {
+	if len(req.ExcludedExchanges) > 0 || req.Portfolio != nil {
 		return nil
 	}
 	// Cache key does not include the risk-free rate either; only the legacy
@@ -425,7 +438,7 @@ func (s *ReportService) cacheReport(ctx context.Context, req *GenerateReportRequ
 		return
 	}
 	// Current cache key does not include exclusions; avoid storing filtered variants.
-	if len(req.ExcludedExchanges) > 0 {
+	if len(req.ExcludedExchanges) > 0 || req.Portfolio != nil {
 		return
 	}
 	// Same for custom risk-free rates — the key has no rf dimension.

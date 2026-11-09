@@ -17,8 +17,8 @@ func TestNewCarriesProductionSchema(t *testing.T) {
 		WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`).Scan(&tables); err != nil {
 		t.Fatalf("count tables: %v", err)
 	}
-	if tables != 9 {
-		t.Fatalf("tables = %d, want the 9 of production", tables)
+	if tables != 11 {
+		t.Fatalf("tables = %d, want the 9 of production and the 2 of portfolios", tables)
 	}
 
 	if !repository.NewConnectionRepo(pool).IsTSSchema(ctx) {

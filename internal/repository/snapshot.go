@@ -310,6 +310,48 @@ func (r *SnapshotRepo) GetVerifiableByUserAndDateRange(ctx context.Context, user
 	return r.getByUserAndDateRange(ctx, userUID, start, end)
 }
 
+// ExternalRebuilderDay is one connection's day holding a snapshot from the
+// external history-rebuilder.
+type ExternalRebuilderDay struct {
+	Exchange string
+	Label    string
+	Day      time.Time
+}
+
+// GetExternalRebuilderConnectionDays is GetExternalRebuilderDays by connection,
+// for a report that covers only some of them.
+func (r *SnapshotRepo) GetExternalRebuilderConnectionDays(ctx context.Context, userUID string, start, end time.Time) ([]ExternalRebuilderDay, error) {
+	if !r.hasFromExternalRebuilderColumn(ctx) {
+		return nil, nil
+	}
+	userCol := "user_uid"
+	if r.isTSSchema {
+		userCol = `"userUid"`
+	}
+	rows, err := r.pool.Query(ctx, fmt.Sprintf(`
+		SELECT DISTINCT exchange, COALESCE(label, ''), date_trunc('day', timestamp AT TIME ZONE 'UTC')
+		FROM snapshot_data
+		WHERE %s = $1 AND timestamp >= $2 AND timestamp <= $3
+		  AND from_external_rebuilder = TRUE`, userCol),
+		userUID, start, end,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var days []ExternalRebuilderDay
+	for rows.Next() {
+		var d ExternalRebuilderDay
+		if err := rows.Scan(&d.Exchange, &d.Label, &d.Day); err != nil {
+			return nil, err
+		}
+		d.Day = time.Date(d.Day.Year(), d.Day.Month(), d.Day.Day(), 0, 0, 0, 0, time.UTC)
+		days = append(days, d)
+	}
+	return days, rows.Err()
+}
+
 // GetExternalRebuilderDays returns the set of UTC day-keys (00:00:00 of the
 // day) for which the user has at least one snapshot produced by the external
 // history-rebuilder service in [start, end]. The signed-report builder uses

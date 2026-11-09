@@ -233,6 +233,7 @@ message ReportRequest {
   string report_name = 7;
   string base_currency = 8;     // USD, EUR, etc. (default: USD)
   double risk_free_rate = 9;    // annual %, e.g. 2.5 (0 = legacy behavior, rf excluded)
+  string portfolio_id = 10;     // one of the user's portfolios (optional; empty = every reported connection)
 }
 
 // Response with cryptographically signed report

@@ -59,12 +59,18 @@ type Server struct {
 	syncSvc           *service.SyncService
 	metricsSvc        *service.MetricsService
 	reportSvc         *service.ReportService
+	portfolioSvc      reportPortfolios
 	snapshotRepo      *repository.SnapshotRepo
 	userRepo          *repository.UserRepo
 	attestSvc         *attestation.Service
 	grpcServer        *grpc.Server
 	jwtSecret         []byte // HMAC-SHA256 secret for JWT verification; nil = dev mode (no auth)
 	jwtExpectedIssuer string // pins the `iss` claim when non-empty (AUTH-002)
+}
+
+// reportPortfolios reads the portfolio a signed report is scoped to.
+type reportPortfolios interface {
+	ForReport(ctx context.Context, userUID, id string) (*service.ReportPortfolio, error)
 }
 
 type connectionService interface {
@@ -100,6 +106,7 @@ type Services struct {
 	SyncSvc      *service.SyncService
 	MetricsSvc   *service.MetricsService
 	ReportSvc    *service.ReportService
+	PortfolioSvc reportPortfolios
 	SnapshotRepo *repository.SnapshotRepo
 	UserRepo     *repository.UserRepo
 	AttestSvc    *attestation.Service
@@ -117,6 +124,7 @@ func NewServer(logger *zap.Logger, svcs Services, opts ServerOptions) *Server {
 		syncSvc:           svcs.SyncSvc,
 		metricsSvc:        svcs.MetricsSvc,
 		reportSvc:         svcs.ReportSvc,
+		portfolioSvc:      svcs.PortfolioSvc,
 		snapshotRepo:      svcs.SnapshotRepo,
 		userRepo:          svcs.UserRepo,
 		attestSvc:         svcs.AttestSvc,
@@ -766,6 +774,22 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 		}
 	}
 
+	// The owner comes from the verified uid: another user's id reads as unknown.
+	var portfolio *service.ReportPortfolio
+	if req.PortfolioId != "" {
+		if s.portfolioSvc == nil {
+			return &pb.SignedReportResponse{Success: false, Error: "portfolios not configured"}, nil
+		}
+		loaded, err := s.portfolioSvc.ForReport(ctx, userUID, req.PortfolioId)
+		if err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				return &pb.SignedReportResponse{Success: false, Error: "portfolio not found"}, nil
+			}
+			return &pb.SignedReportResponse{Success: false, Error: s.sanitizeErrorForClient(err)}, nil
+		}
+		portfolio = loaded
+	}
+
 	report, err := s.reportSvc.GenerateReport(ctx, &service.GenerateReportRequest{
 		UserUID:            userUID,
 		StartDate:          startDate,
@@ -777,6 +801,7 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 		IncludeRiskMetrics: req.IncludeRiskMetrics,
 		IncludeDrawdown:    req.IncludeDrawdown,
 		ExcludedExchanges:  excludedConnectionKeys,
+		Portfolio:          portfolio,
 		Manager:            "",
 		Firm:               "",
 	})

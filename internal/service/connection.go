@@ -684,6 +684,11 @@ func (s *ConnectionService) decryptConnection(conn *repository.ExchangeConnectio
 }
 
 // GetActiveConnections returns all active connections for a user (encrypted)
+// CountConnections counts the user's connections, paused ones included.
+func (s *ConnectionService) CountConnections(ctx context.Context, userUID string) (int, error) {
+	return s.repo.CountByUser(ctx, userUID)
+}
+
 func (s *ConnectionService) GetActiveConnections(ctx context.Context, userUID string) ([]*repository.ExchangeConnection, error) {
 	return s.repo.GetActiveByUser(ctx, userUID)
 }

@@ -105,6 +105,7 @@ type Handler struct {
 	reportSvc    *service.ReportService
 	snapshotRepo *repository.SnapshotRepo
 	userRepo     *repository.UserRepo
+	portfolioSvc portfolioService
 
 	// New services for attestation, TLS, and E2E encryption
 	tlsKeygen *tlspkg.KeyGenerator
@@ -120,6 +121,7 @@ type HandlerOptions struct {
 	ReportSvc    *service.ReportService
 	SnapshotRepo *repository.SnapshotRepo
 	UserRepo     *repository.UserRepo
+	PortfolioSvc portfolioService
 	TLSKeygen    *tlspkg.KeyGenerator
 	AttestSvc    *attestation.Service
 	ECIESSvc     *encryption.ECIESService
@@ -140,6 +142,7 @@ func NewHandlerWithOptions(opts HandlerOptions) *Handler {
 		reportSvc:    opts.ReportSvc,
 		snapshotRepo: opts.SnapshotRepo,
 		userRepo:     opts.UserRepo,
+		portfolioSvc: opts.PortfolioSvc,
 		tlsKeygen:    opts.TLSKeygen,
 		attestSvc:    opts.AttestSvc,
 		eciesSvc:     opts.ECIESSvc,

@@ -137,6 +137,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// a warning and passes the request through.
 	mux.HandleFunc("/api/v1/credentials/connect", credRateLimiter.Middleware(s.jwtRequired(s.handler.ConnectCredentials)))
 
+	// Portfolios: the JWT is the only source of the user (see Handler.Portfolios).
+	mux.HandleFunc(portfoliosPath, s.jwtRequired(s.handler.Portfolios))
+	mux.HandleFunc(portfoliosPath+"/", s.jwtRequired(s.handler.Portfolios))
+
 	// Admin endpoints: enforced localhost-only (SEC-001). The `localhostOnly`
 	// wrapper inspects r.RemoteAddr (not X-Forwarded-For, which is spoofable
 	// and only set by the front proxy anyway). Non-loopback peers get 403.
