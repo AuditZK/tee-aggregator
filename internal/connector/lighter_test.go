@@ -6,6 +6,8 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -209,6 +211,34 @@ func TestLighterGetTradesWalletFormReturnsEmpty(t *testing.T) {
 	}
 	if trades != nil {
 		t.Errorf("got %v, want nil", trades)
+	}
+}
+
+func TestLighterRefusesASigningKeyBeforeAnyRequest(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
+	defer srv.Close()
+
+	for name, cred := range map[string]string{
+		"signing key":   "0x" + strings.Repeat("ab", 40),
+		"short address": "0xAbCd1234567890",
+	} {
+		l := NewLighter(&Credentials{APIKey: cred})
+		l.baseURL = srv.URL
+		err := l.TestConnection(context.Background())
+		if err == nil {
+			t.Errorf("%s: connection accepted", name)
+			continue
+		}
+		if errors.Is(err, ErrTransient) {
+			t.Errorf("%s: classified transient, the holder must be told now: %v", name, err)
+		}
+		if strings.Contains(err.Error(), cred[2:10]) {
+			t.Errorf("%s: error quotes the credential: %v", name, err)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Errorf("%d requests left for the venue, want 0", hits.Load())
 	}
 }
 

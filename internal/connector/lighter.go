@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -20,10 +22,12 @@ const lighterAPI = "https://mainnet.zklighter.elliot.ai"
 // Lighter is a read-only DEX connector for the Lighter Protocol.
 // Credentials: apiKey is either
 //   - a read-only auth token "ro:<account_index>:single:<ts>:<sig>" — enables
-//     both balance and trade history (via /api/v1/export), or
+//     both balance and fills (via /api/v1/export), or
 //   - an L1 wallet address "0x..." — enables balance/positions only, since
 //     /api/v1/export requires a signed token. Trade fetches return empty
 //     when only the wallet address is provided.
+//
+// Either form rebuilds the history: the venue's portfolio series is public.
 type Lighter struct {
 	authToken     string
 	walletAddress string
@@ -63,22 +67,9 @@ func NewLighter(creds *Credentials) *Lighter {
 
 func (l *Lighter) Exchange() string { return "lighter" }
 
-// lighterHistoryNeedsToken is the capability gap of a wallet-address
-// connection: balance and positions read fine, the trade history does not.
-const lighterHistoryNeedsToken = "lighter_history_needs_ro_token"
-
-// CapabilityWarnings implements CapabilityWarner. A wallet address reads the
-// account's balance and positions but not its fills, so its history can never
-// be rebuilt; the rebuilder refuses the address outright. Said here, on every
-// sync, the gap reaches sync_statuses and the dashboard banner, where the one
-// person who can fix it, by pasting a ro: token, will see it. It used to be a
-// 400 in the enclave's log and a connection recorded as completed.
-func (l *Lighter) CapabilityWarnings() []string {
-	if l.walletAddress == "" {
-		return nil
-	}
-	return []string{lighterHistoryNeedsToken}
-}
+// A Lighter API key is a signing key, 0x followed by 80 hex characters. It
+// starts like an address, and looked up as one it would leave in a query string.
+var lighterL1Address = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
 
 // DetectIsPaper mirrors TS behavior: Lighter connector targets mainnet.
 func (l *Lighter) DetectIsPaper(_ context.Context) (bool, error) {
@@ -247,6 +238,9 @@ func (l *Lighter) fetchAccount(ctx context.Context) (*lighterAccount, error) {
 		return decodeFirstAccount(data, fmt.Sprintf("index %d", *l.accountIndex))
 
 	case l.walletAddress != "":
+		if !lighterL1Address.MatchString(l.walletAddress) {
+			return nil, errors.New("lighter: credentials must be a ro:<index>:... token or an 0x... wallet address of 40 hex characters")
+		}
 		data, err := l.request(ctx, "/api/v1/account", map[string]string{
 			"by":    "l1_address",
 			"value": l.walletAddress,
