@@ -44,7 +44,7 @@ func TestOptionalInterfaces(t *testing.T) {
 		{"IBKR", NewIBKR(&Credentials{APIKey: "t", APISecret: "q"}), true, true, false, true},
 		{"Alpaca", NewAlpaca(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, true},
 		{"Hyperliquid", NewHyperliquid(&Credentials{WalletAddress: "0x1"}), true, true, true, true},
-		{"Lighter", NewLighter(&Credentials{WalletAddress: "0x1"}), false, true, false, true},
+		{"Lighter", NewLighter(&Credentials{WalletAddress: "0x1"}), true, true, false, true},
 		{"MEXC", NewMEXC(&Credentials{APIKey: "k", APISecret: "s"}), true, true, true, false},
 		// Bybit reads its capital flows from the unified transaction log, like
 		// the other crypto venues; without the fetcher every snapshot carried

@@ -3,9 +3,12 @@ package connector
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -116,9 +119,9 @@ func TestLighterGetBalanceByWalletAddress(t *testing.T) {
 
 func TestLighterGetPositions(t *testing.T) {
 	srv := lighterAccountServer(t, `{"accounts":[{"index":713194,"positions":[
-		{"symbol":"BTC","sign":1,"size":"2.5","avg_entry_price":"60000","unrealized_pnl":"150.5"},
-		{"symbol":"ETH","sign":-1,"size":"10","avg_entry_price":"2500","unrealized_pnl":"-40"},
-		{"symbol":"SOL","sign":1,"size":"0","avg_entry_price":"100","unrealized_pnl":"0"}
+		{"symbol":"BTC","sign":1,"position":"2.5","avg_entry_price":"60000","unrealized_pnl":"150.5"},
+		{"symbol":"ETH","sign":-1,"position":"10","avg_entry_price":"2500","unrealized_pnl":"-40"},
+		{"symbol":"SOL","sign":1,"position":"0","avg_entry_price":"100","unrealized_pnl":"0"}
 	]}]}`)
 	pos, err := lighterAt(srv.URL).GetPositions(context.Background())
 	if err != nil {
@@ -304,5 +307,133 @@ func TestLighterWalletPrefixRedaction(t *testing.T) {
 	}
 	if short := "0xABCD"; walletPrefix(short) != short {
 		t.Errorf("short address altered: %q", walletPrefix(short))
+	}
+}
+
+func TestLighterGetCashflowsFromTheHourlySeries(t *testing.T) {
+	now := time.Now().UTC()
+	h0 := now.Truncate(time.Hour).Add(-4 * time.Hour)
+	since := h0.Add(30 * time.Minute)
+	type pt struct {
+		at          time.Time
+		in, out, pn float64
+	}
+	series := []pt{
+		{h0.Add(-time.Hour), 1000, 0, 0},
+		{h0, 1200, 0, 5},                      // before since: already read
+		{h0.Add(time.Hour), 1500, 0, -40},     // deposit 300
+		{h0.Add(2 * time.Hour), 1500, 250, 2}, // withdrawal 250
+		{h0.Add(3 * time.Hour), 1500, 250, 9}, // trading only
+		{h0.Add(4 * time.Hour), 1600, 260, 9}, // both in the same hour
+		{now, 1900, 260, 9},                   // hour still open
+	}
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/pnl" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if r.Header.Get("authorization") != "" {
+			t.Errorf("token sent on a public read")
+		}
+		gotQuery = r.URL.Query()
+		var b strings.Builder
+		b.WriteString(`{"code":200,"resolution":"1h","pnl":[`)
+		for i, p := range series {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"timestamp":%d,"inflow":%v,"outflow":%v,"trade_pnl":%v}`, p.at.Unix(), p.in, p.out, p.pn)
+		}
+		b.WriteString(`]}`)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	t.Cleanup(srv.Close)
+
+	l := NewLighter(&Credentials{APIKey: lighterTestToken})
+	l.baseURL = srv.URL
+	flows, err := l.GetCashflows(context.Background(), since)
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	if gotQuery.Get("by") != "index" || gotQuery.Get("value") != "713194" || gotQuery.Get("resolution") != "1h" {
+		t.Errorf("query = %v", gotQuery)
+	}
+	want := []struct {
+		at     time.Time
+		amount float64
+	}{
+		{h0.Add(time.Hour), 300},
+		{h0.Add(2 * time.Hour), -250},
+		{h0.Add(4 * time.Hour), 100},
+		{h0.Add(4 * time.Hour), -10},
+	}
+	if len(flows) != len(want) {
+		t.Fatalf("got %d flows, want %d: %+v", len(flows), len(want), flows)
+	}
+	for i, w := range want {
+		if !flows[i].Timestamp.Equal(w.at) || !approxEq(flows[i].Amount, w.amount) || flows[i].Currency != "USDC" {
+			t.Errorf("[%d] = %v %v %s, want %v %v USDC", i, flows[i].Timestamp, flows[i].Amount, flows[i].Currency, w.at, w.amount)
+		}
+	}
+}
+
+func TestLighterGetCashflowsTransportErrorIsTransient(t *testing.T) {
+	l := NewLighter(&Credentials{APIKey: lighterTestToken})
+	l.baseURL = "http://127.0.0.1:1"
+	_, err := l.GetCashflows(context.Background(), time.Now().Add(-time.Hour))
+	if !errors.Is(err, ErrTransient) {
+		t.Fatalf("got %v, want ErrTransient", err)
+	}
+}
+
+func TestLighterGetCashflowsSplitsAWideWindow(t *testing.T) {
+	now := time.Now().UTC()
+	since := now.Add(-20 * 24 * time.Hour)
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		q := r.URL.Query()
+		start, _ := strconv.ParseInt(q.Get("start_timestamp"), 10, 64)
+		end, _ := strconv.ParseInt(q.Get("end_timestamp"), 10, 64)
+		if time.Duration(end-start)*time.Second > lighterHourlySpan {
+			_, _ = w.Write([]byte(`{"code":22403,"message":"time range exceeds maximum allowed range for the specified resolution"}`))
+			return
+		}
+		// One deposit of 1 per hour, cumulative since the epoch hour.
+		var b strings.Builder
+		b.WriteString(`{"code":200,"pnl":[`)
+		first := true
+		for h := time.Unix(start, 0).UTC().Truncate(time.Hour); !h.After(time.Unix(end, 0)); h = h.Add(time.Hour) {
+			if h.Unix() < start {
+				continue
+			}
+			if !first {
+				b.WriteString(",")
+			}
+			first = false
+			fmt.Fprintf(&b, `{"timestamp":%d,"inflow":%d,"outflow":0,"trade_pnl":0}`, h.Unix(), h.Unix()/3600)
+		}
+		b.WriteString(`]}`)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	t.Cleanup(srv.Close)
+
+	l := NewLighter(&Credentials{APIKey: lighterTestToken})
+	l.baseURL = srv.URL
+	flows, err := l.GetCashflows(context.Background(), since)
+	if err != nil {
+		t.Fatalf("GetCashflows: %v", err)
+	}
+	if calls < 3 {
+		t.Errorf("%d requests for a 20-day window, want at least 3", calls)
+	}
+	want := int(now.Truncate(time.Hour).Sub(since.Truncate(time.Hour)) / time.Hour)
+	if len(flows) != want {
+		t.Fatalf("got %d hourly deposits, want %d (none lost or doubled at a seam)", len(flows), want)
+	}
+	for _, f := range flows {
+		if !approxEq(f.Amount, 1) {
+			t.Fatalf("flow %v at %v, want 1", f.Amount, f.Timestamp)
+		}
 	}
 }
