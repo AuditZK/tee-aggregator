@@ -1845,17 +1845,6 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 			endEquity = latest.TotalEquity
 		}
 	}
-	if gap := rebuildCredentialGap(connMeta.Exchange, creds.APIKey); gap != "" {
-		// Not an error: the connection is fine, the credential just cannot
-		// rebuild, and the connector reports that gap on every sync.
-		s.logger.Info("history backfill: credential cannot rebuild, skipping",
-			zap.String("user_uid", connMeta.UserUID),
-			zap.String("exchange", connMeta.Exchange),
-			zap.String("gap", gap),
-		)
-		creds = nil
-		return
-	}
 	s.logger.Info("history backfill: dispatching to external rebuilder",
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
@@ -1899,26 +1888,6 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 	firstSync := s.isFirstSync(ctx, connMeta)
 	s.persistHistoricalSnapshots(ctx, connMeta, res.Snapshots, firstSync, sourceExternalRebuilder, opts)
 	s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
-}
-
-// errRebuildCredentialGap marks a connection whose stored credential can
-// read the account but not its history, so no rebuild will ever succeed
-// until the holder replaces it.
-var errRebuildCredentialGap = errors.New("credential cannot rebuild history")
-
-// rebuildCredentialGap names why a credential cannot rebuild, or returns ""
-// when it can. Only Lighter draws that line today: a "ro:" token reads the
-// fills, a wallet address does not, and the rebuilder refuses the address
-// with a 400. Sending it anyway is plaintext egress for an answer already
-// known, every connect and every midnight after that.
-func rebuildCredentialGap(exchange, apiKey string) string {
-	if strings.ToLower(strings.TrimSpace(exchange)) != "lighter" {
-		return ""
-	}
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(apiKey)), "ro:") {
-		return ""
-	}
-	return "lighter_history_needs_ro_token"
 }
 
 // externalRebuilderExchanges lists the exchanges the deployed rebuilder
@@ -1974,14 +1943,16 @@ func rebuildCredentialGap(exchange, apiKey string) string {
 // rebuilder host reaches api.bybit.com directly and needs no tunnel. A key
 // IP-locked to the enclave egress will still be refused from the rebuilder.
 //
-// mexc, lighter: back in the list on 2026-08-28. Both were dropped on
-// 2026-05-28 because the prod rebuilder did not register them yet; it has
-// since 2026-07-08, and their modules now honour EndEquityOverride exactly
-// like hyperliquid (calibrated MTM walk anchored on the midnight snapshot),
-// which is the condition (b) above. The lighter module needs a read-only
-// "ro:" token — a bare wallet address cannot read fills — and answers a
-// credential error otherwise, which the connect hook reports as a rebuild
-// failure without touching the live connection.
+// mexc: back in the list on 2026-08-28. It was dropped on 2026-05-28 because
+// the prod rebuilder did not register it yet; it has since 2026-07-08, and its
+// module now honours EndEquityOverride exactly like hyperliquid (calibrated
+// MTM walk anchored on the midnight snapshot), which is the condition (b)
+// above.
+//
+// lighter: absolute family. The module reads the venue's own public portfolio
+// series (cumulative flows and marked PnL per midnight), so a wallet address
+// rebuilds as well as a read-only token and EndEquityOverride is ignored. The
+// midnight pass is the idempotent re-read that finalizes.
 var externalRebuilderExchanges = []string{"hyperliquid", "bitget", "binance", "okx", "alpaca", "bybit", "kraken", "mexc", "lighter"}
 
 // externalRebuilderSupports reports whether the deployed rebuilder registers
@@ -2126,15 +2097,8 @@ func (s *SyncService) RecalibrateRebuiltHistories(ctx context.Context) {
 	start := time.Now()
 	var success, failed int
 
-	var skipped int
 	for _, conn := range conns {
 		if err := s.recalibrateOne(ctx, conn); err != nil {
-			if errors.Is(err, errRebuildCredentialGap) {
-				// Nothing to retry: the credential cannot rebuild, and the
-				// connector already says so on the connection's status.
-				skipped++
-				continue
-			}
 			failed++
 			if s.counters != nil {
 				s.counters.IncrCounter("recalibration_failures_total")
@@ -2162,7 +2126,6 @@ func (s *SyncService) RecalibrateRebuiltHistories(ctx context.Context) {
 	s.logger.Info("midnight recalibration: done",
 		zap.Int("success", success),
 		zap.Int("failed", failed),
-		zap.Int("skipped", skipped),
 		zap.Duration("duration", time.Since(start)),
 	)
 }
@@ -2189,11 +2152,6 @@ func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.Excha
 	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, conn.UserUID, conn.Exchange, conn.Label)
 	if err != nil {
 		return fmt.Errorf("decrypt credentials: %w", err)
-	}
-
-	if gap := rebuildCredentialGap(conn.Exchange, creds.APIKey); gap != "" {
-		creds = nil
-		return fmt.Errorf("%w: %s", errRebuildCredentialGap, gap)
 	}
 
 	// 3. Dispatch to rebuilder with EndEquityOverride. Skips fetchLiveEquity
