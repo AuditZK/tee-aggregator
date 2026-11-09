@@ -564,17 +564,26 @@ func main() {
 		logger.Info("gRPC JWT auth enabled")
 	}
 
+	grpcServices := enclaveGrpc.Services{
+		ConnSvc:      connSvc,
+		SyncSvc:      syncSvc,
+		MetricsSvc:   metricsSvc,
+		ReportSvc:    reportSvc,
+		SnapshotRepo: snapshotRepo,
+		UserRepo:     userRepo,
+		AttestSvc:    attestSvc,
+	}
+	// Portfolios need the database and the connections it checks members against.
+	// Set only once they exist: a nil pointer in an interface field reads as configured.
+	var portfolioSvc *service.PortfolioService
+	if pool != nil && connSvc != nil {
+		portfolioSvc = service.NewPortfolioService(repository.NewPortfolioRepo(pool), connSvc)
+		grpcServices.PortfolioSvc = portfolioSvc
+	}
+
 	grpcServer := enclaveGrpc.NewServer(
 		logger,
-		enclaveGrpc.Services{
-			ConnSvc:      connSvc,
-			SyncSvc:      syncSvc,
-			MetricsSvc:   metricsSvc,
-			ReportSvc:    reportSvc,
-			SnapshotRepo: snapshotRepo,
-			UserRepo:     userRepo,
-			AttestSvc:    attestSvc,
-		},
+		grpcServices,
 		enclaveGrpc.ServerOptions{
 			JWTSecret:         jwtSecret,
 			JWTExpectedIssuer: cfg.JWTExpectedIssuer,
@@ -593,7 +602,7 @@ func main() {
 	// endpoints enforce JWT just like the gRPC authInterceptor does.
 	restServer.SetJWTSecret(jwtSecret)
 	restServer.SetJWTExpectedIssuer(cfg.JWTExpectedIssuer)
-	restServer.SetHandler(server.NewHandlerWithOptions(server.HandlerOptions{
+	handlerOptions := server.HandlerOptions{
 		Logger:       logger,
 		ConnSvc:      connSvc,
 		SyncSvc:      syncSvc,
@@ -604,7 +613,11 @@ func main() {
 		TLSKeygen:    tlsKeygen,
 		AttestSvc:    attestSvc,
 		ECIESSvc:     eciesSvc,
-	}))
+	}
+	if portfolioSvc != nil {
+		handlerOptions.PortfolioSvc = portfolioSvc
+	}
+	restServer.SetHandler(server.NewHandlerWithOptions(handlerOptions))
 
 	// B2 handoff server: expose POST /api/v1/admin/handoff so a
 	// successor enclave can fetch this enclave's master key over an
