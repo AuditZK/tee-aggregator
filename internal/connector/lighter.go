@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -198,7 +199,7 @@ type lighterPosition struct {
 	MarketID      int    `json:"market_id"`
 	Symbol        string `json:"symbol"`
 	Sign          int    `json:"sign"` // 1=long, -1=short
-	Size          string `json:"size"`
+	Size          string `json:"position"`
 	AvgEntryPrice string `json:"avg_entry_price"`
 	UnrealizedPnl string `json:"unrealized_pnl"`
 }
@@ -506,6 +507,103 @@ func (l *Lighter) request(ctx context.Context, path string, query map[string]str
 func parseFloatOrZero(value string) float64 {
 	result, _ := strconv.ParseFloat(value, 64)
 	return result
+}
+
+// lighterFlowDust is the step below which a move of the cumulative flows is
+// float noise rather than a transfer.
+const lighterFlowDust = 1e-6
+
+// lighterHourlySpan stays under the venue's cap on an hourly range, which
+// answers 22403 somewhere between 8 and 10 days.
+const lighterHourlySpan = 7 * 24 * time.Hour
+
+// GetCashflows implements CashflowFetcher from the account's public hourly
+// portfolio series: its cumulative inflow and outflow are exactly what moved
+// total_asset_value without being traded, so each hour's step is that hour's
+// deposits and withdrawals, stamped at the hour's end.
+//
+// The point stamped with the request time is left out: its hour is still
+// open, and the next read would count the same flows again in the full hour.
+func (l *Lighter) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
+	accountIndex, err := l.getAccountIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	since = since.UTC()
+	now := time.Now().UTC()
+	from := since.Truncate(time.Hour).Add(-time.Hour)
+
+	byHour := make(map[time.Time]lighterFlowPoint)
+	for start := from; start.Before(now); start = start.Add(lighterHourlySpan) {
+		end := start.Add(lighterHourlySpan)
+		if end.After(now) {
+			end = now
+		}
+		points, err := l.fetchFlowSeries(ctx, accountIndex, start, end)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range points {
+			if p.at.Equal(p.at.Truncate(time.Hour)) {
+				byHour[p.at] = p
+			}
+		}
+	}
+	points := make([]lighterFlowPoint, 0, len(byHour))
+	for _, p := range byHour {
+		points = append(points, p)
+	}
+	sort.Slice(points, func(i, j int) bool { return points[i].at.Before(points[j].at) })
+
+	var flows []*Cashflow
+	for i := 1; i < len(points); i++ {
+		prev, p := points[i-1], points[i]
+		if !p.at.After(since) {
+			continue
+		}
+		// Both totals only grow; a step back is booked on the other side so
+		// the hour's net still matches the series.
+		for _, net := range []float64{p.inflow - prev.inflow, prev.outflow - p.outflow} {
+			if math.Abs(net) > lighterFlowDust {
+				flows = append(flows, &Cashflow{Amount: net, Currency: "USDC", Timestamp: p.at})
+			}
+		}
+	}
+	return flows, nil
+}
+
+type lighterFlowPoint struct {
+	at              time.Time
+	inflow, outflow float64
+}
+
+func (l *Lighter) fetchFlowSeries(ctx context.Context, accountIndex int, start, end time.Time) ([]lighterFlowPoint, error) {
+	data, err := l.request(ctx, "/api/v1/pnl", map[string]string{
+		"by":              "index",
+		"value":           strconv.Itoa(accountIndex),
+		"resolution":      "1h",
+		"start_timestamp": strconv.FormatInt(start.Unix(), 10),
+		"end_timestamp":   strconv.FormatInt(end.Unix(), 10),
+		"count_back":      strconv.Itoa(int(end.Sub(start)/time.Hour) + 2),
+	}, "")
+	if err != nil {
+		return nil, fmt.Errorf("lighter: fetch flow series: %w", err)
+	}
+	var resp struct {
+		PnL []struct {
+			Timestamp int64   `json:"timestamp"`
+			Inflow    float64 `json:"inflow"`
+			Outflow   float64 `json:"outflow"`
+		} `json:"pnl"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("lighter: decode flow series: %w", err)
+	}
+	out := make([]lighterFlowPoint, 0, len(resp.PnL))
+	for _, e := range resp.PnL {
+		out = append(out, lighterFlowPoint{at: time.Unix(e.Timestamp, 0).UTC(), inflow: e.Inflow, outflow: e.Outflow})
+	}
+	return out, nil
 }
 
 // GetBalanceByMarket returns swap market balance (Lighter is perps-only).
