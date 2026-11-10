@@ -22,13 +22,11 @@ type binanceMove struct {
 var binanceUMMovementTypes = []string{"TRANSFER", "INTERNAL_TRANSFER", "STRATEGY_UMFUTURES_TRANSFER"}
 
 // binanceUMCounterpartTypes are the universal transfers with a USDⓈ-M leg
-// that the sync already accounts for, as an internal move (spot, margin) or
-// as a booked flow (funding). Options is left out on purpose: nothing books a
-// USDⓈ-M↔options transfer, so its income row has to surface as a stray flow.
-// Mirrors the history rebuilder's umCounterpartTransferTypes.
+// that the sync already accounts for, as an internal move (spot, margin,
+// options when read) or as a booked flow (funding, options when unreadable).
 var binanceUMCounterpartTypes = []string{
 	"MAIN_UMFUTURE", "UMFUTURE_MAIN", "FUNDING_UMFUTURE", "UMFUTURE_FUNDING",
-	"MARGIN_UMFUTURE", "UMFUTURE_MARGIN",
+	"MARGIN_UMFUTURE", "UMFUTURE_MARGIN", "UMFUTURE_OPTION", "OPTION_UMFUTURE",
 }
 
 // binanceCounterpartWindow is how far apart the two legs of one transfer may

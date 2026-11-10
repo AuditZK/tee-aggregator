@@ -50,7 +50,6 @@ func TestBinance_Cashflows_UniversalTransferSigns(t *testing.T) {
 	}{
 		{"FUNDING_MAIN", 100}, {"MAIN_FUNDING", -100},
 		{"FUNDING_UMFUTURE", 100}, {"UMFUTURE_FUNDING", -100},
-		{"MAIN_OPTION", -100}, {"OPTION_MAIN", 100},
 		{"MAIN_MINING", -100}, {"MINING_MAIN", 100},
 		{"MAIN_UMFUTURE", 0},
 		// CONN-07: margin and COIN-M sit inside the live equity, so these
@@ -61,7 +60,9 @@ func TestBinance_Cashflows_UniversalTransferSigns(t *testing.T) {
 		// And these cross into or out of the measured wallets.
 		{"FUNDING_MARGIN", 100}, {"MARGIN_FUNDING", -100},
 		{"FUNDING_CMFUTURE", 100}, {"CMFUTURE_FUNDING", -100},
-		{"UMFUTURE_OPTION", -100}, {"OPTION_MARGIN", 100},
+		// The options account is read too.
+		{"MAIN_OPTION", 0}, {"OPTION_MAIN", 0},
+		{"UMFUTURE_OPTION", 0}, {"OPTION_MARGIN", 0},
 	}
 	stamp := time.Now().UTC().Add(-time.Hour).UnixMilli()
 	for _, tc := range cases {
@@ -104,6 +105,9 @@ func TestBinanceTransferSignFollowsTheWalletsRead(t *testing.T) {
 		{"MARGIN_MAIN", noMargin, +1},
 		{"FUNDING_MARGIN", noMargin, 0},
 		{"FUNDING_MAIN", noMargin, +1},
+		{"UMFUTURE_OPTION", all, 0},
+		{"UMFUTURE_OPTION", noMargin, -1},
+		{"OPTION_MAIN", noMargin, +1},
 		{"NOT_A_TYPE", all, 0},
 	}
 	for _, tc := range cases {
