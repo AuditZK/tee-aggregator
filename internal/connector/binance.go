@@ -19,6 +19,7 @@ const (
 	binanceSpotAPI         = "https://api.binance.com"
 	binanceFuturesAPI      = "https://fapi.binance.com"
 	binanceCoinMFuturesAPI = "https://dapi.binance.com"
+	binanceOptionsAPI      = "https://eapi.binance.com"
 
 	// QUAL-001: extracted to remove duplication across signed-request sites.
 	binancePathAccount = "/api/v3/account"
@@ -44,8 +45,8 @@ type Binance struct {
 	capabilityWarnings []string
 	// coverage grades every wallet the last GetBalance tried to reach
 	// (CoverageReporter). Scope note: it answers "did we reach what we
-	// tried", not "did we try everything the account holds" — Earn is not
-	// fetched at all and therefore not listed.
+	// tried", not "did we try everything the account holds": the funding and
+	// mining wallets are not fetched and therefore not listed.
 	coverage []WalletCoverage
 	// cashflowNotes carries the markers the last GetCashflows raised.
 	cashflowNotes noteList
@@ -60,10 +61,10 @@ const (
 	binanceWalletCross    = "cross_margin"
 	binanceWalletIsolated = "isolated_margin"
 	binanceWalletEarn     = "simple_earn"
+	binanceWalletOption   = "option"
 
 	// Wallets GetBalance does not read: a transfer to one leaves the equity.
 	binanceWalletFunding = "funding"
-	binanceWalletOption  = "option"
 	binanceWalletMining  = "mining"
 )
 
@@ -258,6 +259,18 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 		b.noteWallet(binanceWalletIsolated, ierr)
 	}
 
+	if eq, oerr := b.getOptionsEquity(ctx, priceMap); oerr == nil {
+		total.Equity += eq
+		nonUM += eq
+		b.noteWallet(binanceWalletOption, nil)
+	} else if errors.Is(oerr, ErrTransient) {
+		return nil, fmt.Errorf("options balance: %w", oerr)
+	} else {
+		// Coverage only, no capability warning: most accounts never opened
+		// options, and the frontend turns any warning into "check your key".
+		b.noteWallet(binanceWalletOption, oerr)
+	}
+
 	if earnErr == nil {
 		eq := ValueSpotHoldingsUSD(earn.positions, priceMap)
 		total.Equity += eq
@@ -392,6 +405,36 @@ func (b *Binance) getCoinMFuturesEquity(ctx context.Context, priceMap map[string
 		upnl, _ := strconv.ParseFloat(a.CrossUnPnl, 64)
 		if mb := bal + upnl; mb != 0 {
 			holdings = append(holdings, SpotHolding{Asset: a.Asset, Amount: mb})
+		}
+	}
+	return ValueSpotHoldingsUSD(holdings, priceMap), nil
+}
+
+// getOptionsEquity returns the options account equity in USD: per margin
+// asset, its balance plus the mark value of the open options, so a long
+// option's premium stays in the equity instead of reading as a loss.
+func (b *Binance) getOptionsEquity(ctx context.Context, priceMap map[string]float64) (float64, error) {
+	body, err := b.doRequest(ctx, "GET", binanceOptionsAPI, "/eapi/v1/marginAccount", url.Values{}, true)
+	if err != nil {
+		return 0, err
+	}
+	return parseBinanceOptionsEquity(body, priceMap)
+}
+
+func parseBinanceOptionsEquity(body []byte, priceMap map[string]float64) (float64, error) {
+	var resp struct {
+		Asset []struct {
+			Asset  string `json:"asset"`
+			Equity string `json:"equity"`
+		} `json:"asset"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, fmt.Errorf("decode options account: %w", err)
+	}
+	var holdings []SpotHolding
+	for _, a := range resp.Asset {
+		if eq, _ := strconv.ParseFloat(a.Equity, 64); eq != 0 {
+			holdings = append(holdings, SpotHolding{Asset: a.Asset, Amount: eq})
 		}
 	}
 	return ValueSpotHoldingsUSD(holdings, priceMap), nil
@@ -905,7 +948,7 @@ var binanceTransferWallets = map[string][2]string{
 }
 
 // binanceLiveWallets are the wallets GetBalance sums into the equity.
-var binanceLiveWallets = []string{binanceWalletSpot, binanceWalletUM, binanceWalletCoinM, binanceWalletCross, binanceWalletIsolated}
+var binanceLiveWallets = []string{binanceWalletSpot, binanceWalletUM, binanceWalletCoinM, binanceWalletCross, binanceWalletIsolated, binanceWalletOption}
 
 // binanceTransferSign is +1 when the transfer brings value into the measured
 // wallets, -1 when it takes value out, 0 when it moves value between two of
