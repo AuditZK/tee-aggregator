@@ -2477,7 +2477,17 @@ func (s *SyncService) persistHistoricalSnapshots(
 	// which would book the whole account as a deposit on that day.
 	var superseded *repository.Snapshot
 	if !opts.window.isSet() {
-		superseded = s.applyInceptionDeposit(ctx, connMeta, snapshots)
+		var baseline *repository.Snapshot
+		superseded, baseline = s.applyInceptionDeposit(ctx, connMeta, snapshots, opts.coveredFrom)
+		if baseline != nil {
+			snapshots = append(snapshots, baseline)
+			s.logger.Info("inception baseline written the day before the first funded day",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.Time("baseline_day", baseline.Timestamp),
+			)
+		}
 	}
 	// The connect hook runs the live sync BEFORE this reconstruction, on
 	// purpose (it writes the equity anchor the rebuild dispatch reads). That
@@ -2624,19 +2634,20 @@ func (s *SyncService) persistHistoricalSnapshots(
 // the old first day stays in DB, so later window starts never get a phantom
 // mid-series deposit. Best-effort — a failed history lookup changes nothing.
 // Returns the pre-existing snapshot whose own inception stamp this series
-// supersedes, with its deposit already zeroed, for the caller to persist in the
-// same batch. Nil when there is nothing to correct.
-func (s *SyncService) applyInceptionDeposit(ctx context.Context, connMeta *repository.ExchangeConnection, snapshots []*repository.Snapshot) *repository.Snapshot {
+// supersedes, with its deposit already zeroed, and the inception baseline (see
+// inceptionBaseline), both for the caller to persist in the same batch. Nil
+// when there is nothing to add.
+func (s *SyncService) applyInceptionDeposit(ctx context.Context, connMeta *repository.ExchangeConnection, snapshots []*repository.Snapshot, coveredFrom time.Time) (superseded, baseline *repository.Snapshot) {
 	earliest := earliestFundedDay(snapshots)
 	if earliest == nil {
-		return nil
+		return nil, nil
 	}
 	// One read of the connection's whole existing timeline serves both checks:
 	// whether history already reaches further back (then this is not inception)
 	// and whether a connect-time stamp is now superseded.
 	existing, err := s.snapshotRepo.GetByUserAndDateRange(ctx, connMeta.UserUID, time.Unix(0, 0).UTC(), time.Now().UTC().Add(24*time.Hour))
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	mine := make([]*repository.Snapshot, 0, len(existing))
 	for _, p := range existing {
@@ -2645,6 +2656,7 @@ func (s *SyncService) applyInceptionDeposit(ctx context.Context, connMeta *repos
 		}
 	}
 	stamp, superseded := resolveInception(earliest, mine)
+	baseline = inceptionBaseline(earliest, mine, coveredFrom)
 	if stamp {
 		earliest.Deposits = earliest.TotalEquity
 		s.logger.Info("inception deposit stamped on reconstructed series (UX-001)",
@@ -2655,7 +2667,51 @@ func (s *SyncService) applyInceptionDeposit(ctx context.Context, connMeta *repos
 			zap.Float64("deposit", earliest.Deposits),
 		)
 	}
-	return superseded
+	return superseded, baseline
+}
+
+// inceptionBaseline scores the account's first day. Every TWR here (analytics,
+// signed report, charts) starts on the series' second point, so a first day
+// that funded the account AND traded it read as the base: the first day's P&L
+// was never counted. When the rebuild proves the day is the account's real
+// inception (it saw earlier days and found no capital) and the day carries a
+// ledger deposit, the deposit becomes a baseline the day before, and the first
+// day is scored like any day with flows: (close - base + withdrawals) / base.
+// The first day's deposit is cleared in place. A previous run's baseline is
+// the only older row allowed, so a re-run writes the same rows again.
+func inceptionBaseline(earliest *repository.Snapshot, mine []*repository.Snapshot, coveredFrom time.Time) *repository.Snapshot {
+	if !earliest.FromExternalRebuilder || coveredFrom.IsZero() {
+		return nil
+	}
+	day := earliest.Timestamp.AddDate(0, 0, -1)
+	firstSeen := time.Date(coveredFrom.Year(), coveredFrom.Month(), coveredFrom.Day(), 0, 0, 0, 0, time.UTC)
+	if day.Before(firstSeen) {
+		return nil
+	}
+	deposit := earliest.Deposits
+	if deposit < minTWRBaseUSD || math.Abs(deposit-earliest.TotalEquity) <= inceptionStampEpsilon {
+		return nil
+	}
+	for _, p := range mine {
+		if p.Timestamp.Before(earliest.Timestamp) && !p.Timestamp.Equal(day) {
+			return nil
+		}
+	}
+	earliest.Deposits = 0
+	return &repository.Snapshot{
+		UserUID:         earliest.UserUID,
+		Exchange:        earliest.Exchange,
+		Label:           earliest.Label,
+		Timestamp:       day,
+		TotalEquity:     deposit,
+		RealizedBalance: deposit,
+		Deposits:        deposit,
+		Breakdown: &repository.MarketBreakdown{
+			Global: &repository.MarketMetrics{Equity: deposit, AvailableMargin: deposit},
+		},
+		IsHistorical:          earliest.IsHistorical,
+		FromExternalRebuilder: true,
+	}
 }
 
 // reproductionTolerance separates two instruments measuring one account from
