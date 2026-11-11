@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,12 @@ import (
 
 // QUAL-001: extracted to remove a 3-way duplication of the bridge sessions path.
 const metatraderPathSessions = "/api/v1/sessions/"
+
+// mtServerName is what an MT5 server name or a bare hostname looks like. The
+// name is typed by the account holder and decides where the bridge connects,
+// so a port, a scheme or a path never leaves the enclave. The bridge applies
+// the same rule.
+var mtServerName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$`)
 
 // MetaTrader implements Connector for MT4/MT5 through mt-bridge service.
 type MetaTrader struct {
@@ -40,7 +47,7 @@ type MetaTrader struct {
 const mtBridgeMinSecretLen = 24
 
 // NewMetaTrader creates a MetaTrader connector.
-// creds.APIKey=login, creds.APISecret=investor password, creds.Passphrase=server[:port].
+// creds.APIKey=login, creds.APISecret=investor password, creds.Passphrase=server name.
 //
 // SEC-13: the bridge connect call carries the investor password in cleartext
 // JSON, so production refuses to build the connector unless the link is
@@ -247,6 +254,9 @@ func (m *MetaTrader) ensureSession(ctx context.Context) (string, error) {
 
 	if m.login <= 0 || m.password == "" || m.server == "" {
 		return "", fmt.Errorf("metatrader requires login(api_key), investor password(api_secret), and server(passphrase)")
+	}
+	if !mtServerName.MatchString(m.server) {
+		return "", fmt.Errorf("mt-bridge [UNKNOWN_SERVER]: not an MT5 server name")
 	}
 
 	payload := map[string]any{
