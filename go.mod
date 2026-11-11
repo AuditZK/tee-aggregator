@@ -1,7 +1,7 @@
 module github.com/trackrecord/enclave
 
-// SUPPLY-001: pin to 1.26.10 to pick up the stdlib CVEs fixed across the
-// 1.26.x series. 1.26.9 carried GO-2026-6809 (crypto/x509 trusting
+// SUPPLY-001: pin to 1.26.11 to pick up the stdlib CVEs fixed across the
+// 1.26.x series. 1.26.10 carried GO-2026-6859 (net/http). 1.26.9 carried GO-2026-6809 (crypto/x509 trusting
 // compromised intermediate certificates). 1.26.6 carried GO-2026-6617, GO-2026-6613, GO-2026-6612 and
 // GO-2026-6611 (net/http, HTTP/2 framing reached from the gRPC server and
 // every exchange call). Earlier, reachable at 1.26.5 (govulncheck): GO-2026-6090
@@ -16,9 +16,9 @@ module github.com/trackrecord/enclave
 // name-constraint bypasses, net/url IPv6 host parse, os FileInfo root escape
 // (≤1.26.2), html/template escaper-bypass XSS (GO-2026-4982/4980), net
 // NUL-byte panic (GO-2026-4971) and the net/http HTTP/2 SETTINGS infinite
-// loop (GO-2026-4918) (≤1.26.3). The Docker images pin golang:1.26.10-alpine;
+// loop (GO-2026-4918) (≤1.26.3). The Docker images pin golang:1.26.11-alpine;
 // this makes local developer builds match.
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/google/uuid v1.6.0
