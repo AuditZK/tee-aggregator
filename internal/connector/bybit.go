@@ -128,6 +128,10 @@ func (b *Bybit) GetBalance(ctx context.Context) (*Balance, error) {
 	equity, _ := strconv.ParseFloat(account.TotalEquity, 64)
 	available, _ := strconv.ParseFloat(account.TotalAvailableBalance, 64)
 	unrealized, _ := strconv.ParseFloat(account.TotalPerpUPL, 64)
+	// totalEquity counts open options at their value, totalPerpUPL leaves them out.
+	if optionUPL, err := b.optionUnrealized(ctx); err == nil {
+		unrealized += optionUPL
+	}
 
 	return &Balance{
 		Available:     available,
@@ -135,6 +139,46 @@ func (b *Bybit) GetBalance(ctx context.Context) (*Balance, error) {
 		UnrealizedPnL: unrealized,
 		Currency:      "USDT",
 	}, nil
+}
+
+const bybitMaxOptionPositionPages = 10
+
+// optionUnrealized sums the venue's unrealised PnL over the open option
+// positions. A key that cannot read positions returns an error, and the caller
+// keeps the perpetual figure alone.
+func (b *Bybit) optionUnrealized(ctx context.Context) (float64, error) {
+	total := 0.0
+	cursor := ""
+	for page := 0; page < bybitMaxOptionPositionPages; page++ {
+		params := "category=option&limit=200"
+		if cursor != "" {
+			params += "&cursor=" + cursor
+		}
+		body, err := b.doRequest(ctx, "GET", "/v5/position/list", params)
+		if err != nil {
+			return 0, err
+		}
+		var resp struct {
+			Result struct {
+				NextPageCursor string `json:"nextPageCursor"`
+				List           []struct {
+					UnrealisedPnl string `json:"unrealisedPnl"`
+				} `json:"list"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return 0, fmt.Errorf("decode bybit option positions: %w", err)
+		}
+		for _, p := range resp.Result.List {
+			upl, _ := strconv.ParseFloat(p.UnrealisedPnl, 64)
+			total += upl
+		}
+		cursor = resp.Result.NextPageCursor
+		if cursor == "" || len(resp.Result.List) == 0 {
+			return total, nil
+		}
+	}
+	return 0, fmt.Errorf("read bybit option positions: more than %d pages", bybitMaxOptionPositionPages)
 }
 
 func (b *Bybit) GetPositions(ctx context.Context) ([]*Position, error) {
