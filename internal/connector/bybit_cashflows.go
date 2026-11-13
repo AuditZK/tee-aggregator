@@ -54,6 +54,12 @@ type bybitLogRow struct {
 	CashFlow float64
 	// Funding is signed as the log reports it, positive when received.
 	Funding float64
+
+	Category   string
+	Side       string
+	Qty        float64
+	TradePrice float64
+	Fee        float64
 }
 
 func (b *Bybit) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
@@ -138,6 +144,12 @@ func bybitNonStableTransferCoins(rows []bybitLogRow) []string {
 // deposit, and an under-reported deposit is indistinguishable from profit once
 // the snapshot is written.
 func (b *Bybit) fetchTransactionLog(ctx context.Context, since, now time.Time) ([]bybitLogRow, error) {
+	return b.fetchTransactionLogFiltered(ctx, since, now, "")
+}
+
+// fetchTransactionLogFiltered narrows the read with the endpoint's own query
+// filters, given as "&name=value" pairs.
+func (b *Bybit) fetchTransactionLogFiltered(ctx context.Context, since, now time.Time, filter string) ([]bybitLogRow, error) {
 	seen := map[string]bool{}
 	var rows []bybitLogRow
 
@@ -151,7 +163,7 @@ func (b *Bybit) fetchTransactionLog(ctx context.Context, since, now time.Time) (
 		if winEnd.After(now) {
 			winEnd = now
 		}
-		batch, err := b.fetchLogWindow(ctx, winStart, winEnd, seen)
+		batch, err := b.fetchLogWindow(ctx, winStart, winEnd, filter, seen)
 		if err != nil {
 			return nil, err
 		}
@@ -168,7 +180,7 @@ func (b *Bybit) fetchTransactionLog(ctx context.Context, since, now time.Time) (
 	return rows, nil
 }
 
-func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, seen map[string]bool) ([]bybitLogRow, error) {
+func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, filter string, seen map[string]bool) ([]bybitLogRow, error) {
 	var out []bybitLogRow
 	cursor := ""
 
@@ -182,7 +194,7 @@ func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, 
 		}
 
 		params := fmt.Sprintf("accountType=UNIFIED&startTime=%d&endTime=%d&limit=%d",
-			winStart.UnixMilli(), winEnd.UnixMilli(), bybitLogPageLimit)
+			winStart.UnixMilli(), winEnd.UnixMilli(), bybitLogPageLimit) + filter
 		if cursor != "" {
 			// Sent unescaped: the signature covers the query string exactly as
 			// transmitted, and the venue returns the cursor already encoded.
@@ -204,6 +216,11 @@ func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, 
 					CashFlow        string `json:"cashFlow"`
 					Funding         string `json:"funding"`
 					Symbol          string `json:"symbol"`
+					Category        string `json:"category"`
+					Side            string `json:"side"`
+					Qty             string `json:"qty"`
+					TradePrice      string `json:"tradePrice"`
+					Fee             string `json:"fee"`
 					CashBalance     string `json:"cashBalance"`
 					TransactionTime string `json:"transactionTime"`
 				} `json:"list"`
@@ -230,6 +247,9 @@ func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, 
 			added++
 			cashFlow, _ := strconv.ParseFloat(row.CashFlow, 64)
 			funding, _ := strconv.ParseFloat(row.Funding, 64)
+			qty, _ := strconv.ParseFloat(row.Qty, 64)
+			tradePrice, _ := strconv.ParseFloat(row.TradePrice, 64)
+			fee, _ := strconv.ParseFloat(row.Fee, 64)
 			out = append(out, bybitLogRow{
 				ID:       key,
 				T:        time.UnixMilli(ms).UTC(),
@@ -238,6 +258,12 @@ func (b *Bybit) fetchLogWindow(ctx context.Context, winStart, winEnd time.Time, 
 				Symbol:   row.Symbol,
 				CashFlow: cashFlow,
 				Funding:  funding,
+
+				Category:   strings.ToLower(row.Category),
+				Side:       row.Side,
+				Qty:        qty,
+				TradePrice: tradePrice,
+				Fee:        fee,
 			})
 		}
 
