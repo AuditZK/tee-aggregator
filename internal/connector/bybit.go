@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -421,6 +422,42 @@ func (b *Bybit) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, 
 		})
 	}
 
+	options, err := b.optionTrades(ctx, start, end)
+	if err != nil {
+		return nil, err
+	}
+	return append(trades, options...), nil
+}
+
+// optionTrades reads the option fills from the transaction log, as the
+// history rebuild does: the execution list serves options one base coin at a
+// time and defaults to BTC, so it cannot list them all. Fills share the swap
+// bucket with the rebuilt days.
+func (b *Bybit) optionTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
+	if reach := bybitMaxLogWindows * bybitLogWindow; end.Sub(start) > reach {
+		start = end.Add(-reach)
+	}
+	rows, err := b.fetchTransactionLogFiltered(ctx, start, end, "&category=option&type=TRADE")
+	if err != nil {
+		return nil, fmt.Errorf("read bybit option fills: %w", err)
+	}
+	var trades []*Trade
+	for _, r := range rows {
+		if r.Category != "option" || r.Type != "TRADE" {
+			continue
+		}
+		trades = append(trades, &Trade{
+			ID:          r.ID,
+			Symbol:      r.Symbol,
+			Side:        strings.ToLower(r.Side),
+			Price:       r.TradePrice,
+			Quantity:    math.Abs(r.Qty),
+			Fee:         r.Fee,
+			FeeCurrency: r.Coin,
+			Timestamp:   r.T,
+			MarketType:  "swap",
+		})
+	}
 	return trades, nil
 }
 

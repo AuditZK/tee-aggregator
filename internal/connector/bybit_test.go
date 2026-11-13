@@ -38,6 +38,10 @@ func newBybitExecServer(t *testing.T, rows []bybitExecRow, stallAt int) *bybitEx
 	s := &bybitExecServer{rows: rows, stallAt: stallAt}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v5/account/transaction-log" {
+			io.WriteString(w, `{"retCode":0,"result":{"nextPageCursor":"","list":[]}}`)
+			return
+		}
 		q := r.URL.Query()
 		s.mu.Lock()
 		s.queries = append(s.queries, q)
