@@ -101,6 +101,110 @@ type dailyReturn struct {
 	outperformance   float64
 	cumulativeReturn float64
 	nav              float64
+	activity         dayActivity
+}
+
+// dayActivity is what the account did on a day beside its return, read off the
+// day's snapshots. A nil field is a figure the snapshots do not state, signed
+// as null rather than as a zero nobody measured.
+type dayActivity struct {
+	committed   *float64
+	turnover    *float64
+	trades      *int
+	volume      *float64
+	tradingFees *float64
+	fundingFees *float64
+}
+
+// marketsOf lists a breakdown's markets, leaving out global: it is the TS
+// aggregate of the others, and counting it beside them would double the day.
+func marketsOf(b *repository.MarketBreakdown) []*repository.MarketMetrics {
+	if b == nil {
+		return nil
+	}
+	return []*repository.MarketMetrics{
+		b.Stocks, b.Spot, b.Swap, b.Futures, b.Options, b.Margin, b.Earn, b.CFD, b.Forex, b.Commodities,
+	}
+}
+
+// activityOf reads a day's activity off the snapshots of the connections that
+// reported that day. A connection forward-filled through a silent day has no
+// snapshot to read, so the day is stated over the ones that did report.
+//
+//   - committed: 1 − free margin ÷ equity, when every reporting connection
+//     states its balances by market. The free margin is the one sync stores
+//     per market, already clamped to that market's equity. A day where no
+//     connection states any free margin at all is unknown, not 100% committed:
+//     a venue that publishes no balance would otherwise read as fully invested.
+//   - trades, volume, fees, funding: summed, unless one of the snapshots was
+//     rebuilt from broker statements (IBKR Flex), which carry the equity and
+//     nothing about the trades, so the day's activity is unknown.
+//   - turnover: volume ÷ the equity of the same connections.
+func activityOf(snaps map[string]*repository.Snapshot) dayActivity {
+	var out dayActivity
+	if len(snaps) == 0 {
+		return out
+	}
+
+	equity := 0.0
+	free := 0.0
+	balancesKnown := true
+	anyFree := false
+	tradesKnown := true
+	trades := 0
+	volume := 0.0
+	fees := 0.0
+	funding := 0.0
+
+	for _, snap := range snaps {
+		equity += snap.TotalEquity
+		markets := marketsOf(snap.Breakdown)
+		stated := false
+		for _, m := range markets {
+			if m == nil {
+				continue
+			}
+			if m.Equity != 0 || m.AvailableMargin != 0 {
+				stated = true
+				free += m.AvailableMargin
+				if m.AvailableMargin != 0 {
+					anyFree = true
+				}
+			}
+			funding += m.FundingFees
+		}
+		if !stated {
+			balancesKnown = false
+		}
+		if snap.IsHistorical {
+			tradesKnown = false
+		}
+		trades += snap.TotalTrades
+		volume += snap.TotalVolume
+		fees += snap.TotalFees
+	}
+
+	if balancesKnown && anyFree && equity > 0 {
+		c := 1 - free/equity
+		if c < 0 {
+			c = 0
+		}
+		if c > 1 {
+			c = 1
+		}
+		out.committed = &c
+	}
+	if tradesKnown {
+		out.trades = &trades
+		out.volume = &volume
+		out.tradingFees = &fees
+		out.fundingFees = &funding
+		if equity > 0 {
+			t := volume / equity
+			out.turnover = &t
+		}
+	}
+	return out
 }
 
 // monthlyReturn is the internal representation during computation
@@ -683,6 +787,7 @@ func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyRet
 			outperformance:   dayReturn,
 			cumulativeReturn: cumulativeReturn,
 			nav:              nav,
+			activity:         activityOf(dg.exchanges),
 		})
 	}
 
@@ -985,6 +1090,12 @@ func toSigningDailyReturns(daily []dailyReturn, snapshots []*repository.Snapshot
 			CumulativeReturn:   dr.cumulativeReturn,
 			NAV:                dr.nav,
 			VerifiabilityClass: class,
+			Committed:          dr.activity.committed,
+			Turnover:           dr.activity.turnover,
+			Trades:             dr.activity.trades,
+			Volume:             dr.activity.volume,
+			TradingFees:        dr.activity.tradingFees,
+			FundingFees:        dr.activity.fundingFees,
 		}
 	}
 	return result

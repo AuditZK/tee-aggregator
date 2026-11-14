@@ -864,6 +864,12 @@ func (s *Server) GenerateSignedReport(ctx context.Context, req *pb.ReportRequest
 				Outperformance:   dr.Outperformance,
 				CumulativeReturn: dr.CumulativeReturn,
 				Nav:              dr.NAV,
+				Committed:        dr.Committed,
+				Turnover:         dr.Turnover,
+				Trades:           int32Ptr(dr.Trades),
+				Volume:           dr.Volume,
+				TradingFees:      dr.TradingFees,
+				FundingFees:      dr.FundingFees,
 			})
 		}
 	}
