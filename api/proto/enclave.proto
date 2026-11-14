@@ -345,6 +345,14 @@ message DailyReturnData {
   double outperformance = 4;    // Portfolio - Benchmark
   double cumulative_return = 5; // Cumulative return factor
   double nav = 6;               // Net Asset Value
+  // What the account did that day, signed at payload 1.10. Unset when the
+  // day's snapshots do not state it, never zero in its place.
+  optional double committed = 7;     // share of account value in positions, 0..1
+  optional double turnover = 8;      // notional traded / account value
+  optional int32 trades = 9;         // executions that day
+  optional double volume = 10;       // notional traded, report currency
+  optional double trading_fees = 11; // commissions, report currency
+  optional double funding_fees = 12; // funding, report currency
 }
 
 // Monthly return data for tables
