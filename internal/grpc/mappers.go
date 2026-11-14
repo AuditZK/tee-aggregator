@@ -62,6 +62,16 @@ func isConnectionExcluded(excluded map[string]struct{}, exchange, label string) 
 	return ok
 }
 
+// int32Ptr carries an optional count onto an optional proto field: unset
+// stays unset rather than becoming zero.
+func int32Ptr(v *int) *int32 {
+	if v == nil {
+		return nil
+	}
+	n := int32(*v)
+	return &n
+}
+
 func mapMarketMetrics(in *repository.MarketMetrics) *pb.MarketMetrics {
 	if in == nil {
 		return nil

@@ -72,8 +72,33 @@ const (
 	//       of the user's connections it holds and the dated stays by venue. A
 	//       report's scope has to sit under the signature, or a chosen subset of
 	//       accounts reads as the whole record.
-	PayloadVersion = "1.9"
+	// 1.10 = adds, on each day of dailyReturns, what the account did that day
+	//       beside its return: committed (share of account value tied up in
+	//       positions, 1 − free margin ÷ equity), turnover (notional traded ÷
+	//       equity), trades, and the amounts volume, tradingFees and
+	//       fundingFees. Each is null on a day the snapshots do not state it,
+	//       never zero in its place. The percent view withholds the three
+	//       amounts the way it withholds nav. Daily aggregates only: no
+	//       instrument, size or individual trade.
+	PayloadVersion = "1.10"
 )
+
+// payloadVersionsWithoutDailyActivity are the pre-1.10 signed-payload shapes,
+// whose daily returns carry no committed share, turnover, trades or amounts.
+// Older reports keep their original shape so VerifyReport reproduces their hash.
+var payloadVersionsWithoutDailyActivity = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+	"1.2": {},
+	"1.3": {},
+	"1.4": {},
+	"1.5": {},
+	"1.6": {},
+	"1.7": {},
+	"1.8": {},
+	"1.9": {},
+}
 
 // payloadVersionsWithoutVerifiedHistory are the pre-1.9 signed-payload shapes,
 // with neither verifiedFrom nor portfolio. Older reports keep their original
@@ -325,6 +350,22 @@ type DailyReturn struct {
 	// the canonical payload via the payloadVersionsWithoutVerifiabilityClass
 	// gate). See the package-level constants for the allowed values.
 	VerifiabilityClass string `json:"verifiability_class,omitempty"`
+
+	// What the account did that day beside its return, signed at
+	// PayloadVersion >= 1.10. Nil when the day's snapshots do not state it
+	// (signed as null), never a zero standing in for an unknown.
+	//
+	// Committed is the share of account value tied up in positions, 0..1:
+	// 1 − free margin ÷ equity over the connections that reported that day.
+	// Turnover is the notional traded ÷ that equity. Trades counts executions.
+	// Volume, TradingFees and FundingFees are amounts in the report currency,
+	// withheld from the percent view.
+	Committed   *float64 `json:"committed,omitempty"`
+	Turnover    *float64 `json:"turnover,omitempty"`
+	Trades      *int     `json:"trades,omitempty"`
+	Volume      *float64 `json:"volume,omitempty"`
+	TradingFees *float64 `json:"trading_fees,omitempty"`
+	FundingFees *float64 `json:"funding_fees,omitempty"`
 }
 
 // MonthlyReturn represents a single month's return data.
@@ -580,6 +621,11 @@ func PercentPayload(report *SignedReport) ([]byte, error) {
 	payload := buildFinancialPayload(report)
 	for _, day := range payload["dailyReturns"].([]map[string]any) {
 		delete(day, "nav")
+		// Amounts since 1.10. The shares and the trade count stay: they say
+		// how the account behaved without saying how large it is.
+		delete(day, "volume")
+		delete(day, "tradingFees")
+		delete(day, "fundingFees")
 	}
 	for _, month := range payload["monthlyReturns"].([]map[string]any) {
 		delete(month, "aum")
@@ -750,6 +796,7 @@ func toExchangeDetailsPayload(in []ExchangeInfo) []map[string]any {
 
 func toDailyReturnsPayload(in []DailyReturn, payloadVersion string) []map[string]any {
 	_, omitVerifiability := payloadVersionsWithoutVerifiabilityClass[payloadVersion]
+	_, omitActivity := payloadVersionsWithoutDailyActivity[payloadVersion]
 	out := make([]map[string]any, 0, len(in))
 	for _, dr := range in {
 		entry := map[string]any{
@@ -767,9 +814,35 @@ func toDailyReturnsPayload(in []DailyReturn, payloadVersion string) []map[string
 		if !omitVerifiability {
 			entry["verifiabilityClass"] = dr.VerifiabilityClass
 		}
+		if !omitActivity {
+			entry["committed"] = floatOrNull(dr.Committed)
+			entry["turnover"] = floatOrNull(dr.Turnover)
+			entry["trades"] = intOrNull(dr.Trades)
+			entry["volume"] = floatOrNull(dr.Volume)
+			entry["tradingFees"] = floatOrNull(dr.TradingFees)
+			entry["fundingFees"] = floatOrNull(dr.FundingFees)
+		}
 		out = append(out, entry)
 	}
 	return out
+}
+
+// floatOrNull and intOrNull hand the canonical writer an untyped nil for an
+// unknown value, which it writes as null, and the value itself otherwise. A
+// typed nil pointer would reach encoding/json and print the same bytes, but
+// the writer's own nil case keeps the path the byte-parity test covers.
+func floatOrNull(v *float64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func intOrNull(v *int) any {
+	if v == nil {
+		return nil
+	}
+	return *v
 }
 
 func toMonthlyReturnsPayload(in []MonthlyReturn) []map[string]any {

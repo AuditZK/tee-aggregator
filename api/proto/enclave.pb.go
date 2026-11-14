@@ -2038,8 +2038,16 @@ type DailyReturnData struct {
 	Outperformance   float64                `protobuf:"fixed64,4,opt,name=outperformance,proto3" json:"outperformance,omitempty"`                             // Portfolio - Benchmark
 	CumulativeReturn float64                `protobuf:"fixed64,5,opt,name=cumulative_return,json=cumulativeReturn,proto3" json:"cumulative_return,omitempty"` // Cumulative return factor
 	Nav              float64                `protobuf:"fixed64,6,opt,name=nav,proto3" json:"nav,omitempty"`                                                   // Net Asset Value
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// What the account did that day, signed at payload 1.10. Unset when the
+	// day's snapshots do not state it, never zero in its place.
+	Committed     *float64 `protobuf:"fixed64,7,opt,name=committed,proto3,oneof" json:"committed,omitempty"`                         // share of account value in positions, 0..1
+	Turnover      *float64 `protobuf:"fixed64,8,opt,name=turnover,proto3,oneof" json:"turnover,omitempty"`                           // notional traded / account value
+	Trades        *int32   `protobuf:"varint,9,opt,name=trades,proto3,oneof" json:"trades,omitempty"`                                // executions that day
+	Volume        *float64 `protobuf:"fixed64,10,opt,name=volume,proto3,oneof" json:"volume,omitempty"`                              // notional traded, report currency
+	TradingFees   *float64 `protobuf:"fixed64,11,opt,name=trading_fees,json=tradingFees,proto3,oneof" json:"trading_fees,omitempty"` // commissions, report currency
+	FundingFees   *float64 `protobuf:"fixed64,12,opt,name=funding_fees,json=fundingFees,proto3,oneof" json:"funding_fees,omitempty"` // funding, report currency
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DailyReturnData) Reset() {
@@ -2110,6 +2118,48 @@ func (x *DailyReturnData) GetCumulativeReturn() float64 {
 func (x *DailyReturnData) GetNav() float64 {
 	if x != nil {
 		return x.Nav
+	}
+	return 0
+}
+
+func (x *DailyReturnData) GetCommitted() float64 {
+	if x != nil && x.Committed != nil {
+		return *x.Committed
+	}
+	return 0
+}
+
+func (x *DailyReturnData) GetTurnover() float64 {
+	if x != nil && x.Turnover != nil {
+		return *x.Turnover
+	}
+	return 0
+}
+
+func (x *DailyReturnData) GetTrades() int32 {
+	if x != nil && x.Trades != nil {
+		return *x.Trades
+	}
+	return 0
+}
+
+func (x *DailyReturnData) GetVolume() float64 {
+	if x != nil && x.Volume != nil {
+		return *x.Volume
+	}
+	return 0
+}
+
+func (x *DailyReturnData) GetTradingFees() float64 {
+	if x != nil && x.TradingFees != nil {
+		return *x.TradingFees
+	}
+	return 0
+}
+
+func (x *DailyReturnData) GetFundingFees() float64 {
+	if x != nil && x.FundingFees != nil {
+		return *x.FundingFees
 	}
 	return 0
 }
@@ -2651,7 +2701,7 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\fExchangeInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\tkyc_level\x18\x02 \x01(\tR\bkycLevel\x12\x19\n" +
-	"\bis_paper\x18\x03 \x01(\bR\aisPaper\"\xd6\x01\n" +
+	"\bis_paper\x18\x03 \x01(\bR\aisPaper\"\xf7\x03\n" +
 	"\x0fDailyReturnData\x12\x12\n" +
 	"\x04date\x18\x01 \x01(\tR\x04date\x12\x1d\n" +
 	"\n" +
@@ -2659,7 +2709,21 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\x10benchmark_return\x18\x03 \x01(\x01R\x0fbenchmarkReturn\x12&\n" +
 	"\x0eoutperformance\x18\x04 \x01(\x01R\x0eoutperformance\x12+\n" +
 	"\x11cumulative_return\x18\x05 \x01(\x01R\x10cumulativeReturn\x12\x10\n" +
-	"\x03nav\x18\x06 \x01(\x01R\x03nav\"\xab\x01\n" +
+	"\x03nav\x18\x06 \x01(\x01R\x03nav\x12!\n" +
+	"\tcommitted\x18\a \x01(\x01H\x00R\tcommitted\x88\x01\x01\x12\x1f\n" +
+	"\bturnover\x18\b \x01(\x01H\x01R\bturnover\x88\x01\x01\x12\x1b\n" +
+	"\x06trades\x18\t \x01(\x05H\x02R\x06trades\x88\x01\x01\x12\x1b\n" +
+	"\x06volume\x18\n" +
+	" \x01(\x01H\x03R\x06volume\x88\x01\x01\x12&\n" +
+	"\ftrading_fees\x18\v \x01(\x01H\x04R\vtradingFees\x88\x01\x01\x12&\n" +
+	"\ffunding_fees\x18\f \x01(\x01H\x05R\vfundingFees\x88\x01\x01B\f\n" +
+	"\n" +
+	"_committedB\v\n" +
+	"\t_turnoverB\t\n" +
+	"\a_tradesB\t\n" +
+	"\a_volumeB\x0f\n" +
+	"\r_trading_feesB\x0f\n" +
+	"\r_funding_fees\"\xab\x01\n" +
 	"\x11MonthlyReturnData\x12\x12\n" +
 	"\x04date\x18\x01 \x01(\tR\x04date\x12\x1d\n" +
 	"\n" +
@@ -2782,6 +2846,7 @@ func file_api_proto_enclave_proto_init() {
 	if File_api_proto_enclave_proto != nil {
 		return
 	}
+	file_api_proto_enclave_proto_msgTypes[18].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
