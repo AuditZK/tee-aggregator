@@ -3,20 +3,54 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const kucoinAPI = "https://api.kucoin.com"
+
+// kucoinFallbackHosts are the regional KuCoin sites tried, in order, when the
+// global one answers 400003. A key exists only on the site that issued it, and
+// KuCoin EU (EEA accounts) serves its keys from api.kucoin.eu; the global site
+// answers "The API key does not exist or site mismatch" for them. The connect
+// form does not ask for the site, so the connector probes and pins the first
+// one that recognises the key, as the OKX connector does for its regions.
+var kucoinFallbackHosts = []string{
+	"https://api.kucoin.eu",
+}
+
+const kucoinCodeKeyUnknown = "400003"
+
+// kucoinCodeHints spell out the caller-fixable auth codes in the error that
+// reaches the logs. 400006 is not here: it becomes ErrIPRestricted.
+var kucoinCodeHints = map[string]string{
+	"400001": "a signing header is missing",
+	"400002": "request timestamp outside the accepted window",
+	"400003": "API key unknown on this KuCoin site",
+	"400004": "passphrase rejected, it is the API passphrase set when the key was created, not the login password",
+	"400005": "signature rejected, check the API secret",
+	"400007": "the key lacks the General permission",
+	"400008": "version 1 keys are disabled, a new key is needed",
+	"400009": "API key version not accepted",
+	"400302": "access refused for the caller's IP address or region",
+	"400303": "the account must complete KYC verification",
+	"400304": "the master account must complete KYC verification",
+	"411100": "the account is frozen or restricted by KuCoin",
+}
 
 // KuCoin implements Connector for KuCoin exchange using native HTTP.
 // Uses HMAC-SHA256 + HMAC-signed passphrase.
 type KuCoin struct {
 	base       CryptoBase
 	passphrase string
+
+	mu        sync.Mutex
+	fallbacks []string
 }
 
 // NewKuCoin creates a new KuCoin connector.
@@ -24,6 +58,7 @@ func NewKuCoin(creds *Credentials) *KuCoin {
 	return &KuCoin{
 		base:       NewCryptoBase(creds.APIKey, creds.APISecret, kucoinAPI),
 		passphrase: creds.Passphrase,
+		fallbacks:  append([]string(nil), kucoinFallbackHosts...),
 	}
 }
 
@@ -37,12 +72,56 @@ func (k *KuCoin) signedPassphrase() string {
 	return k.hmacSign(k.passphrase)
 }
 
+func (k *KuCoin) hosts() []string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return append([]string{k.base.BaseURL}, k.fallbacks...)
+}
+
+func (k *KuCoin) baseURL() string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.base.BaseURL
+}
+
+func (k *KuCoin) pinHost(host string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.base.BaseURL = host
+	k.fallbacks = nil
+}
+
 func (k *KuCoin) doRequest(ctx context.Context, method, path string) ([]byte, error) {
-	body, err := retryHTTP(k.base.Client, func() (*http.Request, error) {
+	hosts := k.hosts()
+	var err error
+	for i, host := range hosts {
+		var body []byte
+		var code string
+		body, code, err = k.doRequestAt(ctx, host, method, path)
+		if err == nil {
+			if i > 0 {
+				k.pinHost(host)
+			}
+			return body, nil
+		}
+		if code != kucoinCodeKeyUnknown {
+			return nil, err
+		}
+	}
+	if len(hosts) > 1 {
+		return nil, fmt.Errorf("API key unknown on every KuCoin site (%s): %w", kucoinHostNames(hosts), err)
+	}
+	return nil, err
+}
+
+// doRequestAt returns the KuCoin code of a refusal alongside the error: auth
+// failures come back as HTTP 401 carrying the usual {code,msg} envelope.
+func (k *KuCoin) doRequestAt(ctx context.Context, host, method, path string) ([]byte, string, error) {
+	body, httpErr := retryHTTP(k.base.Client, func() (*http.Request, error) {
 		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 		signature := k.hmacSign(timestamp + method + path)
 
-		req, err := http.NewRequestWithContext(ctx, method, k.base.BaseURL+path, nil)
+		req, err := http.NewRequestWithContext(ctx, method, host+path, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -55,20 +134,47 @@ func (k *KuCoin) doRequest(ctx context.Context, method, path string) ([]byte, er
 		req.Header.Set("Content-Type", "application/json")
 		return req, nil
 	})
-	if err != nil {
-		return nil, err
-	}
 
 	var result struct {
 		Code string `json:"code"`
 		Msg  string `json:"msg"`
 	}
-	json.Unmarshal(body, &result)
-	if result.Code != "200000" {
-		return nil, fmt.Errorf("kucoin API error: %s (code %s)", vendorErrorDetail(result.Msg), result.Code)
+	if json.Unmarshal(body, &result) != nil || result.Code == "" {
+		if httpErr != nil {
+			return nil, "", httpErr
+		}
+		return nil, "", fmt.Errorf("kucoin API error: unreadable response: %s", TruncatedBody(body))
 	}
+	if result.Code != "200000" {
+		return nil, result.Code, kucoinAPIError(result.Code, result.Msg, httpErr)
+	}
+	if httpErr != nil {
+		return nil, "", httpErr
+	}
+	return body, "", nil
+}
 
-	return body, nil
+func kucoinAPIError(code, msg string, httpErr error) error {
+	detail := vendorErrorDetail(msg)
+	if code == "400006" {
+		return fmt.Errorf("%w: kucoin API error: %s (code %s)", ErrIPRestricted, detail, code)
+	}
+	err := fmt.Errorf("kucoin API error: %s (code %s)", detail, code)
+	if hint, ok := kucoinCodeHints[code]; ok {
+		err = fmt.Errorf("kucoin API error: %s (code %s: %s)", detail, code, hint)
+	}
+	if errors.Is(httpErr, ErrTransient) {
+		return fmt.Errorf("%w: %w", ErrTransient, err)
+	}
+	return err
+}
+
+func kucoinHostNames(hosts []string) string {
+	names := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		names = append(names, strings.TrimPrefix(strings.TrimPrefix(h, "https://"), "http://"))
+	}
+	return strings.Join(names, ", ")
 }
 
 func (k *KuCoin) TestConnection(ctx context.Context) error {
@@ -249,7 +355,7 @@ func (k *KuCoin) GetCashflows(_ context.Context, _ time.Time) ([]*Cashflow, erro
 // (BTC-USDT -> BTCUSDT).
 func (k *KuCoin) fetchPriceMap(ctx context.Context) (map[string]float64, error) {
 	body, err := retryHTTP(k.base.Client, func() (*http.Request, error) {
-		return http.NewRequestWithContext(ctx, "GET", k.base.BaseURL+"/api/v1/market/allTickers", nil)
+		return http.NewRequestWithContext(ctx, "GET", k.baseURL()+"/api/v1/market/allTickers", nil)
 	})
 	if err != nil {
 		return nil, err
