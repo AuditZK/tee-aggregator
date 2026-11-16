@@ -15,6 +15,11 @@ services:
     # `unless-stopped` restarts it after a reboot but still honours a deliberate
     # `docker stop` during maintenance. Keep in sync with compose.prod.KEEP.
     restart: unless-stopped
+    # OPS-005: json-file logs died with every recreate; journald keeps them on the host.
+    logging:
+      driver: journald
+      options:
+        tag: enclave_go_prod
     # OPS-01: still root because /dev/sev-guest is mode 0600 root:root on the
     # host — a non-root container user cannot open it without a host-side udev
     # rule giving the device a readable group. To go non-root: add such a rule
