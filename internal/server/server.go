@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,7 +15,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/trackrecord/enclave/internal/auth"
 	"github.com/trackrecord/enclave/internal/config"
-	"github.com/trackrecord/enclave/internal/connector"
 	"github.com/trackrecord/enclave/internal/rebuilderclient"
 	"github.com/trackrecord/enclave/internal/repository"
 	"github.com/trackrecord/enclave/internal/service"
@@ -46,13 +44,9 @@ type Server struct {
 	// (AUTH-002 follow-up). Mirrors the gRPC interceptor.
 	jwtExpectedIssuer string
 
-	// probeSvc overrides the balance prober used by the admin probe endpoint.
-	// Nil in production, where the endpoint goes through the sync service that
-	// already holds the DEK; set by tests, which have no enclave to unwrap.
-	probeSvc balanceProbeRunner
-
-	// reflowSvc overrides the reflower behind the admin reflow endpoint, for
-	// the same reason as probeSvc.
+	// reflowSvc overrides the reflower behind the admin reflow endpoint. Nil in
+	// production, where the endpoint goes through the sync service that already
+	// holds the DEK; set by tests, which have no enclave to unwrap.
 	reflowSvc cashflowReflower
 	// recountSvc does the same for the admin recount-activity endpoint.
 	recountSvc activityRecounter
@@ -146,14 +140,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// and only set by the front proxy anyway). Non-loopback peers get 403.
 	mux.HandleFunc("/api/v1/admin/sync-now", s.localhostOnly(s.handleAdminSyncNow))
 	mux.HandleFunc("/api/v1/admin/sync-connection", s.localhostOnly(s.handleAdminSyncConnection))
-	mux.HandleFunc("/api/v1/admin/cashflows", s.localhostOnly(s.handleAdminDumpCashflows))
 	mux.HandleFunc("/api/v1/admin/reconstruct", s.localhostOnly(s.handleAdminReconstruct))
 	mux.HandleFunc("/api/v1/admin/reconstruct-deep", s.localhostOnly(s.handleAdminReconstructDeep))
 	mux.HandleFunc("/api/v1/admin/unpin-broker-accounts", s.localhostOnly(s.handleAdminUnpinBrokerAccounts))
-	mux.HandleFunc("/api/v1/admin/balance-probe", s.localhostOnly(s.handleAdminBalanceProbe))
 	mux.HandleFunc("/api/v1/admin/refresh-metadata", s.localhostOnly(s.handleAdminRefreshMetadata))
-	mux.HandleFunc("/api/v1/admin/raw-statement", s.localhostOnly(s.handleAdminRawStatement))
-	mux.HandleFunc("/api/v1/admin/funding-probe", s.localhostOnly(s.handleAdminFundingProbe))
 	mux.HandleFunc("/api/v1/admin/reflow", s.localhostOnly(s.handleAdminReflow))
 	mux.HandleFunc("/api/v1/admin/convert-to-usd", s.localhostOnly(s.handleAdminConvertToUSD))
 	mux.HandleFunc("/api/v1/admin/recount-activity", s.localhostOnly(s.handleAdminRecountActivity))
@@ -559,85 +549,9 @@ func dryRunRows(days []*repository.Snapshot) []map[string]any {
 	return rows
 }
 
-// handleAdminDumpCashflows dumps all BALANCE deals for a user/exchange/label since a date.
-// Usage: GET /api/v1/admin/cashflows?user_uid=X&exchange=mt5&label=Y&from=2026-04-01
-//
-// Intended for admin backfills when the normal sync window missed cashflows
-// (e.g. the Headway side=buy/sell bug). Requires a running enclave with the
-// DEK unwrapped so broker credentials can be decrypted.
-func (s *Server) handleAdminDumpCashflows(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "GET only"})
-		return
-	}
-
-	q := r.URL.Query()
-	userUID := q.Get("user_uid")
-	exchange := q.Get("exchange")
-	label := q.Get("label")
-	fromStr := q.Get("from")
-
-	if userUID == "" || exchange == "" || fromStr == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": "user_uid, exchange, and from (YYYY-MM-DD) are required",
-		})
-		return
-	}
-
-	since, err := time.Parse("2006-01-02", fromStr)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid from date, use YYYY-MM-DD"})
-		return
-	}
-
-	if s.handler == nil || s.handler.syncSvc == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
-		return
-	}
-
-	// raw=true returns the unfiltered balance-operation ledger (every
-	// operationType) instead of the deposit/withdraw view — for diagnosing
-	// balance jumps the op-0/1 filter can't explain (e.g. demo resets).
-	if q.Get("raw") == "true" {
-		ops, err := s.handler.syncSvc.DumpRawCashflows(r.Context(), userUID, exchange, label, since)
-		if err != nil {
-			s.logger.Error("dump raw cashflows failed", zap.Error(err))
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.handler.sanitizeErr(err)})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"success": true,
-			"count":   len(ops),
-			"raw_ops": ops,
-		})
-		return
-	}
-
-	cashflows, warnings, err := s.handler.syncSvc.DumpCashflows(r.Context(), userUID, exchange, label, since)
-	if err != nil {
-		s.logger.Error("dump cashflows failed", zap.Error(err))
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.handler.sanitizeErr(err)})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"success":   true,
-		"count":     len(cashflows),
-		"cashflows": cashflows,
-		"warnings":  warnings,
-	})
-}
-
-// balanceProbeRunner is the slice of the sync service the balance probe needs.
-// An interface rather than the concrete service so the handler can be
-// exercised without a DEK-unwrapped enclave behind it.
-type balanceProbeRunner interface {
-	ProbeBalance(ctx context.Context, userUID, exchange, label string) (*connector.BalanceProbe, error)
-}
-
 // log returns the server's logger, or a no-op one when the server was built
-// without it. Keeps the probe handler usable from a test that wires nothing
-// but the prober.
+// without it. Keeps a handler usable from a test that wires nothing but its
+// service.
 func (s *Server) log() *zap.Logger {
 	if s.logger == nil {
 		return zap.NewNop()
@@ -652,85 +566,6 @@ func (s *Server) sanitizeErr(err error) string {
 		return genericInternalError
 	}
 	return s.handler.sanitizeErr(err)
-}
-
-func (s *Server) balanceProber() balanceProbeRunner {
-	if s.probeSvc != nil {
-		return s.probeSvc
-	}
-	if s.handler == nil || s.handler.syncSvc == nil {
-		return nil
-	}
-	return s.handler.syncSvc
-}
-
-// handleAdminBalanceProbe answers with the venue's own balance payload beside
-// the Balance this enclave derives from it, for one connection.
-//
-// Usage: POST /api/v1/admin/balance-probe?user_uid=X&exchange=okx&label=Y
-//
-// It exists to settle a free-margin figure against a real customer account
-// without anyone handling that account's credentials: the credentials are
-// decrypted in here exactly as a sync decrypts them, one balance call goes out,
-// and both sides of the comparison come back in the HTTP response. Nothing is
-// persisted, and the amounts are deliberately absent from the logs — the
-// response goes to a loopback caller, a log file goes everywhere a log file
-// goes. A connector with no BalanceProber answers 501 rather than an empty
-// result that would read like an empty account.
-func (s *Server) handleAdminBalanceProbe(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
-		return
-	}
-
-	q := r.URL.Query()
-	userUID := q.Get("user_uid")
-	exchange := q.Get("exchange")
-	label := q.Get("label")
-
-	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
-	if err := validation.ValidateUserUID(userUID); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if err := validation.ValidateExchange(exchange); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if label != "" {
-		if err := validation.ValidateLabel(label); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-	}
-
-	prober := s.balanceProber()
-	if prober == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
-		return
-	}
-
-	probe, err := prober.ProbeBalance(r.Context(), userUID, exchange, label)
-	if err != nil {
-		if errors.Is(err, service.ErrBalanceProbeUnsupported) {
-			writeJSON(w, http.StatusNotImplemented, map[string]any{
-				"error":    "connector does not expose a balance probe",
-				"exchange": exchange,
-			})
-			return
-		}
-		s.log().Error("balance probe failed",
-			zap.String("exchange", exchange),
-			zap.Error(err),
-		)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
-		return
-	}
-
-	// One line, no amounts: the figures are the whole point of the call and
-	// they belong in the answer to the loopback caller, not in a log.
-	s.log().Info("balance probe served", zap.String("exchange", exchange))
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "probe": probe})
 }
 
 // handleAdminRefreshMetadata re-probes paper/live and KYC status for a user's
@@ -809,178 +644,6 @@ func (s *Server) handleAdminRefreshMetadata(w http.ResponseWriter, r *http.Reque
 		"failed":       failed,
 		"connections":  results,
 	})
-}
-
-// handleAdminRawStatement hands back the venue's own statement document for one
-// connection, unparsed.
-//
-// Usage: GET /api/v1/admin/raw-statement?user_uid=X&exchange=ibkr&label=Y[&from=2023-01-01&to=2023-12-31]
-//
-// from/to ask for that period instead of the one saved at the venue (at most
-// 365 days, IBKR's ceiling per statement).
-//
-// It exists because IBKR rations Flex statements to roughly one per token per
-// six hours and counts refusals, so a question our parsed views cannot answer
-// costs another six-hour wait. Taking the document once makes every later
-// question free. The response carries live account data and goes to a loopback
-// caller only; it is deliberately absent from the logs, which record that a
-// dump was served and its size, never its content.
-func (s *Server) handleAdminRawStatement(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "GET only"})
-		return
-	}
-
-	q := r.URL.Query()
-	userUID := q.Get("user_uid")
-	exchange := q.Get("exchange")
-	label := q.Get("label")
-
-	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
-	if err := validation.ValidateUserUID(userUID); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if err := validation.ValidateExchange(exchange); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if label != "" {
-		if err := validation.ValidateLabel(label); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-	}
-
-	if s.handler == nil || s.handler.syncSvc == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
-		return
-	}
-
-	var (
-		doc         []byte
-		contentType string
-		err         error
-	)
-	extendWriteDeadline(w, 10*time.Minute)
-	if q.Get("from") != "" || q.Get("to") != "" {
-		from, to, perr := validation.ParseStatementPeriod(q.Get("from"), q.Get("to"), time.Now())
-		if perr != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": perr.Error()})
-			return
-		}
-		doc, contentType, err = s.handler.syncSvc.DumpRawStatementForPeriod(r.Context(), userUID, exchange, label, from, to)
-	} else {
-		doc, contentType, err = s.handler.syncSvc.DumpRawStatement(r.Context(), userUID, exchange, label)
-	}
-	if err != nil {
-		if errors.Is(err, service.ErrRawStatementUnsupported) {
-			writeJSON(w, http.StatusNotImplemented, map[string]any{
-				"error":    "connector does not expose a raw statement",
-				"exchange": exchange,
-			})
-			return
-		}
-		s.log().Error("raw statement dump failed",
-			zap.String("exchange", exchange),
-			zap.Error(err),
-		)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
-		return
-	}
-
-	s.log().Info("raw statement served",
-		zap.String("exchange", exchange),
-		zap.Int("bytes", len(doc)),
-	)
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-	w.Header().Set("Content-Type", contentType)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(doc)
-}
-
-// handleAdminFundingProbe answers with the wallet the tracked perimeter leaves
-// out, for one connection.
-//
-// Usage: GET /api/v1/admin/funding-probe?user_uid=X&exchange=okx&label=Y&from=2026-09-01
-//
-// A transfer out of the trading account is indistinguishable, from inside the
-// perimeter, between money parked in the customer's other wallet and money
-// that left the venue. The two lead to opposite readings of the same day — one
-// is performance, the other is capital — and only the venue can settle it. The
-// rows come back verbatim rather than classified: the published type tables
-// for this ledger disagree with each other, and a classifier written from the
-// wrong one would be wrong silently. The response carries live account data
-// and goes to a loopback caller only; the log records that a probe was served
-// and how many rows, never their content.
-func (s *Server) handleAdminFundingProbe(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "GET only"})
-		return
-	}
-
-	q := r.URL.Query()
-	userUID := q.Get("user_uid")
-	exchange := q.Get("exchange")
-	label := q.Get("label")
-
-	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
-	if err := validation.ValidateUserUID(userUID); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if err := validation.ValidateExchange(exchange); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if label != "" {
-		if err := validation.ValidateLabel(label); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-	}
-
-	since := time.Now().UTC().AddDate(0, 0, -90)
-	if fromStr := q.Get("from"); fromStr != "" {
-		parsed, err := time.Parse("2006-01-02", fromStr)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from must be YYYY-MM-DD"})
-			return
-		}
-		since = parsed
-	}
-
-	if s.handler == nil || s.handler.syncSvc == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
-		return
-	}
-
-	extendWriteDeadline(w, 10*time.Minute)
-	probe, err := s.handler.syncSvc.ProbeFunding(r.Context(), userUID, exchange, label, since)
-	if err != nil {
-		if errors.Is(err, service.ErrFundingProbeUnsupported) {
-			writeJSON(w, http.StatusNotImplemented, map[string]any{
-				"error":    "connector does not expose a funding probe",
-				"exchange": exchange,
-			})
-			return
-		}
-		s.log().Error("funding probe failed",
-			zap.String("exchange", exchange),
-			zap.Error(err),
-		)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
-		return
-	}
-
-	s.log().Info("funding probe served",
-		zap.String("exchange", exchange),
-		zap.Int("balances", len(probe.Balances)),
-		zap.Int("bills", len(probe.Bills)),
-	)
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "funding": probe})
 }
 
 // cashflowReflower is the slice of the sync service the reflow endpoint needs.
