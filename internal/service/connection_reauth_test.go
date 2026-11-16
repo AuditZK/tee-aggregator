@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/logredact"
+	"go.uber.org/zap"
 )
 
 // stubOAuthConnector reports tokens that differ from the ones it was built
@@ -95,6 +97,23 @@ func TestReauthValidationOutcome(t *testing.T) {
 				t.Fatalf("error %q should mention %q", got, tc.wantIn)
 			}
 		})
+	}
+}
+
+// A refusal is logged via zap.Error; the broker's code must survive the redactor.
+func TestReauthRefusalSurvivesLogRedaction(t *testing.T) {
+	const detail = "cTrader error ACCESS_DENIED: synthetic broker detail"
+	refusal := reauthValidationOutcome(errors.New(detail))
+	if refusal == nil {
+		t.Fatal("want a refusal")
+	}
+	got := logredact.RedactFields([]zap.Field{zap.Error(refusal)})[0]
+	rendered := got.String
+	if got.Interface != nil {
+		rendered = got.Interface.(error).Error()
+	}
+	if !strings.Contains(rendered, detail) {
+		t.Fatalf("broker detail lost to redaction: %q", rendered)
 	}
 }
 

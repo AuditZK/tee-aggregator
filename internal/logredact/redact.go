@@ -274,13 +274,53 @@ func maskFieldValue(f zapcore.Field) zapcore.Field {
 	return f
 }
 
+// Our own error-wrap prefixes ending in a tier-1 word: read as "key: value"
+// they collapsed the whole chain, broker code included. The cause is still scanned.
+var errorWrapPhrases = []string{
+	"invalid credentials: ",
+	"decrypt credentials: ",
+	"rebind credentials: ",
+	"check duplicate credentials: ",
+	"encrypt api secret: ",
+	"decrypt api secret: ",
+	"encrypt passphrase: ",
+	"decrypt passphrase: ",
+	"decode ciphertext: ",
+	"decode ts ciphertext: ",
+	"init dek: ",
+	"load active dek: ",
+	"generate dek: ",
+	"wrap dek: ",
+	"deactivate old dek: ",
+	"store new dek: ",
+}
+
 // containsSensitiveValue checks if a string value contains patterns like
-// "api_key=xxx" or "password:xxx" that could leak secrets in error messages.
+// "api_key=xxx", "password:xxx" or `"token":"xxx"` that could leak secrets in
+// error messages.
 func containsSensitiveValue(val string) bool {
 	lower := strings.ToLower(val)
+	if !hasTier1KeyMarker(lower) {
+		return false
+	}
+	for _, w := range errorWrapPhrases {
+		lower = strings.ReplaceAll(lower, w, "\n")
+	}
+	return hasTier1KeyMarker(lower)
+}
+
+func hasTier1KeyMarker(lower string) bool {
 	for _, p := range tier1Prefixes {
-		if strings.Contains(lower, p+"=") || strings.Contains(lower, p+":") {
-			return true
+		for rest := lower; ; {
+			i := strings.Index(rest, p)
+			if i < 0 {
+				break
+			}
+			after := rest[i+len(p):]
+			if strings.HasPrefix(after, "=") || strings.HasPrefix(after, ":") || strings.HasPrefix(after, `":`) {
+				return true
+			}
+			rest = rest[i+1:]
 		}
 	}
 	return false
