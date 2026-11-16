@@ -2,8 +2,14 @@ package connector
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -754,5 +760,351 @@ func TestIGSessionIsReusedAcrossCalls(t *testing.T) {
 	}
 	if got := logins.Load(); got != 1 {
 		t.Fatalf("logins = %d, want 1 (session cached across calls)", got)
+	}
+}
+
+const (
+	igTestEncTimeStamp = int64(1700000000000)
+	igTestCST          = "cst-1"
+	igTestSecToken     = "xst-1"
+)
+
+var (
+	igTestRSAOnce sync.Once
+	igTestRSAKey  *rsa.PrivateKey
+)
+
+func igTestKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	igTestRSAOnce.Do(func() {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			panic(err)
+		}
+		igTestRSAKey = key
+	})
+	return igTestRSAKey
+}
+
+// igEncryptedServer plays IG for a client whose plaintext v3 login is refused
+// with encryption.required, as IG documents for IG Singapore clients.
+type igEncryptedServer struct {
+	t   *testing.T
+	key *rsa.PrivateKey
+
+	currentAccount string
+	accountsJSON   string
+	// rejectFirstAccounts answers the first /accounts with a dead CST.
+	rejectFirstAccounts bool
+
+	mu             sync.Mutex
+	v3Logins       int
+	v2Logins       int
+	keyFetches     int
+	accountCalls   int
+	switches       []string
+	securityToken  string
+	authedRequests []http.Header
+}
+
+func (s *igEncryptedServer) handler(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch {
+	case r.URL.Path == "/session/encryptionKey" && r.Method == http.MethodGet:
+		s.keyFetches++
+		der, err := x509.MarshalPKIXPublicKey(&s.key.PublicKey)
+		if err != nil {
+			s.t.Errorf("marshal test key: %v", err)
+			return
+		}
+		fmt.Fprintf(w, `{"encryptionKey":%q,"timeStamp":%d}`, base64.StdEncoding.EncodeToString(der), igTestEncTimeStamp)
+
+	case r.URL.Path == "/session" && r.Method == http.MethodPost && r.Header.Get("Version") == "3":
+		s.v3Logins++
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"errorCode":"error.public-api.failure.encryption.required"}`)
+
+	case r.URL.Path == "/session" && r.Method == http.MethodPost && r.Header.Get("Version") == "2":
+		s.v2Logins++
+		raw, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(raw), igTestPassword) {
+			s.t.Errorf("v2 login carried the plaintext password")
+		}
+		var body struct {
+			Identifier        string `json:"identifier"`
+			Password          string `json:"password"`
+			EncryptedPassword bool   `json:"encryptedPassword"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			s.t.Errorf("decode v2 login: %v", err)
+			return
+		}
+		if body.Identifier != igTestUser || !body.EncryptedPassword {
+			s.t.Errorf("v2 login identifier=%q encryptedPassword=%v", body.Identifier, body.EncryptedPassword)
+		}
+		sealed, err := base64.StdEncoding.DecodeString(body.Password)
+		if err != nil {
+			s.t.Errorf("password is not base64: %v", err)
+			return
+		}
+		//lint:ignore SA1019 mirrors IG's server side of the PKCS#1 v1.5 login.
+		plain, err := rsa.DecryptPKCS1v15(nil, s.key, sealed)
+		if err != nil {
+			s.t.Errorf("decrypt password: %v", err)
+			return
+		}
+		want := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s|%d", igTestPassword, igTestEncTimeStamp)))
+		if string(plain) != want {
+			s.t.Errorf("decrypted payload = %q, want base64(password|timeStamp) %q", plain, want)
+		}
+		s.securityToken = igTestSecToken
+		w.Header().Set("CST", igTestCST)
+		w.Header().Set("X-SECURITY-TOKEN", s.securityToken)
+		fmt.Fprintf(w, `{"currentAccountId":%q,"clientId":"C1"}`, s.currentAccount)
+
+	case r.URL.Path == "/session" && r.Method == http.MethodPut:
+		s.authedRequests = append(s.authedRequests, r.Header.Clone())
+		raw, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(raw), "defaultAccount") {
+			s.t.Errorf("account switch touched the default account: %s", raw)
+		}
+		var body struct {
+			AccountID string `json:"accountId"`
+		}
+		_ = json.Unmarshal(raw, &body)
+		s.switches = append(s.switches, body.AccountID)
+		s.currentAccount = body.AccountID
+		s.securityToken = "xst-switched"
+		w.Header().Set("X-SECURITY-TOKEN", s.securityToken)
+		fmt.Fprint(w, `{"dealingEnabled":true}`)
+
+	case r.URL.Path == "/accounts":
+		s.authedRequests = append(s.authedRequests, r.Header.Clone())
+		s.accountCalls++
+		if s.rejectFirstAccounts && s.accountCalls == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"errorCode":"error.security.client-token-invalid"}`)
+			return
+		}
+		fmt.Fprint(w, s.accountsJSON)
+
+	case r.URL.Path == "/positions":
+		s.authedRequests = append(s.authedRequests, r.Header.Clone())
+		if r.Header.Get("X-SECURITY-TOKEN") != s.securityToken {
+			s.t.Errorf("positions read with X-SECURITY-TOKEN %q, want %q", r.Header.Get("X-SECURITY-TOKEN"), s.securityToken)
+		}
+		fmt.Fprint(w, `{"positions":[]}`)
+
+	default:
+		s.t.Errorf("unexpected %s %s (Version %s)", r.Method, r.URL.Path, r.Header.Get("Version"))
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func newIGEncryptedTest(t *testing.T, srv *igEncryptedServer) *IG {
+	t.Helper()
+	srv.t = t
+	srv.key = igTestKey(t)
+	if srv.currentAccount == "" {
+		srv.currentAccount = igTestAccount
+	}
+	if srv.accountsJSON == "" {
+		srv.accountsJSON = igTestAccountsJSON
+	}
+	return newIGTest(t, false, srv.handler)
+}
+
+func assertIGCSTHeaders(t *testing.T, headers []http.Header) {
+	t.Helper()
+	if len(headers) == 0 {
+		t.Fatal("no authenticated request reached the server")
+	}
+	for _, h := range headers {
+		if h.Get("CST") != igTestCST || h.Get("X-SECURITY-TOKEN") == "" {
+			t.Fatalf("request missing the v2 session pair: CST=%q X-SECURITY-TOKEN=%q", h.Get("CST"), h.Get("X-SECURITY-TOKEN"))
+		}
+		if h.Get("Authorization") != "" {
+			t.Fatalf("v2 session sent a bearer token: %q", h.Get("Authorization"))
+		}
+		if h.Get("X-IG-API-KEY") != "test-key" {
+			t.Fatalf("request missing the API key")
+		}
+	}
+}
+
+func TestIGEncryptedLoginWhenV3RequiresIt(t *testing.T) {
+	srv := &igEncryptedServer{}
+	ig := newIGEncryptedTest(t, srv)
+
+	for range 2 {
+		if _, err := ig.GetBalance(context.Background()); err != nil {
+			t.Fatalf("GetBalance: %v", err)
+		}
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.v3Logins != 1 || srv.v2Logins != 1 || srv.keyFetches != 1 {
+		t.Fatalf("v3=%d v2=%d keyFetches=%d, want 1/1/1 (session reused, v3 not retried)", srv.v3Logins, srv.v2Logins, srv.keyFetches)
+	}
+	if len(srv.switches) != 0 {
+		t.Fatalf("account discovery switched the session: %v", srv.switches)
+	}
+	assertIGCSTHeaders(t, srv.authedRequests)
+}
+
+// v2 has no per-request account header: reading an account other than the
+// login's default must switch the session, once, and carry the token IG hands
+// back from the switch.
+func TestIGEncryptedSessionSwitchesToSelectedAccount(t *testing.T) {
+	srv := &igEncryptedServer{
+		currentAccount: "SPB001",
+		accountsJSON: `{"accounts":[
+			{"accountId":"SPB001","accountType":"SPREADBET","preferred":false,"currency":"EUR","balance":{"balance":1,"profitLoss":0,"available":1}},
+			{"accountId":"ABC123","accountType":"CFD","preferred":true,"currency":"EUR","balance":{"balance":1,"profitLoss":0,"available":1}}]}`,
+	}
+	ig := newIGEncryptedTest(t, srv)
+
+	for range 2 {
+		if _, err := ig.GetPositions(context.Background()); err != nil {
+			t.Fatalf("GetPositions: %v", err)
+		}
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.switches) != 1 || srv.switches[0] != igTestAccount {
+		t.Fatalf("switches = %v, want one switch to %s", srv.switches, igTestAccount)
+	}
+	assertIGCSTHeaders(t, srv.authedRequests)
+}
+
+func TestIGEncryptedSessionReLogsInOnRejection(t *testing.T) {
+	srv := &igEncryptedServer{rejectFirstAccounts: true}
+	ig := newIGEncryptedTest(t, srv)
+
+	if _, err := ig.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance should recover from a rejected CST: %v", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.v3Logins != 1 || srv.v2Logins != 2 || srv.keyFetches != 2 {
+		t.Fatalf("v3=%d v2=%d keyFetches=%d, want 1/2/2 (re-login stays on v2 with a fresh key)", srv.v3Logins, srv.v2Logins, srv.keyFetches)
+	}
+}
+
+func TestIGPlainLoginNeverFetchesEncryptionKey(t *testing.T) {
+	var keyFetches atomic.Int32
+	var bearer atomic.Value
+	ig := newIGTest(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/session":
+			if r.Header.Get("Version") != "3" {
+				t.Errorf("login Version = %q, want 3", r.Header.Get("Version"))
+			}
+			igWriteSession(w)
+		case "/session/encryptionKey":
+			keyFetches.Add(1)
+		case "/accounts":
+			bearer.Store(r.Header.Get("Authorization") + "|" + r.Header.Get("CST"))
+			fmt.Fprint(w, igTestAccountsJSON)
+		}
+	})
+
+	if _, err := ig.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if keyFetches.Load() != 0 {
+		t.Fatal("a v3 login fetched the encryption key")
+	}
+	if got := bearer.Load(); got != "Bearer tok-1|" {
+		t.Fatalf("v3 request auth = %q, want bearer only", got)
+	}
+}
+
+func TestIGEncryptedLoginErrorDoesNotLeakPassword(t *testing.T) {
+	srv := &igEncryptedServer{}
+	ig := newIGEncryptedTest(t, srv)
+	ig.client.Transport = igEchoV2Failure{next: http.DefaultTransport}
+
+	err := ig.TestConnection(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), igTestPassword) || strings.Contains(err.Error(), "encryptedPassword") {
+		t.Fatalf("error leaked the login payload: %v", err)
+	}
+}
+
+// igEchoV2Failure answers the v2 login by echoing its request body back.
+type igEchoV2Failure struct{ next http.RoundTripper }
+
+func (e igEchoV2Failure) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Path != "/session" || r.Header.Get("Version") != "2" {
+		return e.next.RoundTrip(r)
+	}
+	raw, _ := io.ReadAll(r.Body)
+	return &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"errorCode":"error.security.invalid-details","echo":` + string(raw) + `}`)),
+		Request:    r,
+	}, nil
+}
+
+func TestIGLoginRefusalsNameTheFix(t *testing.T) {
+	tests := []struct {
+		name       string
+		identifier string
+		version    string
+		status     int
+		code       string
+		want       string
+	}{
+		{"email identifier", "someone@example.com", "3", http.StatusBadRequest, "invalid.input", "username, not the email"},
+		{"locked login", igTestUser, "3", http.StatusUnauthorized, "error.security.too-many-failed-attempts", "too many failed attempts"},
+		{"pending agreements", igTestUser, "3", http.StatusUnauthorized, "error.public-api.failure.pending.agreements.required", "agreements pending"},
+		{"api key", igTestUser, "3", http.StatusForbidden, "error.security.api-key-restricted", "API key"},
+		{"v2 share-dealing default", igTestUser, "2", http.StatusForbidden, "error.public-api.failure.stockbroking-not-supported", "as the default in My IG"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			key := igTestKey(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/session/encryptionKey":
+					der, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+					fmt.Fprintf(w, `{"encryptionKey":%q,"timeStamp":%d}`, base64.StdEncoding.EncodeToString(der), igTestEncTimeStamp)
+				case r.Header.Get("Version") == tc.version:
+					w.WriteHeader(tc.status)
+					fmt.Fprintf(w, `{"errorCode":%q}`, tc.code)
+				default:
+					w.WriteHeader(http.StatusBadRequest)
+					fmt.Fprint(w, `{"errorCode":"error.public-api.failure.encryption.required"}`)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			ig := NewIG(&Credentials{APIKey: "test-key", APISecret: igTestPassword, Passphrase: tc.identifier}, false)
+			ig.baseURL = srv.URL
+
+			err := ig.TestConnection(context.Background())
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not contain %q", err, tc.want)
+			}
+			if errors.Is(err, ErrTransient) {
+				t.Fatalf("a permanent refusal was marked transient: %v", err)
+			}
+			if ClassifyConnectFailure(err) != ConnectFailureCredentials {
+				t.Fatalf("refusal no longer reaches the front as invalid credentials: %v", err)
+			}
+		})
 	}
 }
