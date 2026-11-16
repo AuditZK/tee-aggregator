@@ -28,7 +28,7 @@ var ErrIPRestricted = errors.New("ip not whitelisted")
 //	binance  -2015   "Invalid API-key, IP, or permissions for action."
 //	okx      50110   "Invalid IP" (see the rebuilder egress note in service/sync.go)
 //	bybit    10010   "request ip mismatch" / "unmatched ip"
-//	kucoin   400006  "invalid ip"
+//	kucoin   400006  "The request IP address is not on the whitelist" (also wrapped by code)
 //	mexc     700006  "IP not in whitelist"
 //	bitget   40018   "invalid ip"
 var ipRestrictionMarkers = []string{
