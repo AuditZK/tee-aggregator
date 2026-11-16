@@ -3,7 +3,12 @@ package connector
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -26,6 +31,9 @@ const (
 	// Re-login this long before the stated expiry so a request in flight does
 	// not straddle it.
 	igTokenSafetyMargin = 10 * time.Second
+	// IG documents a v2 CST pair as valid for six hours at first, extended
+	// while in use; the floor is the figure to plan around.
+	igCSTLifetime = 6 * time.Hour
 
 	igTimeFormat = "2006-01-02T15:04:05"
 
@@ -58,19 +66,35 @@ var igDepositCodes = map[string]bool{
 var igTransferHints = []string{"virement", "transfer", "retrait", "withdraw"}
 
 type igSession struct {
-	token string
+	// token is a v3 OAuth access token; cst and securityToken carry a v2
+	// session instead. A session holds one kind or the other.
+	token         string
+	cst           string
+	securityToken string
 	// accountID is the login's default account — only a bootstrap identity for
 	// listing accounts. Business requests pin their own account explicitly.
 	accountID string
-	expiry    time.Time
+	// activeAccountID is the account a v2 session acts under. v2 has no
+	// per-request account header: pinning an account switches the session.
+	activeAccountID string
+	expiry          time.Time
 	// gen identifies which login produced this token, so a caller holding a
 	// rejected token can only retire that one.
 	gen uint64
 }
 
 func (s igSession) valid() bool {
-	return s.token != "" && time.Now().Before(s.expiry)
+	return (s.token != "" || s.cst != "") && time.Now().Before(s.expiry)
 }
+
+func (s igSession) cstBased() bool {
+	return s.cst != ""
+}
+
+var (
+	errIGEncryptionRequired = errors.New("ig requires an encrypted-password login")
+	errIGSessionRejected    = errors.New("ig rejected the session token")
+)
 
 // IG implements Connector for IG Group's REST trading API.
 type IG struct {
@@ -87,6 +111,9 @@ type IG struct {
 	sessionMu  sync.Mutex
 	sess       igSession
 	sessionGen uint64
+	// encryptedLogin is set once v3 has answered encryption.required, so
+	// re-logins go straight to the encrypted v2 login.
+	encryptedLogin bool
 
 	accountMu         sync.Mutex
 	selectedAccountID string
@@ -151,18 +178,34 @@ func (i *IG) DetectIsPaper(_ context.Context) (bool, error) {
 // fail the sync.
 func igSessionRejected(body []byte) bool {
 	return bytes.Contains(body, []byte("error.security.client-token-invalid")) ||
+		bytes.Contains(body, []byte("error.security.account-token-invalid")) ||
 		bytes.Contains(body, []byte("error.security.oauth-token-invalid")) ||
 		bytes.Contains(body, []byte("error.security.oauth-token-expired"))
 }
 
-func (i *IG) session(ctx context.Context) (igSession, error) {
+// session returns a live session acting for accountID. Only a v2 session has
+// to be switched for that; a v3 request names its account in a header.
+func (i *IG) session(ctx context.Context, accountID string) (igSession, error) {
 	i.sessionMu.Lock()
 	defer i.sessionMu.Unlock()
 
-	if i.sess.valid() {
+	if !i.sess.valid() {
+		if err := i.loginLocked(ctx); err != nil {
+			return igSession{}, err
+		}
+	}
+	if !i.sess.cstBased() || accountID == "" {
 		return i.sess, nil
 	}
-	if err := i.loginLocked(ctx); err != nil {
+
+	err := i.switchAccountLocked(ctx, accountID)
+	if errors.Is(err, errIGSessionRejected) {
+		i.sess = igSession{}
+		if err = i.loginLocked(ctx); err == nil {
+			err = i.switchAccountLocked(ctx, accountID)
+		}
+	}
+	if err != nil {
 		return igSession{}, err
 	}
 	return i.sess, nil
@@ -181,7 +224,33 @@ func (i *IG) invalidateSession(gen uint64) {
 	i.sessionMu.Unlock()
 }
 
+// loginLocked logs in with session v3 and falls back to the encrypted v2 login
+// only when IG asks for it.
+//
+// Session v3, deliberately. The v1/v2 CST login is refused outright
+// (error.public-api.failure.stockbroking-not-supported, observed against a
+// real account) whenever the login's DEFAULT account is a share-dealing one —
+// even when an eligible CFD account sits right next to it, and the login API
+// offers no way to pick. v3 authenticates the client instead and lets every
+// request pin its account via IG-ACCOUNT-ID, so a user's default-account
+// setting can't brick the connection.
+//
+// IG Singapore clients must send their password RSA-encrypted, and only v1/v2
+// take the encryptedPassword flag. IG answers such a client's plaintext login
+// with error.public-api.failure.encryption.required, and that answer is the
+// only signal used: the client's region is not known up front.
 func (i *IG) loginLocked(ctx context.Context) error {
+	if !i.encryptedLogin {
+		err := i.loginV3Locked(ctx)
+		if !errors.Is(err, errIGEncryptionRequired) {
+			return err
+		}
+		i.encryptedLogin = true
+	}
+	return i.loginV2EncryptedLocked(ctx)
+}
+
+func (i *IG) loginV3Locked(ctx context.Context) error {
 	payload, err := json.Marshal(map[string]string{
 		"identifier": i.username,
 		"password":   i.password,
@@ -190,48 +259,15 @@ func (i *IG) loginLocked(ctx context.Context) error {
 		return fmt.Errorf("encode ig session request: %w", err)
 	}
 
-	// Session v3, deliberately. The v1/v2 CST login is refused outright
-	// (error.public-api.failure.stockbroking-not-supported, observed against a
-	// real account) whenever the login's DEFAULT account is a share-dealing
-	// one — even when an eligible CFD account sits right next to it, and the
-	// login API offers no way to pick. v3 authenticates the client instead and
-	// lets every request pin its account via IG-ACCOUNT-ID, so a user's
-	// default-account setting can't brick the connection.
-	req, err := http.NewRequestWithContext(ctx, "POST", i.baseURL+"/session", bytes.NewReader(payload))
+	resp, body, err := i.postSession(ctx, "3", payload)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-IG-API-KEY", i.apiKey)
-	req.Header.Set("Version", "3")
-	req.Header.Set("Content-Type", igContentType)
-	req.Header.Set("Accept", igContentType)
-
-	resp, err := i.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("%w: post ig session: %w", ErrTransient, err)
-	}
-
-	// CONN-AUDIT-001: bounded read for both error and success paths.
-	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
-	if err != nil {
-		return fmt.Errorf("read ig session: %w", err)
-	}
-
 	if resp.StatusCode != http.StatusOK {
-		// A rate-limited or unavailable login is not a bad password. Marking it
-		// transient stops connection create from rejecting a valid account and
-		// lets the scheduler retry instead.
-		if isRetryableStatus(resp.StatusCode) {
-			return fmt.Errorf("%w: ig session HTTP %d: %s", ErrTransient, resp.StatusCode, vendorErrorDetail(string(body)))
+		if bytes.Contains(body, []byte("error.public-api.failure.encryption.required")) {
+			return errIGEncryptionRequired
 		}
-		// IG's Web API serves CFD and spread-bet accounts only; a share-dealing
-		// login is refused at the session itself. Left as a bare status this
-		// reads as a credential failure, sending the holder of a perfectly good
-		// account to re-check a password that was never the problem.
-		if bytes.Contains(body, []byte("stockbroking-not-supported")) {
-			return fmt.Errorf("ig share-dealing accounts are not served by the Web API: connect a CFD or spread-bet account instead")
-		}
-		return fmt.Errorf("ig session HTTP %d: %s", resp.StatusCode, vendorErrorDetail(string(body)))
+		return i.loginFailure(resp.StatusCode, body, false)
 	}
 
 	var parsed struct {
@@ -266,6 +302,232 @@ func (i *IG) loginLocked(ctx context.Context) error {
 	return nil
 }
 
+func (i *IG) loginV2EncryptedLocked(ctx context.Context) error {
+	encrypted, err := i.encryptPassword(ctx)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(struct {
+		Identifier        string `json:"identifier"`
+		Password          string `json:"password"`
+		EncryptedPassword bool   `json:"encryptedPassword"`
+	}{i.username, encrypted, true})
+	if err != nil {
+		return fmt.Errorf("encode ig session request: %w", err)
+	}
+
+	resp, body, err := i.postSession(ctx, "2", payload)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return i.loginFailure(resp.StatusCode, body, true)
+	}
+
+	var parsed struct {
+		CurrentAccountID string `json:"currentAccountId"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return fmt.Errorf("decode ig session: %w", err)
+	}
+	cst := resp.Header.Get("CST")
+	securityToken := resp.Header.Get("X-SECURITY-TOKEN")
+	if cst == "" || securityToken == "" {
+		return fmt.Errorf("ig session returned no CST or X-SECURITY-TOKEN")
+	}
+
+	i.sessionGen++
+	i.sess = igSession{
+		cst:             cst,
+		securityToken:   securityToken,
+		accountID:       parsed.CurrentAccountID,
+		activeAccountID: parsed.CurrentAccountID,
+		expiry:          time.Now().Add(igCSTLifetime - igTokenSafetyMargin),
+		gen:             i.sessionGen,
+	}
+	return nil
+}
+
+// encryptPassword fetches IG's login key and encrypts the password with it.
+// The ciphertext embeds IG's timestamp, so the key is fetched for every login.
+func (i *IG) encryptPassword(ctx context.Context) (string, error) {
+	body, err := retryHTTP(i.client, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, i.baseURL+"/session/encryptionKey", nil)
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("X-IG-API-KEY", i.apiKey)
+		req.Header.Set("Version", "1")
+		req.Header.Set("Accept", igContentType)
+		return req, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("fetch ig encryption key: %w", err)
+	}
+
+	var parsed struct {
+		EncryptionKey string      `json:"encryptionKey"`
+		TimeStamp     json.Number `json:"timeStamp"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", fmt.Errorf("decode ig encryption key: %w", err)
+	}
+	timeStamp, err := parsed.TimeStamp.Int64()
+	if err != nil {
+		return "", fmt.Errorf("decode ig encryption key timestamp: %w", err)
+	}
+	return igEncryptPassword(i.password, parsed.EncryptionKey, timeStamp)
+}
+
+// igEncryptPassword builds the encryptedPassword login secret the way IG's own
+// samples do (Java AuthenticationService.encryptPassword, the JS companion):
+// base64(RSA-PKCS#1-v1.5(base64(password + "|" + timeStamp))), keyed by the
+// base64 X.509 SubjectPublicKeyInfo from GET /session/encryptionKey.
+func igEncryptPassword(password, keyB64 string, timeStamp int64) (string, error) {
+	der, err := base64.StdEncoding.DecodeString(keyB64)
+	if err != nil {
+		return "", fmt.Errorf("decode ig encryption key: %w", err)
+	}
+	parsedKey, err := x509.ParsePKIXPublicKey(der)
+	if err != nil {
+		return "", fmt.Errorf("parse ig encryption key: %w", err)
+	}
+	pub, ok := parsedKey.(*rsa.PublicKey)
+	if !ok {
+		return "", fmt.Errorf("parse ig encryption key: not an RSA key")
+	}
+
+	plain := base64.StdEncoding.EncodeToString([]byte(password + "|" + strconv.FormatInt(timeStamp, 10)))
+	//lint:ignore SA1019 IG's encrypted login accepts PKCS#1 v1.5 only.
+	sealed, err := rsa.EncryptPKCS1v15(rand.Reader, pub, []byte(plain))
+	if err != nil {
+		return "", fmt.Errorf("encrypt ig password: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+// postSession sends a login. The response body is already read and closed.
+func (i *IG) postSession(ctx context.Context, version string, payload []byte) (*http.Response, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, i.baseURL+"/session", bytes.NewReader(payload))
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("X-IG-API-KEY", i.apiKey)
+	req.Header.Set("Version", version)
+	req.Header.Set("Content-Type", igContentType)
+	req.Header.Set("Accept", igContentType)
+
+	resp, err := i.client.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: post ig session: %w", ErrTransient, err)
+	}
+	// CONN-AUDIT-001: bounded read for both error and success paths.
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read ig session: %w", err)
+	}
+	return resp, body, nil
+}
+
+// igLoginRefusals names the login refusals a user can act on. Left as a bare
+// status each reads as a wrong password, which sends the holder of a working
+// login to re-check the one thing that was never the problem.
+var igLoginRefusals = []struct {
+	code    string
+	message string
+}{
+	// IG's Web API serves CFD and spread-bet accounts only; a share-dealing
+	// login is refused at the session itself.
+	{"stockbroking-not-supported", "ig share-dealing accounts are not served by the Web API: connect a CFD or spread-bet account instead"},
+	{"product-code-not-allowed", "ig serves only CFD, spread-bet and listed futures and options accounts through the Web API"},
+	{"failure.kyc.required", "ig blocks API logins until the account holder completes the steps pending on the IG web platform"},
+	{"pending.agreements.required", "ig blocks API logins until the account holder accepts the agreements pending on the IG web platform"},
+	{"too-many-failed-attempts", "ig locked this login after too many failed attempts: sign in on the IG web platform to unlock it before retrying"},
+	{"error.security.api-key-", "ig refused the API key: check it is enabled and was created for this environment (live or demo)"},
+}
+
+func (i *IG) loginFailure(status int, body []byte, encrypted bool) error {
+	detail := vendorErrorDetail(string(body))
+	// A rate-limited or unavailable login is not a bad password. Marking it
+	// transient stops connection create from rejecting a valid account and
+	// lets the scheduler retry instead.
+	if isRetryableStatus(status) {
+		return fmt.Errorf("%w: ig session HTTP %d: %s", ErrTransient, status, detail)
+	}
+	// The v2 login is refused when the DEFAULT account is share dealing, and
+	// unlike v3 no account pin gets past it.
+	if encrypted && bytes.Contains(body, []byte("stockbroking-not-supported")) {
+		return fmt.Errorf("ig refuses an encrypted-password login whose default account is share dealing: set a CFD or spread-bet account as the default in My IG")
+	}
+	for _, r := range igLoginRefusals {
+		if bytes.Contains(body, []byte(r.code)) {
+			return errors.New(r.message)
+		}
+	}
+	if strings.Contains(i.username, "@") {
+		return fmt.Errorf("ig session HTTP %d: %s: the IG login identifier is the username, not the email address", status, detail)
+	}
+	return fmt.Errorf("ig session HTTP %d: %s", status, detail)
+}
+
+// switchAccountLocked moves a v2 session onto accountID without touching the
+// user's default account.
+func (i *IG) switchAccountLocked(ctx context.Context, accountID string) error {
+	if accountID == i.sess.activeAccountID {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]string{"accountId": accountID})
+	if err != nil {
+		return fmt.Errorf("encode ig account switch: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, i.baseURL+"/session", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	i.setAuthHeaders(req, i.sess, accountID)
+	req.Header.Set("Version", "1")
+	req.Header.Set("Content-Type", igContentType)
+	req.Header.Set("Accept", igContentType)
+
+	resp, err := i.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: switch ig account: %w", ErrTransient, err)
+	}
+	body, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
+	if err != nil {
+		return fmt.Errorf("read ig account switch: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		if igSessionRejected(body) {
+			return errIGSessionRejected
+		}
+		if isRetryableStatus(resp.StatusCode) {
+			return fmt.Errorf("%w: switch ig account HTTP %d: %s", ErrTransient, resp.StatusCode, vendorErrorDetail(string(body)))
+		}
+		return fmt.Errorf("switch ig account %s HTTP %d: %s", accountID, resp.StatusCode, vendorErrorDetail(string(body)))
+	}
+
+	if v := resp.Header.Get("CST"); v != "" {
+		i.sess.cst = v
+	}
+	if v := resp.Header.Get("X-SECURITY-TOKEN"); v != "" {
+		i.sess.securityToken = v
+	}
+	i.sess.activeAccountID = accountID
+	return nil
+}
+
+func (i *IG) setAuthHeaders(req *http.Request, sess igSession, accountID string) {
+	req.Header.Set("X-IG-API-KEY", i.apiKey)
+	if sess.cstBased() {
+		req.Header.Set("CST", sess.cst)
+		req.Header.Set("X-SECURITY-TOKEN", sess.securityToken)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+sess.token)
+	req.Header.Set("IG-ACCOUNT-ID", accountID)
+}
+
 // doAuthed issues an authenticated GET against accountID. An empty accountID
 // falls back to the login's default account — only account discovery itself
 // should do that; every business read names the account it wants.
@@ -283,7 +545,7 @@ func (i *IG) doAuthed(ctx context.Context, version, path string, query url.Value
 // rejection retires that token and not whichever one happens to be cached by
 // the time the caller reacts.
 func (i *IG) authedOnce(ctx context.Context, version, path string, query url.Values, accountID string) ([]byte, uint64, error) {
-	sess, err := i.session(ctx)
+	sess, err := i.session(ctx, accountID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -301,9 +563,7 @@ func (i *IG) authedOnce(ctx context.Context, version, path string, query url.Val
 		if rerr != nil {
 			return nil, rerr
 		}
-		req.Header.Set("X-IG-API-KEY", i.apiKey)
-		req.Header.Set("Authorization", "Bearer "+sess.token)
-		req.Header.Set("IG-ACCOUNT-ID", accountID)
+		i.setAuthHeaders(req, sess, accountID)
 		req.Header.Set("Version", version)
 		req.Header.Set("Accept", igContentType)
 		return req, nil
