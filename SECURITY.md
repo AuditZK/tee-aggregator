@@ -63,7 +63,6 @@ The enclave processes sensitive data (API credentials, individual trades, positi
 │  │  Individual Trades (NEVER transmitted)     │         │
 │  │  - Trade prices, timestamps, sizes         │         │
 │  │  - Position details                        │         │
-│  │  - Account balances by market              │         │
 │  └────────────────────────────────────────────┘         │
 │                     │                                    │
 │                     ▼                                    │
@@ -941,7 +940,7 @@ if !report.Verified {
 ✅ **Credential Confidentiality**
 - API keys decrypted ONLY in enclave memory (AMD SEV-SNP protected)
 - NEVER logged (TIER 1 redaction)
-- NEVER transmitted outside enclave
+- Transmitted outside the enclave only to the two services named in [Credential egress](#credential-egress)
 - Wiped from memory after use
 
 ✅ **Trade Privacy**

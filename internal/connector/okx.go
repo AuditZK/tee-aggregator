@@ -56,12 +56,6 @@ type OKX struct {
 
 	cashflowWarnings []string // markers from the last GetCashflows, guarded by mu
 	balanceWarnings  []string // markers from the last GetBalance, guarded by mu
-
-	// acctLv caches GET /api/v5/account/config's account mode for the life of
-	// the connector. Only the probe reads it — the balance path infers the mode
-	// from which fields OKX left empty and spends no request on it.
-	acctLv        string
-	acctLvFetched bool
 }
 
 // NewOKX creates a new OKX connector
@@ -307,8 +301,7 @@ const (
 )
 
 // okxMarginReading is what one balance payload says about free margin, plus
-// the field pair it was read from — the probe endpoint reports both so an
-// operator can see which branch fired on a real account.
+// the field pair it was read from, so the branch that fired can be told.
 type okxMarginReading struct {
 	Available  float64
 	Unrealized float64

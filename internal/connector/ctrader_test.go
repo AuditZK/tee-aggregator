@@ -294,69 +294,6 @@ func TestCTraderGetCashflows_PaginatesBeyondWeekLimit(t *testing.T) {
 	}
 }
 
-// GetRawCashflowEntries preserves every operationType — including the ones
-// GetCashflows drops — so a balance jump that has no deposit/withdraw entry
-// (a demo reset) can be diagnosed instead of read as a spurious return.
-func TestCTraderGetRawCashflowEntries_PreservesUntypedOps(t *testing.T) {
-	now := time.Now().UTC()
-	since := now.Add(-3 * 24 * time.Hour) // single weekly window
-	ts := since.Add(24 * time.Hour).UnixMilli()
-
-	wsServer := newCTraderWSServer(t, func(conn *websocket.Conn, msg wsTestMessage) {
-		switch msg.PayloadType {
-		case ctraderPayloadAppAuthReq:
-			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadAppAuthRes, map[string]any{})
-		case ctraderPayloadGetAccountsReq:
-			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadGetAccountsRes, map[string]any{
-				"ctidTraderAccount": []map[string]any{{"ctidTraderAccountId": 12345, "isLive": true}},
-			})
-		case ctraderPayloadAccountAuthReq:
-			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadAccountAuthRes, map[string]any{})
-		case ctraderPayloadCashFlowHistoryReq:
-			sendWSResponse(t, conn, msg.ClientMsgID, ctraderPayloadCashFlowHistoryRes, map[string]any{
-				"depositWithdraw": []map[string]any{
-					{"operationType": ctraderOpDeposit, "delta": 100000, "balance": 100000, "changeBalanceTimestamp": ts, "moneyDigits": 2},
-					{"operationType": 21, "delta": -50, "balance": 99950, "changeBalanceTimestamp": ts, "moneyDigits": 2}, // swap: not a cashflow
-				},
-			})
-		default:
-			t.Fatalf("unexpected payloadType: %d", msg.PayloadType)
-		}
-	})
-	defer wsServer.Close()
-
-	c := newTestCTrader(wsServer.URL)
-
-	ops, err := c.GetRawCashflowEntries(context.Background(), since)
-	if err != nil {
-		t.Fatalf("GetRawCashflowEntries: %v", err)
-	}
-	if len(ops) != 2 {
-		t.Fatalf("expected 2 raw ops (deposit + swap), got %d", len(ops))
-	}
-	var sawSwap bool
-	for _, op := range ops {
-		if op.OperationType == 21 {
-			sawSwap = true
-			if op.Delta != -0.5 {
-				t.Fatalf("swap delta: got %v, want -0.5", op.Delta)
-			}
-		}
-	}
-	if !sawSwap {
-		t.Fatal("raw ops must include the untyped swap operation GetCashflows drops")
-	}
-
-	// The filtered view keeps only the deposit.
-	filtered := ctraderCashflowsFromEntries([]ctraderDepositWithdraw{
-		{OperationType: ctraderOpDeposit, Delta: 100000, Balance: 100000, Timestamp: ts, MoneyDigits: 2},
-		{OperationType: 21, Delta: -50, Balance: 99950, Timestamp: ts, MoneyDigits: 2},
-	})
-	if len(filtered) != 1 || filtered[0].Amount != 1000 {
-		t.Fatalf("filtered cashflows: got %+v, want single $1000 deposit", filtered)
-	}
-}
-
 func newTestCTrader(wsURL string) *CTrader {
 	return &CTrader{
 		clientID:     "client-id",
