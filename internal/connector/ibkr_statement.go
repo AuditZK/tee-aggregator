@@ -705,8 +705,7 @@ func (c cashReportTransfers) flows(since time.Time) []*Cashflow {
 
 // statementReport is the Flex report every figure is read from: the daily
 // statement reaching back to from, narrowed to the one account this connection
-// measures. The raw views (GetRawStatement, GetRawCashflowEntries) keep the
-// whole document.
+// measures.
 func (i *IBKR) statementReport(ctx context.Context, from time.Time) ([]byte, error) {
 	report, err := i.dailyStatement(ctx, from)
 	if err != nil {
