@@ -1,7 +1,10 @@
 package connector
 
 import (
+	"context"
+	"encoding/json"
 	"math"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -46,6 +49,100 @@ func binanceMarginAssetUSD(asset, qty string, priceMap map[string]float64) float
 		return q
 	}
 	return q * priceMap[asset+"USDT"]
+}
+
+// ProbeBalance returns the USDⓈ-M account payload as Binance sent it, the
+// account's asset mode, and the Balance GetBalance derives today. It also
+// states how much margin collateral the account totals leave out when they
+// cover USDT only (single-asset mode, or a BNFCR credit account) — the
+// amount a sync counting every margin asset would add to the equity. Nothing
+// here changes what a sync records.
+func (b *Binance) ProbeBalance(ctx context.Context) (*BalanceProbe, error) {
+	probe := &BalanceProbe{
+		Exchange:    b.Exchange(),
+		MarginBasis: "fapi/v2/account totalMarginBalance + spot + coin-m + cross + isolated margin + simple earn + options",
+		Account:     map[string]string{},
+		Currencies:  []map[string]string{},
+	}
+
+	if body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v1/multiAssetsMargin", url.Values{}, true); err == nil {
+		var mode struct {
+			MultiAssetsMargin *bool `json:"multiAssetsMargin"`
+		}
+		if json.Unmarshal(body, &mode) == nil && mode.MultiAssetsMargin != nil {
+			probe.AccountMode = "multiAssetsMargin=" + strconv.FormatBool(*mode.MultiAssetsMargin)
+		}
+	} else {
+		probe.Notes = append(probe.Notes, "asset mode unavailable: "+vendorErrorDetail(err.Error()))
+	}
+
+	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v2/account", url.Values{}, true)
+	if err != nil {
+		probe.Notes = append(probe.Notes, "futures account unavailable: "+vendorErrorDetail(err.Error()))
+	} else {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(body, &raw); err != nil {
+			probe.Notes = append(probe.Notes, "futures account unreadable")
+		} else {
+			for _, k := range []string{
+				"totalWalletBalance", "totalMarginBalance", "totalUnrealizedProfit",
+				"availableBalance", "totalCrossWalletBalance", "maxWithdrawAmount",
+			} {
+				if v, ok := raw[k]; ok {
+					probe.Account[k] = strings.Trim(string(v), `"`)
+				}
+			}
+			var assets []binanceFuturesAssetRow
+			_ = json.Unmarshal(raw["assets"], &assets)
+			priceMap, perr := FetchBinanceStylePriceMap(ctx, b.client, binanceSpotAPI)
+			if perr != nil {
+				probe.Notes = append(probe.Notes, "spot prices unavailable: non-stable collateral valued at 0")
+			}
+			usdtOnly := binanceTotalsCoverUSDTOnly(probe.Account["totalWalletBalance"], assets)
+			outside := 0.0
+			for _, a := range assets {
+				if isZeroAmount(a.WalletBalance) && isZeroAmount(a.MarginBalance) {
+					continue
+				}
+				probe.Currencies = append(probe.Currencies, map[string]string{
+					"asset":            a.Asset,
+					"walletBalance":    a.WalletBalance,
+					"marginBalance":    a.MarginBalance,
+					"unrealizedProfit": a.UnrealizedProfit,
+					"availableBalance": a.AvailableBalance,
+				})
+				if usdtOnly && !strings.EqualFold(a.Asset, "USDT") {
+					outside += binanceMarginAssetUSD(a.Asset, a.MarginBalance, priceMap)
+				}
+			}
+			probe.Account["probe.totals_cover_usdt_only"] = strconv.FormatBool(usdtOnly)
+			probe.Account["probe.collateral_outside_totals_usd"] = strconv.FormatFloat(outside, 'f', 2, 64)
+		}
+	}
+
+	if earn, err := b.getSimpleEarn(ctx); err != nil {
+		probe.Notes = append(probe.Notes, "simple earn unavailable: "+vendorErrorDetail(err.Error()))
+	} else if priceMap, perr := FetchBinanceStylePriceMap(ctx, b.client, binanceSpotAPI); perr != nil {
+		probe.Notes = append(probe.Notes, "spot prices unavailable: simple earn not valued")
+	} else {
+		probe.Account["probe.simple_earn_usd"] = strconv.FormatFloat(ValueSpotHoldingsUSD(earn.positions, priceMap), 'f', 2, 64)
+	}
+
+	if priceMap, perr := FetchBinanceStylePriceMap(ctx, b.client, binanceSpotAPI); perr != nil {
+		probe.Notes = append(probe.Notes, "spot prices unavailable: options not valued")
+	} else if eq, err := b.getOptionsEquity(ctx, priceMap); err != nil {
+		probe.Notes = append(probe.Notes, "options unavailable: "+vendorErrorDetail(err.Error()))
+	} else {
+		probe.Account["probe.options_usd"] = strconv.FormatFloat(eq, 'f', 2, 64)
+	}
+
+	derived, err := b.GetBalance(ctx)
+	if err != nil {
+		probe.Notes = append(probe.Notes, "balance unavailable: "+vendorErrorDetail(err.Error()))
+	} else {
+		probe.Derived = derived
+	}
+	return probe, nil
 }
 
 func isZeroAmount(s string) bool {

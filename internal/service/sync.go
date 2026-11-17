@@ -217,7 +217,8 @@ type reconstructOpts struct {
 	// collect receives the days a dry run would have written. The log lines
 	// cannot carry them: logredact masks every money field, on purpose, so a
 	// diagnostic that reports through the log reports nothing. The days go to
-	// the loopback caller that asked for them instead.
+	// the loopback caller that asked for them instead, the same channel the
+	// raw-statement dump uses and for the same reason.
 	collect func([]*repository.Snapshot)
 	// rewrite carries a deep reconstruction through yesterday instead of
 	// stopping at the earliest stored day: the stored days are read again,
@@ -3303,6 +3304,210 @@ func (s *SyncService) getOrCreateConnector(exchange, userUID, label string, cred
 		return nil, fmt.Errorf("build connector for %s: empty result", exchange)
 	}
 	return conn, nil
+}
+
+// DumpCashflows fetches BALANCE deals (deposits/withdrawals) from the broker
+// for a user over a wider date range than the normal daily sync window.
+// Intended for admin backfills after a bug affected cashflow capture.
+func (s *SyncService) DumpCashflows(
+	ctx context.Context,
+	userUID, exchange, label string,
+	since time.Time,
+) ([]*connector.Cashflow, []string, error) {
+	if s.connSvc == nil {
+		return nil, nil, fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build connector: %w", err)
+	}
+
+	cfFetcher, ok := conn.(connector.CashflowFetcher)
+	if !ok {
+		return nil, nil, fmt.Errorf("connector %s does not support cashflow fetching", exchange)
+	}
+
+	flows, err := cfFetcher.GetCashflows(ctx, since)
+	if err != nil {
+		return nil, nil, err
+	}
+	// A degraded fetch (shortened window, unpriceable currency) is success
+	// with a caveat; the dump states the caveat instead of hiding it behind
+	// either a clean result or a sanitized error.
+	var warnings []string
+	if cw, ok := conn.(connector.CapabilityWarner); ok {
+		warnings = cw.CapabilityWarnings()
+	}
+	return flows, warnings, nil
+}
+
+// ErrBalanceProbeUnsupported is returned when the connection's connector has
+// no BalanceProber. The admin endpoint turns it into a 501 so "this venue was
+// never wired for probing" cannot be misread as "this account has no balance".
+var ErrBalanceProbeUnsupported = errors.New("connector does not implement balance probing")
+
+// ProbeBalance decrypts the connection's credentials the way a sync does,
+// asks the venue for its balance once, and returns that payload verbatim
+// beside the Balance the connector derived from it.
+//
+// It exists because a free-margin figure that looks wrong on the dashboard
+// cannot be settled from the outside: the raw fields never leave the enclave,
+// and re-reading them by hand would mean handling the customer's API key. The
+// caller is the loopback-only admin endpoint; nothing here is persisted and
+// the amounts are not logged.
+func (s *SyncService) ProbeBalance(
+	ctx context.Context,
+	userUID, exchange, label string,
+) (*connector.BalanceProbe, error) {
+	if s.connSvc == nil {
+		return nil, fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build connector: %w", err)
+	}
+
+	prober, ok := conn.(connector.BalanceProber)
+	if !ok {
+		return nil, fmt.Errorf("%s: %w", exchange, ErrBalanceProbeUnsupported)
+	}
+	return prober.ProbeBalance(ctx)
+}
+
+// ErrFundingProbeUnsupported is returned when the connection's connector has
+// no FundingProber, which for most venues means there is no second wallet to
+// read rather than a missing feature.
+var ErrFundingProbeUnsupported = errors.New("connector does not implement funding probing")
+
+// ProbeFunding reports the wallet that sits outside the tracked perimeter.
+//
+// A transfer out of the trading account is booked as a withdrawal and its
+// return as a deposit, so a round trip turns whatever the holding did in
+// between into capital. Telling that apart from a real exit needs the other
+// wallet's ledger, which only this enclave can read. Nothing is persisted and
+// the rows are not logged.
+func (s *SyncService) ProbeFunding(
+	ctx context.Context,
+	userUID, exchange, label string,
+	since time.Time,
+) (*connector.FundingProbe, error) {
+	if s.connSvc == nil {
+		return nil, fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build connector: %w", err)
+	}
+
+	prober, ok := conn.(connector.FundingProber)
+	if !ok {
+		return nil, fmt.Errorf("%s: %w", exchange, ErrFundingProbeUnsupported)
+	}
+	return prober.ProbeFunding(ctx, since)
+}
+
+// DumpRawCashflows returns the broker's unfiltered balance-operation ledger for
+// a user, every operationType preserved. Diagnostic for balance jumps that the
+// deposit/withdraw filter (op 0/1) can't explain — a demo reset that surfaces
+// as a spurious return has no BALANCE_DEPOSIT entry, so this exposes whichever
+// operation (or none) actually moved the balance.
+func (s *SyncService) DumpRawCashflows(
+	ctx context.Context,
+	userUID, exchange, label string,
+	since time.Time,
+) ([]connector.RawBalanceOp, error) {
+	if s.connSvc == nil {
+		return nil, fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build connector: %w", err)
+	}
+
+	rawFetcher, ok := conn.(connector.RawCashflowFetcher)
+	if !ok {
+		return nil, fmt.Errorf("connector %s does not support raw cashflow fetching", exchange)
+	}
+
+	return rawFetcher.GetRawCashflowEntries(ctx, since)
+}
+
+// ErrRawStatementUnsupported is returned when the connection's connector has
+// no statement document to hand over.
+var ErrRawStatementUnsupported = errors.New("connector does not expose a raw statement")
+
+// DumpRawStatement returns the venue's own statement document for one
+// connection, whole. On a venue that rations statements (IBKR: roughly one
+// Flex request per token per six hours, refusals counted), taking the document
+// once is what stops every further question from costing another wait.
+func (s *SyncService) DumpRawStatement(ctx context.Context, userUID, exchange, label string) ([]byte, string, error) {
+	if s.connSvc == nil {
+		return nil, "", fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, "", fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, "", fmt.Errorf("build connector: %w", err)
+	}
+
+	provider, ok := conn.(connector.RawStatementProvider)
+	if !ok {
+		return nil, "", fmt.Errorf("%s: %w", exchange, ErrRawStatementUnsupported)
+	}
+	return provider.GetRawStatement(ctx)
+}
+
+// DumpRawStatementForPeriod is DumpRawStatement over [from, to] instead of the
+// period saved at the venue.
+func (s *SyncService) DumpRawStatementForPeriod(ctx context.Context, userUID, exchange, label string, from, to time.Time) ([]byte, string, error) {
+	if s.connSvc == nil {
+		return nil, "", fmt.Errorf("connection service not configured")
+	}
+
+	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
+	if err != nil {
+		return nil, "", fmt.Errorf("decrypt credentials: %w", err)
+	}
+
+	conn, err := s.getOrCreateConnector(strings.ToLower(exchange), userUID, label, creds)
+	if err != nil {
+		return nil, "", fmt.Errorf("build connector: %w", err)
+	}
+
+	provider, ok := conn.(connector.RawStatementPeriodProvider)
+	if !ok {
+		return nil, "", fmt.Errorf("%s: %w", exchange, ErrRawStatementUnsupported)
+	}
+	return provider.GetRawStatementForPeriod(ctx, from, to)
 }
 
 // ExchangeMetadataRefresh reports what one connection's metadata probe stored.
