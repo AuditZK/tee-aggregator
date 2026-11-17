@@ -1,0 +1,214 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/service"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+)
+
+// fakeProber stands in for the sync service, which in production needs a
+// DEK-unwrapped enclave behind it.
+type fakeProber struct {
+	probe *connector.BalanceProbe
+	err   error
+
+	gotUser, gotExchange, gotLabel string
+}
+
+func (f *fakeProber) ProbeBalance(_ context.Context, userUID, exchange, label string) (*connector.BalanceProbe, error) {
+	f.gotUser, f.gotExchange, f.gotLabel = userUID, exchange, label
+	return f.probe, f.err
+}
+
+// okxProbeFromVenue builds the probe the OKX connector would return, by
+// actually fetching the venue payload over HTTP — a portfolio-margin account's
+// shape, served by an httptest stand-in for OKX.
+func okxProbeFromVenue(t *testing.T) *connector.BalanceProbe {
+	t.Helper()
+	const body = `{"code":"0","data":[{"totalEq":"25431.17","adjEq":"24876.52","availEq":"23712.08",` +
+		`"imr":"1318.64","mmr":"436.21","upl":"-112.73","details":[` +
+		`{"ccy":"USDC","eq":"3547.29","eqUsd":"3547.29","availBal":"3547.29","availEq":"3547.29","upl":"0"}]}]}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/api/v5/account/balance")
+	if err != nil {
+		t.Fatalf("fetch venue payload: %v", err)
+	}
+	defer resp.Body.Close()
+	var venue struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&venue); err != nil {
+		t.Fatalf("decode venue payload: %v", err)
+	}
+
+	account := map[string]string{}
+	for _, k := range []string{"totalEq", "adjEq", "availEq", "imr", "mmr", "upl"} {
+		account[k] = fmt.Sprint(venue.Data[0][k])
+	}
+	return &connector.BalanceProbe{
+		Exchange:    "okx",
+		AccountMode: "acctLv 4 (portfolio margin mode)",
+		MarginBasis: "account.adjEq - account.imr",
+		Account:     account,
+		Currencies: []map[string]string{
+			{"ccy": "USDC", "availBal": "3547.29", "availEq": "3547.29", "upl": "0"},
+		},
+		Derived: &connector.Balance{
+			Available:     24876.52 - 1318.64,
+			Equity:        25431.17,
+			UnrealizedPnL: -112.73,
+			Currency:      "USDT",
+		},
+	}
+}
+
+func observedServer(prober balanceProbeRunner) (*Server, *observer.ObservedLogs) {
+	core, logs := observer.New(zap.DebugLevel)
+	return &Server{logger: zap.New(core), probeSvc: prober}, logs
+}
+
+func postProbe(s *Server, qs string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/balance-probe?"+qs, nil)
+	s.handleAdminBalanceProbe(rec, req)
+	return rec
+}
+
+// The figures are the answer and they go to the loopback caller. They must not
+// also go to a log: a log is the one artefact of this endpoint that outlives
+// the call and travels.
+func TestHandleAdminBalanceProbe_ServesTheFiguresAndLogsNone(t *testing.T) {
+	prober := &fakeProber{probe: okxProbeFromVenue(t)}
+	s, logs := observedServer(prober)
+
+	rec := postProbe(s, "user_uid=user_abc1234567890&exchange=okx&label=acct-2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if prober.gotUser != "user_abc1234567890" || prober.gotExchange != "okx" || prober.gotLabel != "acct-2" {
+		t.Fatalf("probe called with (%q, %q, %q)", prober.gotUser, prober.gotExchange, prober.gotLabel)
+	}
+
+	var got struct {
+		Success bool                    `json:"success"`
+		Probe   *connector.BalanceProbe `json:"probe"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if !got.Success || got.Probe == nil {
+		t.Fatalf("response carries no probe: %s", rec.Body.String())
+	}
+	if got.Probe.Account["adjEq"] != "24876.52" || got.Probe.Account["imr"] != "1318.64" {
+		t.Errorf("raw account fields missing from the response: %v", got.Probe.Account)
+	}
+	if got.Probe.MarginBasis != "account.adjEq - account.imr" {
+		t.Errorf("margin basis = %q", got.Probe.MarginBasis)
+	}
+	if got.Probe.Derived == nil || got.Probe.Derived.Available >= got.Probe.Derived.Equity {
+		t.Errorf("derived balance did not come through: %+v", got.Probe.Derived)
+	}
+
+	entries := logs.All()
+	if len(entries) != 1 || entries[0].Message != "balance probe served" {
+		t.Fatalf("log entries = %v, want exactly one \"balance probe served\"", entries)
+	}
+	for _, amount := range []string{"25431", "24876", "1318", "112.73", "3547", "acct-2", "user_abc1234567890"} {
+		if strings.Contains(fmt.Sprint(entries[0].ContextMap()), amount) ||
+			strings.Contains(entries[0].Message, amount) {
+			t.Errorf("log line leaks %q: %v %v", amount, entries[0].Message, entries[0].ContextMap())
+		}
+	}
+}
+
+// A venue nobody wired for probing must say so. An empty 200 would read like
+// an account holding nothing.
+func TestHandleAdminBalanceProbe_UnsupportedConnectorIs501(t *testing.T) {
+	s, _ := observedServer(&fakeProber{
+		err: fmt.Errorf("bitget: %w", service.ErrBalanceProbeUnsupported),
+	})
+
+	rec := postProbe(s, "user_uid=user_abc1234567890&exchange=bitget")
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("got %d, want 501: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleAdminBalanceProbe_FailureIsA500WithNoFiguresLogged(t *testing.T) {
+	s, logs := observedServer(&fakeProber{err: errors.New("decrypt credentials: no such connection")})
+
+	rec := postProbe(s, "user_uid=user_abc1234567890&exchange=okx")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("got %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+	if logs.FilterMessage("balance probe served").Len() != 0 {
+		t.Error("a failed probe logged itself as served")
+	}
+}
+
+// SEC-10: trust-boundary inputs are validated like every other REST entrypoint.
+func TestHandleAdminBalanceProbe_Validation(t *testing.T) {
+	s, _ := observedServer(&fakeProber{probe: okxProbeFromVenue(t)})
+
+	bad := []struct{ name, qs string }{
+		{"missing user_uid", "exchange=okx"},
+		{"bad user_uid", "user_uid=bad%20uid%21&exchange=okx"},
+		{"missing exchange", "user_uid=user_abc1234567890"},
+		{"bad exchange", "user_uid=user_abc1234567890&exchange=BAD%2FEX"},
+		{"label with delimiter", "user_uid=user_abc1234567890&exchange=okx&label=a%2Fb"},
+	}
+	for _, tc := range bad {
+		if got := postProbe(s, tc.qs).Code; got != http.StatusBadRequest {
+			t.Errorf("%s: got %d, want 400", tc.name, got)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	s.handleAdminBalanceProbe(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/balance-probe?user_uid=user_abc1234567890&exchange=okx", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET got %d, want 405", rec.Code)
+	}
+}
+
+// Without a sync service there is nothing to decrypt credentials with; say so
+// rather than answering as if the account were empty.
+func TestHandleAdminBalanceProbe_NoServiceIs503(t *testing.T) {
+	core, _ := observer.New(zap.DebugLevel)
+	s := &Server{logger: zap.New(core)}
+
+	if got := postProbe(s, "user_uid=user_abc1234567890&exchange=okx").Code; got != http.StatusServiceUnavailable {
+		t.Errorf("got %d, want 503", got)
+	}
+}
+
+// SEC-001: the probe returns a customer's balance, so it is loopback-only like
+// every other admin endpoint.
+func TestHandleAdminBalanceProbe_IsLoopbackOnly(t *testing.T) {
+	s, _ := observedServer(&fakeProber{probe: okxProbeFromVenue(t)})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/balance-probe?user_uid=user_abc1234567890&exchange=okx", nil)
+	req.RemoteAddr = "203.0.113.7:51234"
+	s.localhostOnly(s.handleAdminBalanceProbe)(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("a remote peer got %d, want 403", rec.Code)
+	}
+}

@@ -124,6 +124,14 @@ func TestStatementReport_MultiAccountRaisesAWarning(t *testing.T) {
 	if !warned {
 		t.Fatalf("warnings %v, want ibkr_multi_account_statement(x2)", i.CapabilityWarnings())
 	}
+
+	raw, _, err := i.GetRawStatement(context.Background())
+	if err != nil {
+		t.Fatalf("raw statement: %v", err)
+	}
+	if !bytes.Contains(raw, []byte("F0000001")) {
+		t.Fatalf("the raw view must keep every account")
+	}
 }
 
 // dailyBlock is one day of a "Breakout by Day" report: the previous day's NAV

@@ -15,5 +15,3 @@
 # full Dockerfile.production build.
 FROM tee-aggregator-enclave:latest
 COPY enclave_linux /app/enclave
-# admin-probe left the image; one built before that still carries the binary.
-RUN rm -f /app/admin-probe
