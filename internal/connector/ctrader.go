@@ -1812,6 +1812,28 @@ func (c *CTrader) getRawCashflows(ctx context.Context, since time.Time) ([]ctrad
 	return c.getAllCashflows(ctx, accountID, since, time.Now().UTC())
 }
 
+// GetRawCashflowEntries returns cTrader's balance-operation ledger for
+// [since, now] with every operationType included and money values decoded.
+// GetCashflows keeps only the capital operations; this exposes everything a
+// balance jump may hide behind (demo resets, charges, adjustments).
+func (c *CTrader) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error) {
+	entries, err := c.getRawCashflows(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	ops := make([]RawBalanceOp, 0, len(entries))
+	for _, dw := range entries {
+		div := ctraderMoneyDivisor(dw.MoneyDigits)
+		ops = append(ops, RawBalanceOp{
+			OperationType: dw.OperationType,
+			Delta:         float64(dw.Delta) / div,
+			BalanceAfter:  float64(dw.Balance) / div,
+			Timestamp:     time.UnixMilli(dw.Timestamp).UTC(),
+		})
+	}
+	return ops, nil
+}
+
 // ctraderDepositWithdraw is a single ProtoOADepositWithdraw entry from a
 // ProtoOACashFlowHistoryListRes payload.
 type ctraderDepositWithdraw struct {

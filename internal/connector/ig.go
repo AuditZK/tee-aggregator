@@ -877,7 +877,7 @@ func (i *IG) GetPositions(ctx context.Context) ([]*Position, error) {
 // IGRawTransaction is one unparsed line of IG's transaction ledger, with the
 // vendor's own strings and codes preserved. The parsed views drop what they
 // cannot classify, so this is the surface to read when a balance move does not
-// reconcile.
+// reconcile — the same role cTrader's raw cash-flow probe plays.
 type IGRawTransaction struct {
 	CashTransaction bool   `json:"cashTransaction"`
 	CloseLevel      string `json:"closeLevel"`
