@@ -331,6 +331,24 @@ type HistoricalSnapshotProvider interface {
 	GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*HistoricalSnapshot, error)
 }
 
+// HistoryCoverageReporter is a history provider whose reconstruction depends
+// on how much the venue agreed to serve, so a short history can be told apart
+// from a young account.
+type HistoryCoverageReporter interface {
+	HistoryCoverage() HistoryCoverage
+}
+
+// HistoryCoverage counts what the last reconstruction read. It carries no
+// amount and no instrument.
+type HistoryCoverage struct {
+	LedgerLines        int
+	OldestLine         time.Time
+	HeldPositions      int
+	Instruments        int
+	PricePoints        int
+	PriceAllowanceLeft int
+}
+
 // PeriodHistoryProvider reads the daily timeline of a chosen period: a
 // connection's year a month at a time (the statement backfill), and history
 // older than a year (the deep reconstruction). One call covers at most 365

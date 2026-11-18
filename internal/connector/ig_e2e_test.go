@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,6 +32,13 @@ type igFakeServer struct {
 	// rejectGenBelow rejects every token issued by a login older than this
 	// generation, so all concurrent holders of the old pair are refused at once.
 	rejectGenBelow int
+
+	// positionsJSON, activities and bars feed the endpoints the history
+	// reconstruction reads; positionsJSON replaces the default open position.
+	positionsJSON string
+	activities    []map[string]any
+	bars          map[string][]map[string]any
+	priceHits     atomic.Int32
 
 	logins     atomic.Int32
 	authedReqs atomic.Int32
@@ -82,6 +90,10 @@ func (f *igFakeServer) handler() http.HandlerFunc {
 			_ = json.NewEncoder(w).Encode(resp)
 
 		case "/positions":
+			if f.positionsJSON != "" {
+				fmt.Fprint(w, f.positionsJSON)
+				return
+			}
 			fmt.Fprint(w, `{"positions":[
 				{"market":{"instrumentName":"EUR/USD","instrumentType":"CURRENCIES","bid":1.1050,"offer":1.1052},
 				 "position":{"dealId":"D1","direction":"BUY","size":2,"level":1.1000,"contractSize":1}}
@@ -91,7 +103,18 @@ func (f *igFakeServer) handler() http.HandlerFunc {
 			f.pageHits.Add(1)
 			f.writeTransactionPage(w, r)
 
+		case "/history/activity":
+			_ = json.NewEncoder(w).Encode(map[string]any{"activities": f.activities, "metadata": map[string]any{"paging": map[string]any{"size": len(f.activities)}}})
+
 		default:
+			if epic, ok := strings.CutPrefix(r.URL.Path, "/prices/"); ok && f.bars != nil {
+				f.priceHits.Add(1)
+				if r.URL.Query().Get("resolution") != "DAY" {
+					f.t.Errorf("price resolution = %q, want DAY", r.URL.Query().Get("resolution"))
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"prices": f.bars[epic], "metadata": map[string]any{"allowance": map[string]any{"remainingAllowance": 9000, "totalAllowance": 10000}}})
+				return
+			}
 			f.t.Errorf("unexpected path: %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 		}
