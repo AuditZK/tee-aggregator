@@ -117,6 +117,9 @@ type IG struct {
 
 	accountMu         sync.Mutex
 	selectedAccountID string
+
+	historyMu sync.Mutex
+	coverage  HistoryCoverage
 }
 
 // NewIG creates an IG connector. Credentials map as:
@@ -885,6 +888,7 @@ type IGRawTransaction struct {
 	DateUTC         string `json:"dateUtc"`
 	InstrumentName  string `json:"instrumentName"`
 	OpenLevel       string `json:"openLevel"`
+	OpenDateUTC     string `json:"openDateUtc"`
 	ProfitAndLoss   string `json:"profitAndLoss"`
 	Reference       string `json:"reference"`
 	Size            string `json:"size"`

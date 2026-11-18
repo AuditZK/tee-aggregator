@@ -2268,6 +2268,22 @@ func (s *SyncService) syncFromHistoricalProvider(ctx context.Context, connMeta *
 		return err
 	}
 
+	if r, ok := provider.(connector.HistoryCoverageReporter); ok {
+		c := r.HistoryCoverage()
+		s.logger.Info("history reconstruction coverage",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Int("ledger_lines", c.LedgerLines),
+			zap.Time("oldest_line", c.OldestLine),
+			zap.Int("held_positions", c.HeldPositions),
+			zap.Int("instruments", c.Instruments),
+			zap.Int("price_points", c.PricePoints),
+			zap.Int("price_allowance_left", c.PriceAllowanceLeft),
+			zap.Int("days", len(historicalSnapshots)),
+		)
+	}
+
 	// In USD before the gate compares it with stored days and anything is
 	// written (fx.go).
 	historicalSnapshots, err = s.convertHistoryToUSD(ctx, connMeta, historicalSnapshots)
