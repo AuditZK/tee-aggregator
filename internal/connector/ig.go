@@ -1038,7 +1038,67 @@ func (i *IG) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, err
 			trades = append(trades, trade)
 		}
 	}
+	igSetPointValues(trades, igPointValues(txs))
 	return trades, nil
+}
+
+// igInstrumentKey groups the deals of one instrument. IG appends the rate it
+// converted a foreign-currency P&L at to the instrument name ("USD/JPY
+// converted at 0.0063..."), so every such deal would otherwise stand alone.
+func igInstrumentKey(name string) string {
+	if at := strings.Index(name, " converted at "); at >= 0 {
+		name = name[:at]
+	}
+	return strings.TrimSpace(name)
+}
+
+// igPointValues is, per instrument, what one point of one contract is worth in
+// the account's currency, read off the deals' own P&L. IG's size counts
+// contracts and its level is the instrument's price, so level × size is a
+// notional only for a contract worth 1 per point: a dollar-yen contract is
+// worth about 0.64 per point and a S$1 index contract about 0.77. The median
+// keeps a deal whose open level IG wrote on another scale from setting it.
+func igPointValues(txs []IGRawTransaction) map[string]float64 {
+	samples := map[string][]float64{}
+	for _, t := range txs {
+		if !isIGTradeLine(t) {
+			continue
+		}
+		size, err := ParseIGDecimal(t.Size)
+		if err != nil {
+			continue
+		}
+		open, oerr := ParseIGDecimal(t.OpenLevel)
+		closeLevel, cerr := ParseIGDecimal(t.CloseLevel)
+		pnl, perr := ParseIGDecimal(t.ProfitAndLoss)
+		if oerr != nil || cerr != nil || perr != nil {
+			continue
+		}
+		move := (closeLevel - open) * size
+		if math.Abs(move) <= igMinPointMove {
+			continue
+		}
+		if point := pnl / move; point > 0 && !math.IsInf(point, 0) {
+			key := igInstrumentKey(t.InstrumentName)
+			samples[key] = append(samples[key], point)
+		}
+	}
+	points := make(map[string]float64, len(samples))
+	for key, s := range samples {
+		points[key] = median(s)
+	}
+	return points
+}
+
+// igSetPointValues gives each trade its instrument's point value as the
+// contract multiplier, so its notional is in the account's currency. A trade
+// of an instrument no deal priced keeps level × size.
+func igSetPointValues(trades []*Trade, points map[string]float64) {
+	for _, t := range trades {
+		if p := points[igInstrumentKey(t.Symbol)]; p > 0 {
+			t.Multiplier = p
+		}
+	}
 }
 
 // isIGWithdrawal reports whether a WITH line is a real capital transfer out

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1106,5 +1107,49 @@ func TestIGLoginRefusalsNameTheFix(t *testing.T) {
 				t.Fatalf("refusal no longer reaches the front as invalid credentials: %v", err)
 			}
 		})
+	}
+}
+
+// A contract is worth its point value, not its level: one dollar-yen contract
+// moving 1,000 points made 637.50 here, so it is worth about 0.64 a point. The
+// third deal's open level is on another scale and must not set the value.
+func TestIGTradeNotionalUsesThePointValue(t *testing.T) {
+	ig := newIGTest(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/session":
+			igWriteSession(w)
+		case "/accounts":
+			fmt.Fprint(w, igTestAccountsJSON)
+		case "/history/transactions":
+			fmt.Fprint(w, `{"transactions":[
+				{"transactionType":"DEAL","profitAndLoss":"$200.00","size":"+5","openLevel":"60000","closeLevel":"60040","currency":"$","dateUtc":"2026-07-02T01:00:00","reference":"D1","instrumentName":"Synthetic Index ($1)"},
+				{"transactionType":"DEAL","profitAndLoss":"$637.50","size":"-1","openLevel":"158000","closeLevel":"157000","currency":"$","dateUtc":"2026-07-02T02:00:00","reference":"D2","instrumentName":"USD/JPY converted at 0.006375"},
+				{"transactionType":"DEAL","profitAndLoss":"$-318.75","size":"+1","openLevel":"158500","closeLevel":"158000","currency":"$","dateUtc":"2026-07-02T03:00:00","reference":"D3","instrumentName":"USD/JPY converted at 0.006380"},
+				{"transactionType":"DEAL","profitAndLoss":"$300.00","size":"+1","openLevel":"155.1","closeLevel":"157300","currency":"$","dateUtc":"2026-07-02T04:00:00","reference":"D4","instrumentName":"USD/JPY converted at 0.006390"},
+				{"transactionType":"DEAL","profitAndLoss":"$0.00","size":"+2","openLevel":"100","closeLevel":"100","currency":"$","dateUtc":"2026-07-02T05:00:00","reference":"D5","instrumentName":"Unpriced Market"}
+			],"metaData":{"pageData":{"totalPages":1}}}`)
+		}
+	})
+
+	trades, err := ig.GetTrades(context.Background(),
+		time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 3, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	want := map[string]float64{
+		"D1": 5 * 60040 * 1.0,
+		"D2": 1 * 157000 * 0.6375,
+		"D3": 1 * 158000 * 0.6375,
+		"D4": 1 * 157300 * 0.6375,
+		"D5": 2 * 100,
+	}
+	if len(trades) != len(want) {
+		t.Fatalf("got %d trades, want %d", len(trades), len(want))
+	}
+	for _, tr := range trades {
+		if got := tr.Notional(); math.Abs(got-want[tr.ID]) > 0.01 {
+			t.Errorf("%s notional = %.2f, want %.2f", tr.ID, got, want[tr.ID])
+		}
 	}
 }
