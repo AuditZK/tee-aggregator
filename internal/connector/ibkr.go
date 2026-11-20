@@ -171,6 +171,10 @@ func FlexRetryAt(err error) (time.Time, bool) {
 // is retried the same way.
 var ErrStatementNotPublished = fmt.Errorf("%w: flex statement not published yet", ErrTransient)
 
+// ErrStatementStillGenerating marks a statement IBKR accepted and had not
+// produced when the poll gave up. A shorter period generates faster.
+var ErrStatementStillGenerating = fmt.Errorf("%w: flex statement still generating", ErrTransient)
+
 // ErrStatementUnavailable is IBKR's 1003, "Statement is not available": no
 // statement exists for the period asked, either not yet or not at all.
 var ErrStatementUnavailable = errors.New("flex statement not available")
@@ -698,7 +702,7 @@ func (i *IBKR) pollFlexReport(ctx context.Context, u string) ([]byte, error) {
 
 	// IBKR answered "in progress" every time: the same condition as 1019,
 	// transient by its own account.
-	return nil, fmt.Errorf("%w: flex statement still generating after %d polls", ErrTransient, len(delays))
+	return nil, fmt.Errorf("%w after %d polls", ErrStatementStillGenerating, len(delays))
 }
 
 // preview returns the first n chars of s with an ellipsis when truncated.

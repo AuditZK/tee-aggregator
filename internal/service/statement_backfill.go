@@ -26,6 +26,11 @@ const statementBackfillPeriodDays = 31
 // about fifty.
 const statementBackfillMaxReads = 80
 
+// statementBackfillMinDays is the shortest period a month is split down to
+// when IBKR is still generating its statement at the end of the poll: about
+// the week IBKR itself cuts a statement to under load.
+const statementBackfillMinDays = 8
+
 // statementBackfillTimeout bounds one backfill's year: up to
 // statementBackfillMaxReads statements and the spacing between them.
 const statementBackfillTimeout = 2 * time.Hour
@@ -266,24 +271,51 @@ type statementReader struct {
 }
 
 // month reads one month, following a statement IBKR cut short with one for the
-// rest of the month. Nothing back means the month has no statement.
+// rest of the month. A statement IBKR is still generating when the poll gives
+// up is asked again for half its period, down to statementBackfillMinDays: a
+// month heavy enough to outlast the poll did so on every attempt, and failed
+// the whole backfill each time. Nothing back means the month has no statement.
 func (r *statementReader) month(ctx context.Context, m dayWindow) ([][]*connector.HistoricalSnapshot, error) {
 	var out [][]*connector.HistoricalSnapshot
+	span := statementBackfillPeriodDays
 	for cursor := m.from; !cursor.After(m.to); {
-		days, err := r.read(ctx, dayWindow{from: cursor, to: m.to})
+		end := cursor.AddDate(0, 0, span-1)
+		if end.After(m.to) {
+			end = m.to
+		}
+		days, err := r.read(ctx, dayWindow{from: cursor, to: end})
+		if asked := daysInWindow(cursor, end); errors.Is(err, connector.ErrStatementStillGenerating) && asked > statementBackfillMinDays {
+			span = max((asked+1)/2, statementBackfillMinDays)
+			r.s.logger.Info("statement slow to generate, month read in shorter periods",
+				zap.Time("period_from", cursor),
+				zap.Time("period_to", end),
+				zap.Int("next_period_days", span),
+			)
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
 		if len(days) == 0 {
 			if len(out) > 0 && !holidayTail(cursor, m.to) {
-				return nil, fmt.Errorf("statement %s..%s has no day, after the first days of its month", cursor.Format(time.DateOnly), m.to.Format(time.DateOnly))
+				return nil, fmt.Errorf("statement %s..%s has no day, after the first days of its month", cursor.Format(time.DateOnly), end.Format(time.DateOnly))
+			}
+			// A shortened period before the account's first day says nothing
+			// of the rest of its month.
+			if len(out) == 0 && end.Before(m.to) {
+				cursor = end.AddDate(0, 0, 1)
+				continue
 			}
 			return out, nil
 		}
 		out = append(out, days)
-		cursor = nextBackfillCursor(days, m.to)
+		cursor = nextBackfillCursor(days, end)
 	}
 	return out, nil
+}
+
+func daysInWindow(from, to time.Time) int {
+	return int(to.Sub(from).Hours()/24) + 1
 }
 
 func (r *statementReader) read(ctx context.Context, p dayWindow) ([]*connector.HistoricalSnapshot, error) {
