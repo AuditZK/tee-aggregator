@@ -526,3 +526,38 @@ func TestDBPersistOAuthTokensRoundTrip(t *testing.T) {
 		t.Errorf("tokens = %q/%q, want the persisted pair", creds.APIKey, creds.APISecret)
 	}
 }
+
+// The pass after a connect reads from the moment the connect read began, so
+// the trades made that morning are not counted on both days. IG dates every
+// ledger line to the second, which is what makes resuming mid-day safe.
+func TestDBActivityWindowResumesAfterTheConnectRead(t *testing.T) {
+	for _, exchange := range []string{"bybit", "ig"} {
+		t.Run(exchange, func(t *testing.T) {
+			h := newDBHarness(t)
+			h.seedConnection(t, exchange, "main", dbKey, dbSecret)
+			connMeta, err := h.conns.GetByUserExchangeLabel(h.ctx, dbUser, exchange, "main")
+			if err != nil {
+				t.Fatalf("read connection: %v", err)
+			}
+			today := startOfTodayUTC()
+			yesterday := today.Add(-24 * time.Hour)
+			connected := yesterday.Add(10*time.Hour + 40*time.Minute)
+			if err := h.snaps.Upsert(h.ctx, &repository.Snapshot{
+				UserUID: dbUser, Exchange: exchange, Label: "main", Timestamp: yesterday,
+				TotalEquity: 5000, RealizedBalance: 5000, Deposits: 5000,
+			}); err != nil {
+				t.Fatalf("seed connect-day row: %v", err)
+			}
+			if err := h.statuses.Upsert(h.ctx, &repository.SyncStatus{
+				UserUID: dbUser, Exchange: exchange, Label: "main",
+				LastSyncTime: &connected, Status: "completed",
+			}); err != nil {
+				t.Fatalf("seed connect-day status: %v", err)
+			}
+
+			if got := h.sync.activityWindowStart(h.ctx, connMeta, today); !got.Equal(connected) {
+				t.Errorf("window starts %s, want the connect read at %s", got.Format(time.RFC3339), connected.Format(time.RFC3339))
+			}
+		})
+	}
+}
