@@ -34,6 +34,9 @@ func TestPollFlexReport_StatementStillGeneratingIsTransient(t *testing.T) {
 	if !errors.Is(err, ErrTransient) {
 		t.Fatalf("still generating is IBKR's own retry-later, it must be transient: %v", err)
 	}
+	if !errors.Is(err, ErrStatementStillGenerating) {
+		t.Fatalf("the backfill halves the period on this error, it must be told apart: %v", err)
+	}
 	if got := stub.polls.Load(); got != 3 {
 		t.Fatalf("polled %d times, want one per delay (3)", got)
 	}

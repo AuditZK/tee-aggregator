@@ -1,8 +1,14 @@
 package service
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/trackrecord/enclave/internal/connector"
 )
@@ -70,5 +76,147 @@ func TestNextBackfillCursor(t *testing.T) {
 		if got := nextBackfillCursor(tc.days, isoDay(tc.end)); !got.Equal(isoDay(tc.want)) {
 			t.Fatalf("%s: next %s, want %s", tc.name, got.Format(time.DateOnly), tc.want)
 		}
+	}
+}
+
+// slowStatements serves business days from first on, and is still generating
+// any period longer than slowOver days when the poll gives up. A period
+// without a day is answered 1003.
+type slowStatements struct {
+	first    time.Time
+	missing  dayWindow
+	slowOver int
+	asked    []dayWindow
+}
+
+func (p *slowStatements) GetHistoricalSnapshotsForPeriod(_ context.Context, from, to time.Time) ([]*connector.HistoricalSnapshot, error) {
+	p.asked = append(p.asked, dayWindow{from: from, to: to})
+	if daysInWindow(from, to) > p.slowOver {
+		return nil, fmt.Errorf("%w after 20 polls", connector.ErrStatementStillGenerating)
+	}
+	var out []*connector.HistoricalSnapshot
+	for d := from; !d.After(to); d = d.AddDate(0, 0, 1) {
+		weekend := d.Weekday() == time.Saturday || d.Weekday() == time.Sunday
+		missing := p.missing.isSet() && !d.Before(p.missing.from) && !d.After(p.missing.to)
+		if weekend || missing || d.Before(p.first) {
+			continue
+		}
+		out = append(out, &connector.HistoricalSnapshot{Date: d})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: synthetic", connector.ErrStatementUnavailable)
+	}
+	return out, nil
+}
+
+func readMonth(t *testing.T, p *slowStatements, m dayWindow) ([]time.Time, error) {
+	t.Helper()
+	saved := statementBackfillSpacing
+	statementBackfillSpacing = 0
+	t.Cleanup(func() { statementBackfillSpacing = saved })
+
+	r := &statementReader{s: &SyncService{logger: zap.NewNop()}, provider: p, maxReads: statementBackfillMaxReads}
+	periods, err := r.month(context.Background(), m)
+	var days []time.Time
+	for _, period := range periods {
+		for _, d := range period {
+			days = append(days, d.Date)
+		}
+	}
+	return days, err
+}
+
+func businessDays(from, to time.Time) int {
+	n := 0
+	for d := from; !d.After(to); d = d.AddDate(0, 0, 1) {
+		if d.Weekday() != time.Saturday && d.Weekday() != time.Sunday {
+			n++
+		}
+	}
+	return n
+}
+
+// A month IBKR is still generating when the poll gives up failed the backfill
+// on every attempt. It is asked again in halves, and every day is read once.
+func TestStatementMonthSlowToGenerateIsReadInShorterPeriods(t *testing.T) {
+	m := dayWindow{from: isoDay("2026-03-01"), to: isoDay("2026-03-31")}
+	p := &slowStatements{first: isoDay("2026-01-01"), slowOver: 16}
+
+	days, err := readMonth(t, p, m)
+	if err != nil {
+		t.Fatalf("slow month: %v", err)
+	}
+	if want := businessDays(m.from, m.to); len(days) != want {
+		t.Fatalf("%d days read, want the month's %d", len(days), want)
+	}
+	seen := map[time.Time]bool{}
+	for _, d := range days {
+		if seen[d] {
+			t.Fatalf("%s read twice", d.Format(time.DateOnly))
+		}
+		seen[d] = true
+	}
+	want := []dayWindow{
+		{from: isoDay("2026-03-01"), to: isoDay("2026-03-31")},
+		{from: isoDay("2026-03-01"), to: isoDay("2026-03-16")},
+		{from: isoDay("2026-03-17"), to: isoDay("2026-03-31")},
+	}
+	if len(p.asked) != len(want) {
+		t.Fatalf("%d statements asked, want %d: %v", len(p.asked), len(want), p.asked)
+	}
+	for n, w := range want {
+		if !p.asked[n].from.Equal(w.from) || !p.asked[n].to.Equal(w.to) {
+			t.Fatalf("statement %d is %s..%s, want %s..%s", n, p.asked[n].from.Format(time.DateOnly), p.asked[n].to.Format(time.DateOnly), w.from.Format(time.DateOnly), w.to.Format(time.DateOnly))
+		}
+	}
+}
+
+// Each period still generating is a failure on the token's daily budget: the
+// halving stops at statementBackfillMinDays and the month fails.
+func TestStatementMonthStopsHalvingAtTheShortestPeriod(t *testing.T) {
+	m := dayWindow{from: isoDay("2026-03-01"), to: isoDay("2026-03-31")}
+	p := &slowStatements{first: isoDay("2026-01-01"), slowOver: 0}
+
+	_, err := readMonth(t, p, m)
+	if !errors.Is(err, connector.ErrStatementStillGenerating) {
+		t.Fatalf("month never generated: %v, want the still-generating failure", err)
+	}
+	if len(p.asked) != 3 {
+		t.Fatalf("%d statements asked, want 31, 16 then 8 days: %v", len(p.asked), p.asked)
+	}
+	if last := p.asked[len(p.asked)-1]; daysInWindow(last.from, last.to) != statementBackfillMinDays {
+		t.Fatalf("last period is %d days, want %d", daysInWindow(last.from, last.to), statementBackfillMinDays)
+	}
+}
+
+// Halved, the older half of the account's first month has no statement. That
+// is not the month having none: the days after it are read.
+func TestStatementMonthHalvedKeepsReadingPastTheAccountStart(t *testing.T) {
+	m := dayWindow{from: isoDay("2026-03-01"), to: isoDay("2026-03-31")}
+	first := isoDay("2026-03-20")
+	p := &slowStatements{first: first, slowOver: 16}
+
+	days, err := readMonth(t, p, m)
+	if err != nil {
+		t.Fatalf("first month: %v", err)
+	}
+	if want := businessDays(first, m.to); len(days) != want {
+		t.Fatalf("%d days read, want the %d from the account's first", len(days), want)
+	}
+}
+
+// A shortened period without a day, after days of its month were read, is a
+// hole IBKR left: the month fails rather than be written around it.
+func TestStatementMonthHalvedFailsOnAHole(t *testing.T) {
+	m := dayWindow{from: isoDay("2026-03-01"), to: isoDay("2026-03-31")}
+	p := &slowStatements{
+		first:    isoDay("2026-01-01"),
+		slowOver: 8,
+		missing:  dayWindow{from: isoDay("2026-03-09"), to: isoDay("2026-03-16")},
+	}
+
+	_, err := readMonth(t, p, m)
+	if err == nil || !strings.Contains(err.Error(), "has no day") {
+		t.Fatalf("hole in a halved month: %v, want a failure naming the empty period", err)
 	}
 }
