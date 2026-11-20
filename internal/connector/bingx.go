@@ -420,3 +420,7 @@ func (b *BingX) fetchPriceMap(ctx context.Context) (map[string]float64, error) {
 	}
 	return prices, nil
 }
+
+// bingxVSTAPI serves the demo perpetual account (VST), reachable with the same
+// key as the live account.
+const bingxVSTAPI = "https://open-api-vst.bingx.com"

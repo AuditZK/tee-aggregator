@@ -63,48 +63,6 @@ type CashflowFetcher interface {
 	GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error)
 }
 
-// RawBalanceOp is a single broker balance-operation ledger entry with its raw
-// operation type preserved — including the ones GetCashflows drops (swap,
-// commission, and any untyped adjustment/reset). Diagnostic surface for
-// classifying balance jumps a deposit/withdraw filter can't explain.
-type RawBalanceOp struct {
-	OperationType int       `json:"operationType"`
-	Delta         float64   `json:"delta"`        // signed change to the balance
-	BalanceAfter  float64   `json:"balanceAfter"` // account balance after the operation; 0 on venues whose ledger carries no running balance
-	Timestamp     time.Time `json:"timestamp"`
-	// Label carries the venue's own type name where it is not numeric, so a
-	// ledger entry can be read without a code table.
-	Label    string `json:"label,omitempty"`
-	Currency string `json:"currency,omitempty"`
-	Symbol   string `json:"symbol,omitempty"`
-	// PositionValue is the market value an entry moves without moving cash.
-	// A position transfer is invisible in Delta by construction, and that is
-	// exactly the entry worth seeing.
-	PositionValue float64 `json:"positionValue,omitempty"`
-}
-
-// RawCashflowFetcher optionally exposes the unfiltered balance-operation ledger.
-type RawCashflowFetcher interface {
-	GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error)
-}
-
-// RawStatementProvider optionally exposes the venue's own statement document,
-// whole and unparsed. It exists for venues that ration statements: IBKR allows
-// roughly one Flex request per token per six hours and counts refusals, so a
-// question the parsed views cannot answer costs another six-hour wait. Taking
-// the document once makes every later question free. Secrets are scrubbed by
-// the implementation; the caller still holds live account data and must keep
-// it inside the enclave.
-type RawStatementProvider interface {
-	GetRawStatement(ctx context.Context) (document []byte, contentType string, err error)
-}
-
-// RawStatementPeriodProvider is RawStatementProvider for a chosen period
-// rather than the one saved at the venue.
-type RawStatementPeriodProvider interface {
-	GetRawStatementForPeriod(ctx context.Context, from, to time.Time) (document []byte, contentType string, err error)
-}
-
 // MarketBalance holds equity data for a specific market type.
 type MarketBalance struct {
 	MarketType      string  `json:"market_type"`
@@ -116,55 +74,6 @@ type MarketBalance struct {
 // Connectors that support market-specific balance queries implement this.
 type BalanceByMarketFetcher interface {
 	GetBalanceByMarket(ctx context.Context) ([]*MarketBalance, error)
-}
-
-// BalanceProbe is one venue balance payload shown as it arrived, next to the
-// Balance the connector derived from it. It exists so a free-margin figure can
-// be checked against a real account without anybody reading the account's
-// credentials or its trades: every amount is a verbatim string from the venue,
-// the derived side says which field pair produced it, and nothing here is
-// persisted or logged. Served only to a loopback caller
-// (POST /api/v1/admin/balance-probe).
-type BalanceProbe struct {
-	Exchange string `json:"exchange"`
-
-	// AccountMode is the venue's own name for the account's margin mode, when
-	// the connector could read it; empty when it could not.
-	AccountMode string `json:"account_mode,omitempty"`
-
-	// MarginBasis names the fields Available was computed from, in the venue's
-	// own field names — e.g. "account.adjEq - account.imr". This is the answer
-	// the probe exists to give: which reading of the payload is in force.
-	MarginBasis string `json:"margin_basis"`
-
-	// Account holds the account-level fields verbatim, Currencies the
-	// per-currency lines. Strings, not floats: an inapplicable field is "" at
-	// the venue and must not arrive here as a zero.
-	Account    map[string]string   `json:"account"`
-	Currencies []map[string]string `json:"currencies"`
-
-	// Derived is what GetBalance returns from this very payload.
-	Derived *Balance `json:"derived"`
-
-	// Notes carry anything degraded about the probe itself (a mode lookup that
-	// failed, say) rather than about the account.
-	Notes []string `json:"notes,omitempty"`
-}
-
-// BalanceProber is implemented by connectors that can show their work: the
-// venue's raw balance payload alongside the Balance they computed from it.
-// A connector that does not implement it answers the admin probe with 501
-// rather than a wrong-looking empty result.
-type BalanceProber interface {
-	ProbeBalance(ctx context.Context) (*BalanceProbe, error)
-}
-
-// FundingProber is implemented by connectors whose venue keeps a second wallet
-// outside the tracked perimeter. It reports that wallet's balances and ledger
-// verbatim, so a transfer that left the perimeter can be told apart from money
-// that left the venue.
-type FundingProber interface {
-	ProbeFunding(ctx context.Context, since time.Time) (*FundingProbe, error)
 }
 
 // BalanceFreshnessProvider is implemented by statement-based connectors (IBKR

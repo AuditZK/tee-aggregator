@@ -15,3 +15,5 @@
 # full Dockerfile.production build.
 FROM tee-aggregator-enclave:latest
 COPY enclave_linux /app/enclave
+# An image built before this one still carries the binary removed below.
+RUN rm -f /app/admin-probe

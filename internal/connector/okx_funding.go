@@ -20,58 +20,11 @@ import (
 // The perimeter rule here must stay identical to the history rebuilder's. The
 // two instruments meet on every reconstructed day, and the gate that compares
 // them reads a disagreement as a corrupted rebuild rather than as two rules.
-//
-// ProbeFunding is the diagnostic half: it reports the ledger verbatim, which is
-// how the type codes below were established in the first place.
 
 const (
 	okxAssetBillsPageLimit = 100
 	okxAssetBillsMaxPages  = 40
 )
-
-// FundingProbe is the funding account as OKX describes it. Values stay the
-// strings the venue sent — an inapplicable field is "" there and must not
-// arrive here as a zero.
-type FundingProbe struct {
-	Balances []map[string]string `json:"balances"`
-	Bills    []map[string]string `json:"bills"`
-
-	// Notes carry what the probe could not read, so an empty ledger is never
-	// mistaken for an idle account.
-	Notes []string `json:"notes,omitempty"`
-}
-
-func (o *OKX) ProbeFunding(ctx context.Context, since time.Time) (*FundingProbe, error) {
-	probe := &FundingProbe{Balances: []map[string]string{}, Bills: []map[string]string{}}
-
-	balances, err := o.fetchAssetRows(ctx, "/api/v5/asset/balances")
-	if err != nil {
-		probe.Notes = append(probe.Notes, "funding balances unavailable: "+vendorErrorDetail(err.Error()))
-	} else {
-		probe.Balances = balances
-	}
-
-	// asset/bills serves a short recent window and asset/bills-history the
-	// older one; a key without the funding permission fails both, which is an
-	// answer worth reporting rather than an error to abort on.
-	seen := map[string]bool{}
-	var read int
-	for _, endpoint := range []string{"/api/v5/asset/bills", "/api/v5/asset/bills-history"} {
-		rows, err := o.fetchAssetBills(ctx, endpoint, since, time.Now().UTC(), seen)
-		if err != nil {
-			probe.Notes = append(probe.Notes, endpoint+" unavailable: "+vendorErrorDetail(err.Error()))
-			continue
-		}
-		read++
-		probe.Bills = append(probe.Bills, rows...)
-	}
-	if read == 0 && len(probe.Balances) == 0 {
-		return nil, fmt.Errorf("okx: funding account unreadable with this key")
-	}
-
-	sort.SliceStable(probe.Bills, func(i, j int) bool { return probe.Bills[i]["ts"] < probe.Bills[j]["ts"] })
-	return probe, nil
-}
 
 func (o *OKX) fetchAssetBills(ctx context.Context, endpoint string, since, now time.Time, seen map[string]bool) ([]map[string]string, error) {
 	var out []map[string]string
@@ -115,9 +68,8 @@ func (o *OKX) fetchAssetBills(ctx context.Context, endpoint string, since, now t
 	return out, nil
 }
 
-// fetchAssetRows decodes into string maps so a field this code has never heard
-// of still reaches the operator — the point of the probe is the fields we do
-// not yet know the meaning of.
+// fetchAssetRows decodes into string maps: OKX adds fields without notice and
+// a typed decode would drop them.
 func (o *OKX) fetchAssetRows(ctx context.Context, path string) ([]map[string]string, error) {
 	body, err := o.doRequest(ctx, "GET", path)
 	if err != nil {
