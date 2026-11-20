@@ -153,6 +153,13 @@ func igLedgerLines(txs []IGRawTransaction) ([]igLedgerLine, error) {
 		lines = append(lines, l)
 	}
 	sort.SliceStable(lines, func(a, b int) bool { return lines[a].at.Before(lines[b].at) })
+	trades := make([]*Trade, 0, len(lines))
+	for _, l := range lines {
+		if l.trade != nil {
+			trades = append(trades, l.trade)
+		}
+	}
+	igSetPointValues(trades, igPointValues(txs))
 	return lines, nil
 }
 

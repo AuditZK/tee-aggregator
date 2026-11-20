@@ -141,6 +141,7 @@ var instantLedgerExchanges = map[string]bool{
 	"bitget":      true,
 	"bybit":       true,
 	"hyperliquid": true,
+	"ig":          true,
 	"okx":         true,
 }
 
