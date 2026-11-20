@@ -198,6 +198,7 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	b.noteWallet(binanceWalletSpot, nil) // reached: getSpotBalance failing is fatal above
 
 	var futures *Balance
+	portfolioMargin := false
 	b.capabilityWarnings = nil
 	if fut, ferr := b.getFuturesBalance(ctx, priceMap); ferr == nil && fut != nil {
 		total.Equity += fut.Equity
@@ -206,7 +207,21 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 		b.noteWallet(binanceWalletUM, nil)
 	} else if errors.Is(ferr, ErrTransient) {
 		return nil, fmt.Errorf("futures balance: %w", ferr)
-	} else if ferr != nil && (strings.Contains(ferr.Error(), "-2015") || strings.Contains(ferr.Error(), "Invalid API-key")) {
+	} else if pm, perr := b.portfolioMarginAfterRefusal(ctx, ferr, priceMap); errors.Is(perr, ErrTransient) {
+		// A Portfolio Margin account read without papi one day would drop its
+		// futures from that day's equity.
+		return nil, fmt.Errorf("portfolio margin balance: %w", perr)
+	} else if pm != nil {
+		total.Equity += pm.Equity
+		total.UnrealizedPnL += pm.UnrealizedPnL
+		futures = pm
+		portfolioMargin = true
+		// The three wallets are one pool, read once: counting the sapi cross
+		// margin read on top would book the same collateral twice.
+		b.noteWallet(binanceWalletUM, nil)
+		b.noteWallet(binanceWalletCoinM, nil)
+		b.noteWallet(binanceWalletCross, nil)
+	} else if isBinancePermissionRefusal(ferr) {
 		// Permission-style refusal on the futures scope while the spot read
 		// above succeeded with the same key: the UM wallet may hold value
 		// (or debt) we cannot see. Not fatal — the sync proceeds on what the
@@ -219,31 +234,33 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 		b.noteWallet(binanceWalletUM, ferr)
 	}
 
-	if eq, cerr := b.getCoinMFuturesEquity(ctx, priceMap); cerr == nil {
-		total.Equity += eq
-		nonUM += eq
-		b.noteWallet(binanceWalletCoinM, nil)
-	} else if errors.Is(cerr, ErrTransient) {
-		return nil, fmt.Errorf("coin-m balance: %w", cerr)
-	} else {
-		// Was dropped in silence: a permission-style refusal here removed the
-		// wallet from the equity with no warning and no trace, and a
-		// margin-heavy account can hold most of its capital in one of these.
-		b.capabilityWarnings = append(b.capabilityWarnings, "coinm_unreadable")
-		b.noteWallet(binanceWalletCoinM, cerr)
-	}
-	if eq, merr := b.getCrossMarginEquity(ctx, priceMap); merr == nil {
-		total.Equity += eq
-		nonUM += eq
-		b.noteWallet(binanceWalletCross, nil)
-	} else if errors.Is(merr, ErrTransient) {
-		return nil, fmt.Errorf("cross margin balance: %w", merr)
-	} else {
-		// Was dropped in silence: a permission-style refusal here removed the
-		// wallet from the equity with no warning and no trace, and a
-		// margin-heavy account can hold most of its capital in one of these.
-		b.capabilityWarnings = append(b.capabilityWarnings, "cross_margin_unreadable")
-		b.noteWallet(binanceWalletCross, merr)
+	if !portfolioMargin {
+		if eq, cerr := b.getCoinMFuturesEquity(ctx, priceMap); cerr == nil {
+			total.Equity += eq
+			nonUM += eq
+			b.noteWallet(binanceWalletCoinM, nil)
+		} else if errors.Is(cerr, ErrTransient) {
+			return nil, fmt.Errorf("coin-m balance: %w", cerr)
+		} else {
+			// Was dropped in silence: a permission-style refusal here removed the
+			// wallet from the equity with no warning and no trace, and a
+			// margin-heavy account can hold most of its capital in one of these.
+			b.capabilityWarnings = append(b.capabilityWarnings, "coinm_unreadable")
+			b.noteWallet(binanceWalletCoinM, cerr)
+		}
+		if eq, merr := b.getCrossMarginEquity(ctx, priceMap); merr == nil {
+			total.Equity += eq
+			nonUM += eq
+			b.noteWallet(binanceWalletCross, nil)
+		} else if errors.Is(merr, ErrTransient) {
+			return nil, fmt.Errorf("cross margin balance: %w", merr)
+		} else {
+			// Was dropped in silence: a permission-style refusal here removed the
+			// wallet from the equity with no warning and no trace, and a
+			// margin-heavy account can hold most of its capital in one of these.
+			b.capabilityWarnings = append(b.capabilityWarnings, "cross_margin_unreadable")
+			b.noteWallet(binanceWalletCross, merr)
+		}
 	}
 	if eq, ierr := b.getIsolatedMarginEquity(ctx, priceMap); ierr == nil {
 		total.Equity += eq
@@ -655,6 +672,11 @@ func (b *Binance) getFuturesBalanceFromBalanceEndpoint(ctx context.Context) (*Ba
 func (b *Binance) GetPositions(ctx context.Context) ([]*Position, error) {
 	params := url.Values{}
 	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v2/positionRisk", params, true)
+	if isBinancePermissionRefusal(err) {
+		if pmBody, pmErr := b.doRequest(ctx, "GET", binancePortfolioMarginAPI, "/papi/v1/um/positionRisk", url.Values{}, true); pmErr == nil {
+			body, err = pmBody, nil
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
