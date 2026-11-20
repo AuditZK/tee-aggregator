@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -596,9 +595,9 @@ func (b *Binance) getFuturesBalance(ctx context.Context, priceMap map[string]flo
 	available, _ := strconv.ParseFloat(resp.AvailableBalance, 64)
 
 	// In single-asset mode the totals count USDT alone: a USDC or BNFCR margin
-	// wallet would read as its USDT leftover. Measured before shipping with the
-	// balance probe across every connected Binance account: none held
-	// collateral outside its totals, so no live equity jumps on the change.
+	// wallet would read as its USDT leftover. Measured before shipping across
+	// every connected Binance account: none held collateral outside its
+	// totals, so no live equity jumps on the change.
 	if binanceTotalsCoverUSDTOnly(resp.TotalWalletBalance, resp.Assets) {
 		for _, a := range resp.Assets {
 			if strings.EqualFold(a.Asset, "USDT") {
@@ -1024,24 +1023,6 @@ func (b *Binance) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflo
 		return nil, err
 	}
 	return flows, nil
-}
-
-// GetRawCashflowEntries returns the flows GetCashflows books, each labelled
-// with the ledger it came from and the asset it moved. A flow the equity never
-// showed can then be traced to its source instead of deduced from amounts.
-func (b *Binance) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error) {
-	var ops []RawBalanceOp
-	var coin string
-	err := b.collectCashflows(ctx, since, func(source string) func(time.Time, float64) {
-		return func(t time.Time, usd float64) {
-			ops = append(ops, RawBalanceOp{Label: source, Delta: usd, Currency: coin, Timestamp: t})
-		}
-	}, func(c string) { coin = strings.ToUpper(c) })
-	if err != nil {
-		return nil, err
-	}
-	sort.Slice(ops, func(i, j int) bool { return ops[i].Timestamp.Before(ops[j].Timestamp) })
-	return ops, nil
 }
 
 // collectCashflows reads every ledger that books a Binance cashflow and hands
