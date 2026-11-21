@@ -1,0 +1,1322 @@
+package server
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/trackrecord/enclave/internal/auth"
+	"github.com/trackrecord/enclave/internal/config"
+	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/rebuilderclient"
+	"github.com/trackrecord/enclave/internal/repository"
+	"github.com/trackrecord/enclave/internal/service"
+	"github.com/trackrecord/enclave/internal/validation"
+	"go.uber.org/zap"
+)
+
+// SyncSchedulerRunner can trigger a sync immediately.
+type SyncSchedulerRunner interface {
+	RunNow()
+}
+
+type Server struct {
+	cfg       *config.Config
+	logger    *zap.Logger
+	handler   *Handler
+	http      *http.Server
+	pool      *pgxpool.Pool
+	scheduler SyncSchedulerRunner
+
+	// jwtSecret gates the REST surface when non-nil (SEC-002). Same secret as
+	// the gRPC interceptor — typically ENCLAVE_JWT_SECRET. When nil the
+	// middleware logs a dev-mode warning and passes requests through.
+	jwtSecret []byte
+
+	// jwtExpectedIssuer pins the `iss` claim on inbound JWTs when non-empty
+	// (AUTH-002 follow-up). Mirrors the gRPC interceptor.
+	jwtExpectedIssuer string
+
+	// probeSvc overrides the balance prober used by the admin probe endpoint.
+	// Nil in production, where the endpoint goes through the sync service that
+	// already holds the DEK; set by tests, which have no enclave to unwrap.
+	probeSvc balanceProbeRunner
+
+	// reflowSvc overrides the reflower behind the admin reflow endpoint, for
+	// the same reason as probeSvc.
+	reflowSvc cashflowReflower
+	// recountSvc does the same for the admin recount-activity endpoint.
+	recountSvc activityRecounter
+
+	// handoffHandler, when non-nil, exposes the B2 handoff endpoint
+	// at POST /api/v1/admin/handoff. Successor enclaves use this to
+	// fetch the master key from this instance during an upgrade window.
+	// Wired by main.go via SetHandoffHandler — the handler itself does
+	// the cryptographic gate (attestation + signed allowlist + ECIES).
+	handoffHandler http.Handler
+}
+
+// SetScheduler attaches the scheduler for admin sync trigger.
+func (s *Server) SetScheduler(sched SyncSchedulerRunner) {
+	s.scheduler = sched
+}
+
+// SetJWTSecret wires the HS256 secret used to verify Authorization: Bearer
+// tokens on sensitive REST endpoints. Call before Start().
+func (s *Server) SetJWTSecret(secret []byte) {
+	s.jwtSecret = secret
+}
+
+// SetJWTExpectedIssuer pins the `iss` claim required on inbound JWTs.
+// Empty disables the check (legacy behaviour). Call before Start().
+func (s *Server) SetJWTExpectedIssuer(iss string) {
+	s.jwtExpectedIssuer = iss
+}
+
+// SetHandoffHandler wires the B2 handoff endpoint. When non-nil, a
+// POST to /api/v1/admin/handoff is delegated to this handler. The
+// handler MUST do its own cryptographic gating — see
+// internal/bootstrap.HandoffServer for the production implementation.
+// Call before Start().
+func (s *Server) SetHandoffHandler(h http.Handler) {
+	s.handoffHandler = h
+}
+
+// New creates a REST Server shell. The caller MUST wire the request handler
+// via SetHandler before Start — New deliberately builds none. This keeps the
+// handler's services bound to the same DEK-unwrapped encryption service as the
+// rest of the enclave (see cmd/enclave/main.go) instead of re-deriving one from
+// cfg.EncryptionKey, which in production is not the DEK. Start fails closed if
+// SetHandler was not called.
+func New(cfg *config.Config, logger *zap.Logger, pool *pgxpool.Pool) *Server {
+	return &Server{
+		cfg:    cfg,
+		logger: logger,
+		pool:   pool,
+	}
+}
+
+// SetHandler replaces the handler (used when creating with NewHandlerWithOptions).
+func (s *Server) SetHandler(h *Handler) {
+	s.handler = h
+}
+
+func (s *Server) Start(ctx context.Context) error {
+	mux := http.NewServeMux()
+
+	// Credential rate limiter: 5 requests per 15 minutes per IP (SEC-004).
+	// X-Forwarded-For is honoured only for peers in RATE_LIMIT_TRUSTED_PROXIES.
+	credRateLimiter := NewIPRateLimiter(5, 15*time.Minute, s.cfg.RateLimitTrustedProxies...)
+
+	// attestationRateLimiter bounds the POST (nonce) path of the attestation
+	// endpoint, which is never cached and forks snpguest ~5x plus KDS round
+	// trips per call (SEC-02). ≤6 uncached quotes/min/IP kills the cheap DoS
+	// while tolerating a verify+retry burst; cheap GET probes stay unmetered.
+	attestationRateLimiter := NewIPRateLimiter(6, time.Minute, s.cfg.RateLimitTrustedProxies...)
+
+	// Public routes (no auth required):
+	//   /health                 — liveness probe
+	//   /api/v1/tls/fingerprint  — public by design (used by clients before attestation)
+	//   /api/v1/attestation      — public by design; POST (nonce) path rate-limited (SEC-02)
+	// (/api/v1/verify is public too, but only registered under EnableLegacyREST.)
+	mux.HandleFunc("/health", s.handler.HealthCheck)
+	mux.HandleFunc("/api/v1/tls/fingerprint", s.handler.GetTLSFingerprint)
+	mux.HandleFunc("/api/v1/attestation", attestationPOSTRateLimit(attestationRateLimiter, s.handler.GetAttestation))
+
+	// Gated routes: carry user data or mutate state. Must go through jwtRequired
+	// when ENCLAVE_JWT_SECRET is set (SEC-002). In dev mode, jwtRequired logs
+	// a warning and passes the request through.
+	mux.HandleFunc("/api/v1/credentials/connect", credRateLimiter.Middleware(s.jwtRequired(s.handler.ConnectCredentials)))
+
+	// Admin endpoints: enforced localhost-only (SEC-001). The `localhostOnly`
+	// wrapper inspects r.RemoteAddr (not X-Forwarded-For, which is spoofable
+	// and only set by the front proxy anyway). Non-loopback peers get 403.
+	mux.HandleFunc("/api/v1/admin/sync-now", s.localhostOnly(s.handleAdminSyncNow))
+	mux.HandleFunc("/api/v1/admin/sync-connection", s.localhostOnly(s.handleAdminSyncConnection))
+	mux.HandleFunc("/api/v1/admin/cashflows", s.localhostOnly(s.handleAdminDumpCashflows))
+	mux.HandleFunc("/api/v1/admin/reconstruct", s.localhostOnly(s.handleAdminReconstruct))
+	mux.HandleFunc("/api/v1/admin/reconstruct-deep", s.localhostOnly(s.handleAdminReconstructDeep))
+	mux.HandleFunc("/api/v1/admin/unpin-broker-accounts", s.localhostOnly(s.handleAdminUnpinBrokerAccounts))
+	mux.HandleFunc("/api/v1/admin/balance-probe", s.localhostOnly(s.handleAdminBalanceProbe))
+	mux.HandleFunc("/api/v1/admin/refresh-metadata", s.localhostOnly(s.handleAdminRefreshMetadata))
+	mux.HandleFunc("/api/v1/admin/raw-statement", s.localhostOnly(s.handleAdminRawStatement))
+	mux.HandleFunc("/api/v1/admin/funding-probe", s.localhostOnly(s.handleAdminFundingProbe))
+	mux.HandleFunc("/api/v1/admin/reflow", s.localhostOnly(s.handleAdminReflow))
+	mux.HandleFunc("/api/v1/admin/convert-to-usd", s.localhostOnly(s.handleAdminConvertToUSD))
+	mux.HandleFunc("/api/v1/admin/recount-activity", s.localhostOnly(s.handleAdminRecountActivity))
+
+	// B2 handoff: deliberately NOT gated by localhostOnly because the
+	// successor enclave runs in a different container with a non-loopback
+	// IP on the Docker bridge. The handler itself does cryptographic
+	// gating (signed allowlist + attestation + ECIES); transport-level
+	// scoping is unnecessary. Wired only when SetHandoffHandler was called.
+	if s.handoffHandler != nil {
+		mux.Handle("/api/v1/admin/handoff", s.handoffHandler)
+	}
+
+	// Legacy REST routes are disabled by default for strict TS parity.
+	if s.cfg.EnableLegacyREST {
+		if s.cfg.IsDevelopment() {
+			// Plaintext credential endpoint — legacy only; use /api/v1/credentials/connect.
+			mux.HandleFunc("/api/v1/connection", s.jwtRequired(s.handler.CreateUserConnection))
+		} else {
+			mux.HandleFunc("/api/v1/connection", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, http.StatusGone, map[string]any{
+					"success": false,
+					"error":   "plaintext credential submission is disabled in production; use /api/v1/credentials/connect with E2E encryption",
+				})
+			})
+		}
+		mux.HandleFunc("/api/v1/sync", s.jwtRequired(s.handler.ProcessSyncJob))
+		mux.HandleFunc("/api/v1/metrics", s.jwtRequired(s.handler.GetMetrics))
+		mux.HandleFunc("/api/v1/snapshots", s.jwtRequired(s.handler.GetSnapshots))
+		mux.HandleFunc("/api/v1/history/rebuilt", s.jwtRequired(s.handler.DeleteRebuiltHistory))
+		mux.HandleFunc("/api/v1/report", s.jwtRequired(s.handler.GenerateReport))
+		mux.HandleFunc("/api/v1/verify", s.handler.VerifySignature)
+	}
+
+	// Apply CORS then logging middleware
+	var handler http.Handler = mux
+	if s.cfg.CORSOrigin != "" {
+		handler = CORSMiddleware(s.cfg.CORSOrigin, handler)
+	}
+	handler = s.loggingMiddleware(handler)
+
+	s.http = &http.Server{
+		Addr:         fmt.Sprintf(":%d", s.cfg.RESTPort),
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.http.Shutdown(shutdownCtx); err != nil {
+			s.logger.Warn("REST server did not drain its connections before the deadline", zap.Error(err))
+		}
+		if s.pool != nil {
+			s.pool.Close()
+		}
+	}()
+
+	if s.handler == nil || s.handler.tlsKeygen == nil {
+		return fmt.Errorf("REST TLS credentials are required (tls key generator not configured)")
+	}
+
+	cert, err := tls.X509KeyPair(s.handler.tlsKeygen.CertPEM(), s.handler.tlsKeygen.KeyPEM())
+	if err != nil {
+		return fmt.Errorf("parse REST TLS keypair: %w", err)
+	}
+
+	s.http.TLSConfig = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}
+
+	// Silence TLS handshake errors from scanners/bots (logged to debug instead of stderr)
+	s.http.ErrorLog = log.New(io.Discard, "", 0)
+
+	s.logger.Info("server starting",
+		zap.String("addr", s.http.Addr),
+		zap.Bool("https", true),
+		zap.Bool("legacy_rest", s.cfg.EnableLegacyREST),
+	)
+
+	return s.http.ListenAndServeTLS("", "")
+}
+
+// handleAdminSyncNow triggers the daily sync immediately (admin only).
+func (s *Server) handleAdminSyncNow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "scheduler not configured"})
+		return
+	}
+
+	s.logger.Info("admin sync-now triggered")
+	go s.scheduler.RunNow()
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "sync triggered, check logs"})
+}
+
+// handleAdminSyncConnection runs the scheduled sync of one connection now and
+// overwrites today's snapshot. sync-now would sync every user, and the
+// user-facing sync refuses any account that already has a snapshot.
+//
+// Usage: POST /api/v1/admin/sync-connection?user_uid=X&exchange=ibkr&label=Y
+func (s *Server) handleAdminSyncConnection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	s.logger.Info("admin sync-connection triggered",
+		zap.String("user_uid", userUID),
+		zap.String("exchange", exchange),
+		zap.String("label", label),
+	)
+	// Detached from the request: a caller hanging up must not stop a
+	// reconstruction half-way through rewriting the history.
+	extendWriteDeadline(w, adminReconstructTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), adminReconstructTimeout)
+	defer cancel()
+	result := s.handler.syncSvc.SyncConnectionScheduledByLabel(ctx, userUID, exchange, label)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":            result.Success,
+		"skipped":            result.Skipped,
+		"skip_reason":        result.SkipReason,
+		"error":              result.Error,
+		"snapshot_timestamp": result.SnapshotTimestamp,
+	})
+}
+
+// handleAdminReconstruct triggers in-enclave historical reconstruction for an
+// existing connection. The connect-time hook only fires once at connect, so
+// this is how a previously-connected account — or one whose connector just
+// gained HistoricalSnapshotProvider support (cTrader) — gets backfilled.
+//
+// Usage: POST /api/v1/admin/reconstruct?user_uid=X&exchange=ctrader&label=Y
+//
+// Optional from=YYYY-MM-DD&to=YYYY-MM-DD restricts the write to those days
+// (inclusive) — the gap-repair mode (OPS-004). Without it the reconstruct
+// upserts the provider's whole window, which for the external rebuilder means
+// rewriting up to 90 days of already-correct live snapshots. Both bounds are
+// required together; passing only one is rejected rather than silently
+// widening to a full reconstruct.
+func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
+	// (Egress-consent gating for non-IBKR reconstruction is tracked under
+	// SEC-08, which persists the opt-in this endpoint would key off.)
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	fromStr, toStr := q.Get("from"), q.Get("to")
+	if (fromStr == "") != (toStr == "") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from and to must be provided together"})
+		return
+	}
+	var from, to time.Time
+	if fromStr != "" {
+		var err error
+		if from, err = time.Parse("2006-01-02", fromStr); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from must be YYYY-MM-DD"})
+			return
+		}
+		if to, err = time.Parse("2006-01-02", toStr); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "to must be YYYY-MM-DD"})
+			return
+		}
+		if to.Before(from) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "to must not precede from"})
+			return
+		}
+	}
+
+	// dry_run only makes sense with an explicit window — it exists to inspect a
+	// splice before committing it.
+	dryRun := q.Get("dry_run") == "1" || q.Get("dry_run") == "true"
+	if dryRun && fromStr == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "dry_run requires from and to"})
+		return
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	s.logger.Info("admin reconstruct triggered",
+		zap.String("user_uid", userUID),
+		zap.String("exchange", exchange),
+		zap.String("label", label),
+		zap.String("from", fromStr),
+		zap.String("to", toStr),
+		zap.Bool("dry_run", dryRun),
+	)
+	// A dry run answers the caller rather than the log: logredact masks every
+	// money field, on purpose, so the days would arrive empty. Synchronous for
+	// the same reason — there is nothing to come back for later.
+	if dryRun {
+		extendWriteDeadline(w, adminReconstructTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), adminReconstructTimeout)
+		defer cancel()
+		days := s.handler.syncSvc.DryRunReconstructRange(ctx, userUID, exchange, label, from, to)
+		rows := dryRunRows(days)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true, "dry_run": true, "count": len(rows), "days": rows,
+		})
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), adminReconstructTimeout)
+		defer cancel()
+		if fromStr == "" {
+			s.handler.syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
+			return
+		}
+		s.handler.syncSvc.ReconstructHistoryRange(ctx, userUID, exchange, label, from, to, dryRun)
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "dry_run": dryRun, "message": "reconstruction triggered, check logs"})
+}
+
+// handleAdminReconstructDeep extends a connection's history back to a date
+// older than its venue's rolling window, a month per statement.
+//
+// Usage: POST /api/v1/admin/reconstruct-deep?user_uid=X&exchange=ibkr&label=Y&from=2022-10-11[&dry_run=1][&rewrite=1]
+//
+// A dry run answers with the days instead of writing them, for the same reason
+// as handleAdminReconstruct's. rewrite reads through yesterday, over the
+// stored days: for a connection whose accounts changed (an IB-UKL segment
+// added to the query), after unpin-broker-accounts. While the pin is cleared
+// the stored days, measured on the old accounts, do not witness the rewrite.
+func (s *Server) handleAdminReconstructDeep(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	from, err := validation.ParseHistoryStart(q.Get("from"), time.Now())
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	dryRun := q.Get("dry_run") == "1" || q.Get("dry_run") == "true"
+	rewrite := q.Get("rewrite") == "1" || q.Get("rewrite") == "true"
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	s.logger.Info("admin deep reconstruct triggered",
+		zap.String("user_uid", userUID),
+		zap.String("exchange", exchange),
+		zap.String("label", label),
+		zap.Time("from", from),
+		zap.Bool("dry_run", dryRun),
+		zap.Bool("rewrite", rewrite),
+	)
+	timeout := service.DeepHistoryTimeout(from, time.Now())
+	if dryRun {
+		extendWriteDeadline(w, timeout)
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		days, err := s.handler.syncSvc.DryRunDeepHistory(ctx, userUID, exchange, label, from, rewrite)
+		if err != nil {
+			s.log().Error("deep reconstruct dry run failed", zap.String("exchange", exchange), zap.Error(err))
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+			return
+		}
+		rows := dryRunRows(days)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true, "dry_run": true, "count": len(rows), "days": rows,
+		})
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if err := s.handler.syncSvc.ReconstructDeepHistory(ctx, userUID, exchange, label, from, rewrite); err != nil {
+			s.log().Error("deep reconstruct failed", zap.String("exchange", exchange), zap.Error(err))
+		}
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "deep reconstruction triggered, check logs"})
+}
+
+// handleAdminUnpinBrokerAccounts clears the accounts a connection is pinned
+// to, so its next statement pins the ones it then measures. Run before a
+// reconstruct-deep rewrite when a holder adds an IB-UKL segment to the query.
+//
+// Usage: POST /api/v1/admin/unpin-broker-accounts?user_uid=X&exchange=ibkr&label=Y
+func (s *Server) handleAdminUnpinBrokerAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+	if err := s.handler.syncSvc.UnpinBrokerAccounts(r.Context(), userUID, exchange, label); err != nil {
+		s.log().Error("unpin broker accounts failed", zap.String("exchange", exchange), zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+	s.logger.Info("admin broker accounts unpinned",
+		zap.String("user_uid", userUID),
+		zap.String("exchange", exchange),
+		zap.String("label", label),
+	)
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+}
+
+// The breakdown carries the per-market free margin, which a stored day can
+// lack while its equity is right: margin used is read from it and applied to
+// the stored equity, never the rebuilt equity itself.
+func dryRunRows(days []*repository.Snapshot) []map[string]any {
+	rows := make([]map[string]any, 0, len(days))
+	for _, d := range days {
+		rows = append(rows, map[string]any{
+			"day":                 d.Timestamp.Format("2006-01-02"),
+			"total_equity":        d.TotalEquity,
+			"realized_balance":    d.RealizedBalance,
+			"deposits":            d.Deposits,
+			"withdrawals":         d.Withdrawals,
+			"breakdown_by_market": d.Breakdown,
+		})
+	}
+	return rows
+}
+
+// handleAdminDumpCashflows dumps all BALANCE deals for a user/exchange/label since a date.
+// Usage: GET /api/v1/admin/cashflows?user_uid=X&exchange=mt5&label=Y&from=2026-04-01
+//
+// Intended for admin backfills when the normal sync window missed cashflows
+// (e.g. the Headway side=buy/sell bug). Requires a running enclave with the
+// DEK unwrapped so broker credentials can be decrypted.
+func (s *Server) handleAdminDumpCashflows(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "GET only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+	fromStr := q.Get("from")
+
+	if userUID == "" || exchange == "" || fromStr == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "user_uid, exchange, and from (YYYY-MM-DD) are required",
+		})
+		return
+	}
+
+	since, err := time.Parse("2006-01-02", fromStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid from date, use YYYY-MM-DD"})
+		return
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	// raw=true returns the unfiltered balance-operation ledger (every
+	// operationType) instead of the deposit/withdraw view — for diagnosing
+	// balance jumps the op-0/1 filter can't explain (e.g. demo resets).
+	if q.Get("raw") == "true" {
+		ops, err := s.handler.syncSvc.DumpRawCashflows(r.Context(), userUID, exchange, label, since)
+		if err != nil {
+			s.logger.Error("dump raw cashflows failed", zap.Error(err))
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.handler.sanitizeErr(err)})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"count":   len(ops),
+			"raw_ops": ops,
+		})
+		return
+	}
+
+	cashflows, warnings, err := s.handler.syncSvc.DumpCashflows(r.Context(), userUID, exchange, label, since)
+	if err != nil {
+		s.logger.Error("dump cashflows failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.handler.sanitizeErr(err)})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":   true,
+		"count":     len(cashflows),
+		"cashflows": cashflows,
+		"warnings":  warnings,
+	})
+}
+
+// balanceProbeRunner is the slice of the sync service the balance probe needs.
+// An interface rather than the concrete service so the handler can be
+// exercised without a DEK-unwrapped enclave behind it.
+type balanceProbeRunner interface {
+	ProbeBalance(ctx context.Context, userUID, exchange, label string) (*connector.BalanceProbe, error)
+}
+
+// log returns the server's logger, or a no-op one when the server was built
+// without it. Keeps the probe handler usable from a test that wires nothing
+// but the prober.
+func (s *Server) log() *zap.Logger {
+	if s.logger == nil {
+		return zap.NewNop()
+	}
+	return s.logger
+}
+
+// sanitizeErr is the handler's production error scrubber, nil-safe for a
+// server that has no handler attached.
+func (s *Server) sanitizeErr(err error) string {
+	if s.handler == nil {
+		return genericInternalError
+	}
+	return s.handler.sanitizeErr(err)
+}
+
+func (s *Server) balanceProber() balanceProbeRunner {
+	if s.probeSvc != nil {
+		return s.probeSvc
+	}
+	if s.handler == nil || s.handler.syncSvc == nil {
+		return nil
+	}
+	return s.handler.syncSvc
+}
+
+// handleAdminBalanceProbe answers with the venue's own balance payload beside
+// the Balance this enclave derives from it, for one connection.
+//
+// Usage: POST /api/v1/admin/balance-probe?user_uid=X&exchange=okx&label=Y
+//
+// It exists to settle a free-margin figure against a real customer account
+// without anyone handling that account's credentials: the credentials are
+// decrypted in here exactly as a sync decrypts them, one balance call goes out,
+// and both sides of the comparison come back in the HTTP response. Nothing is
+// persisted, and the amounts are deliberately absent from the logs — the
+// response goes to a loopback caller, a log file goes everywhere a log file
+// goes. A connector with no BalanceProber answers 501 rather than an empty
+// result that would read like an empty account.
+func (s *Server) handleAdminBalanceProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+
+	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	prober := s.balanceProber()
+	if prober == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	probe, err := prober.ProbeBalance(r.Context(), userUID, exchange, label)
+	if err != nil {
+		if errors.Is(err, service.ErrBalanceProbeUnsupported) {
+			writeJSON(w, http.StatusNotImplemented, map[string]any{
+				"error":    "connector does not expose a balance probe",
+				"exchange": exchange,
+			})
+			return
+		}
+		s.log().Error("balance probe failed",
+			zap.String("exchange", exchange),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+
+	// One line, no amounts: the figures are the whole point of the call and
+	// they belong in the answer to the loopback caller, not in a log.
+	s.log().Info("balance probe served", zap.String("exchange", exchange))
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "probe": probe})
+}
+
+// handleAdminRefreshMetadata re-probes paper/live and KYC status for a user's
+// existing connections. Capture runs at connect time only, so a connection
+// predating its connector's probe keeps the flags its row was created with —
+// and a stored false is indistinguishable from never-written.
+//
+// Usage: POST /api/v1/admin/refresh-metadata?user_uid=X[&exchange=ibkr][&label=Y]
+//
+// Each connection costs one broker round trip, so narrow with exchange/label
+// when re-probing a single account.
+func (s *Server) handleAdminRefreshMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+
+	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
+	// exchange and label are optional here — they narrow the pass rather than
+	// address one connection — but are validated when present.
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if exchange != "" {
+		if err := validation.ValidateExchange(exchange); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	results, err := s.handler.syncSvc.RefreshExchangeMetadata(r.Context(), userUID, exchange, label)
+	if err != nil {
+		s.log().Error("refresh exchange metadata failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+
+	probed, failed := 0, 0
+	for _, item := range results {
+		if item.Err != nil {
+			failed++
+			s.log().Error("exchange metadata not refreshed",
+				zap.String("user_uid", userUID),
+				zap.String("exchange", item.Exchange),
+				zap.String("label", item.Label),
+				zap.Error(item.Err),
+			)
+			item.Error = s.sanitizeErr(item.Err)
+		}
+		if item.PaperProbed {
+			probed++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":      true,
+		"count":        len(results),
+		"paper_probed": probed,
+		"failed":       failed,
+		"connections":  results,
+	})
+}
+
+// handleAdminRawStatement hands back the venue's own statement document for one
+// connection, unparsed.
+//
+// Usage: GET /api/v1/admin/raw-statement?user_uid=X&exchange=ibkr&label=Y[&from=2023-01-01&to=2023-12-31]
+//
+// from/to ask for that period instead of the one saved at the venue (at most
+// 365 days, IBKR's ceiling per statement).
+//
+// It exists because IBKR rations Flex statements to roughly one per token per
+// six hours and counts refusals, so a question our parsed views cannot answer
+// costs another six-hour wait. Taking the document once makes every later
+// question free. The response carries live account data and goes to a loopback
+// caller only; it is deliberately absent from the logs, which record that a
+// dump was served and its size, never its content.
+func (s *Server) handleAdminRawStatement(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "GET only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+
+	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	var (
+		doc         []byte
+		contentType string
+		err         error
+	)
+	extendWriteDeadline(w, 10*time.Minute)
+	if q.Get("from") != "" || q.Get("to") != "" {
+		from, to, perr := validation.ParseStatementPeriod(q.Get("from"), q.Get("to"), time.Now())
+		if perr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": perr.Error()})
+			return
+		}
+		doc, contentType, err = s.handler.syncSvc.DumpRawStatementForPeriod(r.Context(), userUID, exchange, label, from, to)
+	} else {
+		doc, contentType, err = s.handler.syncSvc.DumpRawStatement(r.Context(), userUID, exchange, label)
+	}
+	if err != nil {
+		if errors.Is(err, service.ErrRawStatementUnsupported) {
+			writeJSON(w, http.StatusNotImplemented, map[string]any{
+				"error":    "connector does not expose a raw statement",
+				"exchange": exchange,
+			})
+			return
+		}
+		s.log().Error("raw statement dump failed",
+			zap.String("exchange", exchange),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+
+	s.log().Info("raw statement served",
+		zap.String("exchange", exchange),
+		zap.Int("bytes", len(doc)),
+	)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(doc)
+}
+
+// handleAdminFundingProbe answers with the wallet the tracked perimeter leaves
+// out, for one connection.
+//
+// Usage: GET /api/v1/admin/funding-probe?user_uid=X&exchange=okx&label=Y&from=2026-09-01
+//
+// A transfer out of the trading account is indistinguishable, from inside the
+// perimeter, between money parked in the customer's other wallet and money
+// that left the venue. The two lead to opposite readings of the same day — one
+// is performance, the other is capital — and only the venue can settle it. The
+// rows come back verbatim rather than classified: the published type tables
+// for this ledger disagree with each other, and a classifier written from the
+// wrong one would be wrong silently. The response carries live account data
+// and goes to a loopback caller only; the log records that a probe was served
+// and how many rows, never their content.
+func (s *Server) handleAdminFundingProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "GET only"})
+		return
+	}
+
+	q := r.URL.Query()
+	userUID := q.Get("user_uid")
+	exchange := q.Get("exchange")
+	label := q.Get("label")
+
+	// SEC-10: validate trust-boundary inputs like every other REST entrypoint.
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if label != "" {
+		if err := validation.ValidateLabel(label); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	since := time.Now().UTC().AddDate(0, 0, -90)
+	if fromStr := q.Get("from"); fromStr != "" {
+		parsed, err := time.Parse("2006-01-02", fromStr)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from must be YYYY-MM-DD"})
+			return
+		}
+		since = parsed
+	}
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+
+	extendWriteDeadline(w, 10*time.Minute)
+	probe, err := s.handler.syncSvc.ProbeFunding(r.Context(), userUID, exchange, label, since)
+	if err != nil {
+		if errors.Is(err, service.ErrFundingProbeUnsupported) {
+			writeJSON(w, http.StatusNotImplemented, map[string]any{
+				"error":    "connector does not expose a funding probe",
+				"exchange": exchange,
+			})
+			return
+		}
+		s.log().Error("funding probe failed",
+			zap.String("exchange", exchange),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+
+	s.log().Info("funding probe served",
+		zap.String("exchange", exchange),
+		zap.Int("balances", len(probe.Balances)),
+		zap.Int("bills", len(probe.Bills)),
+	)
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "funding": probe})
+}
+
+// cashflowReflower is the slice of the sync service the reflow endpoint needs.
+type cashflowReflower interface {
+	ReflowCashflows(ctx context.Context, userUID, exchange, label string, from, to time.Time, apply bool) ([]service.ReflowDay, error)
+}
+
+func (s *Server) reflower() cashflowReflower {
+	if s.reflowSvc != nil {
+		return s.reflowSvc
+	}
+	if s.handler == nil || s.handler.syncSvc == nil {
+		return nil
+	}
+	return s.handler.syncSvc
+}
+
+// handleAdminReflow re-derives a connection's stored deposits and withdrawals
+// between from and to under the current cashflow classification. A dry run
+// unless apply=1: the response lists every day as stored and as it would be.
+func (s *Server) handleAdminReflow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	from, ferr := time.Parse("2006-01-02", q.Get("from"))
+	to, terr := time.Parse("2006-01-02", q.Get("to"))
+	if ferr != nil || terr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from and to are required, YYYY-MM-DD"})
+		return
+	}
+	apply := q.Get("apply") == "1"
+
+	reflower := s.reflower()
+	if reflower == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+	extendWriteDeadline(w, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	days, err := reflower.ReflowCashflows(ctx, userUID, exchange, label, from, to, apply)
+	if err != nil {
+		s.log().Error("admin reflow failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "apply": apply, "count": len(days), "days": days})
+}
+
+// handleAdminConvertToUSD converts the days a connection stored before the
+// USD conversion existed, each at its day's rate (service/fx_backfill.go). A
+// dry run unless apply=1. currency is the account's, read off its
+// account_currency warning marker.
+//
+// Usage: POST /api/v1/admin/convert-to-usd?user_uid=X&exchange=ibkr&label=Y&currency=EUR[&apply=1]
+func (s *Server) handleAdminConvertToUSD(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	currency := q.Get("currency")
+	if currency == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "currency is required"})
+		return
+	}
+	apply := q.Get("apply") == "1"
+
+	if s.handler == nil || s.handler.syncSvc == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+	extendWriteDeadline(w, 5*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	days, err := s.handler.syncSvc.ConvertStoredToUSD(ctx, userUID, exchange, label, currency, apply)
+	if err != nil {
+		s.log().Error("admin convert-to-usd failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "apply": apply, "count": len(days), "days": days})
+}
+
+// activityRecounter is the slice of the sync service the recount endpoint needs.
+type activityRecounter interface {
+	RecountActivity(ctx context.Context, userUID, exchange, label string, from, to time.Time, apply bool) ([]service.RecountDay, error)
+}
+
+func (s *Server) recounter() activityRecounter {
+	if s.recountSvc != nil {
+		return s.recountSvc
+	}
+	if s.handler == nil || s.handler.syncSvc == nil {
+		return nil
+	}
+	return s.handler.syncSvc
+}
+
+// handleAdminRecountActivity re-derives the trades, volume, fees, funding and
+// buy/sell split of a connection's live days between from and to from the
+// connector's current reading of its fills. Equity and flows are never
+// touched. A dry run unless apply=1.
+//
+// Usage: POST /api/v1/admin/recount-activity?user_uid=X&exchange=bybit&label=Y&from=2026-09-13&to=2026-10-06[&apply=1]
+func (s *Server) handleAdminRecountActivity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	from, ferr := time.Parse("2006-01-02", q.Get("from"))
+	to, terr := time.Parse("2006-01-02", q.Get("to"))
+	if ferr != nil || terr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from and to are required, YYYY-MM-DD"})
+		return
+	}
+	apply := q.Get("apply") == "1"
+
+	recounter := s.recounter()
+	if recounter == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+	extendWriteDeadline(w, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	days, err := recounter.RecountActivity(ctx, userUID, exchange, label, from, to, apply)
+	if err != nil {
+		s.log().Error("admin recount-activity failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "apply": apply, "count": len(days), "days": days})
+}
+
+// adminReconstructTimeout outlasts the rebuilder call it waits on: expiring
+// first would abort, mid-page, a rebuild the rebuilder may still finish.
+const adminReconstructTimeout = rebuilderclient.RequestTimeout + 5*time.Minute
+
+// extendWriteDeadline lifts the server-wide 60s WriteTimeout for one request.
+//
+// A few loopback admin handlers answer only after work that outlives it: a
+// reconstruction walks a venue's whole ledger, and one OKX account with 13,952
+// bills takes three minutes. The server closed the connection at sixty
+// seconds, so the answer never arrived — and the caller, seeing a dropped
+// connection rather than a refusal, retried, which started the three minutes
+// again. A loop that hammered the venue and could not terminate.
+//
+// Only the handlers that own a long unit of work call this; the deadline for
+// every other endpoint stays where it is.
+func extendWriteDeadline(w http.ResponseWriter, d time.Duration) {
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d)); err != nil {
+		// A ResponseWriter that cannot carry a deadline degrades to the
+		// server-wide one: the request may still time out, which is what
+		// happened before this existed.
+		return
+	}
+}
+
+// jwtRequired verifies an HS256 bearer token on REST handlers (SEC-002).
+//
+// When s.jwtSecret is nil (dev mode) the middleware logs a single-shot warning
+// and passes the request through so local development works without extra
+// setup — same policy as the gRPC authInterceptor.
+//
+// When s.jwtSecret is set, the middleware:
+//   - rejects missing / malformed Authorization headers with 401
+//   - verifies via auth.VerifyHS256 (checks exp + aud == "go-enclave")
+//   - injects the verified `sub` into the request context via auth.WithUserUID
+//     so downstream handlers can prefer the JWT-asserted UID over body fields.
+func (s *Server) jwtRequired(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if len(s.jwtSecret) == 0 {
+			s.logger.Warn("REST JWT auth skipped (ENCLAVE_JWT_SECRET not set)",
+				zap.String("path", r.URL.Path),
+			)
+			next(w, r)
+			return
+		}
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": "missing authorization header",
+			})
+			return
+		}
+
+		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+		if tokenStr == authHeader {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": "authorization header must use Bearer scheme",
+			})
+			return
+		}
+
+		claims, err := auth.VerifyHS256WithOptions(tokenStr, s.jwtSecret, auth.VerifyOptions{
+			ExpectedIssuer: s.jwtExpectedIssuer,
+		})
+		if err != nil {
+			s.logger.Warn("REST JWT verification failed",
+				zap.String("path", r.URL.Path),
+				zap.Error(err),
+			)
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": "invalid or expired token",
+			})
+			return
+		}
+
+		r = r.WithContext(auth.WithUserUID(r.Context(), claims.Sub))
+		next(w, r)
+	}
+}
+
+// localhostOnly rejects non-loopback peers. Deliberately inspects
+// r.RemoteAddr (the actual TCP peer) and ignores X-Forwarded-For / X-Real-IP,
+// which are trivially spoofable over HTTPS. The admin tools run inside the
+// same container (`docker exec`), so loopback is sufficient.
+func (s *Server) localhostOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			s.logger.Warn("admin endpoint blocked: non-loopback peer",
+				zap.String("path", r.URL.Path),
+				zap.String("remote_addr", r.RemoteAddr),
+			)
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": "admin endpoints are restricted to loopback callers",
+			})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// attestationPOSTRateLimit applies per-IP rate limiting to the POST (nonce)
+// path only. GET probes — which clients hit before they trust the enclave —
+// pass through unmetered; the POST path forks snpguest and is never cached
+// (SEC-02).
+func attestationPOSTRateLimit(rl *IPRateLimiter, next http.HandlerFunc) http.HandlerFunc {
+	limited := rl.Middleware(next)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			limited(w, r)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+
+		// LOG-NOISE-001: per-request access logs are debug-level. They
+		// used to be INFO for non-/health paths, which produced a steady
+		// stream of entries in the dashboard for every dashboard poll
+		// (errtrack /stats and /groups scrapes alone fire several times
+		// per minute). Aggregate request counts and latency live in
+		// Prometheus (`grpc_request_duration_seconds`, etc.); an operator
+		// who needs per-line traces can flip LOG_LEVEL=debug for a
+		// short investigation window.
+		s.logger.Debug("request",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.Duration("duration", time.Since(start)),
+		)
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+// defaultMaxRequestBodyBytes caps REST request bodies (SEC-007). 64 KiB is
+// far larger than any legitimate credential / sync / report payload and
+// small enough to absorb a burst of hostile requests without growing the
+// enclave heap. Exceeding this returns 413 via http.MaxBytesReader.
+const defaultMaxRequestBodyBytes = int64(64 << 10)
+
+// readJSON decodes the request body into v with a 64 KiB size cap and
+// DisallowUnknownFields enabled (SEC-007). Callers that need a different
+// cap should use readJSONWithLimit.
+func readJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	return readJSONWithLimit(w, r, v, defaultMaxRequestBodyBytes)
+}
+
+func readJSONWithLimit(w http.ResponseWriter, r *http.Request, v any, maxBytes int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}

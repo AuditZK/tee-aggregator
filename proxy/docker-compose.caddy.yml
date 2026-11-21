@@ -1,0 +1,22 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy_tls_proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - ENCLAVE_DOMAIN=${ENCLAVE_DOMAIN}
+      - DASHBOARD_ORIGIN=${DASHBOARD_ORIGIN}
+      - ACME_EMAIL=${ACME_EMAIL}
+    volumes:
+      - ./proxy/Caddyfile.tee-prod:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - default
+
+volumes:
+  caddy_data:
+  caddy_config:

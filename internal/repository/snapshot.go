@@ -1,0 +1,1389 @@
+package repository
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// QUAL-001: snapshot SELECT column lists, extracted to remove the 3-way
+// duplications across GetByUserAndDateRange / GetLatestByUser /
+// GetByUserExchangeAndDate. A typo in either constant now flips every
+// query at once, instead of producing silent column-mismatch bugs.
+const (
+	snapshotColsBase      = "id, user_uid, exchange, timestamp"
+	snapshotColsWithLabel = "id, user_uid, exchange, label, timestamp"
+
+	// Suffix appended to SELECT/INSERT column lists when migration 013
+	// (is_historical) has been applied. Centralized to avoid drift across
+	// the dozen query builders in this file.
+	snapshotIsHistoricalCol = ", is_historical"
+
+	// Suffix appended to INSERT column lists when migration 015
+	// (from_external_rebuilder) has been applied.
+	snapshotFromExternalRebuilderCol = ", from_external_rebuilder"
+)
+
+// snapshotUpdateSetGo / snapshotUpdateSetTS are the ON CONFLICT ... DO UPDATE
+// SET bodies for the Go (snake_case) and TS (Prisma camelCase) schemas.
+// QUAL-001: the Go body was hand-copied across Upsert and UpsertBatch (4
+// sites), the TS body across upsertTS and UpsertBatch (2 sites) — a silent
+// column-drift hazard now reduced to one definition each. Callers append
+// snapshotOptionalCols' `excluded` fragment to the Go body.
+const (
+	snapshotUpdateSetGo = `DO UPDATE SET
+				total_equity = EXCLUDED.total_equity,
+				realized_balance = EXCLUDED.realized_balance,
+				unrealized_pnl = EXCLUDED.unrealized_pnl,
+				deposits = EXCLUDED.deposits,
+				withdrawals = EXCLUDED.withdrawals,
+				total_trades = EXCLUDED.total_trades,
+				total_volume = EXCLUDED.total_volume,
+				total_fees = EXCLUDED.total_fees,
+				breakdown_by_market = EXCLUDED.breakdown_by_market`
+
+	snapshotUpdateSetTS = `DO UPDATE SET
+				"totalEquity" = EXCLUDED."totalEquity",
+				"realizedBalance" = EXCLUDED."realizedBalance",
+				"unrealizedPnL" = EXCLUDED."unrealizedPnL",
+				deposits = EXCLUDED.deposits,
+				withdrawals = EXCLUDED.withdrawals,
+				breakdown_by_market = EXCLUDED.breakdown_by_market,
+				"updatedAt" = EXCLUDED."updatedAt"`
+)
+
+// snapshotOptionalCols builds the trailing column / placeholder / ON CONFLICT
+// fragments for the Go-only optional snapshot columns — is_historical
+// (migration 013) and from_external_rebuilder (migration 015) — together with
+// the matching args. baseArgCount is the number of positional args already
+// bound; the optional columns take $(baseArgCount+1) onward. Keeping the
+// placeholder numbers dynamic avoids the per-call-site hardcoding that made
+// adding a second optional column error-prone.
+func snapshotOptionalCols(s *Snapshot, hasHist, hasOrigin bool, baseArgCount int) (cols, placeholders, excluded string, extra []any) {
+	n := baseArgCount
+	if hasHist {
+		n++
+		cols += snapshotIsHistoricalCol
+		placeholders += fmt.Sprintf(", $%d", n)
+		excluded += ", is_historical = EXCLUDED.is_historical"
+		extra = append(extra, s.IsHistorical)
+	}
+	if hasOrigin {
+		n++
+		cols += snapshotFromExternalRebuilderCol
+		placeholders += fmt.Sprintf(", $%d", n)
+		excluded += ", from_external_rebuilder = EXCLUDED.from_external_rebuilder"
+		extra = append(extra, s.FromExternalRebuilder)
+	}
+	return
+}
+
+// generateCUID generates a CUID-like identifier compatible with Prisma's @id @default(cuid()).
+func generateCUID() string {
+	b := make([]byte, 12)
+	rand.Read(b)
+	return fmt.Sprintf("c%x%010x", time.Now().UnixMilli(), b)
+}
+
+// Snapshot represents a daily equity snapshot.
+type Snapshot struct {
+	ID              string           `json:"id"`
+	UserUID         string           `json:"user_uid"`
+	Exchange        string           `json:"exchange"`
+	Label           string           `json:"label,omitempty"`
+	Timestamp       time.Time        `json:"timestamp"` // 00:00 UTC
+	TotalEquity     float64          `json:"total_equity"`
+	RealizedBalance float64          `json:"realized_balance"`
+	UnrealizedPnL   float64          `json:"unrealized_pnl"`
+	Deposits        float64          `json:"deposits"`
+	Withdrawals     float64          `json:"withdrawals"`
+	TotalTrades     int              `json:"total_trades"`
+	TotalVolume     float64          `json:"total_volume"`
+	TotalFees       float64          `json:"total_fees"`
+	Breakdown       *MarketBreakdown `json:"breakdown,omitempty"`
+	CreatedAt       time.Time        `json:"created_at"`
+
+	// IsHistorical marks snapshots reconstructed from broker history (e.g.
+	// IBKR Flex daily summaries: equity only, no per-trade detail). Live
+	// snapshots from the realtime sync window are false. Persisted only on
+	// the Go schema (TS Prisma schema does not have this column).
+	IsHistorical bool `json:"is_historical,omitempty"`
+
+	// FromExternalRebuilder marks a snapshot reconstructed by the out-of-enclave
+	// history-rebuilder service (SEC-001). The signed report keeps such days
+	// and labels them (verifiability_class, payload 1.3). False for live
+	// snapshots and for IBKR Flex history rebuilt inside the enclave. Read only
+	// where the column exists (migration 015, applied to the Prisma schema by
+	// hand).
+	FromExternalRebuilder bool `json:"from_external_rebuilder,omitempty"`
+}
+
+// MarketBreakdown holds metrics per market type.
+//
+// The "global" field is a TS-compat aggregate written by the TS enclave:
+// it contains the totals across all markets (trades, volume, fees). When
+// loading snapshots from a TS Prisma DB where top-level totals columns
+// don't exist (total_trades, total_volume, total_fees), we recover them
+// from breakdown.global — see scanSnapshotsTS.
+type MarketBreakdown struct {
+	Stocks      *MarketMetrics `json:"stocks,omitempty"`
+	Spot        *MarketMetrics `json:"spot,omitempty"`
+	Swap        *MarketMetrics `json:"swap,omitempty"`
+	Futures     *MarketMetrics `json:"futures,omitempty"`
+	Options     *MarketMetrics `json:"options,omitempty"`
+	Margin      *MarketMetrics `json:"margin,omitempty"`
+	Earn        *MarketMetrics `json:"earn,omitempty"`
+	CFD         *MarketMetrics `json:"cfd,omitempty"`
+	Forex       *MarketMetrics `json:"forex,omitempty"`
+	Commodities *MarketMetrics `json:"commodities,omitempty"`
+	Global      *MarketMetrics `json:"global,omitempty"`
+}
+
+// MarketMetrics holds trading metrics for a market type
+type MarketMetrics struct {
+	Equity          float64 `json:"equity,omitempty"`
+	AvailableMargin float64 `json:"available_margin,omitempty"`
+	Volume          float64 `json:"volume"`
+	Trades          int     `json:"trades"`
+	TradingFees     float64 `json:"trading_fees"`
+	FundingFees     float64 `json:"funding_fees"`
+	LongTrades      int     `json:"long_trades,omitempty"`
+	ShortTrades     int     `json:"short_trades,omitempty"`
+	LongVolume      float64 `json:"long_volume,omitempty"`
+	ShortVolume     float64 `json:"short_volume,omitempty"`
+
+	// NativeCurrency and FXRateToUSD are set on the global entry of a row
+	// converted from an account the broker reports in another currency than
+	// USD: the currency it reported, and the rate its balances were
+	// multiplied by. Absent on a USD row, so a stored row says by itself
+	// whether it was converted, and a backfill never converts one twice.
+	// Kept inside global rather than beside it: every reader of this JSON
+	// treats each top-level key as a market.
+	NativeCurrency string  `json:"native_currency,omitempty"`
+	FXRateToUSD    float64 `json:"fx_rate_to_usd,omitempty"`
+}
+
+// SnapshotRepo handles snapshot persistence.
+// Supports both TS (Prisma camelCase) and Go (snake_case) column naming.
+type SnapshotRepo struct {
+	pool *pgxpool.Pool
+
+	capMu                       sync.Mutex
+	capabilitiesLoaded          bool
+	hasLabelCol                 bool
+	hasIsHistoricalCol          bool // Go schema only; TS Prisma never has it
+	hasFromExternalRebuilderCol bool // Go schema only (migration 015)
+	isTSSchema                  bool // true = TS Prisma camelCase columns
+	changeStampExpr             string
+}
+
+// NewSnapshotRepo creates a new snapshot repository
+func NewSnapshotRepo(pool *pgxpool.Pool) *SnapshotRepo {
+	return &SnapshotRepo{pool: pool}
+}
+
+// Upsert creates or updates a snapshot for a user/exchange/date
+func (r *SnapshotRepo) Upsert(ctx context.Context, s *Snapshot) error {
+	breakdownJSON, _ := json.Marshal(s.Breakdown)
+	hasLabel := r.hasLabelColumn(ctx)
+	hasHist := r.hasIsHistoricalColumn(ctx)
+	hasOrigin := r.hasFromExternalRebuilderColumn(ctx)
+
+	if r.isTSSchema {
+		return r.upsertTS(ctx, s, breakdownJSON, hasOrigin)
+	}
+
+	if hasLabel {
+		args := []any{
+			s.UserUID, s.Exchange, s.Label, s.Timestamp,
+			s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
+			s.Deposits, s.Withdrawals, s.TotalTrades, s.TotalVolume, s.TotalFees,
+			breakdownJSON, time.Now().UTC(),
+		}
+		// Optional columns keep the path compatible with a DB where
+		// migration 013 / 015 has not yet run.
+		optCols, optPlaceholders, optExcluded, optArgs := snapshotOptionalCols(s, hasHist, hasOrigin, len(args))
+		args = append(args, optArgs...)
+		query := fmt.Sprintf(`
+			INSERT INTO snapshot_data (
+				user_uid, exchange, label, timestamp,
+				total_equity, realized_balance, unrealized_pnl,
+				deposits, withdrawals, total_trades, total_volume, total_fees,
+				breakdown_by_market, created_at%s
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14%s)
+			ON CONFLICT (user_uid, exchange, label, timestamp)
+			%s%s
+			RETURNING id`, optCols, optPlaceholders, snapshotUpdateSetGo, optExcluded)
+
+		return r.pool.QueryRow(ctx, query, args...).Scan(&s.ID)
+	}
+
+	args := []any{
+		s.UserUID, s.Exchange, s.Timestamp,
+		s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
+		s.Deposits, s.Withdrawals, s.TotalTrades, s.TotalVolume, s.TotalFees,
+		breakdownJSON, time.Now().UTC(),
+	}
+	optCols, optPlaceholders, optExcluded, optArgs := snapshotOptionalCols(s, hasHist, hasOrigin, len(args))
+	args = append(args, optArgs...)
+	query := fmt.Sprintf(`
+		INSERT INTO snapshot_data (
+			user_uid, exchange, timestamp,
+			total_equity, realized_balance, unrealized_pnl,
+			deposits, withdrawals, total_trades, total_volume, total_fees,
+			breakdown_by_market, created_at%s
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13%s)
+		ON CONFLICT (user_uid, exchange, timestamp)
+		%s%s
+		RETURNING id`, optCols, optPlaceholders, snapshotUpdateSetGo, optExcluded)
+
+	return r.pool.QueryRow(ctx, query, args...).Scan(&s.ID)
+}
+
+// snapshotTSOptionalOrigin builds the from_external_rebuilder fragments for
+// the TS write paths, mirroring snapshotOptionalCols on the Go side. The TS
+// schema gains this one column when migration 015's ALTER is applied by hand
+// (is_historical is never ported). Empty fragments when the column is absent
+// keep the pre-015 SQL byte-identical.
+func snapshotTSOptionalOrigin(s *Snapshot, hasOrigin bool, baseArgCount int) (cols, placeholders, excluded string, extra []any) {
+	if !hasOrigin {
+		return
+	}
+	cols = snapshotFromExternalRebuilderCol
+	placeholders = fmt.Sprintf(", $%d", baseArgCount+1)
+	excluded = ",\n\t\t\t\tfrom_external_rebuilder = EXCLUDED.from_external_rebuilder"
+	extra = []any{s.FromExternalRebuilder}
+	return
+}
+
+// upsertTS writes to TS Prisma schema (camelCase columns, no total_trades/total_volume/total_fees).
+// TS always has the label column. Generates a CUID-like id (Prisma doesn't use UUID defaults).
+func (r *SnapshotRepo) upsertTS(ctx context.Context, s *Snapshot, breakdownJSON []byte, hasOrigin bool) error {
+	now := time.Now().UTC()
+	args := []any{
+		generateCUID(),
+		s.UserUID, s.Exchange, s.Label, s.Timestamp,
+		s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
+		s.Deposits, s.Withdrawals,
+		breakdownJSON, now, now,
+	}
+	optCols, optPlaceholders, optExcluded, optArgs := snapshotTSOptionalOrigin(s, hasOrigin, len(args))
+	args = append(args, optArgs...)
+	query := fmt.Sprintf(`
+		INSERT INTO snapshot_data (
+			id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt", "updatedAt"%s
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13%s)
+		ON CONFLICT ("userUid", exchange, label, timestamp)
+		%s%s
+		RETURNING id`, optCols, optPlaceholders, snapshotUpdateSetTS, optExcluded)
+
+	return r.pool.QueryRow(ctx, query, args...).Scan(&s.ID)
+}
+
+// GetByUserAndDateRange returns snapshots for a user within a date range.
+func (r *SnapshotRepo) GetByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
+	return r.getByUserAndDateRange(ctx, userUID, start, end)
+}
+
+// GetVerifiableByUserAndDateRange returns snapshots eligible for inclusion in
+// a signed report. As of PayloadVersion 1.3 (see internal/signing) this is the
+// FULL set — live + in-enclave-reconstructed + external-rebuilder-reconstructed
+// — and the per-day verifiability is encoded in the signed payload itself via
+// the daily_returns[*].verifiability_class field. Verifiers who require strict
+// in-enclave-only data filter the daily returns at consumption time.
+//
+// Earlier payload versions (≤ 1.2) excluded external-rebuilder snapshots at
+// this layer (SEC-001). That coarse-grained gate is now replaced by per-day
+// labelling so the same signed report can convey both live and rebuilt
+// history with cryptographically attested provenance.
+func (r *SnapshotRepo) GetVerifiableByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
+	return r.getByUserAndDateRange(ctx, userUID, start, end)
+}
+
+// GetExternalRebuilderDays returns the set of UTC day-keys (00:00:00 of the
+// day) for which the user has at least one snapshot produced by the external
+// history-rebuilder service in [start, end]. The signed-report builder uses
+// this to label each daily return with its verifiability_class without
+// scanning every individual snapshot. On a schema that doesn't have the
+// from_external_rebuilder column (legacy TS/Prisma), the returned map is
+// empty — every day is treated as in-enclave/live, which matches the pre-
+// migration-015 reality.
+func (r *SnapshotRepo) GetExternalRebuilderDays(ctx context.Context, userUID string, start, end time.Time) (map[time.Time]struct{}, error) {
+	out := make(map[time.Time]struct{})
+	if !r.hasFromExternalRebuilderColumn(ctx) {
+		return out, nil
+	}
+	// DATA-05: truncate in UTC, not the Postgres session timezone. `timestamp`
+	// is TIMESTAMPTZ; `date_trunc('day', timestamp)` alone buckets by the
+	// session TZ, so on a non-UTC connection the day keys would not line up with
+	// the midnight-UTC keys the signing layer builds — silently dropping
+	// rebuilder taint. `AT TIME ZONE 'UTC'` pins the bucket to the UTC calendar
+	// day regardless of session settings.
+	// The TS schema names the user column "userUid"; hitting the snake_case
+	// name there is a hard SQL error, not an empty result.
+	userCol := "user_uid"
+	if r.isTSSchema {
+		userCol = `"userUid"`
+	}
+	rows, err := r.pool.Query(ctx, fmt.Sprintf(`
+		SELECT DISTINCT date_trunc('day', timestamp AT TIME ZONE 'UTC') AS day
+		FROM snapshot_data
+		WHERE %s = $1 AND timestamp >= $2 AND timestamp <= $3
+		  AND from_external_rebuilder = TRUE`, userCol),
+		userUID, start, end,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var day time.Time
+		if err := rows.Scan(&day); err != nil {
+			return nil, err
+		}
+		// Rebuild the key as midnight UTC from the calendar components so it
+		// matches the signing layer's keys exactly, whatever location pgx used.
+		out[time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
+// GetLatestSnapshotChange returns the most recent moment at which one of the
+// user's snapshots dated in [start, end] was written. A zero time means the
+// window holds no snapshot, or the schema carries no write stamp to read —
+// callers must treat it as "unknown", not as "never written".
+//
+// A signed report is cached against the period it covers, never against the
+// rows it was computed from. A history rebuild rewrites those rows under it
+// (moving a history from realized-only to mark-to-market changes both its
+// total return and its max drawdown), and the cache then keeps serving
+// numbers the data no longer supports. This
+// is the stamp the report cache compares against to notice that.
+//
+// The Go schema has no updated_at and its snapshot upsert leaves created_at
+// alone on conflict, so there this dates each row's first write: a rebuild
+// that overwrites rows in place is invisible. The TS schema, which production
+// runs, refreshes "updatedAt" on every upsert and has no such hole.
+func (r *SnapshotRepo) GetLatestSnapshotChange(ctx context.Context, userUID string, start, end time.Time) (time.Time, error) {
+	r.hasLabelColumn(ctx) // primes capabilitiesLoaded
+	r.capMu.Lock()
+	stamp := r.changeStampExpr
+	isTS := r.isTSSchema
+	r.capMu.Unlock()
+
+	if stamp == "" {
+		return time.Time{}, nil
+	}
+
+	userCol := "user_uid"
+	if isTS {
+		userCol = `"userUid"`
+	}
+
+	query := fmt.Sprintf(`
+		SELECT MAX(%s)
+		FROM snapshot_data
+		WHERE %s = $1 AND timestamp >= $2 AND timestamp <= $3`, stamp, userCol)
+
+	var latest *time.Time
+	if err := r.pool.QueryRow(ctx, query, userUID, start, end).Scan(&latest); err != nil {
+		return time.Time{}, fmt.Errorf("read latest snapshot change: %w", err)
+	}
+	if latest == nil {
+		return time.Time{}, nil
+	}
+	return latest.UTC(), nil
+}
+
+// snapshotChangeStampExpr builds the SQL expression dating a snapshot row's
+// last write, for whichever of the two stamp columns the schema actually has.
+// Empty means the schema carries neither. The COALESCE covers rows written
+// before a nullable "updatedAt" was populated; the stamp never runs backwards
+// because every writer sets both to the same instant on insert.
+func snapshotChangeStampExpr(isTS, hasUpdated, hasCreated bool) string {
+	updated, created := "updated_at", "created_at"
+	if isTS {
+		updated, created = `"updatedAt"`, `"createdAt"`
+	}
+	switch {
+	case hasUpdated && hasCreated:
+		return "COALESCE(" + updated + ", " + created + ")"
+	case hasUpdated:
+		return updated
+	case hasCreated:
+		return created
+	default:
+		return ""
+	}
+}
+
+// ErrOriginUnavailable is returned when an operation needs to tell rebuilt
+// snapshots from live ones but the origin column (migration 015) is absent.
+var ErrOriginUnavailable = errors.New("snapshot origin column unavailable")
+
+// DeleteExternalRebuilderHistory drops the snapshots a connection received
+// from the out-of-perimeter rebuilder and returns how many rows went.
+//
+// The predicate is the origin column rather than a date cutoff, so a user who
+// rebuilt 100 days and has since been syncing keeps every live day, including
+// any that falls inside the rebuilt window. Without that column there is no
+// safe way to separate the two, and a date heuristic would take live
+// snapshots with it — hence the refusal rather than a best effort.
+func (r *SnapshotRepo) DeleteExternalRebuilderHistory(ctx context.Context, userUID, exchange, label string, before time.Time) (int64, error) {
+	if !r.hasFromExternalRebuilderColumn(ctx) {
+		return 0, ErrOriginUnavailable
+	}
+
+	where, args := rebuiltHistoryScope(r.isTSSchema, r.hasLabelColumn(ctx), userUID, exchange, label, before)
+	tag, err := r.pool.Exec(ctx, "DELETE FROM snapshot_data WHERE "+where, args...)
+	if err != nil {
+		return 0, fmt.Errorf("delete rebuilt snapshots: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// PruneRebuiltDaysOutside removes the rebuilt rows a fresh reconstruction no
+// longer produces, inside the span it just wrote. A reconstruction upserts, so
+// a day it stops emitting survives under the new series: harmless while a fix
+// only changes values, and not harmless at all when a fix moves dates. Alpaca's
+// stamping correction moved every close back one calendar day, and the Saturday
+// rows the old keying had invented stayed behind carrying Friday's equity, so
+// each week ended on a two-day plateau that never happened.
+//
+// Scoped three ways, all unconditional. Only rebuilt rows, so the live branch
+// is untouchable. Only inside [from, max(keep)], and never a day present in
+// keep. A caller whose source is the enclave itself must not use this: its rows
+// carry the same origin flag as live ones, and there is no way to tell them
+// apart.
+//
+// from is the caller's, not derived from keep, because the two reconstruction
+// modes need different floors. A bounded repair passes its window start, so the
+// history around the window is untouched. A full run passes the zero time: its
+// output IS the connection's whole rebuilt history, and deriving the floor from
+// keep instead leaves anything the run no longer reaches — a row the previous
+// keying put a day earlier than anything the new one emits, say, which is
+// exactly the residue that survived the Alpaca correction and double-counted a
+// funding day.
+func (r *SnapshotRepo) PruneRebuiltDaysOutside(ctx context.Context, userUID, exchange, label string, from time.Time, keep []time.Time) (int64, error) {
+	if len(keep) == 0 {
+		return 0, nil
+	}
+	if !r.hasFromExternalRebuilderColumn(ctx) {
+		return 0, ErrOriginUnavailable
+	}
+
+	where, args := prunedRebuiltScope(r.isTSSchema, r.hasLabelColumn(ctx), userUID, exchange, label, from, keep)
+	tag, err := r.pool.Exec(ctx, "DELETE FROM snapshot_data WHERE "+where, args...)
+	if err != nil {
+		return 0, fmt.Errorf("prune rebuilt snapshots: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// prunedRebuiltScope builds the predicate for PruneRebuiltDaysOutside. Pure so
+// the three guards can be regression-tested without a live DB: dropping any one
+// of them turns a tidy-up into data loss.
+func prunedRebuiltScope(isTS, hasLabel bool, userUID, exchange, label string, from time.Time, keep []time.Time) (string, []any) {
+	userCol := "user_uid"
+	if isTS {
+		userCol = `"userUid"`
+	}
+
+	to := keep[0].UTC()
+	days := make([]time.Time, 0, len(keep))
+	for _, d := range keep {
+		u := d.UTC()
+		if u.After(to) {
+			to = u
+		}
+		days = append(days, u)
+	}
+	from = from.UTC()
+
+	args := []any{userUID, exchange}
+	clause := userCol + " = $1 AND exchange = $2"
+	if hasLabel {
+		clause += " AND label = $3"
+		args = append(args, label)
+	}
+	args = append(args, from, to, days)
+	n := len(args)
+	return fmt.Sprintf(
+		"%s AND from_external_rebuilder = TRUE AND timestamp >= $%d AND timestamp <= $%d AND timestamp <> ALL($%d)",
+		clause, n-2, n-1, n,
+	), args
+}
+
+// rebuiltHistoryScope builds the predicate isolating one connection's
+// out-of-perimeter rebuilt rows, up to but excluding `before`.
+//
+// Two terms guard the user's live data and both are unconditional. The origin
+// term is the obvious one. The cutoff covers the case it misses: a rebuild
+// that re-runs over days the daily sync already captured re-stamps those rows
+// as rebuilt, and the nightly recalibration does exactly that for a week after
+// connect. Anything dated at or after the connection exists is owned by the
+// live branch whatever flag a later pass wrote on it.
+func rebuiltHistoryScope(isTS, hasLabel bool, userUID, exchange, label string, before time.Time) (string, []any) {
+	userCol := "user_uid"
+	if isTS {
+		userCol = `"userUid"`
+	}
+	args := []any{userUID, exchange}
+	clause := userCol + " = $1 AND exchange = $2"
+	if hasLabel {
+		clause += " AND label = $3"
+		args = append(args, label)
+	}
+	args = append(args, before)
+	return fmt.Sprintf("%s AND from_external_rebuilder = TRUE AND timestamp < $%d", clause, len(args)), args
+}
+
+// CountExternalRebuilderSnapshots reports how many rebuilt rows a connection
+// holds, so a caller can show what a deletion would take before it runs.
+func (r *SnapshotRepo) CountExternalRebuilderSnapshots(ctx context.Context, userUID, exchange, label string, before time.Time) (int64, error) {
+	if !r.hasFromExternalRebuilderColumn(ctx) {
+		return 0, ErrOriginUnavailable
+	}
+
+	where, args := rebuiltHistoryScope(r.isTSSchema, r.hasLabelColumn(ctx), userUID, exchange, label, before)
+	var n int64
+	if err := r.pool.QueryRow(ctx, "SELECT count(*) FROM snapshot_data WHERE "+where, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count rebuilt snapshots: %w", err)
+	}
+	return n, nil
+}
+
+func (r *SnapshotRepo) getByUserAndDateRange(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
+	hasLabel := r.hasLabelColumn(ctx)
+	hasHist := r.hasIsHistoricalColumn(ctx)
+
+	if r.isTSSchema {
+		return r.getByUserAndDateRangeTS(ctx, userUID, start, end)
+	}
+
+	selectCols := snapshotColsBase
+	if hasLabel {
+		selectCols = snapshotColsWithLabel
+	}
+	histCol := ""
+	if hasHist {
+		histCol = snapshotIsHistoricalCol
+	}
+	query := fmt.Sprintf(`
+		SELECT %s,
+			total_equity, realized_balance, unrealized_pnl,
+			deposits, withdrawals, total_trades, total_volume, total_fees,
+			breakdown_by_market, created_at%s
+		FROM snapshot_data
+		WHERE user_uid = $1 AND timestamp >= $2 AND timestamp <= $3
+		ORDER BY timestamp`,
+		selectCols, histCol,
+	)
+
+	rows, err := r.pool.Query(ctx, query, userUID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return r.scanSnapshots(rows, hasLabel, hasHist)
+}
+
+func (r *SnapshotRepo) getByUserAndDateRangeTS(ctx context.Context, userUID string, start, end time.Time) ([]*Snapshot, error) {
+	// The origin column exists on the TS schema too (migration 015 applied
+	// by hand on prod); without it every stored row reads as measured, and
+	// the reproduction gate then holds a fresh reconstruction to the rows
+	// the previous reconstruction wrote.
+	hasOrigin := r.hasFromExternalRebuilderColumn(ctx)
+	originCol := ""
+	if hasOrigin {
+		originCol = snapshotFromExternalRebuilderCol
+	}
+	query := fmt.Sprintf(`
+		SELECT id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt"%s
+		FROM snapshot_data
+		WHERE "userUid" = $1 AND timestamp >= $2 AND timestamp <= $3
+		ORDER BY timestamp`, originCol)
+
+	rows, err := r.pool.Query(ctx, query, userUID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return r.scanSnapshotsTSOrigin(rows, hasOrigin)
+}
+
+// GetLatestByUser returns the most recent snapshot for a user
+func (r *SnapshotRepo) GetLatestByUser(ctx context.Context, userUID string) (*Snapshot, error) {
+	hasLabel := r.hasLabelColumn(ctx)
+	hasHist := r.hasIsHistoricalColumn(ctx)
+
+	if r.isTSSchema {
+		return r.getLatestByUserTS(ctx, userUID)
+	}
+
+	selectCols := snapshotColsBase
+	if hasLabel {
+		selectCols = snapshotColsWithLabel
+	}
+	histCol := ""
+	if hasHist {
+		histCol = snapshotIsHistoricalCol
+	}
+	query := fmt.Sprintf(`
+		SELECT %s,
+			total_equity, realized_balance, unrealized_pnl,
+			deposits, withdrawals, total_trades, total_volume, total_fees,
+			breakdown_by_market, created_at%s
+		FROM snapshot_data
+		WHERE user_uid = $1
+		ORDER BY timestamp DESC
+		LIMIT 1`,
+		selectCols, histCol,
+	)
+
+	rows, err := r.pool.Query(ctx, query, userUID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshots(rows, hasLabel, hasHist)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+
+	return snapshots[0], nil
+}
+
+func (r *SnapshotRepo) getLatestByUserTS(ctx context.Context, userUID string) (*Snapshot, error) {
+	query := `
+		SELECT id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt"
+		FROM snapshot_data
+		WHERE "userUid" = $1
+		ORDER BY timestamp DESC
+		LIMIT 1`
+
+	rows, err := r.pool.Query(ctx, query, userUID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshotsTS(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+
+	return snapshots[0], nil
+}
+
+// GetByUserExchangeAndDate returns a specific snapshot
+func (r *SnapshotRepo) GetByUserExchangeAndDate(ctx context.Context, userUID, exchange string, date time.Time) (*Snapshot, error) {
+	hasLabel := r.hasLabelColumn(ctx)
+	hasHist := r.hasIsHistoricalColumn(ctx)
+
+	if r.isTSSchema {
+		return r.getByUserExchangeAndDateTS(ctx, userUID, exchange, date)
+	}
+
+	selectCols := snapshotColsBase
+	if hasLabel {
+		selectCols = snapshotColsWithLabel
+	}
+	whereClause := "WHERE user_uid = $1 AND exchange = $2 AND timestamp = $3"
+	if hasLabel {
+		whereClause = "WHERE user_uid = $1 AND exchange = $2 AND label = '' AND timestamp = $3"
+	}
+	histCol := ""
+	if hasHist {
+		histCol = snapshotIsHistoricalCol
+	}
+	query := fmt.Sprintf(`
+		SELECT %s,
+			total_equity, realized_balance, unrealized_pnl,
+			deposits, withdrawals, total_trades, total_volume, total_fees,
+			breakdown_by_market, created_at%s
+		FROM snapshot_data
+		%s`,
+		selectCols, histCol, whereClause,
+	)
+
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshots(rows, hasLabel, hasHist)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+
+	return snapshots[0], nil
+}
+
+func (r *SnapshotRepo) getByUserExchangeAndDateTS(ctx context.Context, userUID, exchange string, date time.Time) (*Snapshot, error) {
+	query := `
+		SELECT id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt"
+		FROM snapshot_data
+		WHERE "userUid" = $1 AND exchange = $2 AND label = '' AND timestamp = $3`
+
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshotsTS(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+
+	return snapshots[0], nil
+}
+
+// GetByUserExchangeLabelAndDate returns a specific snapshot for a user/exchange/label/date.
+func (r *SnapshotRepo) GetByUserExchangeLabelAndDate(ctx context.Context, userUID, exchange, label string, date time.Time) (*Snapshot, error) {
+	hasLabel := r.hasLabelColumn(ctx)
+	hasHist := r.hasIsHistoricalColumn(ctx)
+
+	if r.isTSSchema {
+		return r.getByUserExchangeLabelAndDateTS(ctx, userUID, exchange, label, date)
+	}
+
+	if !hasLabel {
+		return r.GetByUserExchangeAndDate(ctx, userUID, exchange, date)
+	}
+
+	histCol := ""
+	if hasHist {
+		histCol = snapshotIsHistoricalCol
+	}
+	query := fmt.Sprintf(`
+		SELECT id, user_uid, exchange, label, timestamp,
+			total_equity, realized_balance, unrealized_pnl,
+			deposits, withdrawals, total_trades, total_volume, total_fees,
+			breakdown_by_market, created_at%s
+		FROM snapshot_data
+		WHERE user_uid = $1 AND exchange = $2 AND label = $3 AND timestamp = $4`, histCol)
+
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, label, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshots(rows, true, hasHist)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+	return snapshots[0], nil
+}
+
+func (r *SnapshotRepo) getByUserExchangeLabelAndDateTS(ctx context.Context, userUID, exchange, label string, date time.Time) (*Snapshot, error) {
+	query := `
+		SELECT id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt"
+		FROM snapshot_data
+		WHERE "userUid" = $1 AND exchange = $2 AND label = $3 AND timestamp = $4`
+
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, label, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshotsTS(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+	return snapshots[0], nil
+}
+
+// GetLatestByUserExchangeLabel returns the most recent snapshot for a user/exchange/label.
+func (r *SnapshotRepo) GetLatestByUserExchangeLabel(ctx context.Context, userUID, exchange, label string) (*Snapshot, error) {
+	hasLabel := r.hasLabelColumn(ctx)
+	hasHist := r.hasIsHistoricalColumn(ctx)
+
+	if r.isTSSchema {
+		return r.getLatestByUserExchangeLabelTS(ctx, userUID, exchange, label)
+	}
+
+	histCol := ""
+	if hasHist {
+		histCol = snapshotIsHistoricalCol
+	}
+
+	if !hasLabel {
+		query := fmt.Sprintf(`
+			SELECT id, user_uid, exchange, timestamp,
+				total_equity, realized_balance, unrealized_pnl,
+				deposits, withdrawals, total_trades, total_volume, total_fees,
+				breakdown_by_market, created_at%s
+			FROM snapshot_data
+			WHERE user_uid = $1 AND exchange = $2
+			ORDER BY timestamp DESC
+			LIMIT 1`, histCol)
+
+		rows, err := r.pool.Query(ctx, query, userUID, exchange)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		snapshots, err := r.scanSnapshots(rows, false, hasHist)
+		if err != nil {
+			return nil, err
+		}
+		if len(snapshots) == 0 {
+			return nil, ErrNotFound
+		}
+		return snapshots[0], nil
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, user_uid, exchange, label, timestamp,
+			total_equity, realized_balance, unrealized_pnl,
+			deposits, withdrawals, total_trades, total_volume, total_fees,
+			breakdown_by_market, created_at%s
+		FROM snapshot_data
+		WHERE user_uid = $1 AND exchange = $2 AND label = $3
+		ORDER BY timestamp DESC
+		LIMIT 1`, histCol)
+
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, label)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshots(rows, true, hasHist)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+	return snapshots[0], nil
+}
+
+func (r *SnapshotRepo) getLatestByUserExchangeLabelTS(ctx context.Context, userUID, exchange, label string) (*Snapshot, error) {
+	query := `
+		SELECT id, "userUid", exchange, label, timestamp,
+			"totalEquity", "realizedBalance", "unrealizedPnL",
+			deposits, withdrawals,
+			breakdown_by_market, "createdAt"
+		FROM snapshot_data
+		WHERE "userUid" = $1 AND exchange = $2 AND label = $3
+		ORDER BY timestamp DESC
+		LIMIT 1`
+
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, label)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	snapshots, err := r.scanSnapshotsTS(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+	return snapshots[0], nil
+}
+
+// GetLatestByUserExchangeLabelBefore returns the most recent snapshot strictly
+// before `before` for the (user, exchange, label) tuple. Capital-flow
+// reconciliation anchors on the previous day's settled balance; using the
+// unqualified latest would pick up a same-day snapshot on a re-sync and compare
+// a balance against itself.
+func (r *SnapshotRepo) GetLatestByUserExchangeLabelBefore(ctx context.Context, userUID, exchange, label string, before time.Time) (*Snapshot, error) {
+	// Prime the capability cache BEFORE reading isTSSchema. If this is the
+	// first repo method the process calls, the flag is still its zero value
+	// and a TS database would be queried with the snake_case column names.
+	r.hasLabelColumn(ctx)
+	if r.isTSSchema {
+		query := `
+			SELECT id, "userUid", exchange, label, timestamp,
+				"totalEquity", "realizedBalance", "unrealizedPnL",
+				deposits, withdrawals,
+				breakdown_by_market, "createdAt"
+			FROM snapshot_data
+			WHERE "userUid" = $1 AND exchange = $2 AND label = $3 AND timestamp < $4
+			ORDER BY timestamp DESC
+			LIMIT 1`
+		rows, err := r.pool.Query(ctx, query, userUID, exchange, label, before)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		snapshots, err := r.scanSnapshotsTS(rows)
+		if err != nil {
+			return nil, err
+		}
+		if len(snapshots) == 0 {
+			return nil, ErrNotFound
+		}
+		return snapshots[0], nil
+	}
+
+	hasLabel := r.hasLabelColumn(ctx)
+	hasHist := r.hasIsHistoricalColumn(ctx)
+	histCol := ""
+	if hasHist {
+		histCol = snapshotIsHistoricalCol
+	}
+	if !hasLabel {
+		query := fmt.Sprintf(`
+			SELECT id, user_uid, exchange, timestamp,
+				total_equity, realized_balance, unrealized_pnl,
+				deposits, withdrawals, total_trades, total_volume, total_fees,
+				breakdown_by_market, created_at%s
+			FROM snapshot_data
+			WHERE user_uid = $1 AND exchange = $2 AND timestamp < $3
+			ORDER BY timestamp DESC
+			LIMIT 1`, histCol)
+		rows, err := r.pool.Query(ctx, query, userUID, exchange, before)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		snapshots, err := r.scanSnapshots(rows, false, hasHist)
+		if err != nil {
+			return nil, err
+		}
+		if len(snapshots) == 0 {
+			return nil, ErrNotFound
+		}
+		return snapshots[0], nil
+	}
+	query := fmt.Sprintf(`
+		SELECT id, user_uid, exchange, label, timestamp,
+			total_equity, realized_balance, unrealized_pnl,
+			deposits, withdrawals, total_trades, total_volume, total_fees,
+			breakdown_by_market, created_at%s
+		FROM snapshot_data
+		WHERE user_uid = $1 AND exchange = $2 AND label = $3 AND timestamp < $4
+		ORDER BY timestamp DESC
+		LIMIT 1`, histCol)
+	rows, err := r.pool.Query(ctx, query, userUID, exchange, label, before)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	snapshots, err := r.scanSnapshots(rows, true, hasHist)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return nil, ErrNotFound
+	}
+	return snapshots[0], nil
+}
+
+// ExistsForUserExchangeLabel returns true if any snapshot already exists for
+// the given (user_uid, exchange, label) tuple. Used by the anti-cherry-pick
+// guard (ENG-001) — replaces the old full-range scan that was O(all user
+// snapshots) and fail-open on DB errors. Returns an error on DB failure so
+// the caller can fail closed.
+func (r *SnapshotRepo) ExistsForUserExchangeLabel(ctx context.Context, userUID, exchange, label string) (bool, error) {
+	hasLabel := r.hasLabelColumn(ctx)
+
+	var query string
+	var args []any
+	switch {
+	case r.isTSSchema:
+		query = `SELECT 1 FROM snapshot_data WHERE "userUid" = $1 AND exchange = $2 AND label = $3 LIMIT 1`
+		args = []any{userUID, exchange, label}
+	case !hasLabel:
+		query = `SELECT 1 FROM snapshot_data WHERE user_uid = $1 AND exchange = $2 LIMIT 1`
+		args = []any{userUID, exchange}
+	default:
+		query = `SELECT 1 FROM snapshot_data WHERE user_uid = $1 AND exchange = $2 AND label = $3 LIMIT 1`
+		args = []any{userUID, exchange, label}
+	}
+
+	var one int
+	err := r.pool.QueryRow(ctx, query, args...).Scan(&one)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// UpdateFlows rewrites one snapshot's deposits and withdrawals, only if they
+// still hold the values the caller read, and leaves every other column as it
+// was. Reports whether the row changed.
+func (r *SnapshotRepo) UpdateFlows(ctx context.Context, id string, oldDeposits, oldWithdrawals, deposits, withdrawals float64) (bool, error) {
+	r.hasLabelColumn(ctx)
+	if !r.isTSSchema {
+		return false, errors.New("update snapshot flows: production schema only")
+	}
+	tag, err := r.pool.Exec(ctx, `UPDATE snapshot_data
+		SET deposits = $1, withdrawals = $2, "updatedAt" = $3
+		WHERE id = $4 AND deposits = $5 AND withdrawals = $6`,
+		deposits, withdrawals, time.Now().UTC(), id, oldDeposits, oldWithdrawals)
+	if err != nil {
+		return false, fmt.Errorf("update snapshot flows: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// GetEarliestTimestamp returns the oldest snapshot timestamp for a
+// (user, exchange, label) tuple. Used by the IBKR Flex sync to detect when
+// the broker's history has been extended retroactively (e.g. user widened
+// their Flex query window) so we can log/flag the reconstruction. Returns
+// (zero time, ErrNotFound) when no snapshot exists for the tuple yet —
+// callers treat this as "first sync, no prior data".
+func (r *SnapshotRepo) GetEarliestTimestamp(ctx context.Context, userUID, exchange, label string) (time.Time, error) {
+	hasLabel := r.hasLabelColumn(ctx)
+
+	var query string
+	var args []any
+	switch {
+	case r.isTSSchema:
+		query = `SELECT MIN(timestamp) FROM snapshot_data WHERE "userUid" = $1 AND exchange = $2 AND label = $3`
+		args = []any{userUID, exchange, label}
+	case !hasLabel:
+		query = `SELECT MIN(timestamp) FROM snapshot_data WHERE user_uid = $1 AND exchange = $2`
+		args = []any{userUID, exchange}
+	default:
+		query = `SELECT MIN(timestamp) FROM snapshot_data WHERE user_uid = $1 AND exchange = $2 AND label = $3`
+		args = []any{userUID, exchange, label}
+	}
+
+	var earliest *time.Time
+	if err := r.pool.QueryRow(ctx, query, args...).Scan(&earliest); err != nil {
+		return time.Time{}, err
+	}
+	if earliest == nil {
+		return time.Time{}, ErrNotFound
+	}
+	return earliest.UTC(), nil
+}
+
+// UpsertBatch atomically upserts multiple snapshots in a single transaction.
+// If any snapshot fails, the entire batch is rolled back (TS parity: atomic daily sync).
+func (r *SnapshotRepo) UpsertBatch(ctx context.Context, snapshots []*Snapshot) error {
+	if len(snapshots) == 0 {
+		return nil
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	hasLabel := r.hasLabelColumn(ctx)
+	hasHist := r.hasIsHistoricalColumn(ctx)
+	hasOrigin := r.hasFromExternalRebuilderColumn(ctx)
+
+	for _, s := range snapshots {
+		breakdownJSON, _ := json.Marshal(s.Breakdown)
+
+		if r.isTSSchema {
+			now := time.Now().UTC()
+			args := []any{
+				generateCUID(),
+				s.UserUID, s.Exchange, s.Label, s.Timestamp,
+				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
+				s.Deposits, s.Withdrawals,
+				breakdownJSON, now, now,
+			}
+			optCols, optPlaceholders, optExcluded, optArgs := snapshotTSOptionalOrigin(s, hasOrigin, len(args))
+			args = append(args, optArgs...)
+			_, err = tx.Exec(ctx, fmt.Sprintf(`
+				INSERT INTO snapshot_data (
+					id, "userUid", exchange, label, timestamp,
+					"totalEquity", "realizedBalance", "unrealizedPnL",
+					deposits, withdrawals,
+					breakdown_by_market, "createdAt", "updatedAt"%s
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13%s)
+				ON CONFLICT ("userUid", exchange, label, timestamp)
+				%s%s`,
+				optCols, optPlaceholders, snapshotUpdateSetTS, optExcluded), args...,
+			)
+		} else if hasLabel {
+			args := []any{
+				s.UserUID, s.Exchange, s.Label, s.Timestamp,
+				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
+				s.Deposits, s.Withdrawals, s.TotalTrades, s.TotalVolume, s.TotalFees,
+				breakdownJSON, time.Now().UTC(),
+			}
+			optCols, optPlaceholders, optExcluded, optArgs := snapshotOptionalCols(s, hasHist, hasOrigin, len(args))
+			args = append(args, optArgs...)
+			_, err = tx.Exec(ctx, fmt.Sprintf(`
+				INSERT INTO snapshot_data (
+					user_uid, exchange, label, timestamp,
+					total_equity, realized_balance, unrealized_pnl,
+					deposits, withdrawals, total_trades, total_volume, total_fees,
+					breakdown_by_market, created_at%s
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14%s)
+				ON CONFLICT (user_uid, exchange, label, timestamp)
+				%s%s`,
+				optCols, optPlaceholders, snapshotUpdateSetGo, optExcluded), args...,
+			)
+		} else {
+			args := []any{
+				s.UserUID, s.Exchange, s.Timestamp,
+				s.TotalEquity, s.RealizedBalance, s.UnrealizedPnL,
+				s.Deposits, s.Withdrawals, s.TotalTrades, s.TotalVolume, s.TotalFees,
+				breakdownJSON, time.Now().UTC(),
+			}
+			optCols, optPlaceholders, optExcluded, optArgs := snapshotOptionalCols(s, hasHist, hasOrigin, len(args))
+			args = append(args, optArgs...)
+			_, err = tx.Exec(ctx, fmt.Sprintf(`
+				INSERT INTO snapshot_data (
+					user_uid, exchange, timestamp,
+					total_equity, realized_balance, unrealized_pnl,
+					deposits, withdrawals, total_trades, total_volume, total_fees,
+					breakdown_by_market, created_at%s
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13%s)
+				ON CONFLICT (user_uid, exchange, timestamp)
+				%s%s`,
+				optCols, optPlaceholders, snapshotUpdateSetGo, optExcluded), args...,
+			)
+		}
+
+		if err != nil {
+			return fmt.Errorf("upsert snapshot %s/%s: %w", s.Exchange, s.Label, err)
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (r *SnapshotRepo) scanSnapshots(rows pgx.Rows, hasLabel, hasHist bool) ([]*Snapshot, error) {
+	var snapshots []*Snapshot
+
+	for rows.Next() {
+		var s Snapshot
+		var breakdownJSON []byte
+
+		scanArgs := []any{&s.ID, &s.UserUID, &s.Exchange}
+		if hasLabel {
+			scanArgs = append(scanArgs, &s.Label)
+		}
+		scanArgs = append(scanArgs,
+			&s.Timestamp,
+			&s.TotalEquity, &s.RealizedBalance, &s.UnrealizedPnL,
+			&s.Deposits, &s.Withdrawals, &s.TotalTrades, &s.TotalVolume, &s.TotalFees,
+			&breakdownJSON, &s.CreatedAt,
+		)
+		if hasHist {
+			scanArgs = append(scanArgs, &s.IsHistorical)
+		}
+
+		err := rows.Scan(scanArgs...)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(breakdownJSON) > 0 {
+			json.Unmarshal(breakdownJSON, &s.Breakdown)
+		}
+
+		snapshots = append(snapshots, &s)
+	}
+
+	return snapshots, rows.Err()
+}
+
+// scanSnapshotsTS scans rows from TS Prisma schema (camelCase columns).
+//
+// The TS schema does not have top-level total_trades/total_volume/total_fees
+// columns — those aggregates live inside the breakdown_by_market JSONB under
+// the "global" key, which is how the TS enclave writes them. To keep parity
+// with the TS GetAggregatedMetrics response, we unmarshal the breakdown and
+// lift breakdown.global.* into the top-level Snapshot fields.
+//
+// TS always has the label column. If breakdown.global is missing (very old
+// rows predating the global aggregate), the totals fall back to zero, which
+// matches TS behaviour for those same rows.
+func (r *SnapshotRepo) scanSnapshotsTS(rows pgx.Rows) ([]*Snapshot, error) {
+	return r.scanSnapshotsTSOrigin(rows, false)
+}
+
+// scanSnapshotsTSOrigin scans the TS column list, plus from_external_rebuilder
+// as the last column when the query selected it.
+func (r *SnapshotRepo) scanSnapshotsTSOrigin(rows pgx.Rows, withOrigin bool) ([]*Snapshot, error) {
+	var snapshots []*Snapshot
+
+	for rows.Next() {
+		var s Snapshot
+		var breakdownJSON []byte
+
+		dest := []any{
+			&s.ID, &s.UserUID, &s.Exchange, &s.Label, &s.Timestamp,
+			&s.TotalEquity, &s.RealizedBalance, &s.UnrealizedPnL,
+			&s.Deposits, &s.Withdrawals,
+			&breakdownJSON, &s.CreatedAt,
+		}
+		if withOrigin {
+			dest = append(dest, &s.FromExternalRebuilder)
+		}
+		err := rows.Scan(dest...)
+		if err != nil {
+			return nil, err
+		}
+
+		// Default to zero; will be overwritten from breakdown.global below
+		// if present.
+		s.TotalTrades = 0
+		s.TotalVolume = 0
+		s.TotalFees = 0
+
+		if len(breakdownJSON) > 0 {
+			if err := json.Unmarshal(breakdownJSON, &s.Breakdown); err == nil && s.Breakdown != nil && s.Breakdown.Global != nil {
+				g := s.Breakdown.Global
+				s.TotalTrades = g.Trades
+				s.TotalVolume = g.Volume
+				s.TotalFees = g.TradingFees + g.FundingFees
+			}
+		}
+
+		snapshots = append(snapshots, &s)
+	}
+
+	return snapshots, rows.Err()
+}
+
+func (r *SnapshotRepo) hasLabelColumn(ctx context.Context) bool {
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+
+	if r.capabilitiesLoaded {
+		return r.hasLabelCol
+	}
+
+	// A failed probe is retried on the next call rather than latched for the
+	// life of the process as "column absent".
+	probeFailed := false
+	probe := func(column string) bool {
+		exists, err := r.columnExists(ctx, "snapshot_data", column)
+		if err != nil {
+			probeFailed = true
+		}
+		return exists
+	}
+
+	// Detect TS Prisma schema (camelCase) vs Go schema (snake_case).
+	// If "userUid" column exists in snapshot_data → TS schema.
+	tsSchema := probe("userUid")
+	r.isTSSchema = tsSchema
+
+	if tsSchema {
+		// TS Prisma always has the label column
+		r.hasLabelCol = true
+		// TS Prisma never has is_historical (Go-only, migration 013).
+		r.hasIsHistoricalCol = false
+		// from_external_rebuilder is different: production runs on the TS
+		// schema, and forcing this to false meant every externally rebuilt
+		// day was signed indistinguishable from attested live data — the
+		// verifiability_class labelling (payload 1.3+) was dead on the very
+		// deployment that needed it. Migration 015's ALTER is applied to the
+		// TS schema by hand, so probe for the column instead of assuming.
+		r.hasFromExternalRebuilderCol = probe("from_external_rebuilder")
+	} else {
+		r.hasLabelCol = probe("label")
+		r.hasIsHistoricalCol = probe("is_historical")
+		r.hasFromExternalRebuilderCol = probe("from_external_rebuilder")
+	}
+
+	updatedName, createdName := "updated_at", "created_at"
+	if tsSchema {
+		updatedName, createdName = "updatedAt", "createdAt"
+	}
+	updatedExists := probe(updatedName)
+	createdExists := probe(createdName)
+	r.changeStampExpr = snapshotChangeStampExpr(tsSchema, updatedExists, createdExists)
+
+	r.capabilitiesLoaded = !probeFailed
+	return r.hasLabelCol
+}
+
+// hasIsHistoricalColumn reports whether migration 013 has been applied. The
+// detection is gated through hasLabelColumn() to share the capability cache.
+func (r *SnapshotRepo) hasIsHistoricalColumn(ctx context.Context) bool {
+	r.hasLabelColumn(ctx) // primes capabilitiesLoaded
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.hasIsHistoricalCol
+}
+
+// hasFromExternalRebuilderColumn reports whether migration 015 has been
+// applied. Detection is gated through hasLabelColumn() to share the cache.
+func (r *SnapshotRepo) hasFromExternalRebuilderColumn(ctx context.Context) bool {
+	r.hasLabelColumn(ctx) // primes capabilitiesLoaded
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.hasFromExternalRebuilderCol
+}
+
+func (r *SnapshotRepo) columnExists(ctx context.Context, tableName, columnName string) (bool, error) {
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = $1
+			  AND column_name = $2
+		)`
+
+	var exists bool
+	if err := r.pool.QueryRow(ctx, query, tableName, columnName).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check column %s.%s: %w", tableName, columnName, err)
+	}
+	return exists, nil
+}

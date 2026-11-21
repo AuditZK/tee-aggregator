@@ -1,0 +1,4 @@
+# Same bytes on every platform. The linker's build ID hashes the source it
+# was given, and a CRLF checkout on Windows changed the hash of a binary
+# whose compiled code was byte-for-byte the same as the Linux build's.
+* text=auto eol=lf

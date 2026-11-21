@@ -1,0 +1,85 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/enclave
+/enclave_linux
+
+# Test binary
+*.test
+
+# Output of go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+.env.local
+# `.env.*` does not match a name with no dot after "env" — widen it.
+.env*
+
+# Host-provisioned material. Never produced by the build; supplied per
+# deployment and mounted read-only into the container.
+#
+# NO trailing slash on purpose: this path is a symlink in a normal working
+# tree, and a `foo/` pattern matches real directories only — a symlink slips
+# straight through it.
+certs
+
+# Local backups of configs and binaries. They routinely carry host-specific
+# values.
+*.bak
+
+# Local AI assistant configuration (never commit, never push)
+.agents/
+.agents/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+/bin/
+/dist/
+
+# TLS material & logs — never commit private keys
+/certs/
+*.pem
+*.key
+*.log
+# Public CA roots and a public chain, needed by the build and its tests
+!internal/rebuilderclient/isrg_roots.pem
+!internal/rebuilderclient/testdata/*.pem
+
+# Audit (local only, never commit)
+doc/AUDIT_PROMPT.md
+doc/AUDIT_PROMPT.en.md
+doc/audit/
+doc/support-audit-securite.md
+# Internal planning / ops notes — local only (already covered by *.md, listed
+# for intent and to survive any future whitelist).
+doc/plan-balance-reconciled-cashflow.md
+
+# Internal docs — only the public-facing markdown files are tracked.
+# Anything else (dev setup, ops runbooks, migration notes) stays local.
+*.md
+!README.md
+!SECURITY.md
+!LICENSE.md
+!CONTRIBUTING.md
+!CHANGELOG.md
+!CODE_OF_CONDUCT.md
+
+# Local operator notes / handoff plans — never committed (contains host + ops detail)
+.handoff/

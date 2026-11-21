@@ -1,0 +1,1092 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/trackrecord/enclave/internal/repository"
+	"github.com/trackrecord/enclave/internal/signing"
+	"go.uber.org/zap"
+)
+
+// Daily TWR scoring guards, mirrored from the analytics daily aggregation
+// (MIN_TWR_BASE_USD / FLOW_DOMINANCE_RATIO) so signed reports and the
+// dashboard score the same days the same way. A day whose base is below
+// minTWRBaseUSD, or whose gross cash flows exceed flowDominanceRatio × base,
+// is not scored (0%).
+const (
+	minTWRBaseUSD      = 1.0
+	flowDominanceRatio = 10.0
+)
+
+// withdrawalsAtOpen lists the venues whose daily close already excludes the
+// day's withdrawals, so the money left before that day's market moved: the
+// withdrawal comes out of the day's base, as IBKR's PortfolioAnalyst counts it.
+// Mirrored in the analytics daily aggregation.
+var withdrawalsAtOpen = map[string]bool{"ibkr": true}
+
+// ReportService generates signed performance reports.
+type ReportService struct {
+	metricsSvc       *MetricsService
+	snapshotRepo     *repository.SnapshotRepo
+	connSvc          *ConnectionService
+	signedReportRepo *repository.SignedReportRepo
+	signer           *signing.ReportSigner
+	benchmarkSvc     *BenchmarkService
+	logger           *zap.Logger
+}
+
+// SetConnectionService configures optional exchange metadata enrichment.
+func (s *ReportService) SetConnectionService(connSvc *ConnectionService) {
+	s.connSvc = connSvc
+}
+
+// NewReportService creates a new report service
+func NewReportService(metricsSvc *MetricsService, snapshotRepo *repository.SnapshotRepo, signer *signing.ReportSigner) *ReportService {
+	return &ReportService{
+		metricsSvc:   metricsSvc,
+		snapshotRepo: snapshotRepo,
+		signer:       signer,
+	}
+}
+
+// NewReportServiceFull creates a report service with caching and benchmarks.
+func NewReportServiceFull(
+	metricsSvc *MetricsService,
+	snapshotRepo *repository.SnapshotRepo,
+	signedReportRepo *repository.SignedReportRepo,
+	signer *signing.ReportSigner,
+	benchmarkSvc *BenchmarkService,
+	logger *zap.Logger,
+) *ReportService {
+	return &ReportService{
+		metricsSvc:       metricsSvc,
+		snapshotRepo:     snapshotRepo,
+		signedReportRepo: signedReportRepo,
+		signer:           signer,
+		benchmarkSvc:     benchmarkSvc,
+		logger:           logger,
+	}
+}
+
+// GenerateReportRequest contains report generation parameters
+type GenerateReportRequest struct {
+	UserUID            string
+	StartDate          time.Time
+	EndDate            time.Time
+	ReportName         string
+	Benchmark          string
+	BaseCurrency       string
+	RiskFreeRate       float64 // annual %, e.g. 2.5 (0 = legacy rf-free ratios)
+	IncludeRiskMetrics bool
+	IncludeDrawdown    bool
+	ExcludedExchanges  map[string]struct{} // keys: "exchange" or "exchange/label"
+	// Display params (NOT signed, applied per request)
+	Manager string
+	Firm    string
+}
+
+// dailyReturn is the internal representation during computation
+type dailyReturn struct {
+	date             string
+	netReturn        float64
+	benchmarkReturn  float64
+	outperformance   float64
+	cumulativeReturn float64
+	nav              float64
+}
+
+// monthlyReturn is the internal representation during computation
+type monthlyReturn struct {
+	date            string
+	netReturn       float64
+	benchmarkReturn float64
+	outperformance  float64
+	aum             float64
+}
+
+// riskMetrics holds computed risk metrics
+type riskMetrics struct {
+	var95             float64
+	var99             float64
+	expectedShortfall float64
+	skewness          float64
+	kurtosis          float64
+}
+
+// drawdownPeriod holds a single drawdown event
+type drawdownPeriod struct {
+	startDate string
+	endDate   string
+	depth     float64
+	duration  int
+	recovered bool
+}
+
+// drawdownData holds drawdown analysis results
+type drawdownData struct {
+	currentDrawdown     float64
+	maxDrawdownDuration int
+	periods             []*drawdownPeriod
+}
+
+// GenerateReport creates a signed performance report with full analytics
+func (s *ReportService) GenerateReport(ctx context.Context, req *GenerateReportRequest) (*signing.SignedReport, error) {
+	// 0. Check cache (dedup by user + dates + benchmark)
+	if cached := s.checkReportCache(ctx, req); cached != nil {
+		// Apply display params (not signed) to cached report
+		cached.Manager = req.Manager
+		cached.Firm = req.Firm
+		return cached, nil
+	}
+
+	// 1. Fetch snapshots. As of PayloadVersion 1.3 the signed report covers
+	// the full history (live + in-enclave reconstructed + external-rebuilder
+	// reconstructed) and each daily return carries a verifiabilityClass label
+	// derived from the underlying snapshots' provenance. Verifiers who need
+	// strict in-enclave-only data filter the daily returns at consumption
+	// time. The previous SEC-001 coarse gate was replaced by per-day
+	// labelling so that user-facing PDFs and signed reports stay byte-for-
+	// byte consistent on the equity curve.
+	snapshots, err := s.snapshotRepo.GetVerifiableByUserAndDateRange(ctx, req.UserUID, req.StartDate, req.EndDate)
+	if err != nil {
+		return nil, fmt.Errorf("fetch snapshots: %w", err)
+	}
+
+	// Days that include at least one external-rebuilder snapshot — used to
+	// label the verifiabilityClass of each daily return (1.3+ payload).
+	externalRebuilderDays, err := s.snapshotRepo.GetExternalRebuilderDays(ctx, req.UserUID, req.StartDate, req.EndDate)
+	if err != nil {
+		// SEC-09: fail closed. Proceeding with an empty set would label
+		// rebuilder-tainted days as live/in-enclave — over-declaring
+		// verifiability on a signed report. Refuse to sign rather than emit a
+		// report whose provenance labels under-report the rebuilder taint.
+		return nil, fmt.Errorf("resolve external-rebuilder day set: %w", err)
+	}
+
+	snapshots = filterSnapshotsByExcludedExchanges(snapshots, req.ExcludedExchanges)
+
+	if len(snapshots) < 2 {
+		return nil, fmt.Errorf("insufficient data: need at least 2 snapshots, got %d", len(snapshots))
+	}
+
+	// Sort by timestamp
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].Timestamp.Before(snapshots[j].Timestamp)
+	})
+
+	// 1b. A report in another currency is computed in it: every amount is
+	// valued at its day's rate before any return is taken.
+	ccy := reportCurrency(req.BaseCurrency)
+	var fx fxRates
+	if ccy != "USD" {
+		if fx, err = s.loadReportRates(ctx, ccy, snapshots, req.StartDate, req.EndDate); err != nil {
+			return nil, err
+		}
+		if snapshots, err = snapshotsInCurrency(snapshots, fx, ccy, time.Now().UTC()); err != nil {
+			return nil, err
+		}
+		if len(snapshots) < 2 {
+			return nil, fmt.Errorf("insufficient data: need at least 2 snapshots with a final %s rate, got %d", ccy, len(snapshots))
+		}
+	}
+
+	// 2. Convert to daily returns (TWR with multi-exchange support)
+	snapshots = dropLeadingDustDays(snapshots)
+	dailyReturns := convertSnapshotsToDailyReturns(snapshots)
+
+	// 2b. Enrich daily returns with the benchmark series (same decimal unit
+	// as netReturn) BEFORE monthly aggregation and signing, so the signed
+	// report carries per-day benchmark data for charts (rolling beta,
+	// portfolio-vs-benchmark) — not just the aggregate metrics. One fetch
+	// serves both this enrichment and section 9's metrics. Failure is
+	// non-fatal: the series stays at zero, as before.
+	var benchmarkSeries map[string]float64
+	if req.Benchmark != "" && s.benchmarkSvc != nil && len(dailyReturns) > 0 {
+		series, err := s.benchmarkSvc.DailyReturnsByDateIn(ctx, req.Benchmark, req.StartDate, req.EndDate, fx, ccy)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("benchmark series fetch failed, continuing without", zap.Error(err))
+			}
+		} else {
+			benchmarkSeries = series
+			for i := range dailyReturns {
+				if br, ok := benchmarkSeries[dailyReturns[i].date]; ok {
+					dailyReturns[i].benchmarkReturn = br
+					dailyReturns[i].outperformance = dailyReturns[i].netReturn - br
+				}
+			}
+		}
+	}
+
+	// 3. Calculate core metrics over the SAME verifiable, exchange-filtered
+	// snapshot set. Re-fetching via the MetricsService would silently
+	// re-include the external-rebuilder history excluded in step 1 (SEC-001).
+	metrics, err := s.metricsSvc.CalculateFromSnapshots(snapshots, req.RiskFreeRate)
+	if err != nil {
+		return nil, fmt.Errorf("calculate metrics: %w", err)
+	}
+
+	// 4. Aggregate to monthly returns
+	monthlyReturns := aggregateToMonthlyReturns(dailyReturns, snapshots)
+
+	// 5. Collect exchanges
+	exchangeSet := make(map[string]bool)
+	for _, snap := range snapshots {
+		exchangeSet[snap.Exchange] = true
+	}
+	var exchanges []string
+	for ex := range exchangeSet {
+		exchanges = append(exchanges, ex)
+	}
+	sort.Strings(exchanges)
+
+	// 6. Build report input
+	input := &signing.ReportInput{
+		UserUID:          req.UserUID,
+		ReportName:       req.ReportName,
+		RiskFreeRate:     req.RiskFreeRate,
+		PeriodStart:      metrics.PeriodStart,
+		PeriodEnd:        metrics.PeriodEnd,
+		TotalReturn:      metrics.TotalReturn,
+		AnnualizedReturn: metrics.AnnualizedReturn,
+		Annualized:       metrics.Annualized,
+		PeriodDays:       metrics.PeriodDays,
+		SharpeRatio:      metrics.SharpeRatio,
+		SortinoRatio:     metrics.SortinoRatio,
+		CalmarRatio:      metrics.CalmarRatio,
+		MaxDrawdown:      metrics.MaxDrawdown,
+		Volatility:       metrics.Volatility,
+		WinRate:          metrics.WinRate,
+		ProfitFactor:     metrics.ProfitFactor,
+		DataPoints:       metrics.DataPoints,
+		BaseCurrency:     ccy,
+		BenchmarkUsed:    req.Benchmark,
+		Exchanges:        exchanges,
+		ExchangeDetails:  s.buildExchangeDetails(ctx, req.UserUID, exchanges),
+		DailyReturns:     toSigningDailyReturns(dailyReturns, snapshots, externalRebuilderDays),
+		MonthlyReturns:   toSigningMonthlyReturns(monthlyReturns),
+	}
+
+	if input.ReportName == "" {
+		input.ReportName = fmt.Sprintf("Performance Report %s to %s",
+			input.PeriodStart.Format(dateFormat),
+			input.PeriodEnd.Format(dateFormat))
+	}
+
+	// 7. Optional risk metrics
+	if req.IncludeRiskMetrics && len(dailyReturns) > 0 {
+		returns := make([]float64, len(dailyReturns))
+		for i, dr := range dailyReturns {
+			returns[i] = dr.netReturn
+		}
+		rm := calculateRiskMetrics(returns)
+		input.RiskMetrics = toSigningRiskMetrics(rm)
+	}
+
+	// 8. Optional drawdown data
+	if req.IncludeDrawdown && len(dailyReturns) > 0 {
+		dd := calculateDrawdownData(dailyReturns)
+		input.DrawdownData = toSigningDrawdownData(dd)
+	}
+
+	// 9. Optional benchmark metrics — computed over the date-aligned series
+	// fetched in 2b (only days where both portfolio and benchmark have data).
+	if benchmarkSeries != nil {
+		alignedPortfolio := make([]float64, 0, len(dailyReturns))
+		alignedBenchmark := make([]float64, 0, len(dailyReturns))
+		for _, dr := range dailyReturns {
+			if br, ok := benchmarkSeries[dr.date]; ok {
+				alignedPortfolio = append(alignedPortfolio, dr.netReturn)
+				alignedBenchmark = append(alignedBenchmark, br)
+			}
+		}
+		bm, err := s.benchmarkSvc.CalculateFromSeries(alignedPortfolio, alignedBenchmark, req.Benchmark)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("benchmark calculation failed, continuing without", zap.Error(err))
+			}
+		} else {
+			input.BenchmarkMetrics = &signing.BenchmarkMetrics{
+				BenchmarkName:    bm.BenchmarkName,
+				BenchmarkReturn:  bm.BenchmarkReturn,
+				Alpha:            bm.Alpha,
+				Beta:             bm.Beta,
+				InformationRatio: bm.InformationRatio,
+				TrackingError:    bm.TrackingError,
+				Correlation:      bm.Correlation,
+			}
+		}
+	}
+
+	// 10. Sign
+	report, err := s.signer.Sign(input)
+	if err != nil {
+		return nil, err
+	}
+
+	// 11. Cache the signed report
+	s.cacheReport(ctx, req, report)
+
+	// 12. Apply display params (not signed)
+	report.Manager = req.Manager
+	report.Firm = req.Firm
+
+	return report, nil
+}
+
+const dateFormat = "2006-01-02"
+
+// cacheIsFresh reports whether a report signed at cachedAt still describes the
+// snapshots it was computed from. The cache key is the period, not the data:
+// a rebuild that rewrites the history under a signed period leaves the cached
+// report serving numbers the snapshots no longer support, forever. Until this
+// gate existed the only way out was to bump signing.EnclaveVersion, which
+// invalidates every user's cache to fix one user's period.
+//
+// A zero latestSnapshotChange means the schema carries no write stamp to read;
+// there is nothing to compare, so the cache is served as before.
+func cacheIsFresh(cachedAt, latestSnapshotChange time.Time) bool {
+	if latestSnapshotChange.IsZero() {
+		return true
+	}
+	return !latestSnapshotChange.After(cachedAt)
+}
+
+// checkReportCache looks for a cached report matching user + dates + benchmark.
+func (s *ReportService) checkReportCache(ctx context.Context, req *GenerateReportRequest) *signing.SignedReport {
+	if s.signedReportRepo == nil {
+		return nil
+	}
+	// Current cache key does not include exclusions; skip cache for filtered reports.
+	if len(req.ExcludedExchanges) > 0 {
+		return nil
+	}
+	// Cache key does not include the risk-free rate either; only the legacy
+	// rf=0 reports are cacheable.
+	if req.RiskFreeRate != 0 {
+		return nil
+	}
+	// Nor the currency: only USD reports are cached.
+	if reportCurrency(req.BaseCurrency) != "USD" {
+		return nil
+	}
+
+	cached, err := s.signedReportRepo.GetCached(ctx, req.UserUID, req.StartDate, req.EndDate, req.Benchmark, signing.EnclaveVersion)
+	if err != nil {
+		if !errors.Is(err, repository.ErrNotFound) && s.logger != nil {
+			s.logger.Warn("report cache lookup failed", zap.Error(err))
+		}
+		return nil
+	}
+
+	if s.snapshotRepo != nil {
+		latestChange, err := s.snapshotRepo.GetLatestSnapshotChange(ctx, req.UserUID, req.StartDate, req.EndDate)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("snapshot freshness lookup failed", zap.Error(err))
+			}
+			return nil
+		}
+		if !cacheIsFresh(cached.CreatedAt, latestChange) {
+			if s.logger != nil {
+				s.logger.Info("signed report cache bypassed: snapshots changed since it was signed",
+					zap.String("user_uid", req.UserUID))
+			}
+			return nil
+		}
+	}
+
+	var report signing.SignedReport
+	if err := json.Unmarshal(cached.ReportData, &report); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("report cache unmarshal failed", zap.Error(err))
+		}
+		return nil
+	}
+	// A report cached while the currency was only a label may say EUR over
+	// USD figures; it never answers a USD request.
+	if reportCurrency(report.BaseCurrency) != "USD" {
+		return nil
+	}
+
+	return &report
+}
+
+// cacheReport stores a signed report for deduplication.
+func (s *ReportService) cacheReport(ctx context.Context, req *GenerateReportRequest, report *signing.SignedReport) {
+	if s.signedReportRepo == nil {
+		return
+	}
+	// Current cache key does not include exclusions; avoid storing filtered variants.
+	if len(req.ExcludedExchanges) > 0 {
+		return
+	}
+	// Same for custom risk-free rates — the key has no rf dimension.
+	if req.RiskFreeRate != 0 {
+		return
+	}
+	if reportCurrency(req.BaseCurrency) != "USD" {
+		return
+	}
+
+	reportData, err := json.Marshal(report)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("report cache marshal failed", zap.Error(err))
+		}
+		return
+	}
+
+	record := &repository.SignedReportRecord{
+		ReportID:       report.ReportID,
+		UserUID:        req.UserUID,
+		StartDate:      req.StartDate,
+		EndDate:        req.EndDate,
+		Benchmark:      req.Benchmark,
+		ReportData:     reportData,
+		Signature:      report.Signature,
+		ReportHash:     report.ReportHash,
+		EnclaveVersion: report.EnclaveVersion,
+	}
+
+	if err := s.signedReportRepo.Create(ctx, record); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("report cache store failed", zap.Error(err))
+		}
+	}
+}
+
+// dropLeadingDustDays removes the run of days that precede the first
+// material equity. A history rebuilder that carries today's balances
+// backwards projects a stablecoin-dust residue ($0.0000969) over every day
+// before the account was funded; those days hold no capital, no trades and
+// no flows, and nothing can be measured on them. Keeping them anchors the
+// equity curve, the period start and the data-point count on a flat zero
+// line months before the first return. The series starts on the first day
+// whose equity across connections reaches minTWRBaseUSD, or that carries a
+// cash flow of at least that much (the account's real inception). The flow
+// must be material: a rebuilt history books its first row's equity as an
+// inception deposit, so a dust first day carries a $0.0000969 "deposit"
+// that would otherwise pin the series on it. Interior runs are kept: an
+// account that blew up to dust and was refunded has a history, and the TWR
+// guards score those days. Snapshots must be sorted by timestamp.
+func dropLeadingDustDays(snapshots []*repository.Snapshot) []*repository.Snapshot {
+	i := 0
+	for i < len(snapshots) {
+		day := snapshots[i].Timestamp.Format("2006-01-02")
+		equity, flows := 0.0, 0.0
+		j := i
+		for j < len(snapshots) && snapshots[j].Timestamp.Format("2006-01-02") == day {
+			equity += snapshots[j].TotalEquity
+			flows += math.Abs(snapshots[j].Deposits) + math.Abs(snapshots[j].Withdrawals)
+			j++
+		}
+		if equity >= minTWRBaseUSD || flows >= minTWRBaseUSD {
+			break
+		}
+		i = j
+	}
+	return snapshots[i:]
+}
+
+// staleConnectionDays is how long a connection may stay silent before it is
+// taken out of the multi-connection TWR. Same threshold as the analytics'
+// consolidated view (STALE_CONNECTION_DAYS), so a signed report and the
+// dashboard agree on when an account has left.
+const staleConnectionDays = 5
+
+// convertSnapshotsToDailyReturns implements TWR with multi-connection support.
+// Groups snapshots by date and connection key (exchange/label), handles virtual
+// deposits when new connections appear, and forward-fills a connection missing
+// for a few days. One silent for longer than staleConnectionDays leaves on its
+// first silent day at its last equity, booked as a withdrawal: held at that
+// value forever, an account that never comes back kept money nobody sees in
+// the report. If it reports again it rejoins as a new connection.
+func convertSnapshotsToDailyReturns(snapshots []*repository.Snapshot) []dailyReturn {
+	if len(snapshots) == 0 {
+		return nil
+	}
+
+	// Group snapshots by date -> exchange -> snapshot
+	type dateGroup struct {
+		date      string
+		timestamp time.Time
+		exchanges map[string]*repository.Snapshot
+	}
+
+	dateMap := make(map[string]*dateGroup)
+	var dateOrder []string
+
+	for _, snap := range snapshots {
+		dateStr := snap.Timestamp.Format("2006-01-02")
+		dg, exists := dateMap[dateStr]
+		if !exists {
+			dg = &dateGroup{
+				date:      dateStr,
+				timestamp: snap.Timestamp,
+				exchanges: make(map[string]*repository.Snapshot),
+			}
+			dateMap[dateStr] = dg
+			dateOrder = append(dateOrder, dateStr)
+		}
+		dg.exchanges[snapshotConnectionKey(snap.Exchange, snap.Label)] = snap
+	}
+
+	sort.Strings(dateOrder)
+
+	if len(dateOrder) < 2 {
+		return nil
+	}
+
+	connDays := make(map[string][]string)
+	for _, dateStr := range dateOrder {
+		for ex := range dateMap[dateStr].exchanges {
+			connDays[ex] = append(connDays[ex], dateStr)
+		}
+	}
+	lastSeen := make(map[string]string)
+	seriesEnd := dateOrder[len(dateOrder)-1]
+
+	// Track known connection keys and their last known equity.
+	knownExchanges := make(map[string]float64) // connection key -> last equity
+	var returns []dailyReturn
+	cumulativeReturn := 0.0
+	nav := 1.0
+
+	for i, dateStr := range dateOrder {
+		dg := dateMap[dateStr]
+
+		if i == 0 {
+			// Initialize known exchanges with first day's data
+			for ex, snap := range dg.exchanges {
+				knownExchanges[ex] = snap.TotalEquity
+				lastSeen[ex] = dateStr
+			}
+			continue
+		}
+
+		// Calculate total previous equity (forward-fill for missing exchanges)
+		totalPrevEquity := 0.0
+		for _, lastEq := range knownExchanges {
+			totalPrevEquity += lastEq
+		}
+
+		if totalPrevEquity == 0 {
+			// Update known exchanges
+			for ex, snap := range dg.exchanges {
+				knownExchanges[ex] = snap.TotalEquity
+				lastSeen[ex] = dateStr
+			}
+			continue
+		}
+
+		// Calculate current total, handling new exchanges as virtual deposits
+		totalCurrentEquity := 0.0
+		closeEquity := 0.0
+		dayDeposits := 0.0
+		dayWithdrawals := 0.0
+		openWithdrawals := 0.0
+		virtualDeposits := 0.0
+
+		for ex, lastEq := range knownExchanges {
+			if snap, exists := dg.exchanges[ex]; exists {
+				// Exchange has data today
+				adjustedEquity := snap.TotalEquity - snap.Deposits + snap.Withdrawals
+				totalCurrentEquity += adjustedEquity
+				closeEquity += snap.TotalEquity
+				dayDeposits += math.Abs(snap.Deposits)
+				dayWithdrawals += math.Abs(snap.Withdrawals)
+				if withdrawalsAtOpen[snap.Exchange] {
+					openWithdrawals += math.Abs(snap.Withdrawals)
+				}
+				knownExchanges[ex] = snap.TotalEquity
+				lastSeen[ex] = dateStr
+			} else if silentDays(lastSeen[ex], dateStr, connDays[ex], seriesEnd) > staleConnectionDays {
+				// Leaves at its last equity, withdrawn: the exit scores nothing.
+				totalCurrentEquity += lastEq
+				dayWithdrawals += lastEq
+				delete(knownExchanges, ex)
+			} else {
+				// Forward-fill: use last known equity
+				totalCurrentEquity += lastEq
+				closeEquity += lastEq
+			}
+		}
+
+		// Check for new connection keys appearing today.
+		for ex, snap := range dg.exchanges {
+			if _, known := knownExchanges[ex]; !known {
+				// New connection - treat as virtual deposit.
+				virtualDeposits += snap.TotalEquity
+				closeEquity += snap.TotalEquity
+				knownExchanges[ex] = snap.TotalEquity
+				lastSeen[ex] = dateStr
+			}
+		}
+
+		// TWR: adjust denominator for virtual deposits
+		adjustedPrev := totalPrevEquity + virtualDeposits
+		netFlow := dayDeposits - dayWithdrawals
+
+		// Same scoring rules as the analytics daily aggregation, so a signed
+		// report and the dashboard agree on every day:
+		//   - a net inflow that accounts for the whole close is an account
+		//     (re)start, not a return — baseline reset, 0%;
+		//   - a base below minTWRBaseUSD, or gross flows dwarfing the base,
+		//     cannot attribute performance at daily granularity — 0%. A
+		//     stablecoin-dust base ($0.0001) followed by the first funding
+		//     otherwise scores the funding day at +10^8 %;
+		//   - otherwise Modified Dietz: money deposited during the day was at
+		//     risk that day, so it belongs in the base. The open-only base
+		//     turns "deposit 67 onto 201 and blow the lot" into -133%, which
+		//     pins the compounded series at -100% forever. A withdrawal from
+		//     a withdrawalsAtOpen venue leaves the base the same way;
+		//   - a base left below minTWRBaseUSD by those withdrawals — 0%.
+		base := adjustedPrev + dayDeposits - openWithdrawals
+		var dayReturn float64
+		switch {
+		case netFlow > 0 && netFlow >= closeEquity:
+			dayReturn = 0
+		case adjustedPrev >= minTWRBaseUSD && base >= minTWRBaseUSD && dayDeposits+dayWithdrawals <= flowDominanceRatio*adjustedPrev:
+			dayReturn = (totalCurrentEquity + virtualDeposits - adjustedPrev) / base
+		default:
+			dayReturn = 0
+		}
+
+		cumulativeReturn = (1+cumulativeReturn)*(1+dayReturn) - 1
+		nav = nav * (1 + dayReturn)
+
+		returns = append(returns, dailyReturn{
+			date:             dateStr,
+			netReturn:        dayReturn,
+			benchmarkReturn:  0, // Benchmark data not available from exchange APIs
+			outperformance:   dayReturn,
+			cumulativeReturn: cumulativeReturn,
+			nav:              nav,
+		})
+	}
+
+	return returns
+}
+
+// silentDays is the length in calendar days of the silence a connection is in
+// on day: from its last snapshot to its next one, or to the end of the series
+// when none follows. days holds the connection's own dates, sorted.
+func silentDays(last, day string, days []string, seriesEnd string) int {
+	until := seriesEnd
+	if i := sort.SearchStrings(days, day); i < len(days) {
+		until = days[i]
+	}
+	from, _ := time.Parse("2006-01-02", last)
+	to, _ := time.Parse("2006-01-02", until)
+	return int(to.Sub(from).Hours() / 24)
+}
+
+// aggregateToMonthlyReturns groups daily returns by month and compounds them
+func aggregateToMonthlyReturns(daily []dailyReturn, snapshots []*repository.Snapshot) []monthlyReturn {
+	if len(daily) == 0 {
+		return nil
+	}
+
+	// Group by YYYY-MM
+	type monthGroup struct {
+		month   string
+		returns []dailyReturn
+	}
+
+	monthMap := make(map[string]*monthGroup)
+	var monthOrder []string
+
+	for _, dr := range daily {
+		monthStr := dr.date[:7] // "YYYY-MM"
+		mg, exists := monthMap[monthStr]
+		if !exists {
+			mg = &monthGroup{month: monthStr}
+			monthMap[monthStr] = mg
+			monthOrder = append(monthOrder, monthStr)
+		}
+		mg.returns = append(mg.returns, dr)
+	}
+
+	sort.Strings(monthOrder)
+
+	var monthly []monthlyReturn
+	prevCumulative := 0.0
+
+	for _, monthStr := range monthOrder {
+		mg := monthMap[monthStr]
+		if len(mg.returns) == 0 {
+			continue
+		}
+
+		lastDay := mg.returns[len(mg.returns)-1]
+		endCumulative := lastDay.cumulativeReturn
+
+		// Monthly return from cumulative ratios
+		var monthlyRet float64
+		if prevCumulative == 0 && endCumulative == 0 {
+			monthlyRet = 0
+		} else {
+			monthlyRet = (1+endCumulative)/(1+prevCumulative) - 1
+		}
+
+		prevCumulative = endCumulative
+
+		monthly = append(monthly, monthlyReturn{
+			date:            monthStr,
+			netReturn:       monthlyRet,
+			benchmarkReturn: 0,
+			outperformance:  monthlyRet,
+			aum:             lastDay.nav,
+		})
+	}
+
+	return monthly
+}
+
+// calculateRiskMetrics computes VaR, CVaR, skewness, and kurtosis
+func calculateRiskMetrics(returns []float64) *riskMetrics {
+	if len(returns) < 5 {
+		return &riskMetrics{}
+	}
+
+	// Sort returns for percentile calculation
+	sorted := make([]float64, len(returns))
+	copy(sorted, returns)
+	sort.Float64s(sorted)
+
+	n := len(sorted)
+
+	// VaR 95 (historical, 5th percentile)
+	idx95 := int(math.Floor(float64(n) * 0.05))
+	if idx95 >= n {
+		idx95 = n - 1
+	}
+	var95 := -sorted[idx95]
+
+	// VaR 99 (historical, 1st percentile)
+	idx99 := int(math.Floor(float64(n) * 0.01))
+	if idx99 >= n {
+		idx99 = n - 1
+	}
+	var99 := -sorted[idx99]
+
+	// Expected Shortfall (CVaR) - average of returns below VaR95
+	var cvarSum float64
+	var cvarCount int
+	threshold := sorted[idx95]
+	for _, r := range sorted {
+		if r <= threshold {
+			cvarSum += r
+			cvarCount++
+		}
+	}
+	expectedShortfall := 0.0
+	if cvarCount > 0 {
+		expectedShortfall = -cvarSum / float64(cvarCount)
+	}
+
+	// Mean and standard deviation for higher moments
+	avg := 0.0
+	for _, r := range returns {
+		avg += r
+	}
+	avg /= float64(n)
+
+	variance := 0.0
+	for _, r := range returns {
+		diff := r - avg
+		variance += diff * diff
+	}
+	variance /= float64(n)
+	sd := math.Sqrt(variance)
+
+	// Skewness (third standardized moment)
+	skewness := 0.0
+	if sd > 0 {
+		var m3 float64
+		for _, r := range returns {
+			diff := (r - avg) / sd
+			m3 += diff * diff * diff
+		}
+		skewness = m3 / float64(n)
+	}
+
+	// Excess Kurtosis (fourth standardized moment - 3)
+	kurtosis := 0.0
+	if sd > 0 {
+		var m4 float64
+		for _, r := range returns {
+			diff := (r - avg) / sd
+			m4 += diff * diff * diff * diff
+		}
+		kurtosis = m4/float64(n) - 3
+	}
+
+	return &riskMetrics{
+		var95:             var95,
+		var99:             var99,
+		expectedShortfall: expectedShortfall,
+		skewness:          skewness,
+		kurtosis:          kurtosis,
+	}
+}
+
+// calculateDrawdownData tracks drawdown periods with recovery detection
+func calculateDrawdownData(daily []dailyReturn) *drawdownData {
+	if len(daily) == 0 {
+		return &drawdownData{}
+	}
+
+	var periods []*drawdownPeriod
+	var currentPeriod *drawdownPeriod
+	peak := 1.0
+	maxDDDuration := 0
+	ddStartIdx := -1
+
+	for i, dr := range daily {
+		nav := dr.nav
+		if nav > peak {
+			// New peak - close current drawdown period if any
+			if currentPeriod != nil {
+				currentPeriod.recovered = true
+				currentPeriod.endDate = dr.date
+				periods = append(periods, currentPeriod)
+				currentPeriod = nil
+			}
+			peak = nav
+			ddStartIdx = -1
+		} else if nav < peak {
+			dd := (peak - nav) / peak
+			if currentPeriod == nil {
+				// Start new drawdown period
+				ddStartIdx = i
+				currentPeriod = &drawdownPeriod{
+					startDate: dr.date,
+					endDate:   dr.date,
+					depth:     dd,
+					duration:  1,
+					recovered: false,
+				}
+			} else {
+				// Update current period
+				currentPeriod.endDate = dr.date
+				currentPeriod.duration = i - ddStartIdx + 1
+				if dd > currentPeriod.depth {
+					currentPeriod.depth = dd
+				}
+			}
+
+			if currentPeriod.duration > maxDDDuration {
+				maxDDDuration = currentPeriod.duration
+			}
+		}
+	}
+
+	// Add unclosed period
+	if currentPeriod != nil {
+		periods = append(periods, currentPeriod)
+	}
+
+	// Keep last 5 periods
+	if len(periods) > 5 {
+		periods = periods[len(periods)-5:]
+	}
+
+	// Current drawdown
+	lastNav := daily[len(daily)-1].nav
+	currentDD := 0.0
+	if peak > 0 && lastNav < peak {
+		currentDD = (peak - lastNav) / peak
+	}
+
+	return &drawdownData{
+		currentDrawdown:     currentDD,
+		maxDrawdownDuration: maxDDDuration,
+		periods:             periods,
+	}
+}
+
+// Conversion helpers: internal types -> signing types
+
+// toSigningDailyReturns converts internal daily returns to the signing-layer
+// shape, attaching a verifiabilityClass label per day (PayloadVersion 1.3+).
+//
+// Per-day labelling rule (most-restrictive wins; surfaced for verifier
+// policy):
+//
+//	- "rebuilder-service" if any snapshot for the day came from the external
+//	  history-rebuilder (the day's data path briefly left the SEV-SNP
+//	  perimeter).
+//	- "in-enclave" if no rebuilder taint but at least one snapshot was
+//	  reconstructed inside the enclave (IBKR Flex etc.).
+//	- "live" if every snapshot for the day is a live daily-sync write.
+//
+// This decision is made off the snapshot set, NOT the daily-return slice, so
+// the label reflects the underlying data even when the daily aggregation has
+// already collapsed multiple exchanges into one row.
+func toSigningDailyReturns(daily []dailyReturn, snapshots []*repository.Snapshot, externalRebuilderDays map[time.Time]struct{}) []signing.DailyReturn {
+	// Index snapshots by day-key to derive in-enclave vs live without
+	// hitting the rebuilder map twice.
+	inEnclaveDays := make(map[time.Time]bool, len(snapshots))
+	for _, s := range snapshots {
+		if s.IsHistorical && !s.FromExternalRebuilder {
+			day := time.Date(s.Timestamp.Year(), s.Timestamp.Month(), s.Timestamp.Day(), 0, 0, 0, 0, time.UTC)
+			inEnclaveDays[day] = true
+		}
+	}
+
+	result := make([]signing.DailyReturn, len(daily))
+	for i, dr := range daily {
+		dayKey, parseErr := time.Parse("2006-01-02", dr.date)
+		var class string
+		switch {
+		case parseErr != nil:
+			// SEC-09: an unparseable date must not be optimistically labelled.
+			// Fall back to the MOST restrictive class so a strict verifier
+			// filters the day rather than trusting it. The signature still binds
+			// the returned class.
+			class = signing.VerifiabilityClassRebuilderService
+		default:
+			dayKey = dayKey.UTC()
+			if _, taint := externalRebuilderDays[dayKey]; taint {
+				class = signing.VerifiabilityClassRebuilderService
+			} else if inEnclaveDays[dayKey] {
+				class = signing.VerifiabilityClassInEnclave
+			} else {
+				class = signing.VerifiabilityClassLive
+			}
+		}
+		result[i] = signing.DailyReturn{
+			Date:               dr.date,
+			NetReturn:          dr.netReturn,
+			BenchmarkReturn:    dr.benchmarkReturn,
+			Outperformance:     dr.outperformance,
+			CumulativeReturn:   dr.cumulativeReturn,
+			NAV:                dr.nav,
+			VerifiabilityClass: class,
+		}
+	}
+	return result
+}
+
+func toSigningMonthlyReturns(monthly []monthlyReturn) []signing.MonthlyReturn {
+	result := make([]signing.MonthlyReturn, len(monthly))
+	for i, mr := range monthly {
+		result[i] = signing.MonthlyReturn{
+			Date:            mr.date,
+			NetReturn:       mr.netReturn,
+			BenchmarkReturn: mr.benchmarkReturn,
+			Outperformance:  mr.outperformance,
+			AUM:             mr.aum,
+		}
+	}
+	return result
+}
+
+func toSigningRiskMetrics(rm *riskMetrics) *signing.RiskMetrics {
+	return &signing.RiskMetrics{
+		VaR95:             rm.var95,
+		VaR99:             rm.var99,
+		ExpectedShortfall: rm.expectedShortfall,
+		Skewness:          rm.skewness,
+		Kurtosis:          rm.kurtosis,
+	}
+}
+
+func toSigningDrawdownData(dd *drawdownData) *signing.DrawdownData {
+	periods := make([]*signing.DrawdownPeriod, len(dd.periods))
+	for i, p := range dd.periods {
+		periods[i] = &signing.DrawdownPeriod{
+			StartDate: p.startDate,
+			EndDate:   p.endDate,
+			Depth:     p.depth,
+			Duration:  p.duration,
+			Recovered: p.recovered,
+		}
+	}
+	return &signing.DrawdownData{
+		CurrentDrawdown:     dd.currentDrawdown,
+		MaxDrawdownDuration: dd.maxDrawdownDuration,
+		Periods:             periods,
+	}
+}
+
+func buildDefaultExchangeDetails(exchanges []string) []signing.ExchangeInfo {
+	if len(exchanges) == 0 {
+		return nil
+	}
+
+	details := make([]signing.ExchangeInfo, 0, len(exchanges))
+	for _, ex := range exchanges {
+		details = append(details, signing.ExchangeInfo{
+			Name:     ex,
+			KYCLevel: "",
+			IsPaper:  false,
+		})
+	}
+	return details
+}
+
+func (s *ReportService) buildExchangeDetails(ctx context.Context, userUID string, exchanges []string) []signing.ExchangeInfo {
+	defaultDetails := buildDefaultExchangeDetails(exchanges)
+	if s.connSvc == nil {
+		return defaultDetails
+	}
+
+	metadata, err := s.connSvc.GetExchangeMetadata(ctx, userUID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed to load exchange metadata; using defaults", zap.Error(err))
+		}
+		return defaultDetails
+	}
+	if len(metadata) == 0 {
+		return defaultDetails
+	}
+
+	metaByExchange := make(map[string]*ExchangeMetadata, len(metadata))
+	for _, m := range metadata {
+		key := strings.ToLower(strings.TrimSpace(m.Exchange))
+		metaByExchange[key] = m
+	}
+
+	merged := make([]signing.ExchangeInfo, 0, len(exchanges))
+	for _, ex := range exchanges {
+		key := strings.ToLower(strings.TrimSpace(ex))
+		if md, ok := metaByExchange[key]; ok {
+			merged = append(merged, signing.ExchangeInfo{
+				Name:     ex,
+				KYCLevel: md.KYCLevel,
+				IsPaper:  md.IsPaper,
+			})
+			continue
+		}
+		merged = append(merged, signing.ExchangeInfo{
+			Name:     ex,
+			KYCLevel: "",
+			IsPaper:  false,
+		})
+	}
+
+	return merged
+}
+
+// VerifySignature checks if a report signature is valid. Uses the enclave's
+// current SignatureAlgorithm (ECDSA-P256-SHA256) explicitly — no silent
+// algorithm fallback (SEC-108).
+func (s *ReportService) VerifySignature(reportHash, signature, publicKey string) (bool, error) {
+	return signing.Verify(reportHash, signature, publicKey, signing.SignatureAlgorithm)
+}
+
+// PublicKey returns the signer's public key
+func (s *ReportService) PublicKey() string {
+	return s.signer.PublicKey()
+}

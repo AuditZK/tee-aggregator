@@ -1,0 +1,97 @@
+services:
+  # =============================================
+  # PostgreSQL - Go Enclave Database (DEV)
+  # =============================================
+  enclave-go-db:
+    image: postgres:16-alpine
+    container_name: enclave_go_db_dev
+    environment:
+      POSTGRES_USER: enclave
+      POSTGRES_PASSWORD: enclave
+      POSTGRES_DB: enclave_go
+    ports:
+      - "5436:5432"    # Acces host optionnel; le service Go utilise le reseau Docker interne
+    volumes:
+      - enclave-go-db-data-dev:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enclave -d enclave_go"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - enclave-go-network-dev
+
+  # =============================================
+  # Enclave Go - Development Mode (full local Docker)
+  # =============================================
+  enclave-go-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: enclave-go:dev
+    container_name: enclave_go_dev
+    ports:
+      - "8081:8080"    # REST API (8081 pour éviter conflit avec TS sur 8080)
+      - "50051:50051"  # gRPC
+      - "50052:50052"  # Log Stream (SSE)
+      - "9091:9090"    # Prometheus Metrics (9091 pour éviter conflit)
+    env_file:
+      - .env.dev
+    environment:
+      - DATABASE_URL=postgres://enclave:enclave@enclave-go-db:5432/enclave_go?sslmode=disable
+      - ENV=development
+      - LOG_LEVEL=debug
+      - GRPC_INSECURE=true
+      - AUTO_MIGRATE=false
+      - TLS_CERT_PATH=/app/certs/cert.pem
+      - TLS_KEY_PATH=/app/certs/key.pem
+      - TLS_CA_CERT=/app/certs/grpc/ca.crt
+      - TLS_SERVER_CERT=/app/certs/grpc/server.crt
+      - TLS_SERVER_KEY=/app/certs/grpc/server.key
+      - CORS_ORIGIN=*
+      - METRICS_ENABLED=true
+      - ENABLE_DAILY_SYNC=true
+      - DATA_RETENTION_DAYS=30
+      - ENABLE_LEGACY_REST=true
+      # cTrader OAuth app credentials for the enclave's cTrader connector
+      # (app auth + token refresh). Values come from the gitignored .env via
+      # ${...} interpolation, so no secret is committed to this file.
+      - CTRADER_CLIENT_ID=${CTRADER_CLIENT_ID:-}
+      - CTRADER_CLIENT_SECRET=${CTRADER_CLIENT_SECRET:-}
+      # Wire to the external (NON-ZK) history-rebuilder-service running in
+      # track_record_site's compose. The container reaches the host-mapped
+      # port 8082 via the special host.docker.internal DNS (Docker Desktop).
+      # Empty REBUILDER_SERVICE_URL = enclave runs without rebuilder
+      # integration (IBKR-only history reconstruction).
+      # Switched from :8082 (TS port) to :8083 (Go port). Same wire contract,
+      # same JSON, same DB schema — drop-in. Revert if regression.
+      - REBUILDER_SERVICE_URL=http://host.docker.internal:8083
+      - REBUILDER_INTERNAL_TOKEN=dev-token-ad7fcb12c8f54aab8b5e9f0c41728beb
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./certs:/app/certs:ro
+    depends_on:
+      enclave-go-db:
+        condition: service_healthy
+    restart: unless-stopped
+    # Pas de contraintes TEE strictes en dev mode
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - enclave-go-network-dev
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "-qO/dev/null", "https://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  enclave-go-db-data-dev:
+
+networks:
+  enclave-go-network-dev:
+    driver: bridge

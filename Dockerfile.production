@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1.7
+# Production Dockerfile with SEV-SNP attestation support.
+#
+# Reproducibility notes (SEC audit pass 5; SUP-02):
+#   - Base images are pinned by digest (`image@sha256:<digest>`) for
+#     reproducible builds. Bump the digest whenever you bump the tag —
+#     resolve it with `docker buildx imagetools inspect <tag>`.
+#   - snpguest is the upstream release artifact, pinned by version AND sha256
+#     (see the ADD --checksum in the runtime stage) — the build fails on any
+#     divergence.
+
+# Go build stage.
+# VULN-001: pinned to 1.26.4-alpine so stdlib CVEs fixed in 1.26.1 / 1.26.2
+# (GO-2026-4947/4946/4870/4866/4865/4603/4602/4601/4600/4599), 1.26.3
+# (GO-2026-4982/4980/4971/4918) and 1.26.4 (GO-2026-5037 crypto/x509,
+# GO-2026-5039 net/textproto, GO-2026-5038 mime) are picked up
+# deterministically. Pinned by digest (SUP-02) — bump it when bumping the tag.
+FROM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS builder
+
+WORKDIR /app
+
+# Install dependencies
+RUN apk add --no-cache git ca-certificates tzdata
+
+# Copy go mod files
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source
+COPY . .
+
+# Same command as scripts/build-enclave.sh, so a build from a checkout and a
+# build from this context (which has no .git) hash the same.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -trimpath -buildvcs=false \
+    -ldflags="-w -s -buildid=" \
+    -o /enclave \
+    ./cmd/enclave
+
+# Admin tools, operator-run via docker exec (see cmd/admin-*). Shipped in the
+# image so incident response never needs to copy unreviewed binaries into the
+# running TEE container — the 2026-08-04 cold-start incident had to wait for
+# the daily pass for lack of an in-image sync trigger.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-w -s -buildid=" \
+    -o /admin-recover-snapshot ./cmd/admin-recover-snapshot \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-w -s -buildid=" \
+    -o /admin-dump-breakdown ./cmd/admin-dump-breakdown \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-w -s -buildid=" \
+    -o /admin-probe ./cmd/admin-probe
+
+# Runtime stage.
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apk add --no-cache ca-certificates tzdata wget
+
+# snpguest (SEV-SNP attestation tool): the official virtee release artifact,
+# pinned by version and sha256 — the build FAILS if the hash diverges. This
+# replaces a 3-hour cold compile of the same version from source
+# (rust:alpine + vendored OpenSSL); the artifact is static-pie linked, so it
+# runs on this alpine base with no libc dependency. When bumping the version,
+# take the new digest from the GitHub release API and verify locally before
+# pinning.
+ADD --checksum=sha256:70e700465e3523e67dd5104583dc36cd11eef630c6f04c5b9ccafd6ba2e76ca0 \
+    --chmod=755 \
+    https://github.com/virtee/snpguest/releases/download/v0.10.0/snpguest /usr/local/bin/snpguest
+# Build-time smoke test: a corrupt or incompatible artifact must break the
+# build, never production attestation.
+RUN /usr/local/bin/snpguest --version
+
+# Copy Go binary
+COPY --from=builder /enclave /app/enclave
+COPY --from=builder /admin-recover-snapshot /app/admin-recover-snapshot
+COPY --from=builder /admin-dump-breakdown /app/admin-dump-breakdown
+COPY --from=builder /admin-probe /app/admin-probe
+
+# Copy migrations
+COPY --from=builder /app/migrations /app/migrations
+
+# Create non-root user and cache directory for VCEK certs
+# NOTE: For SEV-SNP /dev/sev-guest access, you may need to run as root
+# or configure device permissions. Comment out USER line if needed.
+RUN adduser -D -g '' enclave && \
+    mkdir -p /var/cache/enclave/certs && \
+    chown enclave:enclave /var/cache/enclave/certs
+USER enclave
+
+# Expose ports: REST, gRPC, Log Stream, Metrics
+EXPOSE 8080 50051 50052 9090
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-check-certificate -qO/dev/null https://localhost:8080/health || exit 1
+
+# Run
+ENTRYPOINT ["/app/enclave"]

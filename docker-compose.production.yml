@@ -1,0 +1,182 @@
+version: '3.8'
+
+services:
+  enclave:
+    build:
+      context: .
+      # OPS-AUDIT-001: must be Dockerfile.production — the generic Dockerfile
+      # does NOT bundle snpguest, so attestation would silently fall back to
+      # PlatformUnattestedDev and every signed report would carry attested=false.
+      dockerfile: Dockerfile.production
+    container_name: enclave_go_prod
+    # OPS-004: the enclave must survive a host reboot. GCP reboots this
+    # confidential VM for maintenance, and with no policy here Docker defaults
+    # to "no" — the enclave then stays down until someone notices.
+    # `unless-stopped` restarts it after a reboot but still honours a deliberate
+    # `docker stop` during maintenance. Keep in sync with compose.prod.KEEP.
+    restart: unless-stopped
+    # OPS-01: still root because /dev/sev-guest is mode 0600 root:root on the
+    # host — a non-root container user cannot open it without a host-side udev
+    # rule giving the device a readable group. To go non-root: add such a rule
+    # (e.g. KERNEL=="sev-guest", GROUP="sev", MODE="0640"), drop this line so
+    # the image's `USER enclave` applies, and add `group_add: ["<gid of sev>"]`.
+    user: root
+    ports:
+      # CORS-002: public TLS is terminated by the caddy_tls_proxy sidecar, which
+      # owns host 80/443 and reverse-proxies to this container over the shared
+      # external network (see `networks:` below) by container DNS —
+      # enclave_go_prod:3060 (REST) and :50062 (log-stream/SSE). The REST
+      # listener therefore MUST NOT publish host 443: caddy already binds it and
+      # the container fails to start ("port is already allocated"). The listener
+      # still binds 3060 internally (REST_PORT below) with its own TLS cert;
+      # caddy connects with tls_insecure_skip_verify.
+      # gRPC (50061) is published because gateway-service dials it from off-host.
+      - "50061:50061"
+      - "50062:50062"
+    # CFG-MIGRATION (2026-05-08): single source of truth.
+    #
+    # All deployment-specific values (secrets, URLs, allowlists, log level,
+    # cert paths) live in .env.production and are injected via env_file
+    # below. The previous `environment:` block re-declared most of those
+    # with `${VAR}` substitution, which only resolves from `.env` (NOT
+    # env_file) — meaning if `.env` was missing or out of sync, the
+    # explicit `environment:` line silently overrode the env_file value
+    # with empty (CFG-DRIFT footgun).
+    #
+    # We now keep ONLY in `environment:`:
+    #   - immutable runtime tunables (ENV, GOMEMLIMIT, GOGC, GOTRACEBACK)
+    #   - feature toggles that should never differ per host (AUTO_MIGRATE,
+    #     ENABLE_DAILY_SYNC, ERRTRACK_ENABLED, GRPC_INSECURE)
+    #   - in-container filesystem paths (TLS_CA_CERT etc.) — these depend
+    #     on the image's mount layout, so they belong here, not in env.
+    #
+    # Required keys in .env.production (the enclave fatals at boot if any
+    # are missing — see internal/config/config.go and main.go validators):
+    #   DATABASE_URL, ENCRYPTION_KEY, ENCLAVE_JWT_SECRET, CORS_ORIGIN,
+    #   GRPC_CLIENT_CERT_CN_ALLOWLIST,
+    #   LOG_STREAM_API_KEY, TLS_CERT_PATH, TLS_KEY_PATH
+    # Required to serve MT4/MT5 accounts (CFG-005 — the bridge connect call
+    # carries the investor password in cleartext, so the enclave fatals on a
+    # non-https URL and MetaTrader connectors refuse to build when unset):
+    #   MT_BRIDGE_URL must be https:// AND
+    #   MT_BRIDGE_HMAC_SECRET (≥24 chars; same value as the bridge)
+    # Required when REBUILDER_SERVICE_URL is set (see environment: below):
+    #   REBUILDER_INTERNAL_TOKEN (≥24 chars; same value as the rebuilder's
+    #     env, otherwise the rebuilder rejects with 401)
+    # Required when BENCHMARK_SERVICE_URL is set in production (CFG-004 — the
+    # series feeds the signed report, so an unauthenticated source is refused
+    # at boot): BENCHMARK_SERVICE_URL must be https:// AND
+    #   BENCHMARK_INTERNAL_TOKEN (≥24 chars; same value as the benchmark service)
+    # Optional:
+    #   LOG_LEVEL (default: info), BENCHMARK_SERVICE_URL (omit to disable),
+    #   ERRTRACK_CAPACITY, ERRTRACK_NEW_GROUP_RATE
+    #   CTRADER_CLIENT_ID / CTRADER_CLIENT_SECRET — the Spotware application
+    #     credentials. Not fatal when missing (an enclave serving other brokers
+    #     must still boot) but the boot logs an Error and every cTrader connect
+    #     is refused with "not configured on the enclave" instead of the
+    #     "invalid credentials" it used to blame the user for (G-M7).
+    #   HISTORY_SYNC_NOTIFY_URL / HISTORY_SYNC_NOTIFY_TOKEN — the post-rebuild
+    #     ping to analytics (<url>/<userUid>). The token is sent as
+    #     X-Internal-Token; set the SAME value on the receiving service. Leave
+    #     both unset to disable the ping, or set only the URL to keep the
+    #     current unauthenticated behaviour while the receiver catches up (C6).
+    env_file:
+      - .env.production
+    environment:
+      - ENV=production
+      - GRPC_PORT=50061
+      # PORT-001: the container-side REST port caddy reverse-proxies to
+      # (enclave_go_prod:3060). Without this the REST listener falls back to
+      # config.go default 8080, which caddy is not configured to reach — the
+      # upstream looks up but nothing answers /api/*.
+      - REST_PORT=3060
+      # PERF-002: tell the Go runtime about the 512 MiB cgroup cap so the GC
+      # can target it instead of computing its heap goal from the host's
+      # (much larger) RAM. 480 MiB leaves a 32 MiB buffer below mem_limit so
+      # the kernel OOM-killer doesn't fire before the runtime can react.
+      - GOMEMLIMIT=480MiB
+      # GOGC=75 trades a modest CPU bump for ~25% lower steady-state heap,
+      # justified under the tight 512 MiB cap.
+      - GOGC=75
+      # GOTRACEBACK=single keeps panic dumps focused on the failing goroutine
+      # so we don't bury operators in 50+ goroutine traces under SSE load.
+      - GOTRACEBACK=single
+      # OPS-002: explicit safety flags previously set by start-enclave.sh.
+      # AUTO_MIGRATE=false prevents the enclave from running schema migrations
+      # on its own — those go through a separate migration step.
+      - AUTO_MIGRATE=false
+      # OPS-003: daily snapshot scheduler. The scheduler defaults to enabled
+      # in code, but pin it explicitly so a config drift can't silently
+      # disable the entire sync pipeline.
+      - ENABLE_DAILY_SYNC=true
+      # OBS-001: in-process error aggregation (internal/errtrack). Captures
+      # Error+ log entries through a single sanitize funnel reusing
+      # logredact, exposes the resulting groups via /errors/* on the
+      # logstream server. Disabled by default in code; enabled here so
+      # operators can triage live errors via the dashboard. Capacity and
+      # rate-limit defaults (1024 groups / 50 new groups per second) are
+      # applied unless ERRTRACK_CAPACITY / ERRTRACK_NEW_GROUP_RATE override.
+      - ERRTRACK_ENABLED=1
+      # SEC-003: gRPC must run with TLS (no plaintext) since gateway-service
+      # connects from outside the host.
+      - GRPC_INSECURE=false
+      # mTLS-001: paths to the mTLS material used for gRPC Gateway↔Enclave.
+      # These are mounted from ./certs:/etc/enclave:ro below. Without them
+      # the gRPC server can't validate gateway client certs.
+      - TLS_CA_CERT=/etc/enclave/ca.crt
+      - TLS_SERVER_CERT=/etc/enclave/server.crt
+      - TLS_SERVER_KEY=/etc/enclave/server.key
+      # SEC-ZK-001: external history-rebuilder-go service (NOT in ZK perimeter,
+      # NOT signed). The enclave POSTs decrypted credentials there for non-IBKR
+      # exchanges when the user has explicitly opted into rebuild_history at
+      # connection time. URL pulled from .env.production (cross-VPS: typically
+      # https://<auditzk-host>/internal/history-rebuilder fronted by nginx +
+      # iptables-restricted to this enclave's IP). Empty = integration disabled.
+      # REBUILDER_INTERNAL_TOKEN must match the rebuilder's value;
+      # CFG-002 fatals at boot if the URL is set but the token is missing.
+    # SEV-SNP device access (AMD confidential computing). The explicit device
+    # mapping below is what grants /dev/sev-guest — `privileged: true` was
+    # removed (OPS-01): it handed the container ALL capabilities and every host
+    # device with no isolation, none of which the enclave needs beyond this one
+    # device.
+    devices:
+      - /dev/sev-guest:/dev/sev-guest
+    volumes:
+      # OPS-007: NO host bind-mount of snpguest here — the image bundles its
+      # own pinned binary (see Dockerfile.production). The old mount silently
+      # shadowed the image's copy with whatever the host happened to have, and
+      # on a host missing the file Docker substitutes an empty DIRECTORY at
+      # that path, breaking attestation entirely. One source of truth: the
+      # image. The host's /usr/local/bin/snpguest remains useful for manual
+      # diagnostics only.
+      - enclave_vcek_cache:/var/cache/enclave/certs:rw
+      - ./certs:/etc/enclave:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    # OPS-01: label=disable keeps SELinux from relabel-blocking the bind mounts
+    # above on enforcing hosts. Deliberate, documented exception — revisit once
+    # a dedicated SELinux policy module ships for the enclave.
+    security_opt:
+      - label=disable
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-check-certificate -qO/dev/null https://localhost:3060/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+networks:
+  default:
+    external: true
+    name: zero-knowledge-aggregator-go-test_default
+
+volumes:
+  enclave_vcek_cache:

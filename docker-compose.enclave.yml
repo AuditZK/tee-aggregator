@@ -1,0 +1,139 @@
+# Docker Compose - Enclave Stack (Production)
+# Runs on AMD SEV-SNP confidential VM
+
+services:
+  # ==========================================
+  # Enclave Go Service (gRPC + REST + SSE)
+  # ==========================================
+  enclave-go-service:
+    networks:
+      - enclave-go-network
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    image: enclave-go:enclave
+    container_name: enclave_go_service
+    restart: unless-stopped
+    user: root
+    environment:
+      # Core
+      - ENV=production
+      - GRPC_PORT=50051
+      - REST_PORT=3050
+      - LOG_STREAM_PORT=50052
+      - METRICS_ENABLED=true
+      - METRICS_PORT=9092
+      - GRPC_INSECURE=false
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      # Optional runtime config
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - BENCHMARK_SERVICE_URL=${BENCHMARK_SERVICE_URL:-}
+      - LOG_STREAM_API_KEY=${LOG_STREAM_API_KEY:-}
+      - CTRADER_CLIENT_ID=${CTRADER_CLIENT_ID:-}
+      - CTRADER_CLIENT_SECRET=${CTRADER_CLIENT_SECRET:-}
+      - EXCHANGE_HTTP_PROXY=${EXCHANGE_HTTP_PROXY:-}
+      - PROXY_EXCHANGES=${PROXY_EXCHANGES:-binance}
+      - CORS_ORIGIN=${CORS_ORIGIN:-}
+      - ENABLE_DAILY_SYNC=${ENABLE_DAILY_SYNC:-true}
+      - DATA_RETENTION_DAYS=${DATA_RETENTION_DAYS:-30}
+      # TLS (REST + gRPC)
+      - TLS_CERT_PATH=${TLS_CERT_PATH:-/etc/enclave/server.crt}
+      - TLS_KEY_PATH=${TLS_KEY_PATH:-/etc/enclave/server.key}
+      - TLS_CA_CERT=${TLS_CA_CERT:-/etc/enclave/ca.crt}
+      - TLS_SERVER_CERT=${TLS_SERVER_CERT:-/etc/enclave/server.crt}
+      - TLS_SERVER_KEY=${TLS_SERVER_KEY:-/etc/enclave/server.key}
+    ports:
+      - "50051:50051"  # gRPC
+      - "50052:50052"  # Log stream (SSE)
+      - "3050:3050"    # REST API
+    # Metrics is internal-only (Prometheus scrape via Docker network)
+    expose:
+      - "9092"
+    volumes:
+      - ./certs:/etc/enclave:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - vcek_cache:/var/cache/enclave/certs
+    devices:
+      - /dev/sev-guest:/dev/sev-guest
+    privileged: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9092/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # ==========================================
+  # Prometheus (metrics collection)
+  # ==========================================
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: enclave_go_prometheus
+    restart: unless-stopped
+    networks:
+      - enclave-go-network
+    expose:
+      - "9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+      - "--web.listen-address=0.0.0.0:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==========================================
+  # Grafana (dashboards)
+  # ==========================================
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: enclave_go_grafana
+    restart: unless-stopped
+    networks:
+      - enclave-go-network
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_SECURITY_DISABLE_GRAVATAR=true
+      - GF_SECURITY_COOKIE_SECURE=true
+      - GF_SECURITY_STRICT_TRANSPORT_SECURITY=true
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  enclave-go-network:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  vcek_cache:

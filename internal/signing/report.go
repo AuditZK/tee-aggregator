@@ -1,0 +1,1064 @@
+package signing
+
+import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+const (
+	SignatureAlgorithm = "ECDSA-P256-SHA256"
+	EnclaveVersion     = "1.1.3-go"
+
+	// AnnualizationDays is the one year length every annualised figure the
+	// enclave produces is computed on: volatility, Sharpe, Sortino and the
+	// annualized return in internal/service/metrics.go, and the benchmark
+	// comparisons (alpha, tracking error, information ratio) in
+	// internal/service/benchmark.go. Snapshots are taken 7/7, so every
+	// observation is a calendar day and a year is 365 of them — the same
+	// basis as the analytics service, or the signed report and the dashboard
+	// would disagree on every ratio. An equity-market 252-day year describes
+	// a market that closes at weekends; this data has no weekends.
+	//
+	// Reports carry it as annualization_days so a reader never has to guess
+	// which convention produced the numbers in front of them.
+	AnnualizationDays = 365
+
+	// PayloadVersion bumps whenever the signed payload shape changes.
+	// 1.0 = original (metrics + returns only)
+	// 1.1 = adds enclaveAttestation {measurement, reportData, platform, attested}
+	// 1.2 = adds metrics.winRate and metrics.profitFactor to the signed payload
+	// 1.3 = adds daily_returns[*].verifiabilityClass — per-day provenance
+	//       label ("live" / "in-enclave" / "rebuilder-service") replacing the
+	//       coarse SEC-001 gate that excluded external-rebuilder snapshots.
+	//       The signature now covers the full history (live + reconstructed)
+	//       and a verifier filters by class at consumption time.
+	// 1.4 = adds metrics.riskFreeRate (annual %, 0 = rf-free legacy ratios) —
+	//       the assumption behind sharpeRatio/sortinoRatio must sit under the
+	//       same signature, otherwise a signed Sharpe is ambiguous.
+	// 1.5 = adds reportName. It sat among the identification fields while
+	//       being unsigned, so "Demo account — test" could be renamed "Audited
+	//       track record 2026" and still verify.
+	// 1.6 = adds metrics.annualized and metrics.periodDays. Returns are no
+	//       longer annualised under one year of history, so a verifier must
+	//       see whether annualizedReturn/calmarRatio were computed at all,
+	//       and over how many calendar days, under the same signature.
+	// 1.7 = adds metrics.annualizationDays (AnnualizationDays). The year
+	//       length is the assumption behind volatility, sharpeRatio,
+	//       sortinoRatio, annualizedReturn and every benchmarkMetrics
+	//       figure, exactly as riskFreeRate is the assumption behind the
+	//       Sharpe at 1.4: a signed ratio whose basis sits outside the
+	//       signature can be re-labelled 252 or 365 at will, which rescales
+	//       it by √(365/252) ≈ 1.2 without breaking anything.
+	// 1.8 = baseCurrency is the currency every figure was computed in, each
+	//       day's amounts valued at that day's final rate before returns are
+	//       taken. Before, it was a label over figures computed in USD.
+	PayloadVersion = "1.8"
+)
+
+// payloadVersionsWithoutAnnualizationDays are the pre-1.7 signed-payload
+// shapes whose metrics block carries no annualizationDays. Older reports keep
+// their original shape so VerifyReport reproduces their hash.
+var payloadVersionsWithoutAnnualizationDays = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+	"1.2": {},
+	"1.3": {},
+	"1.4": {},
+	"1.5": {},
+	"1.6": {},
+}
+
+// payloadVersionsWithoutAnnualizationBasis are the pre-1.6 signed-payload
+// shapes whose metrics block carries no annualized/periodDays fields. Older
+// reports keep their original shape so VerifyReport reproduces their hash.
+var payloadVersionsWithoutAnnualizationBasis = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+	"1.2": {},
+	"1.3": {},
+	"1.4": {},
+	"1.5": {},
+}
+
+// payloadVersionsWithoutReportName are the pre-1.5 signed-payload shapes that
+// omit reportName. Older reports keep their original shape so VerifyReport
+// reproduces their hash.
+var payloadVersionsWithoutReportName = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+	"1.2": {},
+	"1.3": {},
+	"1.4": {},
+}
+
+// payloadVersionsWithoutWinRate are the pre-1.2 signed-payload shapes whose
+// metrics block omits winRate/profitFactor. buildFinancialPayload must
+// reproduce that older shape for such reports, or VerifyReport would
+// recompute a different hash and reject an already-issued report.
+var payloadVersionsWithoutWinRate = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+}
+
+// payloadVersionsWithoutVerifiabilityClass are the pre-1.3 signed-payload
+// shapes whose daily_returns entries do not carry verifiabilityClass. Older
+// reports keep their original shape so VerifyReport reproduces their hash.
+var payloadVersionsWithoutVerifiabilityClass = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+	"1.2": {},
+}
+
+// payloadVersionsWithoutRiskFreeRate are the pre-1.4 signed-payload shapes
+// whose metrics block carries no riskFreeRate assumption. Older reports keep
+// their original shape so VerifyReport reproduces their hash.
+var payloadVersionsWithoutRiskFreeRate = map[string]struct{}{
+	"":    {},
+	"1.0": {},
+	"1.1": {},
+	"1.2": {},
+	"1.3": {},
+}
+
+// EnclaveAttestation binds the signed report to a specific SEV-SNP measurement
+// and the report_data field of the attestation quote. A verifier MUST:
+//  1. Verify the ECDSA signature over the canonical payload (proves the
+//     enclave that holds the private key signed this report).
+//  2. Obtain the SEV-SNP attestation quote from GET /api/v1/attestation (or
+//     cached alongside the report).
+//  3. Verify the attestation quote against the AMD root CA via VCEK.
+//  4. Check that attestation.measurement == this.Measurement.
+//  5. Check that attestation.report_data == this.ReportData. The report_data
+//     is defined as SHA256(tlsFingerprint || e2ePublicKey || signingPublicKey),
+//     which cryptographically binds the signing public key to the hardware
+//     measurement.
+//  6. Check that Measurement matches a hash of an audited enclave build
+//     published on the AuditZK GitHub releases.
+//
+// If any step fails, the report MUST NOT be trusted.
+type EnclaveAttestation struct {
+	Measurement string `json:"measurement,omitempty"`
+	ReportData  string `json:"report_data,omitempty"`
+	Platform    string `json:"platform"` // "sev-snp" or "unattested-dev" (SEC-115)
+	Attested    bool   `json:"attested"`
+	// ReportDataBoundToRequest mirrors SevSnpReport.ReportDataBoundToRequest
+	// so verifiers can detect quotes produced via snpguest --random fallback
+	// (REPORT_DATA random instead of keys-hash). A verifier MUST refuse a
+	// signed report whose platform == "sev-snp" but this flag is false
+	// (SEC-104).
+	ReportDataBoundToRequest bool `json:"report_data_bound_to_request"`
+	// VcekVerified is the result of the VCEK certificate-chain check at
+	// signing time. A verifier who skips the live /api/v1/attestation round
+	// trip can fall back to this flag, but SHOULD independently verify the
+	// VCEK chain when possible (SEC-116).
+	VcekVerified bool `json:"vcek_verified"`
+}
+
+// ReportSigner signs performance reports.
+type ReportSigner struct {
+	privateKey      *ecdsa.PrivateKey
+	publicKeyBase64 string
+
+	attestMu    sync.RWMutex
+	attestation *EnclaveAttestation
+}
+
+// SetAttestation binds the signer to a SEV-SNP attestation. Every subsequent
+// call to Sign() will include this attestation inside the signed payload so
+// that a verifier can cryptographically link the signed report to an audited
+// enclave build.
+//
+// Called once at startup from main.go after the attestation service has
+// fetched its first measurement. Safe for concurrent use with Sign().
+func (s *ReportSigner) SetAttestation(att *EnclaveAttestation) {
+	s.attestMu.Lock()
+	defer s.attestMu.Unlock()
+	s.attestation = att
+}
+
+// Attestation returns a copy of the current attestation (or nil if none set).
+func (s *ReportSigner) Attestation() *EnclaveAttestation {
+	s.attestMu.RLock()
+	defer s.attestMu.RUnlock()
+	if s.attestation == nil {
+		return nil
+	}
+	copy := *s.attestation
+	return &copy
+}
+
+// NewReportSignerGenerate creates a signer with a new keypair.
+// Returns an error if the system RNG fails or the public key cannot be
+// serialized — callers (typically main.go startup) should treat failure as
+// fatal since without a signer the enclave cannot produce verifiable reports.
+func NewReportSignerGenerate() (*ReportSigner, error) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate report signer keypair: %w", err)
+	}
+
+	signer, err := newReportSignerFromPrivateKey(privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("initialize report signer: %w", err)
+	}
+	return signer, nil
+}
+
+// MustNewReportSignerGenerate is a test-only helper that panics on error.
+// Production code must use NewReportSignerGenerate and handle the error.
+func MustNewReportSignerGenerate() *ReportSigner {
+	signer, err := NewReportSignerGenerate()
+	if err != nil {
+		panic(err)
+	}
+	return signer
+}
+
+func newReportSignerFromPrivateKey(privateKey *ecdsa.PrivateKey) (*ReportSigner, error) {
+	der, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("marshal public key: %w", err)
+	}
+
+	return &ReportSigner{
+		privateKey:      privateKey,
+		publicKeyBase64: base64.StdEncoding.EncodeToString(der),
+	}, nil
+}
+
+// PublicKey returns the report signing public key (base64 DER-encoded SPKI).
+func (s *ReportSigner) PublicKey() string {
+	return s.publicKeyBase64
+}
+
+// VerifiabilityClass categorises the provenance of the snapshots that fed a
+// daily return, surfaced in the signed payload at PayloadVersion ≥ 1.3 so
+// consumers can apply their own trust policy.
+//
+//	"live"              — all snapshots are live daily-sync writes from the
+//	                      enclave; never historically reconstructed.
+//	"in-enclave"        — at least one snapshot is reconstructed, but all
+//	                      reconstruction happened inside the SEV-SNP
+//	                      perimeter (e.g. IBKR Flex CSV import). The full
+//	                      chain remains ZK-verifiable.
+//	"rebuilder-service" — at least one snapshot was reconstructed by the
+//	                      external history-rebuilder service, which means
+//	                      plaintext credentials briefly left the enclave to
+//	                      fetch exchange history. The DATA is attested by the
+//	                      enclave (we observed it and signed it), but the
+//	                      FETCH path is not ZK. Strict verifiers should
+//	                      filter these out.
+const (
+	VerifiabilityClassLive             = "live"
+	VerifiabilityClassInEnclave        = "in-enclave"
+	VerifiabilityClassRebuilderService = "rebuilder-service"
+)
+
+// DailyReturn represents a single day's return data.
+type DailyReturn struct {
+	Date             string  `json:"date"`
+	NetReturn        float64 `json:"net_return"`
+	BenchmarkReturn  float64 `json:"benchmark_return"`
+	Outperformance   float64 `json:"outperformance"`
+	CumulativeReturn float64 `json:"cumulative_return"`
+	NAV              float64 `json:"nav"`
+
+	// VerifiabilityClass is the provenance label for the snapshots that
+	// produced this daily return. Empty for pre-1.3 reports (omitted from
+	// the canonical payload via the payloadVersionsWithoutVerifiabilityClass
+	// gate). See the package-level constants for the allowed values.
+	VerifiabilityClass string `json:"verifiability_class,omitempty"`
+}
+
+// MonthlyReturn represents a single month's return data.
+type MonthlyReturn struct {
+	Date            string  `json:"date"`
+	NetReturn       float64 `json:"net_return"`
+	BenchmarkReturn float64 `json:"benchmark_return"`
+	Outperformance  float64 `json:"outperformance"`
+	AUM             float64 `json:"aum"`
+}
+
+// RiskMetrics contains risk analysis data.
+type RiskMetrics struct {
+	VaR95             float64 `json:"var_95"`
+	VaR99             float64 `json:"var_99"`
+	ExpectedShortfall float64 `json:"expected_shortfall"`
+	Skewness          float64 `json:"skewness"`
+	Kurtosis          float64 `json:"kurtosis"`
+}
+
+// DrawdownPeriod represents a single drawdown event.
+type DrawdownPeriod struct {
+	StartDate string  `json:"start_date"`
+	EndDate   string  `json:"end_date"`
+	Depth     float64 `json:"depth"`
+	Duration  int     `json:"duration"`
+	Recovered bool    `json:"recovered"`
+}
+
+// DrawdownData contains drawdown analysis.
+type DrawdownData struct {
+	CurrentDrawdown     float64           `json:"current_drawdown"`
+	MaxDrawdownDuration int               `json:"max_drawdown_duration"`
+	Periods             []*DrawdownPeriod `json:"periods"`
+}
+
+// BenchmarkMetrics holds benchmark comparison data for the report.
+type BenchmarkMetrics struct {
+	BenchmarkName    string  `json:"benchmark_name"`
+	BenchmarkReturn  float64 `json:"benchmark_return"`
+	Alpha            float64 `json:"alpha"`
+	Beta             float64 `json:"beta"`
+	InformationRatio float64 `json:"information_ratio"`
+	TrackingError    float64 `json:"tracking_error"`
+	Correlation      float64 `json:"correlation"`
+}
+
+// ExchangeInfo stores exchange-level metadata included in signed reports.
+type ExchangeInfo struct {
+	Name     string `json:"name"`
+	KYCLevel string `json:"kyc_level"`
+	IsPaper  bool   `json:"is_paper"`
+}
+
+// ReportInput contains the data to include in a signed report.
+type ReportInput struct {
+	UserUID     string
+	ReportName  string
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+
+	// Metrics
+	TotalReturn      float64
+	AnnualizedReturn float64
+	Annualized       bool // false under one year: AnnualizedReturn and CalmarRatio are zero by rule
+	PeriodDays       int
+	SharpeRatio      float64
+	SortinoRatio     float64
+	CalmarRatio      float64
+	MaxDrawdown      float64
+	Volatility       float64
+	WinRate          float64
+	ProfitFactor     float64
+	DataPoints       int
+	BaseCurrency     string
+	BenchmarkUsed    string
+	// Annual %, the assumption behind SharpeRatio/SortinoRatio (0 = rf-free)
+	RiskFreeRate float64
+
+	// Extended data
+	Exchanges        []string
+	ExchangeDetails  []ExchangeInfo
+	DailyReturns     []DailyReturn
+	MonthlyReturns   []MonthlyReturn
+	RiskMetrics      *RiskMetrics
+	DrawdownData     *DrawdownData
+	BenchmarkMetrics *BenchmarkMetrics
+}
+
+// SignedReport is the output of signing.
+type SignedReport struct {
+	// Identification
+	ReportID    string `json:"report_id"`
+	UserUID     string `json:"user_uid"`
+	ReportName  string `json:"report_name"`
+	GeneratedAt string `json:"generated_at"`
+
+	// Period
+	PeriodStart string `json:"period_start"`
+	PeriodEnd   string `json:"period_end"`
+
+	// AnnualizationDays is the year length behind every annualised figure
+	// below and in benchmark_metrics (see the package constant). Stated
+	// rather than assumed: report-service passes it through so the reader of
+	// a Sharpe or an alpha knows the basis it was computed on.
+	AnnualizationDays int `json:"annualization_days"` // signed at PayloadVersion >= 1.7
+
+	// Metrics
+	TotalReturn      float64 `json:"total_return"`
+	AnnualizedReturn float64 `json:"annualized_return"`
+	Annualized       bool    `json:"annualized"`  // signed at PayloadVersion >= 1.6
+	PeriodDays       int     `json:"period_days"` // signed at PayloadVersion >= 1.6
+	SharpeRatio      float64 `json:"sharpe_ratio"`
+	SortinoRatio     float64 `json:"sortino_ratio"`
+	CalmarRatio      float64 `json:"calmar_ratio"`
+	MaxDrawdown      float64 `json:"max_drawdown"`
+	Volatility       float64 `json:"volatility"`
+	WinRate          float64 `json:"win_rate"`
+	ProfitFactor     float64 `json:"profit_factor"`
+	DataPoints       int     `json:"data_points"`
+	BaseCurrency     string  `json:"base_currency"`
+	Benchmark        string  `json:"benchmark"`
+	RiskFreeRate     float64 `json:"risk_free_rate"` // annual %, signed at PayloadVersion >= 1.4
+
+	// Extended data
+	Exchanges        []string          `json:"exchanges,omitempty"`
+	ExchangeDetails  []ExchangeInfo    `json:"exchange_details,omitempty"`
+	DailyReturns     []DailyReturn     `json:"daily_returns,omitempty"`
+	MonthlyReturns   []MonthlyReturn   `json:"monthly_returns,omitempty"`
+	RiskMetrics      *RiskMetrics      `json:"risk_metrics,omitempty"`
+	DrawdownData     *DrawdownData     `json:"drawdown_data,omitempty"`
+	BenchmarkMetrics *BenchmarkMetrics `json:"benchmark_metrics,omitempty"`
+
+	// Display params (NOT signed - applied per request)
+	Manager string `json:"manager,omitempty"`
+	Firm    string `json:"firm,omitempty"`
+
+	// Enclave attestation (SIGNED - binds the report to a specific SEV-SNP
+	// measurement). See EnclaveAttestation docs for the verification
+	// procedure a client must follow.
+	EnclaveAttestation *EnclaveAttestation `json:"enclave_attestation,omitempty"`
+
+	// Signature
+	Signature          string `json:"signature"`
+	PublicKey          string `json:"public_key"`
+	SignatureAlgorithm string `json:"signature_algorithm"`
+	ReportHash         string `json:"report_hash"`
+	EnclaveVersion     string `json:"enclave_version"`
+	PayloadVersion     string `json:"payload_version"`
+
+	// The same report with every amount withheld, signed on its own so a
+	// report shared in percentages stays verifiable. See PercentPayload.
+	PercentReportHash string `json:"percent_report_hash,omitempty"`
+	PercentSignature  string `json:"percent_signature,omitempty"`
+}
+
+// Sign creates a signed report from input.
+// TS parity:
+// 1. Build financial data
+// 2. Deterministically serialize with sorted keys
+// 3. reportHash = SHA-256(financialDataJSON) hex
+// 4. signature = ECDSA-SHA256 sign(reportHash string)
+func (s *ReportSigner) Sign(input *ReportInput) (*SignedReport, error) {
+	report := &SignedReport{
+		ReportID:           uuid.New().String(),
+		UserUID:            input.UserUID,
+		ReportName:         input.ReportName,
+		GeneratedAt:        formatISO8601(time.Now().UTC()),
+		PeriodStart:        formatISO8601(input.PeriodStart),
+		PeriodEnd:          formatISO8601(input.PeriodEnd),
+		AnnualizationDays:  AnnualizationDays,
+		TotalReturn:        input.TotalReturn,
+		AnnualizedReturn:   input.AnnualizedReturn,
+		Annualized:         input.Annualized,
+		PeriodDays:         input.PeriodDays,
+		SharpeRatio:        input.SharpeRatio,
+		SortinoRatio:       input.SortinoRatio,
+		CalmarRatio:        input.CalmarRatio,
+		MaxDrawdown:        input.MaxDrawdown,
+		Volatility:         input.Volatility,
+		WinRate:            input.WinRate,
+		ProfitFactor:       input.ProfitFactor,
+		DataPoints:         input.DataPoints,
+		BaseCurrency:       input.BaseCurrency,
+		Benchmark:          input.BenchmarkUsed,
+		RiskFreeRate:       input.RiskFreeRate,
+		Exchanges:          input.Exchanges,
+		ExchangeDetails:    input.ExchangeDetails,
+		DailyReturns:       input.DailyReturns,
+		MonthlyReturns:     input.MonthlyReturns,
+		RiskMetrics:        input.RiskMetrics,
+		DrawdownData:       input.DrawdownData,
+		BenchmarkMetrics:   input.BenchmarkMetrics,
+		EnclaveAttestation: s.Attestation(),
+		PublicKey:          s.PublicKey(),
+		SignatureAlgorithm: SignatureAlgorithm,
+		EnclaveVersion:     EnclaveVersion,
+		PayloadVersion:     PayloadVersion,
+	}
+
+	financialJSON, err := CanonicalPayload(report)
+	if err != nil {
+		return nil, fmt.Errorf("serialize financial payload: %w", err)
+	}
+	if report.ReportHash, report.Signature, err = s.signPayload(financialJSON); err != nil {
+		return nil, fmt.Errorf("sign report hash: %w", err)
+	}
+
+	percentJSON, err := PercentPayload(report)
+	if err != nil {
+		return nil, fmt.Errorf("serialize percent payload: %w", err)
+	}
+	if report.PercentReportHash, report.PercentSignature, err = s.signPayload(percentJSON); err != nil {
+		return nil, fmt.Errorf("sign percent report hash: %w", err)
+	}
+
+	return report, nil
+}
+
+// signPayload returns hex(SHA-256(payload)) and the ECDSA signature over that
+// hex string, the scheme every verifier of a report hash already implements.
+func (s *ReportSigner) signPayload(payload []byte) (hash, signature string, err error) {
+	sum := sha256.Sum256(payload)
+	hash = hex.EncodeToString(sum[:])
+	digest := sha256.Sum256([]byte(hash))
+	signatureDER, err := ecdsa.SignASN1(rand.Reader, s.privateKey, digest[:])
+	if err != nil {
+		return "", "", err
+	}
+	return hash, base64.StdEncoding.EncodeToString(signatureDER), nil
+}
+
+// CanonicalPayload returns the bytes ReportHash is the SHA-256 of.
+func CanonicalPayload(report *SignedReport) ([]byte, error) {
+	return marshalSortedJSON(buildFinancialPayload(report))
+}
+
+// PercentPayload returns the bytes PercentReportHash is the SHA-256 of: the
+// canonical payload without its only amounts, each day's nav and each month's
+// aum. A report shared in percentages must not publish them, and removing them
+// from the canonical payload would break its hash, so this view is signed on
+// its own. amountsWithheld tells a verifier the omission is deliberate.
+func PercentPayload(report *SignedReport) ([]byte, error) {
+	payload := buildFinancialPayload(report)
+	for _, day := range payload["dailyReturns"].([]map[string]any) {
+		delete(day, "nav")
+	}
+	for _, month := range payload["monthlyReturns"].([]map[string]any) {
+		delete(month, "aum")
+	}
+	payload["amountsWithheld"] = true
+	return marshalSortedJSON(payload)
+}
+
+func formatISO8601(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+func buildFinancialPayload(report *SignedReport) map[string]any {
+	payload := map[string]any{
+		"payloadVersion": report.PayloadVersion,
+		"reportId":       report.ReportID,
+		"userUid":        report.UserUID,
+		"generatedAt":    report.GeneratedAt,
+		"periodStart":    report.PeriodStart,
+		"periodEnd":      report.PeriodEnd,
+		"baseCurrency":   report.BaseCurrency,
+		"dataPoints":     report.DataPoints,
+		"exchanges":      report.Exchanges,
+		"metrics": map[string]any{
+			"totalReturn":      report.TotalReturn,
+			"annualizedReturn": report.AnnualizedReturn,
+			"volatility":       report.Volatility,
+			"sharpeRatio":      report.SharpeRatio,
+			"sortinoRatio":     report.SortinoRatio,
+			"maxDrawdown":      report.MaxDrawdown,
+			"calmarRatio":      report.CalmarRatio,
+		},
+		"dailyReturns":   toDailyReturnsPayload(report.DailyReturns, report.PayloadVersion),
+		"monthlyReturns": toMonthlyReturnsPayload(report.MonthlyReturns),
+	}
+
+	// SEC-003: winRate / profitFactor are presented to consumers as report
+	// metrics, so they must be covered by the signature. They entered the
+	// signed payload at PayloadVersion 1.2; reports issued under an earlier
+	// version keep their original metrics shape so VerifyReport still
+	// reproduces their hash.
+	if _, legacy := payloadVersionsWithoutWinRate[report.PayloadVersion]; !legacy {
+		metrics := payload["metrics"].(map[string]any)
+		metrics["winRate"] = report.WinRate
+		metrics["profitFactor"] = report.ProfitFactor
+	}
+
+	// The risk-free rate is the assumption behind sharpeRatio/sortinoRatio,
+	// so a verifier must see it under the same signature (annual %, 0 =
+	// rf-free legacy ratios). Entered the signed payload at PayloadVersion 1.4.
+	if _, legacy := payloadVersionsWithoutRiskFreeRate[report.PayloadVersion]; !legacy {
+		metrics := payload["metrics"].(map[string]any)
+		metrics["riskFreeRate"] = report.RiskFreeRate
+	}
+
+	// Whether annualizedReturn and calmarRatio were computed at all, and over
+	// how many calendar days: under a year they are zero by rule, and a
+	// verifier must tell that from a flat year. Entered the payload at 1.6.
+	if _, legacy := payloadVersionsWithoutAnnualizationBasis[report.PayloadVersion]; !legacy {
+		metrics := payload["metrics"].(map[string]any)
+		metrics["annualized"] = report.Annualized
+		metrics["periodDays"] = report.PeriodDays
+	}
+
+	// The year length behind every annualised figure in the block above and
+	// in benchmarkMetrics below. Signed for the same reason riskFreeRate is:
+	// it is an assumption, not an output, and a Sharpe or an alpha means a
+	// different thing under a 252-day year than under a 365-day one. Read
+	// from the report, not from the package constant, so tampering with the
+	// declared basis invalidates the signature. Entered the payload at 1.7.
+	if _, legacy := payloadVersionsWithoutAnnualizationDays[report.PayloadVersion]; !legacy {
+		metrics := payload["metrics"].(map[string]any)
+		metrics["annualizationDays"] = report.AnnualizationDays
+	}
+
+	// SEC-14: the report label is what a reader sees first, so renaming a
+	// report must break its signature. Entered the signed payload at 1.5.
+	if _, legacy := payloadVersionsWithoutReportName[report.PayloadVersion]; !legacy {
+		payload["reportName"] = report.ReportName
+	}
+
+	// enclaveAttestation binds the signed report to a specific SEV-SNP
+	// measurement. Always include when available, even in dev mode — the
+	// platform field lets the verifier distinguish attested from dev.
+	// reportDataBoundToRequest and vcekVerified are part of the signed payload
+	// (SEC-104 / SEC-116) so a verifier has authenticated signals about
+	// whether the quote actually binds the enclave's keys and whether the
+	// VCEK chain was checked at signing time.
+	if report.EnclaveAttestation != nil {
+		payload["enclaveAttestation"] = map[string]any{
+			"measurement":              report.EnclaveAttestation.Measurement,
+			"reportData":               report.EnclaveAttestation.ReportData,
+			"platform":                 report.EnclaveAttestation.Platform,
+			"attested":                 report.EnclaveAttestation.Attested,
+			"reportDataBoundToRequest": report.EnclaveAttestation.ReportDataBoundToRequest,
+			"vcekVerified":             report.EnclaveAttestation.VcekVerified,
+		}
+	}
+
+	if report.Benchmark != "" {
+		payload["benchmark"] = report.Benchmark
+	}
+	if len(report.ExchangeDetails) > 0 {
+		payload["exchangeDetails"] = toExchangeDetailsPayload(report.ExchangeDetails)
+	}
+	if report.RiskMetrics != nil {
+		payload["metrics"].(map[string]any)["riskMetrics"] = map[string]any{
+			"var95":             report.RiskMetrics.VaR95,
+			"var99":             report.RiskMetrics.VaR99,
+			"expectedShortfall": report.RiskMetrics.ExpectedShortfall,
+			"skewness":          report.RiskMetrics.Skewness,
+			"kurtosis":          report.RiskMetrics.Kurtosis,
+		}
+	}
+	if report.BenchmarkMetrics != nil {
+		payload["metrics"].(map[string]any)["benchmarkMetrics"] = map[string]any{
+			"alpha":            report.BenchmarkMetrics.Alpha,
+			"beta":             report.BenchmarkMetrics.Beta,
+			"informationRatio": report.BenchmarkMetrics.InformationRatio,
+			"trackingError":    report.BenchmarkMetrics.TrackingError,
+			"correlation":      report.BenchmarkMetrics.Correlation,
+		}
+	}
+	if report.DrawdownData != nil {
+		payload["metrics"].(map[string]any)["drawdownData"] = map[string]any{
+			"maxDrawdownDuration": report.DrawdownData.MaxDrawdownDuration,
+			"currentDrawdown":     report.DrawdownData.CurrentDrawdown,
+			"drawdownPeriods":     toDrawdownPeriodsPayload(report.DrawdownData.Periods),
+		}
+	}
+
+	return payload
+}
+
+func toExchangeDetailsPayload(in []ExchangeInfo) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, ex := range in {
+		out = append(out, map[string]any{
+			"name":     ex.Name,
+			"kycLevel": ex.KYCLevel,
+			"isPaper":  ex.IsPaper,
+		})
+	}
+	return out
+}
+
+func toDailyReturnsPayload(in []DailyReturn, payloadVersion string) []map[string]any {
+	_, omitVerifiability := payloadVersionsWithoutVerifiabilityClass[payloadVersion]
+	out := make([]map[string]any, 0, len(in))
+	for _, dr := range in {
+		entry := map[string]any{
+			"date":             dr.Date,
+			"netReturn":        dr.NetReturn,
+			"benchmarkReturn":  dr.BenchmarkReturn,
+			"outperformance":   dr.Outperformance,
+			"cumulativeReturn": dr.CumulativeReturn,
+			"nav":              dr.NAV,
+		}
+		// SEC-001-v2: PayloadVersion 1.3+ carries per-day provenance so a
+		// verifier can apply strict ("in-enclave only") or loose ("anything
+		// attested by the enclave") policies. Older versions stay byte-
+		// identical so VerifyReport still reproduces their hash.
+		if !omitVerifiability {
+			entry["verifiabilityClass"] = dr.VerifiabilityClass
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func toMonthlyReturnsPayload(in []MonthlyReturn) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, mr := range in {
+		out = append(out, map[string]any{
+			"date":            mr.Date,
+			"netReturn":       mr.NetReturn,
+			"benchmarkReturn": mr.BenchmarkReturn,
+			"outperformance":  mr.Outperformance,
+			"aum":             mr.AUM,
+		})
+	}
+	return out
+}
+
+func toDrawdownPeriodsPayload(in []*DrawdownPeriod) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, p := range in {
+		out = append(out, map[string]any{
+			"startDate": p.StartDate,
+			"endDate":   p.EndDate,
+			"depth":     p.Depth,
+			"duration":  p.Duration,
+			"recovered": p.Recovered,
+		})
+	}
+	return out
+}
+
+// marshalSortedJSON produces a deterministic JSON encoding of v, with map
+// keys emitted in lexicographic order at every level. The result is what
+// the report hash is computed over, so its byte layout is part of the
+// signing contract — see TestMarshalSortedJSONMatchesReference for the
+// non-regression test that pins the output against the legacy reference
+// implementation.
+//
+// PERF-001: the previous implementation did Marshal → Unmarshal-into-`any`
+// → re-Marshal-recursive, which cost ~22 k allocs / 700 KB per call on a
+// 365-day report. The new path drives writeSortedJSON directly over the
+// native Go values produced by buildFinancialPayload, so the only fallback
+// to encoding/json is for terminal scalars.
+func marshalSortedJSON(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := writeSortedJSON(&buf, v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// writeSortedJSON walks v and writes a canonical JSON encoding (sorted map
+// keys at every level, no whitespace) to buf. It handles the native Go
+// types emitted by buildFinancialPayload directly, so callers don't have
+// to pre-normalise via Unmarshal-into-any.
+func writeSortedJSON(buf *bytes.Buffer, v any) error {
+	switch t := v.(type) {
+	case nil:
+		buf.WriteString("null")
+		return nil
+	case map[string]any:
+		return writeSortedMap(buf, t)
+	case []any:
+		return writeAnySlice(buf, t)
+	case []map[string]any:
+		// Common shape for toDailyReturnsPayload / toMonthlyReturnsPayload /
+		// toDrawdownPeriodsPayload / toExchangeDetailsPayload — handle
+		// without a per-element type assertion.
+		// PERF-001 byte-parity: a nil typed slice must render as "null"
+		// to match what the reference (Marshal → Unmarshal-into-any →
+		// re-Marshal) emits. Empty (non-nil) slices stay "[]".
+		if t == nil {
+			buf.WriteString("null")
+			return nil
+		}
+		buf.WriteByte('[')
+		for i, item := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeSortedMap(buf, item); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+		return nil
+	case []string:
+		// Exchanges []string. Order is preserved (semantic input order).
+		// Same nil-vs-empty distinction as []map[string]any above.
+		if t == nil {
+			buf.WriteString("null")
+			return nil
+		}
+		buf.WriteByte('[')
+		for i, s := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			b, err := json.Marshal(s)
+			if err != nil {
+				return err
+			}
+			buf.Write(b)
+		}
+		buf.WriteByte(']')
+		return nil
+	default:
+		// Scalars (string, bool, int, float64, …) and any unanticipated
+		// shape: hand off to encoding/json. The legacy reference path
+		// also fell through to json.Marshal for leaves, so output is
+		// byte-identical for the supported buildFinancialPayload types
+		// (verified by TestMarshalSortedJSONMatchesReference).
+		b, err := json.Marshal(t)
+		if err != nil {
+			return err
+		}
+		buf.Write(b)
+		return nil
+	}
+}
+
+func writeSortedMap(buf *bytes.Buffer, m map[string]any) error {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	buf.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		keyBytes, err := json.Marshal(k)
+		if err != nil {
+			return err
+		}
+		buf.Write(keyBytes)
+		buf.WriteByte(':')
+		if err := writeSortedJSON(buf, m[k]); err != nil {
+			return err
+		}
+	}
+	buf.WriteByte('}')
+	return nil
+}
+
+func writeAnySlice(buf *bytes.Buffer, s []any) error {
+	buf.WriteByte('[')
+	for i, item := range s {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		if err := writeSortedJSON(buf, item); err != nil {
+			return err
+		}
+	}
+	buf.WriteByte(']')
+	return nil
+}
+
+// VerifyReport performs the full end-to-end verification of a signed report:
+//
+//  1. Rebuild the canonical signed payload from the SignedReport fields.
+//  2. Recompute SHA-256(canonicalJSON) and compare with report.ReportHash.
+//     This detects any tampering with the report contents (including the
+//     EnclaveAttestation block).
+//  3. Verify the ECDSA signature of the recomputed hash against the
+//     embedded public key.
+//
+// This function does NOT validate the SEV-SNP attestation quote itself —
+// callers must separately verify report.EnclaveAttestation.Measurement
+// against an audited build hash and fetch the quote from the enclave's
+// /api/v1/attestation endpoint to verify the VCEK chain. See the
+// EnclaveAttestation type documentation for the complete verification
+// procedure.
+func VerifyReport(report *SignedReport) (bool, error) {
+	if report == nil {
+		return false, fmt.Errorf("nil report")
+	}
+
+	canonical, err := CanonicalPayload(report)
+	if err != nil {
+		return false, fmt.Errorf("rebuild canonical payload: %w", err)
+	}
+
+	recomputed := sha256.Sum256(canonical)
+	if hex.EncodeToString(recomputed[:]) != report.ReportHash {
+		return false, nil
+	}
+
+	return Verify(report.ReportHash, report.Signature, report.PublicKey, report.SignatureAlgorithm)
+}
+
+// VerifyPercentReport is VerifyReport for the amounts-withheld view: it
+// rebuilds PercentPayload and checks PercentReportHash and PercentSignature.
+func VerifyPercentReport(report *SignedReport) (bool, error) {
+	if report == nil {
+		return false, fmt.Errorf("nil report")
+	}
+	if report.PercentReportHash == "" || report.PercentSignature == "" {
+		return false, nil
+	}
+
+	payload, err := PercentPayload(report)
+	if err != nil {
+		return false, fmt.Errorf("rebuild percent payload: %w", err)
+	}
+
+	recomputed := sha256.Sum256(payload)
+	if hex.EncodeToString(recomputed[:]) != report.PercentReportHash {
+		return false, nil
+	}
+
+	return Verify(report.PercentReportHash, report.PercentSignature, report.PublicKey, report.SignatureAlgorithm)
+}
+
+// Errors surfaced by the strict verifier helpers.
+var (
+	ErrUnknownAlgorithm    = fmt.Errorf("unknown signature algorithm")
+	ErrPublicKeyMismatch   = fmt.Errorf("signing public key does not match expected key")
+	ErrAttestationNotBound = fmt.Errorf("sev-snp report_data is not bound to the enclave keys")
+	ErrVcekUnverified      = fmt.Errorf("sev-snp VCEK certificate chain not verified")
+)
+
+// Verify checks a signature against a report hash, dispatching on algorithm.
+// Unlike the old loose implementation, Verify now REQUIRES the caller to tell
+// it which algorithm to use — there is no silent Ed25519 fallback when the
+// ECDSA decode fails (SEC-108). For caller convenience, an empty algorithm is
+// treated as the current production value (SignatureAlgorithm == ECDSA-P256).
+//
+// Lower-level primitive: callers that already hold a trusted report hash can
+// use this to check the signature only. For end-to-end verification from a
+// SignedReport (including detection of tampering with the payload), use
+// VerifyReport. For strict verification that also pins the signing public key,
+// use VerifyReportStrict (SEC-109).
+func Verify(reportHash, signatureB64, publicKey, algorithm string) (bool, error) {
+	switch algorithm {
+	case "", SignatureAlgorithm:
+		return verifyECDSA(reportHash, signatureB64, publicKey)
+	case "Ed25519":
+		return verifyEd25519Legacy(reportHash, signatureB64, publicKey)
+	default:
+		return false, fmt.Errorf("%w: %q", ErrUnknownAlgorithm, algorithm)
+	}
+}
+
+func verifyECDSA(reportHash, signatureB64, publicKey string) (bool, error) {
+	signatureDER, err := base64.StdEncoding.DecodeString(signatureB64)
+	if err != nil {
+		return false, fmt.Errorf("decode ecdsa signature: %w", err)
+	}
+	publicKeyDER, err := base64.StdEncoding.DecodeString(publicKey)
+	if err != nil {
+		return false, fmt.Errorf("decode ecdsa public key (base64): %w", err)
+	}
+	parsed, err := x509.ParsePKIXPublicKey(publicKeyDER)
+	if err != nil {
+		return false, fmt.Errorf("parse ecdsa public key: %w", err)
+	}
+	ecdsaKey, ok := parsed.(*ecdsa.PublicKey)
+	if !ok {
+		return false, fmt.Errorf("public key is not ECDSA")
+	}
+	reportHashDigest := sha256.Sum256([]byte(reportHash))
+	return ecdsa.VerifyASN1(ecdsaKey, reportHashDigest[:], signatureDER), nil
+}
+
+func verifyEd25519Legacy(reportHash, signatureB64, publicKey string) (bool, error) {
+	hash, err := hex.DecodeString(reportHash)
+	if err != nil {
+		return false, fmt.Errorf("invalid report hash: %w", err)
+	}
+	signature, err := base64.StdEncoding.DecodeString(signatureB64)
+	if err != nil {
+		return false, fmt.Errorf("invalid signature: %w", err)
+	}
+	publicKeyBytes, err := hex.DecodeString(publicKey)
+	if err != nil {
+		return false, fmt.Errorf("invalid public key: %w", err)
+	}
+	if len(publicKeyBytes) != ed25519.PublicKeySize {
+		return false, fmt.Errorf("invalid public key format")
+	}
+	return ed25519.Verify(publicKeyBytes, hash, signature), nil
+}
+
+// VerifyReportStrict is the verifier callers should reach for when they trust
+// an enclave's published signing key (e.g. fetched from /api/v1/attestation
+// and cross-checked against a measurement allowlist).
+//
+// It enforces (SEC-109):
+//  1. report.PublicKey == expectedPubKey (constant-time comparison)
+//  2. Canonical-payload recomputation matches report.ReportHash
+//  3. ECDSA signature over report.ReportHash is valid
+//  4. When expectSevSnp is true, the embedded enclaveAttestation must be
+//     platform == "sev-snp" AND attested == true AND
+//     reportDataBoundToRequest == true (SEC-104 binding check) AND
+//     vcekVerified == true (SEC-04 — the AMD VCEK chain was validated at
+//     signing time).
+//
+// It does NOT check the measurement allowlist or perform out-of-band VCEK
+// chain validation. pkg/reportverify.Verifier is the only fully-supported
+// verification path: it wraps this primitive and adds the measurement
+// allowlist, report_data recomputation, and an optional out-of-band VCEKChecker.
+//
+// Returns (true, nil) only if every step passes. Any mismatch returns a
+// specific sentinel error so callers can log it rather than treating it as a
+// generic verification failure.
+func VerifyReportStrict(report *SignedReport, expectedPubKey string, expectSevSnp bool) (bool, error) {
+	if report == nil {
+		return false, fmt.Errorf("nil report")
+	}
+	if expectedPubKey == "" {
+		return false, fmt.Errorf("expectedPubKey is required")
+	}
+	// Step 1: pin the public key before touching any cryptography. This is
+	// what stops an attacker from self-signing a "valid" report with their
+	// own keypair (SEC-109).
+	if subtleConstantTimeStringEqual(report.PublicKey, expectedPubKey) != 1 {
+		return false, ErrPublicKeyMismatch
+	}
+
+	// Step 2 + 3: hash + signature
+	ok, err := VerifyReport(report)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+
+	// Step 4: attestation posture
+	if expectSevSnp {
+		att := report.EnclaveAttestation
+		if att == nil {
+			return false, fmt.Errorf("signed report has no enclaveAttestation block")
+		}
+		if att.Platform != "sev-snp" || !att.Attested {
+			return false, fmt.Errorf("signed report is not attested by sev-snp (platform=%q attested=%v)", att.Platform, att.Attested)
+		}
+		if !att.ReportDataBoundToRequest {
+			return false, ErrAttestationNotBound
+		}
+		if !att.VcekVerified {
+			return false, ErrVcekUnverified
+		}
+	}
+
+	return true, nil
+}
+
+// subtleConstantTimeStringEqual returns 1 when a and b are equal, 0 otherwise,
+// in constant time (modulo length). Wraps subtle.ConstantTimeCompare to keep
+// the caller free of crypto/subtle imports.
+func subtleConstantTimeStringEqual(a, b string) int {
+	if len(a) != len(b) {
+		return 0
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b))
+}

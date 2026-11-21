@@ -1,0 +1,1329 @@
+package repository
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// ErrNotFound is returned when a repository lookup finds no matching row.
+var ErrNotFound = errors.New("not found")
+
+// ErrAlreadyExists is returned when an insert collides with an existing
+// uniqueness constraint (e.g. one active connection per user/exchange).
+var ErrAlreadyExists = errors.New("already exists")
+
+// ExchangeConnection represents an encrypted exchange connection
+type ExchangeConnection struct {
+	ID                  string    `json:"id"`
+	UserUID             string    `json:"user_uid"`
+	Exchange            string    `json:"exchange"`
+	Label               string    `json:"label"`
+	CredentialsHash     string    `json:"credentials_hash,omitempty"`      // SHA-256 hash(apiKey:apiSecret:passphrase)
+	SyncIntervalMinutes int       `json:"sync_interval_minutes,omitempty"` // Per-connection sync interval
+	ExcludeFromReport   bool      `json:"exclude_from_report,omitempty"`   // true = analytics only, excluded from certified report
+	KYCLevel            string    `json:"kyc_level,omitempty"`             // Optional exchange KYC level metadata
+	IsPaper             bool      `json:"is_paper,omitempty"`              // true = paper/testnet account
+	EncryptedAPIKey     string    `json:"encrypted_api_key"`
+	APIKeyIV            string    `json:"api_key_iv"`
+	APIKeyAuthTag       string    `json:"api_key_auth_tag"`
+	EncryptedAPISecret  string    `json:"encrypted_api_secret"`
+	APISecretIV         string    `json:"api_secret_iv"`
+	APISecretAuthTag    string    `json:"api_secret_auth_tag"`
+	EncryptedPassphrase string    `json:"encrypted_passphrase,omitempty"`
+	PassphraseIV        string    `json:"passphrase_iv,omitempty"`
+	PassphraseAuthTag   string    `json:"passphrase_auth_tag,omitempty"`
+	IsActive            bool      `json:"is_active"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
+	// RebuildFinalizedAt: set by the midnight UTC recalibration pass once the
+	// connection's rebuilt history has been re-anchored on the exact midnight
+	// snapshot equity, and for IBKR once its year of statements has been read
+	// (the statement backfill). NULL = still calibrated to the imprecise
+	// connect-time live value, the IBKR backfill still to run, OR a path that
+	// never sets it (MT5). Only populated by ListUnfinalizedExternalRebuilds +
+	// MarkRebuildFinalized; other scan paths leave it nil.
+	RebuildFinalizedAt *time.Time `json:"rebuild_finalized_at,omitempty"`
+	// RebuildRequestedAt records when the user explicitly opted into external
+	// history reconstruction (rebuild_history=true at create). NULL = no opt-in
+	// → the midnight recalibration pass, which decrypts and POSTs credentials to
+	// the external rebuilder, MUST skip this connection (SEC-08). Set by
+	// MarkRebuildRequested; other scan paths leave it nil.
+	RebuildRequestedAt *time.Time `json:"rebuild_requested_at,omitempty"`
+}
+
+// ConnectionRepo handles exchange connection persistence.
+// Supports both TS (Prisma camelCase) and Go (snake_case) column naming.
+type ConnectionRepo struct {
+	pool *pgxpool.Pool
+
+	capMu                     sync.Mutex
+	capabilitiesLoaded        bool
+	hasCredentialsHashCol     bool
+	hasSyncIntervalMinsCol    bool
+	hasExcludeFromReportCol   bool
+	hasKYCLevelCol            bool
+	hasIsPaperCol             bool
+	hasRebuildFinalizedAtCol  bool
+	hasRebuildRequestedAtCol  bool
+	hasBrokerAccountsCol      bool
+	isTSSchema                bool // true = TS Prisma camelCase columns
+}
+
+// NewConnectionRepo creates a new connection repository
+func NewConnectionRepo(pool *pgxpool.Pool) *ConnectionRepo {
+	return &ConnectionRepo{pool: pool}
+}
+
+// IsTSSchema reports whether the underlying exchange_connections table is the
+// TS/Prisma camelCase variant (single hex column per secret, no separate
+// iv/auth_tag columns). Triggers capability detection on first call.
+//
+// The service layer must consult this before encrypting credentials so it
+// picks the matching format: EncryptTSString for TS schema, EncryptString for
+// the native Go schema. Mismatched formats produce ciphertexts that pass
+// shape validation but fail GCM auth-tag verification on read.
+func (r *ConnectionRepo) IsTSSchema(ctx context.Context) bool {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.isTSSchema
+}
+
+// Create inserts a new exchange connection
+func (r *ConnectionRepo) Create(ctx context.Context, conn *ExchangeConnection) error {
+	now := time.Now().UTC()
+	conn.CreatedAt = now
+	conn.UpdatedAt = now
+	conn.IsActive = true
+	if conn.SyncIntervalMinutes <= 0 {
+		conn.SyncIntervalMinutes = 1440
+	}
+
+	hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper := r.getCapabilityFlags(ctx)
+
+	if r.isTSSchema {
+		return r.createTS(ctx, conn, hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper)
+	}
+
+	columns := []string{
+		"user_uid", "exchange", "label",
+	}
+	args := []any{
+		conn.UserUID, conn.Exchange, conn.Label,
+	}
+
+	if hasCredHash {
+		columns = append(columns, "credentials_hash")
+		args = append(args, conn.CredentialsHash)
+	}
+	if hasSyncMins {
+		columns = append(columns, "sync_interval_minutes")
+		args = append(args, conn.SyncIntervalMinutes)
+	}
+	if hasExclude {
+		columns = append(columns, "exclude_from_report")
+		args = append(args, conn.ExcludeFromReport)
+	}
+	if hasKYCLevel {
+		columns = append(columns, "kyc_level")
+		args = append(args, conn.KYCLevel)
+	}
+	if hasIsPaper {
+		columns = append(columns, "is_paper")
+		args = append(args, conn.IsPaper)
+	}
+
+	columns = append(columns,
+		"encrypted_api_key", "api_key_iv", "api_key_auth_tag",
+		"encrypted_api_secret", "api_secret_iv", "api_secret_auth_tag",
+		"encrypted_passphrase", "passphrase_iv", "passphrase_auth_tag",
+		"is_active", "created_at", "updated_at",
+	)
+	args = append(args,
+		conn.EncryptedAPIKey, conn.APIKeyIV, conn.APIKeyAuthTag,
+		conn.EncryptedAPISecret, conn.APISecretIV, conn.APISecretAuthTag,
+		conn.EncryptedPassphrase, conn.PassphraseIV, conn.PassphraseAuthTag,
+		conn.IsActive, conn.CreatedAt, conn.UpdatedAt,
+	)
+
+	placeholders := make([]string, len(args))
+	for i := range args {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+
+	query := fmt.Sprintf(
+		"INSERT INTO exchange_connections (%s) VALUES (%s) RETURNING id",
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "),
+	)
+
+	err := r.pool.QueryRow(ctx, query, args...).Scan(&conn.ID)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ErrAlreadyExists
+		}
+		return err
+	}
+	return nil
+}
+
+// createTS inserts into the TS/Prisma-shaped exchange_connections: camelCase
+// column names, single encrypted* column per secret (hex-packed iv+tag+ciphertext),
+// and a client-generated id because Prisma's @default(cuid()) isn't a DB default.
+//
+// The service layer is responsible for handing us TS-format ciphertexts when
+// targeting the TS schema (call IsTSSchema before encrypting and use
+// EncryptTSString). We expect EncryptedAPIKey/Secret/Passphrase to already
+// hold the hex(iv16||tag16||ciphertext) string and IV/AuthTag fields to be
+// empty. A previous version of this function repacked Go-format ciphertexts
+// (12-byte nonce) into the TS layout slot-by-slot, but the read path then
+// misread the leading 16 hex bytes as IV and decryption always failed
+// (tracked: connections created via Go enclave between 2026-04-17 and the
+// fix on this branch). See aes.go DecryptTSFormat for the layout contract.
+func (r *ConnectionRepo) createTS(
+	ctx context.Context,
+	conn *ExchangeConnection,
+	hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper bool,
+) error {
+	if conn.EncryptedAPIKey == "" || conn.EncryptedAPISecret == "" {
+		return errors.New("createTS: encrypted credentials missing — service must encrypt with EncryptTSString before calling")
+	}
+	if conn.APIKeyIV != "" || conn.APIKeyAuthTag != "" ||
+		conn.APISecretIV != "" || conn.APISecretAuthTag != "" ||
+		conn.PassphraseIV != "" || conn.PassphraseAuthTag != "" {
+		return errors.New("createTS: IV/AuthTag fields must be empty for TS schema (use EncryptTSString, not EncryptString)")
+	}
+	encAPIKey := conn.EncryptedAPIKey
+	encAPISecret := conn.EncryptedAPISecret
+	var encPassphrase *string
+	if conn.EncryptedPassphrase != "" {
+		p := conn.EncryptedPassphrase
+		encPassphrase = &p
+	}
+
+	if conn.ID == "" {
+		conn.ID = NewConnectionID()
+	}
+	columns := []string{`id`, `"userUid"`, `exchange`, `label`}
+	args := []any{conn.ID, conn.UserUID, conn.Exchange, conn.Label}
+
+	if hasCredHash {
+		columns = append(columns, `"credentialsHash"`)
+		args = append(args, conn.CredentialsHash)
+	}
+	if hasSyncMins {
+		columns = append(columns, `"syncIntervalMinutes"`)
+		args = append(args, conn.SyncIntervalMinutes)
+	}
+	if hasExclude {
+		columns = append(columns, `"excludeFromReport"`)
+		args = append(args, conn.ExcludeFromReport)
+	}
+	if hasKYCLevel {
+		columns = append(columns, `"kycLevel"`)
+		args = append(args, conn.KYCLevel)
+	}
+	if hasIsPaper {
+		columns = append(columns, `"isPaper"`)
+		args = append(args, conn.IsPaper)
+	}
+
+	columns = append(columns,
+		`"encryptedApiKey"`, `"encryptedApiSecret"`, `"encryptedPassphrase"`,
+		`"isActive"`, `"createdAt"`, `"updatedAt"`,
+	)
+	args = append(args,
+		encAPIKey, encAPISecret, encPassphrase,
+		conn.IsActive, conn.CreatedAt, conn.UpdatedAt,
+	)
+
+	placeholders := make([]string, len(args))
+	for i := range args {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+	query := fmt.Sprintf(
+		"INSERT INTO exchange_connections (%s) VALUES (%s) RETURNING id",
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "),
+	)
+
+	if err := r.pool.QueryRow(ctx, query, args...).Scan(&conn.ID); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ErrAlreadyExists
+		}
+		return err
+	}
+	return nil
+}
+
+// NewConnectionID returns a cuid-shaped id for a production-schema row. The
+// service draws it before encrypting, because the ciphertext is bound to it.
+func NewConnectionID() string {
+	return "cuid_" + randomHex(20)
+}
+
+// RebindCredentials swaps a row's ciphertexts for re-encrypted ones only if
+// they are still the ones that were read: a token rotation landing in
+// between wins, and the rebind is retried on the next read. Reports whether
+// the row was rewritten.
+func (r *ConnectionRepo) RebindCredentials(ctx context.Context, connID string, old, bound StoredCredentials) (bool, error) {
+	if !r.IsTSSchema(ctx) {
+		return false, errors.New("rebind credentials: production schema only")
+	}
+	tag, err := r.pool.Exec(ctx, `UPDATE exchange_connections
+		SET "encryptedApiKey" = $1, "encryptedApiSecret" = $2, "encryptedPassphrase" = NULLIF($3, '')
+		WHERE id = $4 AND "encryptedApiKey" = $5 AND "encryptedApiSecret" = $6
+		  AND coalesce("encryptedPassphrase", '') = $7`,
+		bound.APIKey, bound.APISecret, bound.Passphrase, connID, old.APIKey, old.APISecret, old.Passphrase)
+	if err != nil {
+		return false, fmt.Errorf("rebind credentials: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// StoredCredentials are a row's three ciphertext columns as stored.
+type StoredCredentials struct {
+	APIKey, APISecret, Passphrase string
+}
+
+// randomHex returns 2n hex characters of random data, used as the random
+// suffix on client-generated cuid-shaped ids.
+func randomHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// ExistsActiveByCredentialsHash checks whether an active connection already exists
+// for this user with the same credentials hash.
+func (r *ConnectionRepo) ExistsActiveByCredentialsHash(ctx context.Context, userUID, credentialsHash string) (bool, error) {
+	if userUID == "" || credentialsHash == "" {
+		return false, nil
+	}
+
+	hasCredHash, _, _, _, _ := r.getCapabilityFlags(ctx)
+	if !hasCredHash {
+		return false, nil
+	}
+	r.capMu.Lock()
+	isTS := r.isTSSchema
+	r.capMu.Unlock()
+
+	// The TS/Prisma schema quotes camelCase columns; querying the snake_case
+	// names there raises 42703, which the fallback below swallows — turning
+	// this check into a silent no-op on exactly the production schema.
+	query := `
+		SELECT EXISTS (
+			SELECT 1 FROM exchange_connections
+			WHERE user_uid = $1 AND credentials_hash = $2 AND is_active = true
+		)`
+	if isTS {
+		query = `
+		SELECT EXISTS (
+			SELECT 1 FROM exchange_connections
+			WHERE "userUid" = $1 AND "credentialsHash" = $2 AND "isActive" = true
+		)`
+	}
+	var exists bool
+	if err := r.pool.QueryRow(ctx, query, userUID, credentialsHash).Scan(&exists); err != nil {
+		// Graceful fallback if migration has not been applied yet.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42703" {
+			return false, nil
+		}
+		return false, err
+	}
+	return exists, nil
+}
+
+// GetByUserAndExchange retrieves a connection by user and exchange
+func (r *ConnectionRepo) GetByUserAndExchange(ctx context.Context, userUID, exchange string) (*ExchangeConnection, error) {
+	r.getCapabilityFlags(ctx) // Ensure schema detection
+
+	if r.isTSSchema {
+		return r.getByUserAndExchangeTS(ctx, userUID, exchange)
+	}
+
+	query := `
+		SELECT id, user_uid, exchange, label,
+			encrypted_api_key, api_key_iv, api_key_auth_tag,
+			encrypted_api_secret, api_secret_iv, api_secret_auth_tag,
+			encrypted_passphrase, passphrase_iv, passphrase_auth_tag,
+			is_active, created_at, updated_at
+		FROM exchange_connections
+		WHERE user_uid = $1 AND exchange = $2 AND is_active = true`
+
+	var conn ExchangeConnection
+	err := r.pool.QueryRow(ctx, query, userUID, exchange).Scan(
+		&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
+		&conn.EncryptedAPIKey, &conn.APIKeyIV, &conn.APIKeyAuthTag,
+		&conn.EncryptedAPISecret, &conn.APISecretIV, &conn.APISecretAuthTag,
+		&conn.EncryptedPassphrase, &conn.PassphraseIV, &conn.PassphraseAuthTag,
+		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &conn, nil
+}
+
+// getByUserAndExchangeTS reads from TS Prisma camelCase schema.
+// TS has no separate IV/AuthTag columns — encrypted data is a single hex field.
+func (r *ConnectionRepo) getByUserAndExchangeTS(ctx context.Context, userUID, exchange string) (*ExchangeConnection, error) {
+	query := `
+		SELECT id, "userUid", exchange, label,
+			"encryptedApiKey", "encryptedApiSecret", "encryptedPassphrase",
+			"isActive", "createdAt", "updatedAt"
+		FROM exchange_connections
+		WHERE "userUid" = $1 AND exchange = $2 AND "isActive" = true`
+
+	var conn ExchangeConnection
+	var label, encPassphrase *string
+	err := r.pool.QueryRow(ctx, query, userUID, exchange).Scan(
+		&conn.ID, &conn.UserUID, &conn.Exchange, &label,
+		&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &encPassphrase,
+		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if label != nil {
+		conn.Label = *label
+	}
+	if encPassphrase != nil {
+		conn.EncryptedPassphrase = *encPassphrase
+	}
+	return &conn, nil
+}
+
+// GetActiveByUser retrieves all active connections for a user
+func (r *ConnectionRepo) GetActiveByUser(ctx context.Context, userUID string) ([]*ExchangeConnection, error) {
+	hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper := r.getCapabilityFlags(ctx)
+
+	if r.isTSSchema {
+		return r.getActiveByUserTS(ctx, userUID, hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper)
+	}
+
+	columns := []string{"id", "user_uid", "exchange", "label"}
+	if hasCredHash {
+		columns = append(columns, "credentials_hash")
+	}
+	if hasSyncMins {
+		columns = append(columns, "sync_interval_minutes")
+	}
+	if hasExclude {
+		columns = append(columns, "exclude_from_report")
+	}
+	if hasKYCLevel {
+		columns = append(columns, "kyc_level")
+	}
+	if hasIsPaper {
+		columns = append(columns, "is_paper")
+	}
+	columns = append(columns,
+		"encrypted_api_key", "api_key_iv", "api_key_auth_tag",
+		"encrypted_api_secret", "api_secret_iv", "api_secret_auth_tag",
+		"encrypted_passphrase", "passphrase_iv", "passphrase_auth_tag",
+		"is_active", "created_at", "updated_at",
+	)
+
+	query := fmt.Sprintf(`
+		SELECT %s
+		FROM exchange_connections
+		WHERE user_uid = $1 AND is_active = true
+		ORDER BY created_at`,
+		strings.Join(columns, ", "),
+	)
+
+	rows, err := r.pool.Query(ctx, query, userUID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return r.scanConnectionsGo(rows, hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper)
+}
+
+func (r *ConnectionRepo) getActiveByUserTS(ctx context.Context, userUID string, hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper bool) ([]*ExchangeConnection, error) {
+	columns := []string{`id`, `"userUid"`, `exchange`, `label`}
+	if hasCredHash {
+		columns = append(columns, `"credentialsHash"`)
+	}
+	if hasSyncMins {
+		columns = append(columns, `"syncIntervalMinutes"`)
+	}
+	if hasExclude {
+		columns = append(columns, `"excludeFromReport"`)
+	}
+	if hasKYCLevel {
+		columns = append(columns, `"kycLevel"`)
+	}
+	if hasIsPaper {
+		columns = append(columns, `"isPaper"`)
+	}
+	columns = append(columns,
+		`"encryptedApiKey"`, `"encryptedApiSecret"`, `"encryptedPassphrase"`,
+		`"isActive"`, `"createdAt"`, `"updatedAt"`,
+	)
+
+	query := fmt.Sprintf(`
+		SELECT %s
+		FROM exchange_connections
+		WHERE "userUid" = $1 AND "isActive" = true
+		ORDER BY "createdAt"`,
+		strings.Join(columns, ", "),
+	)
+
+	rows, err := r.pool.Query(ctx, query, userUID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var connections []*ExchangeConnection
+	for rows.Next() {
+		var conn ExchangeConnection
+		var label, credHash, kycLevel, encPassphrase *string
+		var isPaper, excludeFromReport *bool
+		scanArgs := []any{&conn.ID, &conn.UserUID, &conn.Exchange, &label}
+		if hasCredHash {
+			scanArgs = append(scanArgs, &credHash)
+		}
+		if hasSyncMins {
+			scanArgs = append(scanArgs, &conn.SyncIntervalMinutes)
+		}
+		if hasExclude {
+			scanArgs = append(scanArgs, &excludeFromReport)
+		}
+		if hasKYCLevel {
+			scanArgs = append(scanArgs, &kycLevel)
+		}
+		if hasIsPaper {
+			scanArgs = append(scanArgs, &isPaper)
+		}
+		// TS: single encrypted field, no IV/AuthTag columns
+		scanArgs = append(scanArgs,
+			&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &encPassphrase,
+			&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
+		)
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, err
+		}
+
+		if label != nil {
+			conn.Label = *label
+		}
+		if credHash != nil {
+			conn.CredentialsHash = *credHash
+		}
+		if kycLevel != nil {
+			conn.KYCLevel = *kycLevel
+		}
+		if isPaper != nil {
+			conn.IsPaper = *isPaper
+		}
+		if excludeFromReport != nil {
+			conn.ExcludeFromReport = *excludeFromReport
+		}
+		if encPassphrase != nil {
+			conn.EncryptedPassphrase = *encPassphrase
+		}
+		if !hasSyncMins {
+			conn.SyncIntervalMinutes = 1440
+		}
+
+		connections = append(connections, &conn)
+	}
+	return connections, rows.Err()
+}
+
+func (r *ConnectionRepo) scanConnectionsGo(rows pgx.Rows, hasCredHash, hasSyncMins, hasExclude, hasKYCLevel, hasIsPaper bool) ([]*ExchangeConnection, error) {
+	var connections []*ExchangeConnection
+	for rows.Next() {
+		var conn ExchangeConnection
+		scanArgs := []any{
+			&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
+		}
+		if hasCredHash {
+			scanArgs = append(scanArgs, &conn.CredentialsHash)
+		}
+		if hasSyncMins {
+			scanArgs = append(scanArgs, &conn.SyncIntervalMinutes)
+		}
+		if hasExclude {
+			scanArgs = append(scanArgs, &conn.ExcludeFromReport)
+		}
+		if hasKYCLevel {
+			scanArgs = append(scanArgs, &conn.KYCLevel)
+		}
+		if hasIsPaper {
+			scanArgs = append(scanArgs, &conn.IsPaper)
+		}
+		scanArgs = append(scanArgs,
+			&conn.EncryptedAPIKey, &conn.APIKeyIV, &conn.APIKeyAuthTag,
+			&conn.EncryptedAPISecret, &conn.APISecretIV, &conn.APISecretAuthTag,
+			&conn.EncryptedPassphrase, &conn.PassphraseIV, &conn.PassphraseAuthTag,
+			&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
+		)
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, err
+		}
+
+		if !hasSyncMins {
+			conn.SyncIntervalMinutes = 1440
+		}
+
+		connections = append(connections, &conn)
+	}
+	return connections, rows.Err()
+}
+
+// GetExcludedExchangesByUser returns all exchanges that should be excluded from reports/analytics.
+func (r *ConnectionRepo) GetExcludedExchangesByUser(ctx context.Context, userUID string) (map[string]struct{}, error) {
+	excludedKeys, err := r.GetExcludedConnectionKeysByUser(ctx, userUID)
+	if err != nil {
+		return nil, err
+	}
+
+	excludedExchanges := make(map[string]struct{}, len(excludedKeys))
+	for key := range excludedKeys {
+		parts := strings.SplitN(key, "/", 2)
+		excludedExchanges[parts[0]] = struct{}{}
+	}
+	return excludedExchanges, nil
+}
+
+// GetExcludedConnectionKeysByUser returns excluded connection keys.
+// Key format is "exchange" or "exchange/label" (lowercase).
+//
+// A paused connection stays excluded: its snapshots are still read into the
+// report, so reading active rows only put a paused account's whole history
+// back in (a free-plan downgrade pauses connections with no user action).
+func (r *ConnectionRepo) GetExcludedConnectionKeysByUser(ctx context.Context, userUID string) (map[string]struct{}, error) {
+	_, _, hasExclude, _, _ := r.getCapabilityFlags(ctx)
+	excluded := make(map[string]struct{})
+	if !hasExclude {
+		return excluded, nil
+	}
+
+	var query string
+	if r.isTSSchema {
+		query = `
+			SELECT DISTINCT exchange, COALESCE(label, '')
+			FROM exchange_connections
+			WHERE "userUid" = $1 AND "excludeFromReport" = true`
+	} else {
+		query = `
+			SELECT DISTINCT exchange, COALESCE(label, '')
+			FROM exchange_connections
+			WHERE user_uid = $1 AND exclude_from_report = true`
+	}
+
+	rows, err := r.pool.Query(ctx, query, userUID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var exchange string
+		var label string
+		if err := rows.Scan(&exchange, &label); err != nil {
+			return nil, err
+		}
+		excluded[connectionKey(exchange, label)] = struct{}{}
+	}
+
+	return excluded, rows.Err()
+}
+
+// ExchangeDetails stores report-relevant metadata for an exchange.
+type ExchangeDetails struct {
+	Exchange string
+	KYCLevel string
+	IsPaper  bool
+}
+
+// GetExchangeDetailsByUser returns exchange metadata for active user connections.
+func (r *ConnectionRepo) GetExchangeDetailsByUser(ctx context.Context, userUID string) ([]*ExchangeDetails, error) {
+	_, _, _, hasKYCLevel, hasIsPaper := r.getCapabilityFlags(ctx)
+
+	var (
+		query string
+		rows  pgx.Rows
+		err   error
+	)
+
+	if hasKYCLevel && hasIsPaper {
+		if r.isTSSchema {
+			query = `
+				SELECT exchange,
+					COALESCE(MAX(NULLIF("kycLevel", '')), '') AS kyc_level,
+					BOOL_OR("isPaper") AS is_paper
+				FROM exchange_connections
+				WHERE "userUid" = $1 AND "isActive" = true
+				GROUP BY exchange
+				ORDER BY exchange`
+		} else {
+			query = `
+				SELECT exchange,
+					COALESCE(MAX(NULLIF(kyc_level, '')), '') AS kyc_level,
+					BOOL_OR(is_paper) AS is_paper
+				FROM exchange_connections
+				WHERE user_uid = $1 AND is_active = true
+				GROUP BY exchange
+				ORDER BY exchange`
+		}
+		rows, err = r.pool.Query(ctx, query, userUID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if r.isTSSchema {
+			query = `SELECT DISTINCT exchange FROM exchange_connections WHERE "userUid" = $1 AND "isActive" = true ORDER BY exchange`
+		} else {
+			query = `SELECT DISTINCT exchange FROM exchange_connections WHERE user_uid = $1 AND is_active = true ORDER BY exchange`
+		}
+		rows, err = r.pool.Query(ctx, query, userUID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer rows.Close()
+
+	details := make([]*ExchangeDetails, 0)
+	for rows.Next() {
+		item := &ExchangeDetails{}
+		if hasKYCLevel && hasIsPaper {
+			if err := rows.Scan(&item.Exchange, &item.KYCLevel, &item.IsPaper); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := rows.Scan(&item.Exchange); err != nil {
+				return nil, err
+			}
+			item.KYCLevel = ""
+			item.IsPaper = false
+		}
+		details = append(details, item)
+	}
+
+	return details, rows.Err()
+}
+
+// updateConnectionMetadataQuery builds the UPDATE behind UpdateIsPaper. Pure
+// so the schema-aware column naming can be pinned by a test: prod runs the TS
+// Prisma schema, where these columns are camelCase and a hardcoded snake_case
+// name updates nothing.
+func updateConnectionMetadataQuery(valueCol, updatedAtCol string) string {
+	return `UPDATE exchange_connections SET ` + valueCol + ` = $1, ` + updatedAtCol + ` = $2 WHERE id = $3`
+}
+
+// UpdateIsPaper updates is_paper metadata for a connection.
+// It no-ops when the column is not present.
+func (r *ConnectionRepo) UpdateIsPaper(ctx context.Context, connectionID string, isPaper bool) error {
+	if strings.TrimSpace(connectionID) == "" {
+		return nil
+	}
+
+	_, _, _, _, hasIsPaper := r.getCapabilityFlags(ctx)
+	if !hasIsPaper {
+		return nil
+	}
+
+	query := updateConnectionMetadataQuery(r.qcol("is_paper"), r.qcol("updated_at"))
+	tag, err := r.pool.Exec(ctx, query, isPaper, time.Now().UTC(), connectionID)
+	if err != nil {
+		return fmt.Errorf("update is paper: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+
+	return nil
+}
+
+func connectionKey(exchange, label string) string {
+	ex := strings.ToLower(strings.TrimSpace(exchange))
+	lb := strings.ToLower(strings.TrimSpace(label))
+	if lb == "" {
+		return ex
+	}
+	return ex + "/" + lb
+}
+
+// RebuiltHistoryTarget carries the only two fields a history deletion needs.
+// Credentials are deliberately absent: the operation touches snapshots, and
+// loading an encrypted key to delete rows would widen its blast radius for
+// nothing.
+type RebuiltHistoryTarget struct {
+	ID        string
+	CreatedAt time.Time
+}
+
+// GetHistoryTarget resolves a connection for a history deletion, disconnected
+// ones included — wanting the data of an account you have already unplugged is
+// the main reason to ask. When a label has been connected more than once the
+// earliest row wins, since its creation date yields the narrowest cutoff.
+func (r *ConnectionRepo) GetHistoryTarget(ctx context.Context, userUID, exchange, label string) (*RebuiltHistoryTarget, error) {
+	r.getCapabilityFlags(ctx)
+
+	userCol, createdCol := "user_uid", "created_at"
+	if r.isTSSchema {
+		userCol, createdCol = `"userUid"`, `"createdAt"`
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, %s
+		FROM exchange_connections
+		WHERE %s = $1 AND exchange = $2 AND TRIM(label) = TRIM($3)
+		ORDER BY %s ASC
+		LIMIT 1`, createdCol, userCol, createdCol)
+
+	var target RebuiltHistoryTarget
+	err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(&target.ID, &target.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load history target: %w", err)
+	}
+	return &target, nil
+}
+
+// getByUserExchangeLabelTS also reads "isPaper": on a venue where one key
+// reaches both accounts (BingX), the stored flag picks which one a sync reads.
+func (r *ConnectionRepo) getByUserExchangeLabelTS(ctx context.Context, userUID, exchange, label string) (*ExchangeConnection, error) {
+	_, _, _, _, hasIsPaper := r.getCapabilityFlags(ctx)
+	paperCol := `false`
+	if hasIsPaper {
+		paperCol = `COALESCE("isPaper", false)`
+	}
+	query := `
+		SELECT id, "userUid", exchange, label,
+			"encryptedApiKey", "encryptedApiSecret", "encryptedPassphrase",
+			"isActive", "createdAt", "updatedAt", ` + paperCol + `
+		FROM exchange_connections
+		WHERE "userUid" = $1 AND exchange = $2 AND TRIM(label) = TRIM($3) AND "isActive" = true`
+
+	var conn ExchangeConnection
+	var encPassphrase *string
+	err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(
+		&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
+		&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &encPassphrase,
+		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt, &conn.IsPaper,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if encPassphrase != nil {
+		conn.EncryptedPassphrase = *encPassphrase
+	}
+	return &conn, err
+}
+
+// GetByUserExchangeLabel retrieves a connection by user, exchange, and label
+func (r *ConnectionRepo) GetByUserExchangeLabel(ctx context.Context, userUID, exchange, label string) (*ExchangeConnection, error) {
+	r.getCapabilityFlags(ctx)
+
+	if r.isTSSchema {
+		return r.getByUserExchangeLabelTS(ctx, userUID, exchange, label)
+	}
+
+	query := `
+		SELECT id, user_uid, exchange, label,
+			encrypted_api_key, api_key_iv, api_key_auth_tag,
+			encrypted_api_secret, api_secret_iv, api_secret_auth_tag,
+			encrypted_passphrase, passphrase_iv, passphrase_auth_tag,
+			is_active, created_at, updated_at
+		FROM exchange_connections
+		WHERE user_uid = $1 AND exchange = $2 AND TRIM(label) = TRIM($3) AND is_active = true`
+
+	var conn ExchangeConnection
+	err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(
+		&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
+		&conn.EncryptedAPIKey, &conn.APIKeyIV, &conn.APIKeyAuthTag,
+		&conn.EncryptedAPISecret, &conn.APISecretIV, &conn.APISecretAuthTag,
+		&conn.EncryptedPassphrase, &conn.PassphraseIV, &conn.PassphraseAuthTag,
+		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return &conn, err
+}
+
+// Deactivate soft-deletes a connection
+func (r *ConnectionRepo) Deactivate(ctx context.Context, id string) error {
+	query := `UPDATE exchange_connections SET ` + r.qcol("is_active") + ` = false, ` + r.qcol("updated_at") + ` = $1 WHERE id = $2`
+	_, err := r.pool.Exec(ctx, query, time.Now().UTC(), id)
+	return err
+}
+
+// UpdateOAuthTokens replaces the encrypted api_key and api_secret (access_token
+// and refresh_token) for an OAuth connection identified by (userUID, exchange, label).
+// Both values must be TS-format ciphertexts (hex-packed iv16||tag16||ciphertext).
+// IV/AuthTag columns are cleared so the TS-format read path is used on the next
+// decrypt regardless of what format was originally stored.
+//
+// E-H3: the label predicate is TRIM-aligned with every read above, and the row
+// count is CHECKED. cTrader rotates single-use refresh tokens, so an UPDATE
+// that matches nothing is not a no-op: the connector has already consumed the
+// stored token, believes the new one is safe, and the row keeps the burned one
+// — the connection is dead at the next refresh. The mismatch was reachable
+// whenever the caller supplied the label (post-create hook, admin/gRPC) against
+// a legacy row whose label carries whitespace: the read TRIMmed, the write did
+// not.
+func (r *ConnectionRepo) UpdateOAuthTokens(ctx context.Context, userUID, exchange, label, encAccessToken, encRefreshToken string) error {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	isTS := r.isTSSchema
+	r.capMu.Unlock()
+
+	now := time.Now().UTC()
+	tag, err := r.pool.Exec(ctx, updateOAuthTokensQuery(isTS), encAccessToken, encRefreshToken, now, userUID, exchange, label)
+	if err != nil {
+		return err
+	}
+	if n := tag.RowsAffected(); n != 1 {
+		return fmt.Errorf("update oauth tokens for %s/%s/%q matched %d active rows, want 1", userUID, exchange, label, n)
+	}
+	return nil
+}
+
+// updateOAuthTokensQuery builds the OAuth-token UPDATE for either schema.
+// Extracted so its shape is assertable without a database: the label
+// predicate MUST be TRIM-aligned with the reads (GetByUserExchangeLabel),
+// otherwise the read finds the row, the write matches nothing, and the
+// rotated single-use refresh token is lost (E-H3).
+func updateOAuthTokensQuery(isTS bool) string {
+	if isTS {
+		return `UPDATE exchange_connections
+			SET "encryptedApiKey" = $1, "encryptedApiSecret" = $2, "updatedAt" = $3
+			WHERE "userUid" = $4 AND exchange = $5 AND TRIM(label) = TRIM($6) AND "isActive" = true`
+	}
+	return `UPDATE exchange_connections
+			SET encrypted_api_key = $1, api_key_iv = '', api_key_auth_tag = '',
+			    encrypted_api_secret = $2, api_secret_iv = '', api_secret_auth_tag = '',
+			    updated_at = $3
+			WHERE user_uid = $4 AND exchange = $5 AND TRIM(label) = TRIM($6) AND is_active = true`
+}
+
+func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentialsHash bool, hasSyncIntervalMinutes bool, hasExcludeFromReport bool, hasKYCLevel bool, hasIsPaper bool) {
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+
+	if r.capabilitiesLoaded {
+		return r.hasCredentialsHashCol, r.hasSyncIntervalMinsCol, r.hasExcludeFromReportCol, r.hasKYCLevelCol, r.hasIsPaperCol
+	}
+
+	// A failed probe is retried on the next call rather than latched for the
+	// life of the process as "column absent".
+	probeFailed := false
+	probe := func(column string) bool {
+		exists, err := r.columnExists(ctx, "exchange_connections", column)
+		if err != nil {
+			probeFailed = true
+		}
+		return exists
+	}
+
+	// Detect TS Prisma schema (camelCase) vs Go schema (snake_case)
+	// If "userUid" column exists → TS schema; if "user_uid" → Go schema
+	tsSchema := probe("userUid")
+	r.isTSSchema = tsSchema
+
+	// Check capability columns using the correct naming
+	credHashCol := probe(r.colName("credentials_hash"))
+	syncIntervalCol := probe(r.colName("sync_interval_minutes"))
+	excludeFromReportCol := probe(r.colName("exclude_from_report"))
+	kycLevelCol := probe(r.colName("kyc_level"))
+	isPaperCol := probe(r.colName("is_paper"))
+	rebuildFinalizedCol := probe(r.colName("rebuild_finalized_at"))
+	rebuildRequestedCol := probe(r.colName("rebuild_requested_at"))
+	brokerAccountsCol := probe(r.colName("broker_accounts"))
+
+	r.hasCredentialsHashCol = credHashCol
+	r.hasSyncIntervalMinsCol = syncIntervalCol
+	r.hasExcludeFromReportCol = excludeFromReportCol
+	r.hasKYCLevelCol = kycLevelCol
+	r.hasIsPaperCol = isPaperCol
+	r.hasRebuildFinalizedAtCol = rebuildFinalizedCol
+	r.hasRebuildRequestedAtCol = rebuildRequestedCol
+	r.hasBrokerAccountsCol = brokerAccountsCol
+	r.capabilitiesLoaded = !probeFailed
+
+	return r.hasCredentialsHashCol, r.hasSyncIntervalMinsCol, r.hasExcludeFromReportCol, r.hasKYCLevelCol, r.hasIsPaperCol
+}
+
+// HasRebuildFinalizedAtCol reports whether the schema includes the
+// rebuild_finalized_at / rebuildFinalizedAt column (migration 017). Callers
+// must check this before invoking ListUnfinalizedExternalRebuilds or
+// MarkRebuildFinalized — if the migration hasn't been applied yet, those
+// methods will return ErrNotFound. The scheduler in service/sync.go uses
+// this to silently no-op on pre-migration DBs (dev environments) rather
+// than spamming errors every nightly tick.
+func (r *ConnectionRepo) HasRebuildFinalizedAtCol(ctx context.Context) bool {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.hasRebuildFinalizedAtCol
+}
+
+// HasRebuildRequestedAtCol reports whether the schema includes the
+// rebuild_requested_at column (migration 018). ListUnfinalizedExternalRebuilds
+// requires it to scope recalibration credential egress to connections that
+// recorded an explicit opt-in (SEC-08); when the column is absent the
+// recalibration pass is a no-op (fail-closed — no egress without consent).
+func (r *ConnectionRepo) HasRebuildRequestedAtCol(ctx context.Context) bool {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.hasRebuildRequestedAtCol
+}
+
+// colName returns the raw column name (without quotes) for columnExists checks.
+func (r *ConnectionRepo) colName(snakeName string) string {
+	if !r.isTSSchema {
+		return snakeName
+	}
+	if mapped, ok := tsColumnMap[snakeName]; ok {
+		return mapped
+	}
+	return snakeName
+}
+
+func (r *ConnectionRepo) columnExists(ctx context.Context, tableName, columnName string) (bool, error) {
+	query := `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = $1
+			  AND column_name = $2
+		)`
+	var exists bool
+	if err := r.pool.QueryRow(ctx, query, tableName, columnName).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check column %s.%s: %w", tableName, columnName, err)
+	}
+	return exists, nil
+}
+
+// tsColumnMap maps Go snake_case column names to TS Prisma camelCase names.
+var tsColumnMap = map[string]string{
+	"user_uid":              "userUid",
+	"encrypted_api_key":     "encryptedApiKey",
+	"encrypted_api_secret":  "encryptedApiSecret",
+	"encrypted_passphrase":  "encryptedPassphrase",
+	"credentials_hash":      "credentialsHash",
+	"is_active":             "isActive",
+	"sync_interval_minutes": "syncIntervalMinutes",
+	"exclude_from_report":   "excludeFromReport",
+	"is_paper":              "isPaper",
+	"kyc_level":             "kycLevel",
+	"created_at":            "createdAt",
+	"updated_at":            "updatedAt",
+	"rebuild_finalized_at":  "rebuildFinalizedAt",
+	"rebuild_requested_at":  "rebuildRequestedAt",
+	"broker_accounts":       "brokerAccounts",
+}
+
+// unfinalizedExternalRebuildsQuery builds the SELECT used by
+// ListUnfinalizedExternalRebuilds. Extracted as a pure function so the SEC-08
+// consent predicate (rebuild_requested_at IS NOT NULL) and the retry-window
+// bound (created_at > $3) can be regression-tested without a live DB — dropping
+// either predicate would re-open unscoped credential egress. Params are the
+// already-quoted, schema-aware column names; $1=beforeCutoff, $2=exchanges,
+// $3=createdAfter.
+func unfinalizedExternalRebuildsQuery(uid, createdAt, rebFin, rebReq, isAct string) string {
+	return `
+		SELECT id, ` + uid + `, exchange, label, ` + createdAt + `
+		FROM exchange_connections
+		WHERE ` + rebReq + ` IS NOT NULL
+		  AND ` + rebFin + ` IS NULL
+		  AND ` + createdAt + ` < $1
+		  AND ` + createdAt + ` > $3
+		  AND ` + isAct + ` = true
+		  AND lower(exchange) = ANY($2)
+		ORDER BY ` + createdAt + ` ASC
+	`
+}
+
+// ListUnfinalizedExternalRebuilds returns active connections whose history
+// was rebuilt via the external rebuilder service AND whose rebuild has not
+// yet been finalized by the midnight UTC recalibration pass. The caller
+// (service/sync.go daily-sync hook) iterates these sequentially and calls
+// the rebuilder with EndEquityOverride = the latest snapshot's totalEquity
+// so the MTM walk's offset aligns to the exact midnight equity.
+//
+// Filters:
+//   - rebuild_requested_at IS NOT NULL — the user explicitly opted into
+//     external reconstruction (SEC-08). This pass decrypts and POSTs
+//     credentials to the external rebuilder, so it MUST be scoped to recorded
+//     consent; connections without an opt-in (including every row created
+//     before migration 018) are excluded.
+//   - rebuild_finalized_at IS NULL (not yet processed)
+//   - createdAt < beforeCutoff (the connection had time to produce at least
+//     one midnight snapshot — typically beforeCutoff = today_midnight)
+//   - createdAt > createdAfter — retry window (SEC-08): a connection that never
+//     finalizes ages out after maxRebuildRetryDays instead of being re-egressed
+//     to the rebuilder on every nightly tick forever.
+//   - isActive = true
+//   - exchange in the externalRebuilderExchanges allowlist (HL / Lighter /
+//     MEXC — connectors that route through the rebuilder service; IBKR /
+//     MT5 use in-enclave history paths that don't need recalibration)
+//
+// Returns (nil, nil) if either the rebuild_finalized_at (migration 017) or
+// rebuild_requested_at (migration 018) column is missing — recalibration stays
+// disabled until both exist, so credential egress is never unscoped.
+func (r *ConnectionRepo) ListUnfinalizedExternalRebuilds(ctx context.Context, beforeCutoff, createdAfter time.Time, externalRebuilderExchanges []string) ([]*ExchangeConnection, error) {
+	if !r.HasRebuildFinalizedAtCol(ctx) || !r.HasRebuildRequestedAtCol(ctx) {
+		return nil, nil
+	}
+	if len(externalRebuilderExchanges) == 0 {
+		return nil, nil
+	}
+
+	// Build the WHERE IN clause params. Lowercase exchange names for safety —
+	// the DB might mix cases historically.
+	exchanges := make([]string, 0, len(externalRebuilderExchanges))
+	for _, e := range externalRebuilderExchanges {
+		exchanges = append(exchanges, strings.ToLower(strings.TrimSpace(e)))
+	}
+
+	query := unfinalizedExternalRebuildsQuery(
+		r.qcol("user_uid"), r.qcol("created_at"),
+		r.qcol("rebuild_finalized_at"), r.qcol("rebuild_requested_at"), r.qcol("is_active"),
+	)
+
+	rows, err := r.pool.Query(ctx, query, beforeCutoff, exchanges, createdAfter)
+	if err != nil {
+		return nil, fmt.Errorf("list unfinalized external rebuilds: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*ExchangeConnection
+	for rows.Next() {
+		conn := &ExchangeConnection{}
+		if err := rows.Scan(&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label, &conn.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan unfinalized connection: %w", err)
+		}
+		out = append(out, conn)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate unfinalized connections: %w", err)
+	}
+	return out, nil
+}
+
+// MarkRebuildFinalized stamps rebuild_finalized_at = at on the given
+// connection. Called after the midnight UTC recalibration rebuild succeeds.
+// No-op if the column doesn't exist (migration not applied). Idempotent:
+// re-setting on an already-finalized row is harmless.
+func (r *ConnectionRepo) MarkRebuildFinalized(ctx context.Context, connID string, at time.Time) error {
+	if !r.HasRebuildFinalizedAtCol(ctx) {
+		return nil
+	}
+	col := r.qcol("rebuild_finalized_at")
+	query := `UPDATE exchange_connections SET ` + col + ` = $1 WHERE id = $2`
+	tag, err := r.pool.Exec(ctx, query, at.UTC(), connID)
+	if err != nil {
+		return fmt.Errorf("mark rebuild finalized: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RebuildFinalizedAt reads rebuild_finalized_at for one connection: nil when
+// the history has not been finalized yet. ErrNotFound when the connection does
+// not exist; nil, nil when the schema has no such column (callers check
+// HasRebuildFinalizedAtCol first to tell the two apart).
+func (r *ConnectionRepo) RebuildFinalizedAt(ctx context.Context, connID string) (*time.Time, error) {
+	if !r.HasRebuildFinalizedAtCol(ctx) {
+		return nil, nil
+	}
+	query := `SELECT ` + r.qcol("rebuild_finalized_at") + ` FROM exchange_connections WHERE id = $1`
+	var at *time.Time
+	if err := r.pool.QueryRow(ctx, query, connID).Scan(&at); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("read rebuild finalized: %w", err)
+	}
+	return at, nil
+}
+
+// MarkRebuildRequested stamps rebuild_requested_at = at, recording the user's
+// explicit opt-in to external history reconstruction (SEC-08). Called from the
+// connection-create flow when rebuild_history=true, before the post-create
+// hook fires, so the nightly recalibration pass can scope credential egress to
+// consenting connections. No-op if the column doesn't exist (migration not
+// applied) — recalibration is then disabled, so consent is never bypassed.
+func (r *ConnectionRepo) MarkRebuildRequested(ctx context.Context, connID string, at time.Time) error {
+	if !r.HasRebuildRequestedAtCol(ctx) {
+		return nil
+	}
+	col := r.qcol("rebuild_requested_at")
+	query := `UPDATE exchange_connections SET ` + col + ` = $1 WHERE id = $2`
+	tag, err := r.pool.Exec(ctx, query, at.UTC(), connID)
+	if err != nil {
+		return fmt.Errorf("mark rebuild requested: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateCredentialsHash rewrites the duplicate-detection hash of a connection.
+// Needed by the OAuth re-authorization path (C3): the new tokens change the
+// hash, and leaving the old one behind means the next connect of the SAME
+// account under a different label no longer looks like a duplicate. No-ops
+// when the column is absent (older schemas).
+func (r *ConnectionRepo) UpdateCredentialsHash(ctx context.Context, connID, credentialsHash string) error {
+	if strings.TrimSpace(connID) == "" {
+		return nil
+	}
+	hasCredentialsHash, _, _, _, _ := r.getCapabilityFlags(ctx)
+	if !hasCredentialsHash {
+		return nil
+	}
+	query := `UPDATE exchange_connections SET ` + r.qcol("credentials_hash") + ` = $1, ` + r.qcol("updated_at") + ` = $2 WHERE id = $3`
+	tag, err := r.pool.Exec(ctx, query, credentialsHash, time.Now().UTC(), connID)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42703" {
+			return nil
+		}
+		return fmt.Errorf("update credentials hash: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearRebuildConsent withdraws the SEC-08 opt-in so the nightly recalibration
+// pass stops selecting this connection. Deleting rebuilt history without this
+// is undone within hours: the pass re-fetches the window and re-upserts it,
+// overwriting live rows on the way through.
+func (r *ConnectionRepo) ClearRebuildConsent(ctx context.Context, connID string) error {
+	if !r.HasRebuildRequestedAtCol(ctx) {
+		return nil
+	}
+	col := r.qcol("rebuild_requested_at")
+	query := `UPDATE exchange_connections SET ` + col + ` = NULL WHERE id = $1`
+	tag, err := r.pool.Exec(ctx, query, connID)
+	if err != nil {
+		return fmt.Errorf("clear rebuild consent: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// HasBrokerAccountsCol reports whether the schema includes the
+// broker_accounts column (migration 019). Without it no connection is pinned
+// to its accounts and the guard lets every statement through.
+func (r *ConnectionRepo) HasBrokerAccountsCol(ctx context.Context) bool {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.hasBrokerAccountsCol
+}
+
+// BrokerAccounts reads the account fingerprints a connection is pinned to:
+// empty when it is not pinned yet or the schema has no such column.
+func (r *ConnectionRepo) BrokerAccounts(ctx context.Context, connID string) (string, error) {
+	if !r.HasBrokerAccountsCol(ctx) {
+		return "", nil
+	}
+	query := `SELECT COALESCE(` + r.qcol("broker_accounts") + `, '') FROM exchange_connections WHERE id = $1`
+	var pinned string
+	if err := r.pool.QueryRow(ctx, query, connID).Scan(&pinned); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("read broker accounts: %w", err)
+	}
+	return pinned, nil
+}
+
+// SetBrokerAccounts pins a connection to account fingerprints; an empty value
+// unpins it. No-op when the column is absent.
+func (r *ConnectionRepo) SetBrokerAccounts(ctx context.Context, connID, pinned string) error {
+	if !r.HasBrokerAccountsCol(ctx) {
+		return nil
+	}
+	query := `UPDATE exchange_connections SET ` + r.qcol("broker_accounts") + ` = NULLIF($1, '') WHERE id = $2`
+	tag, err := r.pool.Exec(ctx, query, pinned, connID)
+	if err != nil {
+		return fmt.Errorf("set broker accounts: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// BrokerAccountsByUser returns, for each active pinned connection of a user on
+// an exchange, its label and account fingerprints.
+func (r *ConnectionRepo) BrokerAccountsByUser(ctx context.Context, userUID, exchange string) (map[string]string, error) {
+	out := map[string]string{}
+	if !r.HasBrokerAccountsCol(ctx) {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx, brokerAccountsByUserQuery(r.qcol("user_uid"), r.qcol("is_active"), r.qcol("broker_accounts")), userUID, exchange)
+	if err != nil {
+		return nil, fmt.Errorf("list broker accounts: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var label, pinned string
+		if err := rows.Scan(&label, &pinned); err != nil {
+			return nil, fmt.Errorf("scan broker accounts: %w", err)
+		}
+		out[label] = pinned
+	}
+	return out, rows.Err()
+}
+
+func brokerAccountsByUserQuery(userUID, isActive, brokerAccounts string) string {
+	return `SELECT TRIM(label), ` + brokerAccounts + ` FROM exchange_connections
+		WHERE ` + userUID + ` = $1 AND exchange = $2 AND ` + isActive + ` = true AND ` + brokerAccounts + ` IS NOT NULL`
+}
+
+// qcol returns the schema-aware, double-quoted column name suitable for
+// embedding in raw SQL. Uses colName() for snake/camel selection then wraps
+// with quotes — safe to splice because the input is a hardcoded constant.
+func (r *ConnectionRepo) qcol(snakeName string) string {
+	return `"` + r.colName(snakeName) + `"`
+}

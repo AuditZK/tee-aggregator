@@ -1,0 +1,1114 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/trackrecord/enclave/internal/attestation"
+	"github.com/trackrecord/enclave/internal/bootstrap"
+	"github.com/trackrecord/enclave/internal/cache"
+	"github.com/trackrecord/enclave/internal/config"
+	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/db"
+	"github.com/trackrecord/enclave/internal/encryption"
+	"github.com/trackrecord/enclave/internal/errtrack"
+	enclaveGrpc "github.com/trackrecord/enclave/internal/grpc"
+	"github.com/trackrecord/enclave/internal/logredact"
+	"github.com/trackrecord/enclave/internal/logstream"
+	"github.com/trackrecord/enclave/internal/metrics"
+	proxyPkg "github.com/trackrecord/enclave/internal/proxy"
+	"github.com/trackrecord/enclave/internal/rebuilderclient"
+	"github.com/trackrecord/enclave/internal/repository"
+	"github.com/trackrecord/enclave/internal/scheduler"
+	"github.com/trackrecord/enclave/internal/security"
+	"github.com/trackrecord/enclave/internal/server"
+	"github.com/trackrecord/enclave/internal/service"
+	"github.com/trackrecord/enclave/internal/signing"
+	tlspkg "github.com/trackrecord/enclave/internal/tls"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+func main() {
+	// 1. Load config
+	cfg := config.Load()
+
+	// SECURITY: In production, enforce secrets from GCP metadata (no .env files)
+	if cfg.Env == "production" {
+		enforceNoEnvFile()
+	}
+
+	// CORS-001: refuse to start in production with a permissive CORS config.
+	// The historical default reflected `*` against any Origin, which would
+	// expose JWT-authenticated endpoints to any cross-site script.
+	if err := server.ValidateCORSConfig(cfg.Env, cfg.CORSOrigin); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 2. Init base logger with configurable log level
+	var baseLogger *zap.Logger
+	if cfg.Env == "production" {
+		prodCfg := zap.NewProductionConfig()
+		if level, err := zapcore.ParseLevel(cfg.LogLevel); err == nil {
+			prodCfg.Level = zap.NewAtomicLevelAt(level)
+		}
+		baseLogger, _ = prodCfg.Build()
+	} else {
+		devCfg := zap.NewDevelopmentConfig()
+		if level, err := zapcore.ParseLevel(cfg.LogLevel); err == nil {
+			devCfg.Level = zap.NewAtomicLevelAt(level)
+		}
+		baseLogger, _ = devCfg.Build()
+	}
+
+	// 3. Wrap logger with redaction core (ALWAYS active, TS parity)
+	// SECURITY: All sensitive fields (credentials, user IDs, balances) are redacted
+	// before any log output. Auditors can verify no sensitive data leaks via logs.
+	redactedLogger := zap.New(
+		logredact.NewRedactCore(baseLogger.Core()),
+		zap.AddCaller(),
+		zap.AddStacktrace(zapcore.ErrorLevel),
+	)
+
+	// 4. Start log stream server (SSE) and wrap logger with broadcast core
+	var logStreamServer *logstream.Server
+	var errStore *errtrack.Store
+	logger := redactedLogger
+
+	if cfg.LogStreamPort > 0 {
+		logStreamServer = logstream.NewServer(cfg.LogStreamPort, cfg.LogStreamAPIKey, baseLogger)
+		// CORS-002: log-stream answers the same dashboard origin as REST.
+		// Folding CORS into the enclave removes the Caddy CORS sidecar.
+		logStreamServer.SetCORSOrigins(cfg.CORSOrigin)
+		// LOG-AUDIT-001: keep stderr scrubbed by wrapping the redacted core as
+		// `inner`; BroadcastCore.Write also re-scrubs entry/fields before the
+		// SSE broadcast (Go passes entry by value, so inner.Write mutations
+		// don't propagate back here).
+		redactedInner := logredact.NewRedactCore(baseLogger.Core())
+		broadcastCore := logstream.NewBroadcastCore(redactedInner, logStreamServer)
+
+		// Optional: errtrack capture core sits OUTSIDE the broadcast/redact
+		// chain so the entries it observes have already been redacted at the
+		// field level. errtrack still re-sanitizes everything as defense in
+		// depth. Disabled by default; enable via ERRTRACK_ENABLED=1.
+		var topCore zapcore.Core = broadcastCore
+		if cfg.ErrTrack.Enabled {
+			errStore = errtrack.NewStore(cfg.ErrTrack.Capacity, cfg.ErrTrack.NewGroupRate)
+			logStreamServer.SetErrorStore(errStore)
+			topCore = errtrack.NewCore(broadcastCore, errStore, zapcore.ErrorLevel)
+		}
+		logger = zap.New(topCore, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
+	}
+	defer logger.Sync()
+
+	logger.Info("starting enclave worker",
+		zap.String("version", "1.1.3-go"),
+		zap.String("env", cfg.Env),
+	)
+
+	// 4. Memory protection (Linux only, no-op on Windows)
+	memProtect := security.NewMemoryProtection(logger)
+	memProtect.Apply()
+
+	// 5. REST TLS certificate loading (mandatory, TS parity)
+	tlsKeygen, err := tlspkg.NewKeyGeneratorFromFiles(cfg.TLSCertPath, cfg.TLSKeyPath)
+	if err != nil {
+		logger.Fatal("REST TLS certificates not found or invalid (server refuses to start)",
+			zap.String("cert_path", cfg.TLSCertPath),
+			zap.String("key_path", cfg.TLSKeyPath),
+			zap.Error(err),
+		)
+	}
+	logger.Info("REST TLS certificate loaded",
+		zap.String("cert_path", cfg.TLSCertPath),
+		zap.String("key_path", cfg.TLSKeyPath),
+		zap.String("fingerprint", tlsKeygen.Fingerprint()[:16]+"..."),
+	)
+
+	// 6. ECIES service (E2E encryption)
+	eciesSvc, err := encryption.NewECIES()
+	if err != nil {
+		logger.Error("ECIES init failed, continuing without E2E", zap.Error(err))
+	} else {
+		logger.Info("ECIES service initialized")
+	}
+
+	// 7. Context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 8. Connect database
+	pool := connectDatabase(ctx, cfg, logger)
+
+	// 9. Init encryption (AES for credentials at rest).
+	//
+	// Credentials on disk were encrypted with a DEK that lives
+	// wrapped inside data_encryption_keys. To decrypt them we must:
+	//   1. Derive the master key (SEV-SNP measurement or env fallback).
+	//   2. Read the active wrapped DEK from the DB.
+	//   3. Unwrap it with the master key.
+	//   4. Use the unwrapped DEK as the AES-256-GCM key.
+	//
+	// The previous implementation used cfg.EncryptionKey directly as
+	// the AES key, bypassing steps 2 and 3. That path silently
+	// produced a "decryption failed: authentication error" for every
+	// credential on a DB seeded by the TS enclave.
+	//
+	// We fall back to the raw ENCRYPTION_KEY path only when there is
+	// no database pool (dev harness) or when the DB is empty and
+	// auto-seeding is explicitly requested — see the pool != nil
+	// branch below.
+	var enc *encryption.Service
+	var keyMgmt *encryption.KeyManagementService
+	var measurementRecovered bool
+	if pool != nil {
+		keyDerivation, derivErr := encryption.NewKeyDerivationService(logger)
+		if derivErr != nil {
+			logger.Fatal("key derivation init failed", zap.Error(derivErr))
+		}
+		logger.Info("key derivation initialized",
+			zap.Bool("hardware_sev_snp", keyDerivation.IsHardwareKey()),
+			zap.String("master_key_id", keyDerivation.GetMasterKeyID()),
+		)
+
+		// B2 handoff: when HANDOFF_PEER_URL is set, this enclave is being
+		// upgraded — fetch the master key from the predecessor over an
+		// attested ECIES channel. This overrides the measurement-derived
+		// key so the existing DEK still unwraps. Failure is fatal: there
+		// is no safe fallback when the operator explicitly asked for handoff.
+		var externalMasterKey []byte
+		if cfg.HandoffPeerURL != "" {
+			externalMasterKey, err = fetchMasterKeyFromPredecessor(ctx, cfg, eciesSvc, tlsKeygen, logger)
+			if err != nil {
+				logger.Fatal("B2 handoff failed", zap.Error(err))
+			}
+			defer wipeBytes(externalMasterKey)
+		} else if cfg.LegacyMasterKeyHex != "" {
+			// Measurement-migration path: the SEV-SNP measurement changed
+			// (host migration, firmware update) and the existing DEK was
+			// wrapped with a master key derived from the old measurement.
+			// The operator supplies the old master key as hex; we use it
+			// for the initial unwrap, after which key_management.go
+			// auto-rewraps the DEK with the new measurement-derived key
+			// and persists it. Remove LEGACY_MASTER_KEY_HEX once the
+			// enclave boots cleanly (see LegacyMasterKeyHex in config.go).
+			externalMasterKey, err = hex.DecodeString(cfg.LegacyMasterKeyHex)
+			if err != nil || len(externalMasterKey) != 32 {
+				logger.Fatal("LEGACY_MASTER_KEY_HEX is invalid",
+					zap.String("hint", "must be 64 hex characters (32 bytes)"),
+					zap.Error(err),
+				)
+			}
+			defer wipeBytes(externalMasterKey)
+			logger.Info("using legacy master key for DEK unwrap (measurement migration)",
+				zap.String("hint", "remove LEGACY_MASTER_KEY_HEX after this boot succeeds"),
+			)
+		}
+
+		keyMgmt, err = encryption.NewKeyManagementService(pool, encryption.KeyManagementOptions{
+			Derivation:            keyDerivation,
+			Logger:                logger,
+			AllowAutoInit:         cfg.IsDevelopment(),
+			ExternalMasterKey:     externalMasterKey,
+			AutoRecovery:          cfg.MeasurementAutoRecovery,
+			RecoveryLookbackDays:  cfg.MeasurementRecoveryLookbackDays,
+			OnMeasurementRecovery: func() { measurementRecovered = true },
+		})
+		if err != nil {
+			// Hard fail: running against a DB whose DEK we cannot
+			// unwrap means every sync will fail. Bail out early with
+			// a descriptive error instead of silently pretending
+			// ENCRYPTION_KEY works.
+			logger.Fatal("key management init failed (cannot unwrap active DEK)",
+				zap.Error(err),
+				zap.String("hint", "check ENCRYPTION_KEY, SEV-SNP attestation, and data_encryption_keys.master_key_id"),
+			)
+		}
+
+		enc, err = keyMgmt.GetEncryptionService()
+		if err != nil {
+			logger.Fatal("build encryption service from DEK failed", zap.Error(err))
+		}
+		logger.Info("encryption service bound to unwrapped DEK from data_encryption_keys")
+	} else {
+		// No DB: use the env-var key directly. This path is for the
+		// dev harness that runs the enclave without a backing
+		// Postgres, so there is no wrapped DEK to load.
+		logger.Warn("no database pool — initializing encryption with ENCRYPTION_KEY directly (dev harness only)")
+		enc, err = encryption.New(cfg.EncryptionKey)
+		if err != nil {
+			logger.Fatal("encryption init failed", zap.Error(err))
+		}
+	}
+
+	// 10. Init repositories
+	var connRepo *repository.ConnectionRepo
+	var snapshotRepo *repository.SnapshotRepo
+	var userRepo *repository.UserRepo
+	var signedReportRepo *repository.SignedReportRepo
+	var syncStatusRepo *repository.SyncStatusRepo
+
+	if pool != nil {
+		connRepo = repository.NewConnectionRepo(pool)
+		snapshotRepo = repository.NewSnapshotRepo(pool)
+		userRepo = repository.NewUserRepo(pool)
+		signedReportRepo = repository.NewSignedReportRepo(pool)
+		syncStatusRepo = repository.NewSyncStatusRepo(pool)
+	}
+
+	// 11. Init services
+	var connSvc *service.ConnectionService
+	var syncSvc *service.SyncService
+	var metricsSvc *service.MetricsService
+	var reportSvc *service.ReportService
+	benchmarkSvc := service.NewBenchmarkService(cfg.BenchmarkServiceURL, cfg.BenchmarkInternalToken)
+	if cfg.BenchmarkServiceURL != "" {
+		// CFG-004: the benchmark series enters the SIGNED report (per-day
+		// benchmarkReturn/outperformance + aggregate alpha/beta/IR/TE). An
+		// unauthenticated http:// source lets whoever controls or MITMs that
+		// link poison the signed metrics, so production refuses to boot without
+		// https:// + an internal token — the same fail-closed stance as the
+		// rebuilder (CFG-002/CFG-003). Dev allows http:// without a token.
+		if err := checkBenchmarkConfig(cfg.BenchmarkServiceURL, cfg.BenchmarkInternalToken, cfg.IsDevelopment()); err != nil {
+			logger.Fatal("benchmark configuration rejected (CFG-004)", zap.Error(err))
+		}
+		if cfg.IsDevelopment() && !isHTTPSURL(cfg.BenchmarkServiceURL) {
+			logger.Warn("benchmark URL is not https; signed-report inputs would transit unauthenticated in cleartext",
+				zap.String("hint", "acceptable for local dev only — production BENCHMARK_SERVICE_URL must be https://"),
+			)
+		}
+		logger.Info("benchmark-service wired", zap.String("url", cfg.BenchmarkServiceURL))
+	} else {
+		logger.Warn("BENCHMARK_SERVICE_URL not set - signed reports will omit benchmark metrics")
+	}
+
+	// 11b. Init connector cache (TS parity: UniversalConnectorCache)
+	connectorCache := cache.NewConnectorCache()
+	defer connectorCache.Stop()
+
+	if pool != nil {
+		connSvc = service.NewConnectionService(connRepo, enc)
+		connSvc.SetLogger(logger)
+		syncSvc = service.NewSyncService(connSvc, snapshotRepo, connectorCache, logger)
+		if cfg.HistorySyncNotifyURL != "" {
+			syncSvc.SetHistoryNotify(cfg.HistorySyncNotifyURL, cfg.HistorySyncNotifyToken)
+			logger.Info("history-rebuilt notify wired",
+				zap.String("url", cfg.HistorySyncNotifyURL),
+				zap.Bool("authenticated", cfg.HistorySyncNotifyToken != ""),
+			)
+		}
+		if syncStatusRepo != nil {
+			syncSvc.SetSyncStatusRepo(syncStatusRepo)
+		}
+		// Accounts held in EUR, GBP… are stored in USD, converted at each
+		// day's rate from the same benchmark-service (service/fx.go). Without
+		// it they are stored as the broker reports them, and every such sync
+		// logs an error saying so.
+		if cfg.BenchmarkServiceURL != "" {
+			syncSvc.SetFXSource(benchmarkSvc)
+		}
+		// Journal throttle events (Flex 1018 races, stale-statement skips) to
+		// sync_rate_limit_logs — the table existed since migration 007 but
+		// nothing ever wrote to it (audit 2026-08-01).
+		syncSvc.SetRateLimitLogRepo(repository.NewSyncRateLimitLogRepo(pool))
+		// SEC-ZK-001: wire the (optional, NON-ZK) external history-rebuilder-service
+		// client. When configured, non-IBKR exchanges (Hyperliquid, …) get
+		// their historical equity rebuilt out-of-perimeter on connect; IBKR
+		// stays in-enclave via Flex (signed by the report chain).
+		// CFG-002: REBUILDER_SERVICE_URL must come paired with a strong
+		// internal token — refusing to boot without auth prevents shipping a
+		// silently-unauthenticated plaintext-creds endpoint to production.
+		if cfg.RebuilderServiceURL != "" {
+			rebuilderClient := rebuilderclient.New(cfg.RebuilderServiceURL, cfg.RebuilderInternalToken, logger)
+			if !rebuilderClient.Configured() {
+				logger.Fatal("rebuilder URL set without internal token",
+					zap.String("hint", "set REBUILDER_INTERNAL_TOKEN (≥24 chars, must match the rebuilder service) or unset REBUILDER_SERVICE_URL to disable the integration"),
+				)
+			}
+			// CFG-003: the rebuilder POST carries decrypted exchange credentials.
+			// An http:// endpoint exposes them in cleartext, so production refuses
+			// to boot on a non-https URL — the same fail-closed stance as CFG-002
+			// for the missing token. Dev is allowed http:// (loopback rebuilder).
+			if !strings.HasPrefix(strings.ToLower(cfg.RebuilderServiceURL), "https://") {
+				if cfg.IsDevelopment() {
+					logger.Warn("rebuilder URL is not https; plaintext credentials would transit in cleartext",
+						zap.String("hint", "acceptable for local dev only — production REBUILDER_SERVICE_URL must be https://"),
+					)
+				} else {
+					logger.Fatal("rebuilder URL must be https in production",
+						zap.String("hint", "REBUILDER_SERVICE_URL ships decrypted exchange credentials; set an https:// URL or unset it to disable the integration"),
+					)
+				}
+			}
+			syncSvc.SetRebuilderClient(rebuilderClient)
+			logger.Info("rebuilder client wired", zap.String("url", cfg.RebuilderServiceURL))
+		}
+		// Take the FIRST live snapshot right away instead of leaving the
+		// account without a today-row and without a sync_statuses entry until
+		// the next 00:00 pass — a user who signed up at 08:33 stayed frozen on
+		// yesterday's rebuilt history all day, with empty status columns in
+		// the admin (cold-start incident, 2026-08-04). The sync pipeline also
+		// writes the sync_statuses row the dashboards display. Failures only
+		// warn: the daily scheduler picks the connection up at midnight
+		// regardless.
+		//
+		// G-H7: this used to live inside the rebuild opt-in, under a comment
+		// claiming "frontend only sends false for mt5". The cTrader OAuth
+		// callback sends no rebuild_history field at all, so the gateway
+		// defaulted it to false and a new cTrader connection got neither a
+		// snapshot nor a status row before midnight — the same cold-start
+		// failure, re-entered by a door nobody had looked at. A snapshot
+		// crosses no perimeter, so it is not gated on anything.
+		connSvc.SetPostCreateSyncHook(func(ctx context.Context, userUID, exchange, label string) {
+			if r := syncSvc.SyncConnectionScheduledByLabel(ctx, userUID, exchange, label); r != nil && r.Error != "" {
+				logger.Warn("first live sync after connect failed; daily pass will retry",
+					zap.String("user_uid", userUID),
+					zap.String("exchange", exchange),
+					zap.String("label", label),
+					zap.String("error", r.Error),
+				)
+			}
+		})
+
+		// Historical backfill on connection creation, behind the explicit
+		// opt-in (SEC-ZK-001/SEC-08). For IBKR the rebuild runs in-enclave
+		// (ZK-native); for other exchanges the hook delegates to the external
+		// rebuilder when configured, which is why it needs consent.
+		//
+		// It runs AFTER the sync hook returns — both share one goroutine — so
+		// the ordering the anchor depends on is unchanged: the row the sync
+		// writes is the equity anchor the rebuild dispatch reads
+		// (EndEquityOverride). Without it the walk-family rebuilders calibrate
+		// on their own wallet valuation and the anchor gate has no witness (a
+		// mispriced walk once published an account at a small fraction of its
+		// equity because connect-time rebuilds carried no anchor).
+		connSvc.SetPostCreateRebuildHook(func(ctx context.Context, userUID, exchange, label string) {
+			syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
+		})
+		metricsSvc = service.NewMetricsService(snapshotRepo)
+	}
+
+	// CFG-005: the mt-bridge connect call ships the account's investor
+	// password in cleartext JSON, and the X-MT-Bridge-Signature it carries is
+	// keyed on MT_BRIDGE_HMAC_SECRET — empty means anyone can compute it.
+	// Same fail-closed stance as the rebuilder (CFG-002/CFG-003), which
+	// crosses the same boundary with the same kind of secret.
+	if err := checkMTBridgeConfig(cfg.MTBridgeURL, cfg.MTBridgeHMACSecret, cfg.IsDevelopment()); err != nil {
+		logger.Fatal("mt-bridge configuration rejected (CFG-005)",
+			zap.Error(err),
+			zap.String("hint", "MT4/MT5 credentials leave the enclave over this link; set MT_BRIDGE_URL to an https:// endpoint with a ≥24-char MT_BRIDGE_HMAC_SECRET, or unset MT_BRIDGE_URL to disable MetaTrader"),
+		)
+	}
+
+	// G-M7: cTrader cannot work without the Spotware application credentials
+	// — every WebSocket session authenticates with them and the OAuth refresh
+	// signs with them. There is deliberately no Fatal here: an enclave that
+	// serves twenty other brokers must not refuse to boot over one that may
+	// not be in use. But it must SAY so, because the alternative is what
+	// production did: answer every cTrader connect with "invalid credentials"
+	// and send the user off to fix a secret they do not hold. The connect path
+	// now returns a "not configured on the enclave" category for the same
+	// reason (G-H4).
+	if cfg.CTraderClientID == "" || cfg.CTraderClientSecret == "" {
+		logger.Error("cTrader is not configured; every cTrader connect and sync will be refused",
+			zap.Bool("client_id_set", cfg.CTraderClientID != ""),
+			zap.Bool("client_secret_set", cfg.CTraderClientSecret != ""),
+			zap.String("hint", "set CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET in the enclave environment, or ignore this if cTrader is not offered"),
+		)
+	}
+
+	// 11c. Wire HTTP proxy for geo-restricted exchanges (e.g. Binance from EU).
+	// Set EXCHANGE_HTTP_PROXY=socks5://user:pass@host:port (or http://)
+	// and PROXY_EXCHANGES=binance (comma-separated, default: binance).
+	if cfg.ExchangeHTTPProxy != "" {
+		proxyCfg := proxyPkg.ParseConfig(cfg.ExchangeHTTPProxy, cfg.ProxyExchanges)
+		proxyFactory := connector.NewFactoryWithProxy(proxyCfg)
+		if connSvc != nil {
+			connSvc.SetFactory(proxyFactory)
+		}
+		if syncSvc != nil {
+			syncSvc.SetFactory(proxyFactory)
+		}
+		logger.Info("exchange HTTP proxy configured",
+			zap.String("exchanges", cfg.ProxyExchanges),
+		)
+	}
+
+	// 12. Init report signer (ephemeral key per startup)
+	signer, err := signing.NewReportSignerGenerate()
+	if err != nil {
+		logger.Fatal("failed to initialize report signer", zap.Error(err))
+	}
+	signingPubKey := signer.PublicKey()
+	logger.Info("report signer initialized",
+		zap.String("algorithm", signing.SignatureAlgorithm),
+		zap.String("public_key", signingPubKey[:16]+"..."),
+	)
+
+	if metricsSvc != nil && snapshotRepo != nil {
+		reportSvc = service.NewReportServiceFull(
+			metricsSvc, snapshotRepo, signedReportRepo,
+			signer, benchmarkSvc, logger,
+		)
+		if connSvc != nil {
+			reportSvc.SetConnectionService(connSvc)
+		}
+	}
+
+	// 13. Attestation service
+	var attestSvc *attestation.Service
+	{
+		opts := attestation.Options{
+			DevMode: cfg.IsDevelopment(),
+			Logger:  logger,
+		}
+		if tlsKeygen != nil {
+			opts.TLSFingerprint = tlsKeygen.Fingerprint()
+		}
+		if eciesSvc != nil {
+			e2ePub, err := eciesSvc.PublicKeyPEM()
+			if err != nil {
+				logger.Fatal("encode E2E public key",
+					zap.Error(err),
+					zap.String("hint", "x509.MarshalPKIXPublicKey failed for the ECDH P-256 key — this should never happen for a well-formed key; rebuild the enclave"),
+				)
+			}
+			opts.E2EPublicKey = e2ePub
+		}
+		opts.SigningPubKey = signingPubKey
+		attestSvc = attestation.NewService(opts)
+		if logStreamServer != nil {
+			logStreamServer.SetAttestationService(attestSvc)
+			// SEC-008: TLS-enable the log-stream listener using the same cert
+			// as the REST server. Falls back to plaintext only when the REST
+			// cert somehow isn't loaded (should never happen in production —
+			// startup would already have failed at step 5).
+			if tlsKeygen != nil {
+				if cert, certErr := tls.X509KeyPair(tlsKeygen.CertPEM(), tlsKeygen.KeyPEM()); certErr == nil {
+					logStreamServer.SetTLSConfig(&tls.Config{
+						MinVersion:   tls.VersionTLS12,
+						Certificates: []tls.Certificate{cert},
+					})
+				} else {
+					logger.Warn("log stream will run plaintext — failed to parse REST TLS cert", zap.Error(certErr))
+				}
+			}
+		}
+	}
+
+	// 13b. Bind the signing key to the SEV-SNP measurement by fetching
+	// the attestation once at startup and storing it in the signer. Every
+	// subsequent Sign() call will include the measurement inside the
+	// canonical signed payload, so a verifier can cryptographically tie
+	// the signed report to an audited enclave build (see
+	// signing.EnclaveAttestation docs for the verification procedure).
+	//
+	// A failure here is non-fatal: the enclave can still sign reports,
+	// but without attestation metadata. Operators are alerted via a
+	// warning log so the missing binding is observable. In production on
+	// SEV-SNP hardware this path must succeed.
+	refreshSignerAttestation(context.Background(), attestSvc, signer, cfg, logger, true)
+
+	// SEC-112: re-attest periodically so a late-stage host compromise does
+	// not keep the signer bound to a stale measurement. A transient error
+	// (attestation fetch failure) leaves the existing binding intact; a hard
+	// allowlist mismatch fatals out via enforceMeasurementAllowlist.
+	if cfg.ReattestInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(cfg.ReattestInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					refreshSignerAttestation(ctx, attestSvc, signer, cfg, logger, false)
+				}
+			}
+		}()
+		logger.Info("periodic re-attestation scheduled", zap.Duration("interval", cfg.ReattestInterval))
+	}
+
+	// 14. Start gRPC server
+	grpcTLSConfig, err := buildGRPCTLSConfig(cfg)
+	if err != nil {
+		logger.Fatal("invalid gRPC TLS configuration", zap.Error(err))
+	}
+	if grpcTLSConfig == nil {
+		logger.Warn("gRPC running without TLS (development mode with GRPC_INSECURE=true)")
+	}
+
+	jwtSecret := []byte(os.Getenv("ENCLAVE_JWT_SECRET"))
+	if len(jwtSecret) == 0 {
+		// CFG-001: a missing secret in production silently downgrades gRPC
+		// JWT auth to a no-op. Refuse to start — the operator almost
+		// certainly forgot to inject the env var, and serving
+		// GenerateSignedReport unauthenticated is strictly worse than
+		// failing loudly on boot.
+		if cfg.Env == "production" {
+			logger.Fatal("ENCLAVE_JWT_SECRET must be set in production — refusing to start with JWT auth disabled")
+		}
+		logger.Warn("ENCLAVE_JWT_SECRET not set — gRPC JWT auth disabled (dev mode)")
+	} else {
+		logger.Info("gRPC JWT auth enabled")
+	}
+
+	grpcServer := enclaveGrpc.NewServer(
+		logger,
+		enclaveGrpc.Services{
+			ConnSvc:      connSvc,
+			SyncSvc:      syncSvc,
+			MetricsSvc:   metricsSvc,
+			ReportSvc:    reportSvc,
+			SnapshotRepo: snapshotRepo,
+			UserRepo:     userRepo,
+			AttestSvc:    attestSvc,
+		},
+		enclaveGrpc.ServerOptions{
+			JWTSecret:         jwtSecret,
+			JWTExpectedIssuer: cfg.JWTExpectedIssuer,
+		},
+	)
+	go func() {
+		if err := grpcServer.Start(cfg.GRPCPort, grpcTLSConfig); err != nil {
+			logger.Fatal("gRPC server failed", zap.Error(err))
+		}
+	}()
+	logger.Info("gRPC server started", zap.Int("port", cfg.GRPCPort))
+
+	// 15. Start REST server (with TLS, attestation, ECIES, CORS, rate limiting)
+	restServer := server.New(cfg, logger, pool)
+	// SEC-002: share the same HS256 secret with the REST surface so sensitive
+	// endpoints enforce JWT just like the gRPC authInterceptor does.
+	restServer.SetJWTSecret(jwtSecret)
+	restServer.SetJWTExpectedIssuer(cfg.JWTExpectedIssuer)
+	restServer.SetHandler(server.NewHandlerWithOptions(server.HandlerOptions{
+		Logger:       logger,
+		ConnSvc:      connSvc,
+		SyncSvc:      syncSvc,
+		MetricsSvc:   metricsSvc,
+		ReportSvc:    reportSvc,
+		SnapshotRepo: snapshotRepo,
+		UserRepo:     userRepo,
+		TLSKeygen:    tlsKeygen,
+		AttestSvc:    attestSvc,
+		ECIESSvc:     eciesSvc,
+	}))
+
+	// B2 handoff server: expose POST /api/v1/admin/handoff so a
+	// successor enclave can fetch this enclave's master key over an
+	// attested ECIES channel during an upgrade window. Only enabled
+	// when keyMgmt is wired (i.e. we have a real master key to hand off).
+	// TEE-01: every request is refused anyway until an operator key that
+	// decodes is set, so the endpoint is not exposed before then.
+	if _, pkErr := bootstrap.DecodeOperatorPubkey(); keyMgmt != nil && pkErr != nil {
+		logger.Info("B2 handoff endpoint not registered: no operator public key to verify a signed allowlist against",
+			zap.Error(pkErr),
+			zap.String("hint", "set operatorPubkey in internal/bootstrap/signed_allowlist.go (see cmd/release-sign) to enable enclave-to-enclave handoff"),
+		)
+	} else if keyMgmt != nil {
+		handoffSrv, hsErr := bootstrap.NewHandoffServer(bootstrap.HandoffServerOptions{
+			KeyExporter: keyMgmt,
+			Logger:      logger,
+		})
+		if hsErr != nil {
+			logger.Fatal("init handoff server", zap.Error(hsErr))
+		}
+		restServer.SetHandoffHandler(handoffSrv)
+		logger.Info("B2 handoff server endpoint registered",
+			zap.String("path", "/api/v1/admin/handoff"))
+	}
+	go func() {
+		if err := restServer.Start(ctx); err != nil {
+			logger.Error("REST server stopped", zap.Error(err))
+		}
+	}()
+	logger.Info("REST server started", zap.Int("port", cfg.RESTPort))
+
+	// 16. Start log stream server
+	if logStreamServer != nil {
+		if err := logStreamServer.Start(ctx); err != nil {
+			logger.Error("log stream server failed", zap.Error(err))
+		} else {
+			logger.Info("log stream server started", zap.Int("port", cfg.LogStreamPort))
+		}
+	}
+
+	// 17. Start Prometheus metrics server
+	var metricsServer *metrics.Metrics
+	if cfg.MetricsEnabled && cfg.MetricsPort > 0 {
+		metricsServer = metrics.New(logger)
+		if err := metricsServer.Start(cfg.MetricsPort); err != nil {
+			logger.Error("metrics server failed", zap.Error(err))
+		} else {
+			logger.Info("metrics server started", zap.Int("port", cfg.MetricsPort))
+		}
+		if measurementRecovered {
+			metricsServer.IncrCounter("enclave_measurement_recovery_total")
+		}
+		if syncSvc != nil {
+			syncSvc.SetMetrics(metricsServer)
+		}
+	}
+
+	// 18. Start sync scheduler (honours ENABLE_DAILY_SYNC)
+	var syncScheduler *scheduler.SyncScheduler
+	if syncSvc != nil && userRepo != nil {
+		syncScheduler = scheduler.NewSyncScheduler(syncSvc, userRepo, logger)
+		restServer.SetScheduler(syncScheduler)
+		if cfg.EnableDailySync {
+			syncScheduler.Start()
+		} else {
+			logger.Info("daily sync scheduler disabled by ENABLE_DAILY_SYNC=false (manual sync via gRPC still works)")
+		}
+	}
+
+	logger.Info("enclave worker ready",
+		zap.Int("grpc_port", cfg.GRPCPort),
+		zap.Int("rest_port", cfg.RESTPort),
+		zap.Bool("database", pool != nil),
+		zap.Bool("tls", tlsKeygen != nil),
+		zap.Bool("e2e", eciesSvc != nil),
+		zap.Bool("attestation", attestSvc != nil),
+		zap.Bool("log_stream", logStreamServer != nil),
+		zap.Bool("metrics", metricsServer != nil),
+	)
+
+	// 19. Wait for shutdown signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-sigCh
+	logger.Info("received shutdown signal", zap.String("signal", sig.String()))
+
+	// Graceful shutdown
+	cancel()
+
+	if syncScheduler != nil {
+		syncScheduler.Stop()
+	}
+	grpcServer.Stop()
+	if logStreamServer != nil {
+		logStreamServer.Stop()
+	}
+	if metricsServer != nil {
+		metricsServer.Stop()
+	}
+	if tlsKeygen != nil {
+		tlsKeygen.Cleanup()
+	}
+	if pool != nil {
+		pool.Close()
+	}
+
+	logger.Info("graceful shutdown completed")
+}
+
+func connectDatabase(ctx context.Context, cfg *config.Config, logger *zap.Logger) *pgxpool.Pool {
+	if cfg.DatabaseURL == "" {
+		logger.Warn("DATABASE_URL not set, running without database")
+		return nil
+	}
+
+	pool, err := db.Connect(ctx, cfg.DatabaseURL, logger)
+	if err != nil {
+		logger.Error("database connection failed, running without database", zap.Error(err))
+		return nil
+	}
+
+	if cfg.AutoMigrate {
+		if err := db.ApplyMigrations(ctx, pool, cfg.MigrationsDir, logger); err != nil {
+			logger.Error("auto-migrate failed, running without database",
+				zap.String("dir", cfg.MigrationsDir),
+				zap.Error(err),
+			)
+			pool.Close()
+			return nil
+		}
+	}
+
+	return pool
+}
+
+func buildGRPCTLSConfig(cfg *config.Config) (*tls.Config, error) {
+	if cfg.GRPCInsecure {
+		if !cfg.IsDevelopment() {
+			return nil, fmt.Errorf("GRPC_INSECURE=true is only allowed in development")
+		}
+		return nil, nil
+	}
+
+	rootCA, err := os.ReadFile(cfg.TLSCACertPath)
+	if err != nil {
+		return nil, fmt.Errorf("read gRPC CA cert %s: %w", cfg.TLSCACertPath, err)
+	}
+	certPEM, err := os.ReadFile(cfg.TLSServerCertPath)
+	if err != nil {
+		return nil, fmt.Errorf("read gRPC server cert %s: %w", cfg.TLSServerCertPath, err)
+	}
+	keyPEM, err := os.ReadFile(cfg.TLSServerKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read gRPC server key %s: %w", cfg.TLSServerKeyPath, err)
+	}
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse gRPC server keypair (cert=%s key=%s): %w", cfg.TLSServerCertPath, cfg.TLSServerKeyPath, err)
+	}
+
+	clientCAPool := x509.NewCertPool()
+	if ok := clientCAPool.AppendCertsFromPEM(rootCA); !ok {
+		return nil, fmt.Errorf("parse gRPC CA cert PEM (%s): no certificates found", cfg.TLSCACertPath)
+	}
+
+	requireClientCert := !cfg.IsDevelopment() || cfg.RequireClientCert
+	clientAuth := tls.NoClientCert
+	if requireClientCert {
+		clientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	// AUTH-002: fail closed in production when the CN allowlist is empty.
+	// An empty allowlist historically meant "accept any cert chained to the
+	// CA", which silently widens the trust boundary beyond the expected
+	// report-service caller. In production we require the allowlist to be
+	// set so misconfigurations are loud rather than silent.
+	if !cfg.IsDevelopment() && len(cfg.ClientCertCNAllowlist) == 0 {
+		return nil, fmt.Errorf("GRPC_CLIENT_CERT_CN_ALLOWLIST must be set in production — refusing to start with an empty client-cert CN allowlist")
+	}
+
+	tlsCfg := &tls.Config{
+		MinVersion:               tls.VersionTLS12,
+		Certificates:             []tls.Certificate{cert},
+		ClientCAs:                clientCAPool,
+		ClientAuth:               clientAuth,
+		PreferServerCipherSuites: true,
+	}
+
+	if requireClientCert {
+		tlsCfg.VerifyPeerCertificate = buildClientCNVerifier(cfg.ClientCertCNAllowlist)
+	}
+
+	return tlsCfg, nil
+}
+
+// buildClientCNVerifier returns a tls.Config.VerifyPeerCertificate callback
+// that rejects any verified client cert whose Subject.CommonName is not in
+// allowlist. An empty allowlist returns nil — stdlib treats nil as "use only
+// the default chain verification", which is the legacy behaviour. AUTH-001.
+func buildClientCNVerifier(allowlist []string) func([][]byte, [][]*x509.Certificate) error {
+	if len(allowlist) == 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(allowlist))
+	for _, cn := range allowlist {
+		allowed[cn] = struct{}{}
+	}
+	return func(_ [][]byte, verifiedChains [][]*x509.Certificate) error {
+		// After tls.RequireAndVerifyClientCert the stdlib has already
+		// verified the chain; verifiedChains[0][0] is the peer leaf.
+		if len(verifiedChains) == 0 || len(verifiedChains[0]) == 0 {
+			return fmt.Errorf("client cert allowlist enforced but no verified chain present")
+		}
+		leafCN := verifiedChains[0][0].Subject.CommonName
+		if _, ok := allowed[leafCN]; !ok {
+			return fmt.Errorf("client cert CN %q is not on the GRPC_CLIENT_CERT_CN_ALLOWLIST", leafCN)
+		}
+		return nil
+	}
+}
+
+// refreshSignerAttestation fetches a fresh SEV-SNP attestation and rebinds
+// it to the signer (SEC-112). Called once at startup (initial=true) and then
+// periodically by the re-attestation goroutine. A transient fetch failure is
+// logged but leaves the previous binding untouched — we never clear an
+// existing good binding because of a temporary hardware / network blip.
+//
+// When the allowlist check fails, enforceMeasurementAllowlist fatals in
+// production; in development it logs a warning and returns normally.
+func refreshSignerAttestation(
+	parentCtx context.Context,
+	attestSvc *attestation.Service,
+	signer *signing.ReportSigner,
+	cfg *config.Config,
+	logger *zap.Logger,
+	initial bool,
+) {
+	attestCtx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
+	defer cancel()
+	attestReport, attestErr := attestSvc.GetAttestation(attestCtx)
+	if attestErr != nil {
+		// OPS-AUDIT-001 (b): in production, a startup attestation FETCH error
+		// is fatal. We must not boot prod with no attestation backing the
+		// signer. Periodic re-attestation failures keep the previous binding
+		// (transient hardware/network blips happen).
+		if initial && cfg.Env == "production" {
+			logger.Fatal("production refuses to start without a fetched SEV-SNP attestation",
+				zap.Error(attestErr),
+			)
+			return
+		}
+		if initial {
+			logger.Warn("failed to fetch attestation for signer binding (reports will omit enclave_attestation)",
+				zap.Error(attestErr),
+			)
+		} else {
+			logger.Warn("re-attestation failed, keeping previous signer binding",
+				zap.Error(attestErr),
+			)
+		}
+		return
+	}
+
+	// OPS-AUDIT-001 (b): hard production gate — even if the wrong Dockerfile
+	// (or a misconfigured runtime) lets the enclave reach this point with no
+	// hardware attestation, refuse to sign reports as "unattested-dev". On
+	// re-attestation, log Error but preserve the previous binding to avoid
+	// outage on transient downgrades.
+	// A refused report must not reach the signer. Returning here is what
+	// makes the "keeping previous binding" message above true.
+	if !enforceProductionAttestation(cfg, attestReport, logger, initial) {
+		return
+	}
+
+	if attestReport.Attestation == nil {
+		return
+	}
+
+	enforceMeasurementAllowlist(cfg, attestReport, logger)
+
+	signer.SetAttestation(&signing.EnclaveAttestation{
+		Measurement:              attestReport.Attestation.Measurement,
+		ReportData:               attestReport.Attestation.ReportData,
+		Platform:                 attestReport.Platform,
+		Attested:                 attestReport.Attestation.Verified,
+		ReportDataBoundToRequest: attestReport.Attestation.ReportDataBoundToRequest,
+		VcekVerified:             attestReport.Attestation.VcekVerified,
+	})
+
+	measurementPrefix := attestReport.Attestation.Measurement
+	if len(measurementPrefix) > 16 {
+		measurementPrefix = measurementPrefix[:16] + "..."
+	}
+	// LOG-NOISE-003: only the INITIAL bind is interesting at INFO — it
+	// proves the signer is anchored to a verified measurement. The
+	// periodic refresh (every ReattestInterval, default 10m) is a
+	// no-op as long as the measurement hasn't changed; emitting it at
+	// INFO produces a steady drip of identical lines. Drop refresh
+	// confirmations to DEBUG; if the measurement ever DOES change, that
+	// would be surfaced separately by the attestation pipeline as a
+	// WARN/ERROR.
+	if initial {
+		logger.Info("report signer bound to SEV-SNP attestation",
+			zap.String("platform", attestReport.Platform),
+			zap.Bool("attested", attestReport.Attestation.Verified),
+			zap.String("measurement_prefix", measurementPrefix),
+		)
+	} else {
+		logger.Debug("report signer re-bound to SEV-SNP attestation (refresh)",
+			zap.String("platform", attestReport.Platform),
+			zap.Bool("attested", attestReport.Attestation.Verified),
+			zap.String("measurement_prefix", measurementPrefix),
+		)
+	}
+}
+
+// isHTTPSURL reports whether url uses the https scheme (case-insensitive).
+func isHTTPSURL(url string) bool {
+	return strings.HasPrefix(strings.ToLower(url), "https://")
+}
+
+// mtBridgeMinSecretLen mirrors the rebuilder token floor (CFG-002): short
+// enough to type, long enough that the HMAC key is not guessable.
+const mtBridgeMinSecretLen = 24
+
+// checkMTBridgeConfig returns a non-nil error when the MetaTrader bridge is
+// misconfigured for production (CFG-005). Returns nil when the URL is unset
+// (MetaTrader disabled — the connector itself refuses to build in production
+// without it) or in development, where a loopback bridge over http is the
+// normal setup.
+func checkMTBridgeConfig(url, secret string, isDev bool) error {
+	if url == "" || isDev {
+		return nil
+	}
+	if !isHTTPSURL(url) {
+		return fmt.Errorf("MT_BRIDGE_URL must be https:// in production (the connect call carries the MT investor password in cleartext)")
+	}
+	if len(secret) < mtBridgeMinSecretLen {
+		return fmt.Errorf("MT_BRIDGE_HMAC_SECRET must be at least %d characters when MT_BRIDGE_URL is set in production (an empty or short key makes X-MT-Bridge-Signature forgeable)", mtBridgeMinSecretLen)
+	}
+	return nil
+}
+
+// checkBenchmarkConfig returns a non-nil error when the benchmark integration
+// is misconfigured for production (CFG-004): the benchmark series enters the
+// SIGNED report, so a URL set in production must be https:// and carry an
+// internal token. Returns nil when the URL is unset (integration disabled) or
+// in development (http + tokenless test stacks are allowed; main logs a Warn
+// for http separately).
+func checkBenchmarkConfig(url, token string, isDev bool) error {
+	if url == "" || isDev {
+		return nil
+	}
+	if !isHTTPSURL(url) {
+		return fmt.Errorf("BENCHMARK_SERVICE_URL must be https:// in production (it feeds the signed report); set https:// or unset it to omit benchmark metrics")
+	}
+	if token == "" {
+		return fmt.Errorf("BENCHMARK_INTERNAL_TOKEN is required when BENCHMARK_SERVICE_URL is set in production (≥24 chars, must match the benchmark service)")
+	}
+	return nil
+}
+
+// enforceProductionAttestation refuses to continue in production when the
+// SEV-SNP attestation is missing, unverified, not chained to the AMD root, or
+// unbound to the enclave's keys (OPS-AUDIT-001 (b)). This guard is independent
+// of which Dockerfile produced the running image: even if the runtime ships
+// without snpguest, the resulting "unattested-dev" platform is rejected loudly
+// instead of signing reports that quietly carry attested=false.
+//
+// initial=true (startup) → Fatal so the container restarts under the
+// orchestrator's eye.
+// initial=false (periodic refresh) → Error and return FALSE, so the caller
+// keeps the previous binding; outages on transient downgrades would be worse
+// than alerting and continuing on the last-known-good attestation.
+//
+// It returns whether the caller may bind this report to the signer. It used
+// to return nothing, and the caller called signer.SetAttestation
+// unconditionally right after — so the log line saying "keeping previous
+// binding" was false: the downgraded report overwrote the good one with
+// attested=false, and every report signed afterwards carried it. The claim
+// only became true when the process restarted, which is exactly when the
+// startup Fatal would have caught it.
+func enforceProductionAttestation(cfg *config.Config, report *attestation.AttestationReport, logger *zap.Logger, initial bool) bool {
+	if cfg.Env != "production" {
+		return true
+	}
+
+	var reason string
+	switch {
+	case report == nil || report.Attestation == nil:
+		reason = "missing SEV-SNP attestation block"
+	case report.Platform != attestation.PlatformSevSnp:
+		reason = "non-sev-snp platform=" + report.Platform
+	case !report.Attestation.Verified:
+		reason = "snpguest report not verified"
+	case !report.Attestation.VcekVerified:
+		// SEC-002: Verified only means snpguest produced a parseable report.
+		// VcekVerified is the real trust anchor — the quote's signature chains
+		// to the AMD root. Without it a host-fabricated blob would pass. The
+		// VCEK is cached 7d (attestation.vcekTTL), so a transient AMD KDS
+		// outage does not block routine reboots; only a cold-cache boot while
+		// KDS is unreachable trips this — which is correct fail-closed.
+		reason = "VCEK/VLEK certificate chain not verified against AMD root (KDS unreachable with a cold cert cache?)"
+	case !report.Attestation.ReportDataBoundToRequest:
+		reason = "snpguest --random fallback used: REPORT_DATA not bound to enclave keys"
+	default:
+		return true
+	}
+
+	if initial {
+		logger.Fatal("production refuses to start without verified SEV-SNP attestation",
+			zap.String("reason", reason),
+		)
+		return false
+	}
+	logger.Error("re-attestation downgrade detected in production (keeping previous binding)",
+		zap.String("reason", reason),
+	)
+	return false
+}
+
+// enforceMeasurementAllowlist verifies that the SEV-SNP launch measurement
+// returned by the attestation service matches one of the values in
+// cfg.MeasurementAllowlist (SEC-106). When the allowlist is empty the check
+// is a no-op — that is an explicit opt-out, documented in SECURITY.md.
+//
+// Behaviour when a mismatch is detected:
+//   - Production (cfg.Env == "production"): logger.Fatal — we must not sign
+//     reports with an enclave build that was not audited.
+//   - Development: logger.Warn so a freshly rebuilt binary can run locally
+//     before its hash is published.
+//
+// A dev-mode attestation (platform != "sev-snp") is skipped: there is no
+// hardware measurement to check, and the allowlist only gates real TEE runs.
+func enforceMeasurementAllowlist(cfg *config.Config, report *attestation.AttestationReport, logger *zap.Logger) {
+	if len(cfg.MeasurementAllowlist) == 0 {
+		return
+	}
+	if report == nil || report.Attestation == nil {
+		return
+	}
+	if report.Platform != "sev-snp" || !report.Attestation.Verified {
+		logger.Info("measurement allowlist not enforced (non-attested run)",
+			zap.String("platform", report.Platform),
+		)
+		return
+	}
+
+	measured := strings.ToLower(strings.TrimSpace(report.Attestation.Measurement))
+	if measured == "" {
+		logger.Fatal("attestation returned attested=true but empty measurement — refusing to start")
+		return
+	}
+
+	for _, allowed := range cfg.MeasurementAllowlist {
+		if measured == allowed {
+			logger.Info("measurement matches allowlist", zap.Int("allowlist_size", len(cfg.MeasurementAllowlist)))
+			return
+		}
+	}
+
+	if cfg.Env == "production" {
+		logger.Fatal("SEV-SNP measurement not in allowlist — refusing to start",
+			zap.String("measured", measured),
+			zap.Int("allowlist_size", len(cfg.MeasurementAllowlist)),
+		)
+		return
+	}
+	logger.Warn("SEV-SNP measurement not in allowlist (dev mode, continuing)",
+		zap.String("measured", measured),
+		zap.Int("allowlist_size", len(cfg.MeasurementAllowlist)),
+	)
+}
+
+// enforceNoEnvFile ensures production enclave does NOT use .env files.
+// Secrets must come from GCP metadata server — auditable and verifiable.
+// This function:
+//  1. Refuses to start if a .env file exists in the working directory
+//  2. Verifies GCP metadata server is accessible
+//  3. Logs the secret source for audit trail
+func enforceNoEnvFile() {
+	// Check for .env file — must NOT exist in production
+	for _, envFile := range []string{".env", ".env.local", ".env.production"} {
+		if _, err := os.Stat(envFile); err == nil {
+			fmt.Fprintf(os.Stderr, "FATAL: %s file detected in production.\n", envFile)
+			fmt.Fprintf(os.Stderr, "Production enclave must load secrets from GCP metadata, not .env files.\n")
+			fmt.Fprintf(os.Stderr, "Remove the file and use: ./scripts/start-enclave.sh\n")
+			os.Exit(1)
+		}
+	}
+
+	// Verify GCP metadata server is accessible
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest("GET",
+		"http://metadata.google.internal/computeMetadata/v1/instance/id", nil)
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "WARNING: GCP metadata server not accessible.\n")
+		fmt.Fprintf(os.Stderr, "Ensure secrets are injected via environment variables (not .env files).\n")
+		// Don't exit — allow non-GCP production environments (e.g., Docker -e flags from start-enclave.sh)
+	} else {
+		resp.Body.Close()
+	}
+}

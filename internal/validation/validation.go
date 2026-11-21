@@ -1,0 +1,314 @@
+package validation
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+)
+
+const (
+	maxUserUIDLen          = 100
+	maxExchangeLen         = 50
+	maxLabelLen            = 100
+	maxAPIKeyLen           = 500
+	maxAPISecretLen        = 500
+	maxPassphraseLen       = 500
+	maxTimestampRangeYears = 5
+	maxFutureTimestampSkew = 24 * time.Hour
+	minSyncIntervalMinutes = 5
+	maxSyncIntervalMinutes = 10080 // 7 days
+)
+
+var (
+	clerkIDRegex  = regexp.MustCompile(`^user_[a-zA-Z0-9]{10,50}$`)
+	uuidRegex     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	cuidRegex     = regexp.MustCompile(`^c[a-z0-9]{20,30}$`)
+	exchangeRegex = regexp.MustCompile(`^[a-z0-9_-]+$`)
+	// Format check only — the benchmark-service is the authority on which
+	// symbols exist (SPY, QQQ, VTI, BTC-USD, CD20, CD100, ...).
+	benchmarkRegex = regexp.MustCompile(`^[A-Za-z0-9-]{1,16}$`)
+	currencyRegex  = regexp.MustCompile(`^[A-Z]{3}$`)
+)
+
+// ValidateUserUID checks if the UID matches Clerk ID, UUID, or CUID format.
+func ValidateUserUID(uid string) error {
+	if uid == "" {
+		return fmt.Errorf("user_uid is required")
+	}
+	if len(uid) > maxUserUIDLen {
+		return fmt.Errorf("user_uid too long: max %d characters", maxUserUIDLen)
+	}
+	if clerkIDRegex.MatchString(uid) || uuidRegex.MatchString(uid) || cuidRegex.MatchString(uid) {
+		return nil
+	}
+	return fmt.Errorf("invalid user_uid format: must be Clerk ID, UUID, or CUID")
+}
+
+// ValidateExchange checks exchange format constraints.
+// TS parity: format validation is enforced, not a hardcoded support list.
+func ValidateExchange(exchange string) error {
+	if exchange == "" {
+		return fmt.Errorf("exchange is required")
+	}
+	if len(exchange) > maxExchangeLen {
+		return fmt.Errorf("exchange too long: max %d characters", maxExchangeLen)
+	}
+	if !exchangeRegex.MatchString(exchange) {
+		return fmt.Errorf("invalid exchange format: must match [a-z0-9_-]+")
+	}
+	return nil
+}
+
+// ValidateLabel checks label constraints.
+func ValidateLabel(label string) error {
+	if strings.TrimSpace(label) == "" {
+		return fmt.Errorf("label is required")
+	}
+	if len(label) > maxLabelLen {
+		return fmt.Errorf("label too long: max %d characters", maxLabelLen)
+	}
+	// SEC-05: the label is joined into the composite connection key
+	// "exchange/label" used for include/exclude matching. A '/' (the delimiter),
+	// a backslash, or a control character would make those keys ambiguous.
+	// Reject them at the trust boundary rather than re-encoding the key in every
+	// builder and checker.
+	for _, r := range label {
+		if r == '/' || r == '\\' || r < 0x20 || r == 0x7f {
+			return fmt.Errorf("label contains an illegal character (no '/', '\\', or control characters)")
+		}
+	}
+	return nil
+}
+
+// ValidateAPIKey checks API key length constraints.
+func ValidateAPIKey(key string) error {
+	if len(key) > maxAPIKeyLen {
+		return fmt.Errorf("api_key too long: max %d characters", maxAPIKeyLen)
+	}
+	return nil
+}
+
+// ValidateAPISecret checks API secret length constraints.
+func ValidateAPISecret(secret string) error {
+	if len(secret) > maxAPISecretLen {
+		return fmt.Errorf("api_secret too long: max %d characters", maxAPISecretLen)
+	}
+	return nil
+}
+
+// ValidatePassphrase checks passphrase length constraints.
+func ValidatePassphrase(passphrase string) error {
+	if len(passphrase) > maxPassphraseLen {
+		return fmt.Errorf("passphrase too long: max %d characters", maxPassphraseLen)
+	}
+	return nil
+}
+
+// ValidateSyncIntervalMinutes validates optional per-connection sync interval.
+// Zero means "not provided" and defaults are applied by the service layer.
+func ValidateSyncIntervalMinutes(minutes int) error {
+	if minutes == 0 {
+		return nil
+	}
+	if minutes < minSyncIntervalMinutes || minutes > maxSyncIntervalMinutes {
+		return fmt.Errorf("sync_interval_minutes must be between %d and %d", minSyncIntervalMinutes, maxSyncIntervalMinutes)
+	}
+	return nil
+}
+
+// ValidateTimestampRange checks that start < end and range is within maxTimestampRangeYears.
+func ValidateTimestampRange(start, end time.Time) error {
+	if !start.IsZero() && !end.IsZero() {
+		if end.Before(start) {
+			return fmt.Errorf("end_date must be after start_date")
+		}
+		maxEnd := start.AddDate(maxTimestampRangeYears, 0, 0)
+		if end.After(maxEnd) {
+			return fmt.Errorf("date range too large: max %d years", maxTimestampRangeYears)
+		}
+	}
+	return nil
+}
+
+// maxStatementPeriodDays is IBKR's ceiling on one Flex statement's period.
+const maxStatementPeriodDays = 365
+
+// ParseStatementPeriod parses a YYYY-MM-DD pair naming one venue statement.
+func ParseStatementPeriod(fromStr, toStr string, now time.Time) (from, to time.Time, err error) {
+	if fromStr == "" || toStr == "" {
+		return time.Time{}, time.Time{}, fmt.Errorf("from and to are both required")
+	}
+	if from, err = time.Parse("2006-01-02", fromStr); err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid from format: use YYYY-MM-DD")
+	}
+	if to, err = time.Parse("2006-01-02", toStr); err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid to format: use YYYY-MM-DD")
+	}
+	if to.Before(from) {
+		return time.Time{}, time.Time{}, fmt.Errorf("to must not be before from")
+	}
+	if to.After(now.Add(maxFutureTimestampSkew)) {
+		return time.Time{}, time.Time{}, fmt.Errorf("to must not be in the future")
+	}
+	if to.Sub(from) >= maxStatementPeriodDays*24*time.Hour {
+		return time.Time{}, time.Time{}, fmt.Errorf("period too long: max %d days", maxStatementPeriodDays)
+	}
+	return from, to, nil
+}
+
+// maxHistoryYears caps how far back a deep reconstruction may start. Each year
+// is one statement request against the holder's token, which IBKR rations.
+const maxHistoryYears = 10
+
+// ParseHistoryStart parses the YYYY-MM-DD day a deep reconstruction starts on.
+func ParseHistoryStart(fromStr string, now time.Time) (time.Time, error) {
+	if fromStr == "" {
+		return time.Time{}, fmt.Errorf("from is required")
+	}
+	from, err := time.Parse("2006-01-02", fromStr)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid from format: use YYYY-MM-DD")
+	}
+	if !from.Before(now) {
+		return time.Time{}, fmt.Errorf("from must be in the past")
+	}
+	if from.Before(now.AddDate(-maxHistoryYears, 0, 0)) {
+		return time.Time{}, fmt.Errorf("from too far back: max %d years", maxHistoryYears)
+	}
+	return from, nil
+}
+
+// ValidateOptionalTimestampMillis validates optional epoch-millisecond timestamps.
+// Zero is treated as "not provided", matching gRPC optional semantics.
+func ValidateOptionalTimestampMillis(ts int64, field string) error {
+	if ts == 0 {
+		return nil
+	}
+	if ts < 0 {
+		return fmt.Errorf("%s must be a positive Unix timestamp in milliseconds", field)
+	}
+	maxAllowed := time.Now().Add(maxFutureTimestampSkew).UnixMilli()
+	if ts >= maxAllowed {
+		return fmt.Errorf("%s must be less than 24h in the future", field)
+	}
+	return nil
+}
+
+// CreateConnectionRequest represents validated connection input.
+type CreateConnectionRequest struct {
+	UserUID             string
+	Exchange            string
+	Label               string
+	APIKey              string
+	APISecret           string
+	Passphrase          string
+	SyncIntervalMinutes int
+}
+
+// ValidateCreateConnection validates all fields for connection creation.
+func ValidateCreateConnection(req *CreateConnectionRequest) error {
+	if err := ValidateUserUID(req.UserUID); err != nil {
+		return err
+	}
+	if err := ValidateExchange(req.Exchange); err != nil {
+		return err
+	}
+	if err := ValidateLabel(req.Label); err != nil {
+		return err
+	}
+	if err := ValidateAPIKey(req.APIKey); err != nil {
+		return err
+	}
+	if err := ValidateAPISecret(req.APISecret); err != nil {
+		return err
+	}
+	if err := ValidatePassphrase(req.Passphrase); err != nil {
+		return err
+	}
+	if err := ValidateSyncIntervalMinutes(req.SyncIntervalMinutes); err != nil {
+		return err
+	}
+	if req.APIKey == "" {
+		return fmt.Errorf("api_key is required")
+	}
+	return nil
+}
+
+// SyncJobRequest represents validated sync input.
+type SyncJobRequest struct {
+	UserUID  string
+	Exchange string // Optional
+}
+
+// ValidateSyncRequest validates sync request fields.
+func ValidateSyncRequest(req *SyncJobRequest) error {
+	if err := ValidateUserUID(req.UserUID); err != nil {
+		return err
+	}
+	if req.Exchange != "" {
+		if err := ValidateExchange(req.Exchange); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ReportRequest represents validated report input.
+type ReportRequest struct {
+	UserUID      string
+	StartDate    string
+	EndDate      string
+	Benchmark    string
+	BaseCurrency string // ISO code, empty = USD
+	RiskFreeRate float64 // annual %, e.g. 2.5
+}
+
+// ValidateReportRequest validates report request fields.
+func ValidateReportRequest(req *ReportRequest) error {
+	if err := ValidateUserUID(req.UserUID); err != nil {
+		return err
+	}
+
+	// start_date / end_date are optional (TS parity). When provided, validate format.
+	var (
+		start time.Time
+		end   time.Time
+		err   error
+	)
+	if req.StartDate != "" {
+		start, err = time.Parse("2006-01-02", req.StartDate)
+		if err != nil {
+			return fmt.Errorf("invalid start_date format: use YYYY-MM-DD")
+		}
+	}
+	if req.EndDate != "" {
+		end, err = time.Parse("2006-01-02", req.EndDate)
+		if err != nil {
+			return fmt.Errorf("invalid end_date format: use YYYY-MM-DD")
+		}
+	}
+
+	// Range checks apply only when both dates are provided.
+	if !start.IsZero() && !end.IsZero() {
+		if err := ValidateTimestampRange(start, end); err != nil {
+			return err
+		}
+	}
+
+	// Benchmark is optional; when provided, only the format is checked here.
+	if req.Benchmark != "" && !benchmarkRegex.MatchString(req.Benchmark) {
+		return fmt.Errorf("invalid benchmark symbol format")
+	}
+
+	// Currency is optional; the service decides which codes it can value in.
+	if req.BaseCurrency != "" && !currencyRegex.MatchString(req.BaseCurrency) {
+		return fmt.Errorf("invalid base_currency: use a three-letter ISO code")
+	}
+
+	// Risk-free rate: annual percent, sane range only (0 = legacy behavior).
+	if req.RiskFreeRate < 0 || req.RiskFreeRate > 25 {
+		return fmt.Errorf("risk_free_rate must be between 0 and 25 (annual %%)")
+	}
+	return nil
+}

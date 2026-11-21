@@ -1,0 +1,188 @@
+package scheduler
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/trackrecord/enclave/internal/rebuilderclient"
+	"github.com/trackrecord/enclave/internal/repository"
+	"github.com/trackrecord/enclave/internal/service"
+	"go.uber.org/zap"
+)
+
+// SyncScheduler fires once per day at 00:00 UTC and syncs all users atomically.
+// CRITICAL: Forces UTC timezone to prevent snapshot manipulation (TS parity).
+type SyncScheduler struct {
+	syncSvc  *service.SyncService
+	userRepo *repository.UserRepo
+	logger   *zap.Logger
+
+	stopCh chan struct{}
+	wg     sync.WaitGroup
+}
+
+// NewSyncScheduler creates a scheduler.
+func NewSyncScheduler(
+	syncSvc *service.SyncService,
+	userRepo *repository.UserRepo,
+	logger *zap.Logger,
+) *SyncScheduler {
+	return &SyncScheduler{
+		syncSvc:  syncSvc,
+		userRepo: userRepo,
+		logger:   logger,
+		stopCh:   make(chan struct{}),
+	}
+}
+
+// Start begins the daily scheduler. Fires at next 00:00 UTC, then every 24h.
+func (s *SyncScheduler) Start() {
+	s.wg.Add(1)
+	go s.run()
+
+	next := timeUntilMidnightUTC()
+	s.logger.Info("daily sync scheduler started",
+		zap.String("policy", "once per day at 00:00 UTC"),
+		zap.Duration("next_sync_in", next),
+		zap.String("next_sync_at", time.Now().UTC().Add(next).Format(time.RFC3339)),
+	)
+}
+
+// Stop gracefully stops the scheduler.
+func (s *SyncScheduler) Stop() {
+	close(s.stopCh)
+	s.wg.Wait()
+	s.logger.Info("daily sync scheduler stopped")
+}
+
+func (s *SyncScheduler) run() {
+	defer s.wg.Done()
+
+	timer := time.NewTimer(timeUntilMidnightUTC())
+
+	for {
+		select {
+		case <-s.stopCh:
+			timer.Stop()
+			return
+
+		case <-timer.C:
+			s.executeDailySync()
+			// Next tick: 24h from now (handles DST-free UTC correctly)
+			timer.Reset(timeUntilMidnightUTC())
+		}
+	}
+}
+
+// timeUntilMidnightUTC returns the duration until the next 00:00 UTC.
+func timeUntilMidnightUTC() time.Duration {
+	now := time.Now().UTC()
+	nextMidnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+	return nextMidnight.Sub(now)
+}
+
+func (s *SyncScheduler) executeDailySync() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	now := time.Now().UTC()
+	s.logger.Info("daily sync started", zap.String("time", now.Format(time.RFC3339)))
+	start := time.Now()
+
+	users, err := s.userRepo.GetAllWithConnections(ctx)
+	if err != nil {
+		s.logger.Error("failed to get users for daily sync", zap.Error(err))
+		return
+	}
+
+	if len(users) == 0 {
+		s.logger.Info("no users to sync")
+		return
+	}
+
+	s.logger.Info("syncing all users", zap.Int("users", len(users)))
+
+	var (
+		userSyncedCount int
+		successCount    int
+		failCount       int
+		mu              sync.Mutex
+		wg              sync.WaitGroup
+	)
+
+	sem := make(chan struct{}, 3) // Max 3 concurrent user syncs to bound memory + exchange-API pressure
+
+	for _, user := range users {
+		wg.Add(1)
+		go func(u *repository.User) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			results, err := s.syncSvc.SyncUserScheduledDueAtomic(ctx, u.UID, now)
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if err != nil {
+				failCount++
+				s.logger.Error("user sync failed",
+					zap.String("user_uid", u.UID),
+					zap.Error(err),
+				)
+				return
+			}
+
+			if len(results) > 0 {
+				userSyncedCount++
+			}
+
+			for _, r := range results {
+				if r.Success {
+					successCount++
+				} else {
+					failCount++
+				}
+			}
+		}(user)
+	}
+
+	wg.Wait()
+
+	// Midnight UTC recalibration pass. By this point every user's live sync
+	// has produced today's snapshot, so the external-rebuilder connections
+	// have an exact midnight-equity anchor in DB. Re-runs the rebuilder
+	// sequentially for connections still on the imprecise connect-time
+	// calibration — see SyncService.RecalibrateRebuiltHistories docstring
+	// for the full rationale.
+	//
+	// Sequential by design (bounds exchange-API pressure: 1 rebuilder request
+	// at a time across all users). Failures are isolated per-connection and
+	// retried on the next nightly tick (RebuildFinalizedAt only stamps on
+	// success). Silent no-op when the rebuilder is unconfigured (dev) or the
+	// migration hasn't been applied (HasRebuildFinalizedAtCol → false).
+	recalCtx, recalCancel := context.WithTimeout(context.Background(), recalibrationBudget)
+	s.syncSvc.RecalibrateRebuiltHistories(recalCtx)
+	recalCancel()
+
+	s.logger.Info("daily sync completed",
+		zap.Int("users_synced", userSyncedCount),
+		zap.Int("total_users", len(users)),
+		zap.Int("snapshots_success", successCount),
+		zap.Int("snapshots_failed", failCount),
+		zap.Duration("duration", time.Since(start)),
+	)
+}
+
+// recalibrationBudget is the midnight recalibration pass's own context, not
+// the sync budget: connections rebuild one after the other and each may take
+// the full rebuilder call, so a night with a few high-frequency Binance
+// accounts queued must not cancel the ones behind them.
+const recalibrationBudget = 4 * rebuilderclient.RequestTimeout
+
+// RunNow executes sync immediately for all users (for manual trigger / testing).
+func (s *SyncScheduler) RunNow() {
+	s.executeDailySync()
+}

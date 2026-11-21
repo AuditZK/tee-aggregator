@@ -1,0 +1,31 @@
+# Local override for running the dev compose alongside the host-side
+# `errtrack-demo.exe` that already binds 50052. The override only:
+#
+#   1. Replaces the ports list to remap log-stream to host port 50054.
+#   2. Sets LOG_STREAM_API_KEY so the dashboard can authenticate.
+#
+# `!override` is required because Compose default-merges arrays by append,
+# which would otherwise leave the original 50052:50052 mapping in place.
+#
+# Bring up with:
+#   docker compose -f docker-compose.dev.yml -f docker-compose.dev.override.yml up -d --build
+#
+# Tear down with:
+#   docker compose -f docker-compose.dev.yml -f docker-compose.dev.override.yml down
+
+services:
+  enclave-go-dev:
+    ports: !override
+      - "8081:8080"
+      - "50051:50051"
+      - "50054:50052"   # remapped to avoid the host-side errtrack-demo on 50052
+      - "9091:9090"
+    environment:
+      - LOG_STREAM_API_KEY=enclave-dev-secret
+      # Enables /errors/* endpoints (in-process error aggregation). Disabled
+      # by default; the dashboard's Errors page returns 503 without it.
+      - ERRTRACK_ENABLED=1
+      # Best-effort "history rebuilt" ping → analytics per-user sync. The
+      # enclave appends /<userUID>. host.docker.internal:3003 reaches the
+      # analytics-service running in the track_record_site compose project.
+      - HISTORY_SYNC_NOTIFY_URL=http://host.docker.internal:3003/api/v1/sync/user

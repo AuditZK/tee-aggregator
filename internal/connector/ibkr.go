@@ -1,0 +1,1858 @@
+package connector
+
+import (
+	"context"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/singleflight"
+)
+
+// Every statement is asked for a chosen period on the documented Flex Web
+// Service. The legacy servlet (gdcdyn …/FlexStatementService) only serves the
+// query's saved period, ignoring fd/td, and answers 1001 at once to a query
+// broken out by day.
+const (
+	ibkrFlexWSSendURL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest"
+	ibkrFlexWSGetURL  = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
+)
+
+// IBKRStatementWindowDays is the shortest period the daily statement covers,
+// ending on LastStatementDay: the business days a sync needs, a weekend
+// included. A statement broken out by day is generated one day at a time, from
+// a tenth of a second to seven seconds a day depending on IBKR's load, and
+// under load it came back cut after about seven days, the oldest kept and no
+// error said. A year of it was still generating after ten minutes. The year is
+// read once, a month at a time (the sync layer's backfill).
+const IBKRStatementWindowDays = 5
+
+// IBKRStatementMaxDays is IBKR's ceiling on one statement's period.
+const IBKRStatementMaxDays = 365
+
+// LastStatementDay is the newest business day IBKR can have published a
+// statement for at now: the weekday before now's UTC date. Saturday, Sunday and
+// Monday all give Friday. Holidays are not modelled.
+func LastStatementDay(now time.Time) time.Time {
+	t := now.UTC()
+	d := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -1)
+	for d.Weekday() == time.Saturday || d.Weekday() == time.Sunday {
+		d = d.AddDate(0, 0, -1)
+	}
+	return d
+}
+
+// statementPeriod pulls [from, to] in to weekdays. IBKR answers 1003,
+// "Statement is not available", to a period ending on a Saturday, as if none of
+// its days had a statement (seen 2026-10-27); a weekend holds no statement day,
+// so nothing is lost. ok is false when no weekday is left.
+func statementPeriod(from, to time.Time) (time.Time, time.Time, bool) {
+	f := from.UTC()
+	from = time.Date(f.Year(), f.Month(), f.Day(), 0, 0, 0, 0, time.UTC)
+	for from.Weekday() == time.Saturday || from.Weekday() == time.Sunday {
+		from = from.AddDate(0, 0, 1)
+	}
+	to = LastStatementDay(to.AddDate(0, 0, 1))
+	return from, to, !from.After(to)
+}
+
+// flexReportEntry holds a cached Flex XML report, shared across IBKR connector
+// instances that use the same token:queryId. Required because IBKR enforces a
+// token-level rate limit (error 1018) and users who link the same Flex
+// credentials would otherwise hammer each other out. from and to are the
+// period it was asked for.
+type flexReportEntry struct {
+	xml       []byte
+	from, to  time.Time
+	fetchedAt time.Time
+}
+
+var (
+	flexReportCache   = make(map[string]*flexReportEntry)
+	flexReportCacheMu sync.Mutex
+	// flexSingleflight coalesces concurrent fetches for the same token:queryId.
+	// It does NOT protect two different query IDs sharing one token — that is
+	// what the token gate below is for.
+	flexSingleflight singleflight.Group
+
+	// flexTokenStates paces each Flex TOKEN. IBKR's 1018 rate limit is per
+	// token, but the cache and singleflight above are keyed token:queryID, so
+	// a user with two accounts on one token (CTO+PEA, two query IDs) raced
+	// both requests into IBKR within the same millisecond, every midnight, and
+	// the loser burned a second request on its follow-up GetBalance for good
+	// measure. The gate makes the loser fail locally, instantly and typed,
+	// without spending IBKR's budget; the sync layer's deferred retry (6h)
+	// then picks it up long after the cooldown.
+	//
+	// Process-local: a restart forgets the back-off and the day's budget, so
+	// recreating the container is itself a way to spend IBKR's patience.
+	flexTokenStates  = make(map[string]*flexTokenState)
+	flexTokenStateMu sync.Mutex
+)
+
+// flexTokenState is what one token has spent and how long it must now wait.
+type flexTokenState struct {
+	lastReq     time.Time
+	failures    int    // consecutive, drives the back-off
+	budgetDay   string // UTC date budgetSpent is counted on
+	budgetSpent int
+	lockedUntil time.Time
+}
+
+const flexReportCacheTTL = 5 * time.Minute
+
+// flexTokenCooldown paces requests on one Flex token after a SUCCESS. IBKR
+// documents the limit with error 1018: one request per second, ten per minute,
+// per token. One minute keeps the guard this exists for, two connections on
+// one token racing into IBKR in the same millisecond where the loser spends a
+// request for nothing, with ten times the headroom the documented limit asks
+// for.
+const flexTokenCooldown = time.Minute
+
+// A failure is not paced the same way, because IBKR counts FAILURES and not
+// just requests. On 2026-09-15 a token answering 1001 ("could not be generated
+// at this time, please try again shortly") was asked nine times in forty
+// minutes and came back 1025, "too many failed attempts, please review your
+// configuration", a code in no published IBKR table, which took a customer's
+// account off the air until the lock lifted. Taking IBKR's invitation to retry
+// shortly at face value is what spent the token's credit.
+//
+// So the wait doubles after each consecutive failure, and the day has a hard
+// budget of them. Once spent, the token waits for the next UTC day, where the
+// scheduled midnight sync picks it up with a fresh one.
+const (
+	flexTokenMaxBackoff    = 2 * time.Hour
+	flexTokenDailyFailures = 6
+)
+
+// flexStaleReuseWindow is how long a statement already fetched may still be
+// served once the gate denies a fresh request. It is deliberately not the
+// cooldown: pacing the network and deciding when a document goes stale are
+// different questions, and tying them together meant shortening one silently
+// shortened the other. IBKR statements carry a full period, so a copy a few
+// hours old answers every question the fresh one would.
+const flexStaleReuseWindow = 3 * time.Hour
+
+// ErrFlexTokenBusy is returned instead of a network call when the shared
+// Flex token was used too recently. It wraps ErrTransient (this is pacing,
+// not a credential problem) and its message is matched by the sync layer's
+// isRateLimitError, which arms the deferred retry.
+var ErrFlexTokenBusy = fmt.Errorf("%w: shared flex token cooling down", ErrTransient)
+
+// flexBusyError is ErrFlexTokenBusy with the time the token reopens, for a
+// caller that can afford to wait for it (FlexRetryAt).
+type flexBusyError struct{ retryAt time.Time }
+
+func (e *flexBusyError) Error() string {
+	return fmt.Sprintf("%s (retry after ~%s UTC)", ErrFlexTokenBusy, e.retryAt.UTC().Format("Jan 2 15:04"))
+}
+
+func (e *flexBusyError) Is(target error) bool { return errors.Is(ErrFlexTokenBusy, target) }
+
+// FlexRetryAt reports when a token err found busy reopens.
+func FlexRetryAt(err error) (time.Time, bool) {
+	var busy *flexBusyError
+	if errors.As(err, &busy) {
+		return busy.retryAt, true
+	}
+	return time.Time{}, false
+}
+
+// ErrStatementNotPublished marks a daily statement IBKR has not published yet:
+// the business day it ends on closes in the US evening and comes out during
+// the night. It is the stale statement of the sync layer in another form, and
+// is retried the same way.
+var ErrStatementNotPublished = fmt.Errorf("%w: flex statement not published yet", ErrTransient)
+
+// ErrStatementUnavailable is IBKR's 1003, "Statement is not available": no
+// statement exists for the period asked, either not yet or not at all.
+var ErrStatementUnavailable = errors.New("flex statement not available")
+
+const flexUnavailableCode = "1003"
+
+// claimFlexToken reports whether the token may go to the network now, and
+// claims it when allowed. The claim is taken BEFORE the request is sent and
+// kept even if the request then fails: a failed send still spent IBKR-side
+// budget, and holding the claim is what stops the same sync cycle from
+// spending a second one. A denial says when the token reopens.
+func claimFlexToken(token string, now time.Time) (retryAt time.Time, ok bool) {
+	flexTokenStateMu.Lock()
+	defer flexTokenStateMu.Unlock()
+
+	st := flexTokenStates[token]
+	if st == nil {
+		st = &flexTokenState{}
+		flexTokenStates[token] = st
+	}
+	if day := now.UTC().Format("2006-01-02"); st.budgetDay != day {
+		st.budgetDay = day
+		st.budgetSpent = 0
+	}
+
+	if now.Before(st.lockedUntil) {
+		return st.lockedUntil, false
+	}
+	if st.budgetSpent >= flexTokenDailyFailures {
+		return nextUTCDay(now), false
+	}
+	if wait := flexTokenWait(st.failures); !st.lastReq.IsZero() && now.Sub(st.lastReq) < wait {
+		return st.lastReq.Add(wait), false
+	}
+
+	st.lastReq = now
+	return time.Time{}, true
+}
+
+func flexTokenWait(failures int) time.Duration {
+	wait := flexTokenCooldown
+	for n := 0; n < failures; n++ {
+		if wait >= flexTokenMaxBackoff {
+			return flexTokenMaxBackoff
+		}
+		wait *= 2
+	}
+	return wait
+}
+
+// noteFlexOutcome closes the attempt claimFlexToken opened. A success clears
+// the back-off; a failure widens it, spends one of the day's attempts, and on
+// 1025 stops asking until tomorrow.
+func noteFlexOutcome(token string, now time.Time, err error) {
+	flexTokenStateMu.Lock()
+	defer flexTokenStateMu.Unlock()
+
+	st := flexTokenStates[token]
+	if st == nil {
+		return
+	}
+	if err == nil {
+		st.failures = 0
+		return
+	}
+	// The wait counts from the failure, not the claim: a statement that took
+	// minutes to fail must not reopen the token for the same sync's next read.
+	st.lastReq = now
+	st.failures++
+	st.budgetSpent++
+	if errors.Is(err, ErrFlexConfigLocked) {
+		st.lockedUntil = nextUTCDay(now)
+	}
+}
+
+// flexTokenWaitMax is how long a read waits for the token another read holds
+// before failing busy: the minute a success holds it, the two minutes after a
+// failure. Two accounts on one token, or a backfill beside a daily read, then
+// take turns instead of one of them losing its day.
+const flexTokenWaitMax = 2 * time.Minute
+
+// claimFlexTokenWaiting is claimFlexToken for a caller that can wait up to
+// flexTokenWaitMax, and no later than its context's deadline. A caller without
+// a deadline, a request someone is waiting on, is answered at once.
+func claimFlexTokenWaiting(ctx context.Context, token string) error {
+	for {
+		retryAt, ok := claimFlexToken(token, time.Now())
+		if ok {
+			return nil
+		}
+		wait := time.Until(retryAt) + time.Second
+		deadline, has := ctx.Deadline()
+		if !has || wait > flexTokenWaitMax || time.Now().Add(wait).After(deadline) {
+			return &flexBusyError{retryAt: retryAt}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+func nextUTCDay(now time.Time) time.Time {
+	t := now.UTC()
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour)
+}
+
+// IBKR implements Connector for Interactive Brokers via Flex Query
+type IBKR struct {
+	token   string // Flex Web Service Token
+	queryID string // Flex Query ID
+	client  *http.Client
+
+	// capabilityWarnings carries statement-shape problems discovered by the
+	// last Flex parse — cash transaction types this connector does not
+	// classify. Surfaced through CapabilityWarner like Binance's key-scope
+	// gaps, because the failure mode is the same shape: money moved, the
+	// number on screen silently stopped being the account.
+	capabilityWarnings []string
+
+	// currencyWarning is kept apart from capabilityWarnings because
+	// GetCashflows rebuilds that slice from scratch on every call, and the
+	// account's denomination is not a statement-shape problem it should be
+	// allowed to erase.
+	currencyWarning string
+	accountCurrency string
+
+	// statementWarning names a multi-account report narrowed to one account
+	// (statementReport); kept apart for the same reason as currencyWarning.
+	statementWarning string
+
+	// accountGuard, when set, vets the accounts every statement is narrowed
+	// to before any figure is read from it; measuredAccounts are the last
+	// daily statement's.
+	accountGuard     func(accounts []string, past bool) error
+	measuredAccounts []string
+
+	// Cached from last GetBalance call (avoids extra Flex requests)
+	cachedBreakdown []*MarketBalance
+	cachedIsPaper   *bool
+	// cachedBalanceAsOf is the reportDate of the summary the last GetBalance
+	// call returned — the real age of the figure, which can lag today by two
+	// days (Flex statements generate after close). Zero when no date parsed.
+	cachedBalanceAsOf time.Time
+}
+
+// NewIBKR creates a new IBKR connector
+func NewIBKR(creds *Credentials) *IBKR {
+	return &IBKR{
+		token:   creds.APIKey,
+		queryID: creds.APISecret,
+		// 5min per HTTP call — large Flex reports (YTD, 30 days) occasionally
+		// take 1-2min to respond; the poll retries (FlexPollBudget) carry the
+		// longer waits, so no individual request should ever hit this ceiling.
+		client: &http.Client{Timeout: 5 * time.Minute},
+	}
+}
+
+// dailyStatement returns the raw statement the daily figures are read from:
+// the period from `from` to LastStatementDay, never shorter than
+// IBKRStatementWindowDays nor longer than IBKRStatementMaxDays. A zero from
+// asks for the window alone.
+func (i *IBKR) dailyStatement(ctx context.Context, from time.Time) ([]byte, error) {
+	to := LastStatementDay(time.Now())
+	from = dailyStatementFrom(from, to)
+	report, err := i.statement(ctx, from, to)
+	if errors.Is(err, ErrStatementUnavailable) {
+		return nil, fmt.Errorf("%w: statement to %s: %w", ErrStatementNotPublished, to.Format("2006-01-02"), err)
+	}
+	return report, err
+}
+
+func dailyStatementFrom(from, to time.Time) time.Time {
+	if earliest := to.AddDate(0, 0, -(IBKRStatementWindowDays - 1)); from.IsZero() || from.After(earliest) {
+		from = earliest
+	}
+	if floor := to.AddDate(0, 0, -(IBKRStatementMaxDays - 1)); from.Before(floor) {
+		from = floor
+	}
+	return time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// statement returns the raw statement for [from, to], or a cached one that
+// covers it: same last day, first day no later. A wider statement answers
+// every question a narrower one does, so the live reads that follow a sync's
+// reconstruction spend no second request.
+func (i *IBKR) statement(ctx context.Context, from, to time.Time) ([]byte, error) {
+	key := i.token + ":" + i.queryID
+	if xml, ok := cachedStatement(key, from, to, flexReportCacheTTL); ok {
+		return xml, nil
+	}
+
+	// Coalesce concurrent fetches of the same statement so parallel syncs
+	// share one Flex round-trip.
+	flight := key + ":" + from.Format("20060102") + ":" + to.Format("20060102")
+	v, err, _ := flexSingleflight.Do(flight, func() (interface{}, error) {
+		if xml, ok := cachedStatement(key, from, to, flexReportCacheTTL); ok {
+			return xml, nil
+		}
+		// Our own statement from earlier in this window is still usable when
+		// the token is not — a slow sync whose 5-minute cache lapsed mid-cycle,
+		// or an admin re-parse after a deploy, keeps working on the same-day
+		// XML. Without one, the read waits its turn on the token.
+		if stale, ok := cachedStatement(key, from, to, flexStaleReuseWindow); ok {
+			if _, free := claimFlexToken(i.token, time.Now()); !free {
+				return stale, nil
+			}
+		} else if err := claimFlexTokenWaiting(ctx, i.token); err != nil {
+			return nil, err
+		}
+
+		report, err := i.requestStatement(ctx, from, to)
+		noteFlexOutcome(i.token, time.Now(), err)
+		if err != nil {
+			return nil, err
+		}
+
+		flexReportCacheMu.Lock()
+		flexReportCache[key] = &flexReportEntry{xml: report, from: from, to: to, fetchedAt: time.Now()}
+		evictFlexReportCache(time.Now())
+		flexReportCacheMu.Unlock()
+		return report, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]byte), nil
+}
+
+func cachedStatement(key string, from, to time.Time, maxAge time.Duration) ([]byte, bool) {
+	flexReportCacheMu.Lock()
+	defer flexReportCacheMu.Unlock()
+	entry, ok := flexReportCache[key]
+	if !ok || time.Since(entry.fetchedAt) >= maxAge || !entry.to.Equal(to) || entry.from.After(from) {
+		return nil, false
+	}
+	return entry.xml, true
+}
+
+// flexReportCacheMaxEntries caps the process-wide Flex cache. Each entry can
+// hold up to IBKRFlexMaxResponseBytes of XML, and nothing ever removed one:
+// the map grew one entry per token:queryID for the life of the process, which
+// on a large IBKR estate is a slow OOM against the production GOMEMLIMIT.
+// CONN-15b, bounded the way internal/errtrack/store.go bounds its groups.
+const flexReportCacheMaxEntries = 256
+
+// evictFlexReportCache drops entries no read can still use, then trims the
+// oldest until the cap holds. Caller must hold flexReportCacheMu. Recency is
+// fetchedAt: an entry is only ever rewritten by a fresh fetch, so insertion
+// order and use order coincide.
+func evictFlexReportCache(now time.Time) {
+	for key, entry := range flexReportCache {
+		if now.Sub(entry.fetchedAt) >= flexStaleReuseWindow {
+			delete(flexReportCache, key)
+		}
+	}
+	for len(flexReportCache) > flexReportCacheMaxEntries {
+		var oldestKey string
+		var oldest time.Time
+		for key, entry := range flexReportCache {
+			if oldestKey == "" || entry.fetchedAt.Before(oldest) {
+				oldestKey, oldest = key, entry.fetchedAt
+			}
+		}
+		delete(flexReportCache, oldestKey)
+	}
+}
+
+func (i *IBKR) Exchange() string {
+	return "ibkr"
+}
+
+// DetectIsPaper mirrors TS behavior:
+// IBKR paper accounts typically use DU/DF account ID prefixes.
+// Uses cached result from GetBalance to avoid extra Flex API call.
+func (i *IBKR) DetectIsPaper(ctx context.Context) (bool, error) {
+	if i.cachedIsPaper != nil {
+		return *i.cachedIsPaper, nil
+	}
+	// Cache empty — call GetBalance to populate it (parses accountId from XML)
+	if _, err := i.GetBalance(ctx); err != nil {
+		return false, err
+	}
+	if i.cachedIsPaper != nil {
+		return *i.cachedIsPaper, nil
+	}
+	return false, nil
+}
+
+func (i *IBKR) TestConnection(ctx context.Context) error {
+	// Use GetBalance instead of just requestFlexReport — this also caches
+	// the account ID (for paper detection) and breakdown (for GetBalanceByMarket).
+	_, err := i.GetBalance(ctx)
+	return err
+}
+
+// flexURL builds the IBKR Flex endpoint URL with properly escaped parameters
+// (CONN-002). Using fmt.Sprintf with raw values risked corrupt requests if a
+// token ever contained URL-reserved characters, and also meant the raw token
+// flowed unescaped into preview/error strings.
+func flexURL(base, token, query string) string {
+	v := url.Values{"t": {token}, "q": {query}, "v": {"3"}}
+	return base + "?" + v.Encode()
+}
+
+// flexPeriodURL overrides the period saved in the holder's query with fd/td,
+// the only way to reach a statement older than the last 365 days.
+func flexPeriodURL(base, token, query string, from, to time.Time) string {
+	v := url.Values{
+		"t":  {token},
+		"q":  {query},
+		"v":  {"3"},
+		"fd": {from.UTC().Format("20060102")},
+		"td": {to.UTC().Format("20060102")},
+	}
+	return base + "?" + v.Encode()
+}
+
+// requestStatement asks IBKR for the statement of [from, to] and polls until
+// it is generated. Pacing is the caller's (claimFlexToken).
+func (i *IBKR) requestStatement(ctx context.Context, from, to time.Time) ([]byte, error) {
+	from, to, ok := statementPeriod(from, to)
+	if !ok {
+		return nil, ErrStatementUnavailable
+	}
+	refCode, err := i.sendFlexRequest(ctx, flexPeriodURL(ibkrFlexWSSendURL, i.token, i.queryID, from, to))
+	if err != nil {
+		return nil, err
+	}
+	return i.pollFlexReport(ctx, flexURL(ibkrFlexWSGetURL, i.token, refCode))
+}
+
+func (i *IBKR) sendFlexRequest(ctx context.Context, u string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := i.client.Do(req)
+	if err != nil {
+		return "", i.transportErr(err)
+	}
+
+	// CONN-AUDIT-001: bounded read with the higher IBKR Flex cap (statements
+	// for long-history accounts can legitimately be tens of MiB).
+	body, err := ReadCappedBody(resp.Body, IBKRFlexMaxResponseBytes)
+	if err != nil {
+		return "", err
+	}
+
+	if len(body) == 0 {
+		return "", fmt.Errorf("flex SendRequest returned empty body (HTTP %d) — likely rate-limited or network blip", resp.StatusCode)
+	}
+
+	// Parse XML response
+	var result struct {
+		XMLName       xml.Name `xml:"FlexStatementResponse"`
+		Status        string   `xml:"Status"`
+		ReferenceCode string   `xml:"ReferenceCode"`
+		ErrorCode     string   `xml:"ErrorCode"`
+		ErrorMessage  string   `xml:"ErrorMessage"`
+	}
+
+	if err := xml.Unmarshal(body, &result); err != nil {
+		// Log the raw body (truncated) so we can diagnose unexpected IBKR responses.
+		// Scrub the token first in case IBKR echoed the request URL back (CONN-002).
+		snippet := scrubSecret(string(body), i.token)
+		if len(snippet) > 300 {
+			snippet = snippet[:300] + "..."
+		}
+		return "", fmt.Errorf("parse flex response (body=%q): %w", snippet, err)
+	}
+
+	if result.Status != "Success" {
+		base := fmt.Errorf("flex request failed: %s - %s", result.ErrorCode, result.ErrorMessage)
+		if result.ErrorCode == flexIPRestrictionCode {
+			return "", fmt.Errorf("%w: %w", ErrIPRestricted, base)
+		}
+		if result.ErrorCode == flexRepeatedFailureCode {
+			return "", fmt.Errorf("%w: %w", ErrFlexConfigLocked, base)
+		}
+		if result.ErrorCode == flexUnavailableCode {
+			return "", fmt.Errorf("%w: %w", ErrStatementUnavailable, base)
+		}
+		if isTransientFlexErrorCode(result.ErrorCode) {
+			return "", fmt.Errorf("%w: %w", ErrTransient, base)
+		}
+		return "", base
+	}
+
+	return result.ReferenceCode, nil
+}
+
+// transientFlexErrorCodes lists the IBKR Flex error codes worth retrying.
+// Descriptions are IBKR's own, from the Flex Web Service v3 error table; an
+// earlier version of this list paraphrased them from memory and got four
+// wrong, which sent 1014 and 1011 into endless retries and told users their
+// token was bad when a P/L figure was simply not computed yet.
+//
+//	1001 - Statement could not be generated at this time. Please try again shortly.
+//	1004 - Statement is incomplete at this time. Please try again shortly.
+//	1005 - Settlement data is not ready at this time. Please try again shortly.
+//	1006 - FIFO P/L data is not ready at this time. Please try again shortly.
+//	1007 - MTM P/L data is not ready at this time. Please try again shortly.
+//	1008 - MTM and FIFO P/L data is not ready at this time. Please try again shortly.
+//	1009 - The server is under heavy load. Statement could not be generated at this time.
+//	1019 - Statement generation in progress. Please try again shortly.
+//	1021 - Statement could not be retrieved at this time. Please try again shortly.
+//
+// 1018 (too many requests: one per second, ten per minute per token) is
+// transient too, but it is paced by claimFlexToken rather than retried blind.
+//
+// Deliberately absent, because the account or its configuration must change
+// first: 1003 (statement not available), 1010 (legacy query unsupported),
+// 1011 (service account inactive), 1012 (token expired), 1014 (query invalid),
+// 1015 (token invalid), 1016 (account invalid), 1017 (reference code invalid),
+// 1020 (invalid request). 1013 is an IP restriction and is neither — it is
+// classified as such upstream so the holder is not sent to regenerate a token
+// that was never the problem.
+var transientFlexErrorCodes = map[string]struct{}{
+	"1001": {},
+	"1004": {},
+	"1005": {},
+	"1006": {},
+	"1007": {},
+	"1008": {},
+	"1009": {},
+	"1018": {},
+	"1019": {},
+	"1021": {},
+}
+
+// flexIPRestrictionCode is IBKR's "IP restriction": the token is valid and the
+// source address is not allowed. Routing it through the credential path sends
+// the holder to replace a working token, and the replacement fails the same
+// way.
+const flexIPRestrictionCode = "1013"
+
+// flexRepeatedFailureCode is IBKR's "Too many failed attempts. Please review
+// your configuration." It appears in no published error table and is not a
+// rate limit: it is what a token earns by being asked again and again while it
+// answers 1001. Nothing local clears it, so the only useful response is to
+// stop asking.
+const flexRepeatedFailureCode = "1025"
+
+// ErrFlexConfigLocked marks that code. It wraps ErrTransient so the sync layer
+// records a pending retry instead of telling the holder their credentials are
+// bad, which they are not.
+var ErrFlexConfigLocked = fmt.Errorf("%w: flex token locked after repeated failures", ErrTransient)
+
+func isTransientFlexErrorCode(code string) bool {
+	_, ok := transientFlexErrorCodes[code]
+	return ok
+}
+
+// flexPollDelays is the wait between GetStatement polls. Small reports are
+// ready in 5-10s and a year on a busy account in 1-3 minutes, but during IBKR's
+// overnight batch, where the 6h deferred retry lands, a year-long statement
+// was still generating after the four minutes this budget used to stop at,
+// and the retry lost its day. About ten minutes now.
+var flexPollDelays = []time.Duration{
+	3 * time.Second, 5 * time.Second, 5 * time.Second, 10 * time.Second, 10 * time.Second,
+	15 * time.Second, 15 * time.Second, 20 * time.Second, 30 * time.Second, 30 * time.Second,
+	30 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second,
+	time.Minute, time.Minute, time.Minute, time.Minute, time.Minute, time.Minute,
+}
+
+// FlexPollBudget is the longest a statement may take to come out before the
+// poll gives up. A caller's deadline shorter than this cuts the poll instead.
+func FlexPollBudget() time.Duration {
+	var total time.Duration
+	for _, d := range flexPollDelays {
+		total += d
+	}
+	return total
+}
+
+func (i *IBKR) pollFlexReport(ctx context.Context, u string) ([]byte, error) {
+	delays := flexPollDelays
+	for _, sleep := range delays {
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := i.client.Do(req)
+		if err != nil {
+			return nil, i.transportErr(err)
+		}
+
+		// CONN-AUDIT-001: Flex statement download — use the higher cap.
+		body, err := ReadCappedBody(resp.Body, IBKRFlexMaxResponseBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		// IBKR returns two root elements:
+		//   - <FlexStatementResponse> → still processing OR hard error
+		//   - <FlexQueryResponse> → the actual report is ready
+		// Substring matching on "1019" was wrong because numeric values inside
+		// a real report can trip it. The root-element distinction is exact.
+		trimmed := strings.TrimSpace(string(body))
+		if strings.HasPrefix(trimmed, "<FlexQueryResponse") {
+			return body, nil
+		}
+		if strings.HasPrefix(trimmed, "<FlexStatementResponse") {
+			// Error if Status="Error", otherwise keep polling.
+			if strings.Contains(trimmed, "<Status>Error</Status>") {
+				// CONN-002: scrub the token in case IBKR echoed our request URL.
+				return nil, fmt.Errorf("flex report error: %s", preview(scrubSecret(trimmed, i.token), 300))
+			}
+			// CONN-005: ctx-aware wait so a cancelled sync propagates
+			// immediately instead of blocking up to 30 s per tick.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(sleep):
+			}
+			continue
+		}
+		// Unknown response shape — surface it (token scrubbed).
+		return nil, fmt.Errorf("unexpected flex response: %s", preview(scrubSecret(trimmed, i.token), 300))
+	}
+
+	// IBKR answered "in progress" every time: the same condition as 1019,
+	// transient by its own account.
+	return nil, fmt.Errorf("%w: flex statement still generating after %d polls", ErrTransient, len(delays))
+}
+
+// preview returns the first n chars of s with an ellipsis when truncated.
+// Used to include a snippet of unexpected IBKR responses in error messages.
+func preview(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// transportErr rebuilds a *url.Error so the Flex token flexURL puts in the
+// query string cannot ride out on the message (SEC-11). http.Client.Do prints
+// the full URL, and net/http's own stripPassword only removes userinfo — the
+// chain is dropped on purpose so no errors.As can recover the raw URL.
+func (i *IBKR) transportErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := scrubSecret(err.Error(), i.token)
+	if esc := url.QueryEscape(i.token); esc != i.token {
+		msg = scrubSecret(msg, esc)
+	}
+	return errors.New(msg)
+}
+
+// scrubSecret replaces every literal occurrence of secret in s with "***"
+// (CONN-002). Used before embedding third-party response text in an error
+// message so an echoed request URL cannot leak the token to logs.
+func scrubSecret(s, secret string) string {
+	if secret == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, secret, "***")
+}
+
+func (i *IBKR) GetBalance(ctx context.Context) (*Balance, error) {
+	report, err := i.statementReport(ctx, time.Time{})
+	if err != nil {
+		return nil, err
+	}
+	return i.parseBalanceFromReport(report)
+}
+
+func (i *IBKR) parseBalanceFromReport(report []byte) (*Balance, error) {
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				AccountID           string `xml:"accountId,attr"`
+				EquitySummaryInBase struct {
+					EquitySummaryByReportDateInBase []struct {
+						ReportDate           string `xml:"reportDate,attr"`
+						Currency             string `xml:"currency,attr"`
+						Total                string `xml:"total,attr"`
+						Cash                 string `xml:"cash,attr"`
+						Stock                string `xml:"stock,attr"`
+						Options              string `xml:"options,attr"`
+						Commodities          string `xml:"commodities,attr"`
+						UnrealizedPnL        string `xml:"unrealizedPnL,attr"`
+						CfdUnrealizedPl      string `xml:"cfdUnrealizedPl,attr"`
+						ForexCfdUnrealizedPl string `xml:"forexCfdUnrealizedPl,attr"`
+					} `xml:"EquitySummaryByReportDateInBase"`
+				} `xml:"EquitySummaryInBase"`
+				OpenPositions struct {
+					OpenPosition []struct {
+						FifoPnlUnrealized string `xml:"fifoPnlUnrealized,attr"`
+						LevelOfDetail     string `xml:"levelOfDetail,attr"`
+					} `xml:"OpenPosition"`
+				} `xml:"OpenPositions"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return nil, fmt.Errorf("parse flex report: %w", err)
+	}
+
+	summaries := flex.FlexStatements.FlexStatement.EquitySummaryInBase.EquitySummaryByReportDateInBase
+	i.cachedBalanceAsOf = time.Time{}
+	if len(summaries) == 0 {
+		return &Balance{Currency: "USD"}, nil
+	}
+
+	summary := summaries[len(summaries)-1] // Latest
+	// Freshness: record the statement date of the figure we are about to
+	// return. "Latest" here means latest IN THE STATEMENT — at midnight UTC
+	// that is typically two days old, and the sync layer must know it
+	// (BalanceFreshnessProvider) before stamping the value with today's date.
+	if d, err := time.Parse("20060102", summary.ReportDate); err == nil {
+		i.cachedBalanceAsOf = d
+	}
+	// Flex reports "in base currency" — the account's denomination, not always
+	// USD. Balance.Currency carries it to the sync, which converts to USD at
+	// the statement date's rate (service/fx.go); the marker below tells the
+	// dashboard which currency the account is held in.
+	currency, inferred := accountCurrency(summary.Currency, report)
+	switch {
+	case currency == "":
+		i.currencyWarning = "ibkr_account_currency_unknown"
+		currency = "USD"
+	case currency != "USD" && inferred:
+		i.currencyWarning = "ibkr_account_currency_" + strings.ToLower(currency) + "_inferred"
+	case currency != "USD":
+		i.currencyWarning = "ibkr_account_currency_" + strings.ToLower(currency)
+	default:
+		i.currencyWarning = ""
+	}
+	i.accountCurrency = currency
+	total, _ := strconv.ParseFloat(summary.Total, 64)
+	cash, _ := strconv.ParseFloat(summary.Cash, 64)
+	unrealized, _ := strconv.ParseFloat(summary.UnrealizedPnL, 64)
+
+	// IBKR EquitySummary only has cfd/forexCfd unrealized fields — not stocks/futures.
+	// Sum fifoPnlUnrealized from OpenPositions for the complete picture.
+	if unrealized == 0 {
+		positions := flex.FlexStatements.FlexStatement.OpenPositions.OpenPosition
+		summaryOnly := false
+		for _, pos := range positions {
+			summaryOnly = summaryOnly || strings.EqualFold(pos.LevelOfDetail, "SUMMARY")
+		}
+		for _, pos := range positions {
+			if summaryOnly && !strings.EqualFold(pos.LevelOfDetail, "SUMMARY") {
+				continue
+			}
+			pnl, _ := strconv.ParseFloat(pos.FifoPnlUnrealized, 64)
+			unrealized += pnl
+		}
+	}
+	// Fallback to CFD fields if no open positions in the report
+	if unrealized == 0 {
+		cfdUnreal, _ := strconv.ParseFloat(summary.CfdUnrealizedPl, 64)
+		fxCfdUnreal, _ := strconv.ParseFloat(summary.ForexCfdUnrealizedPl, 64)
+		unrealized = cfdUnreal + fxCfdUnreal
+	}
+	stockVal, _ := strconv.ParseFloat(summary.Stock, 64)
+	optionsVal, _ := strconv.ParseFloat(summary.Options, 64)
+	commoditiesVal, _ := strconv.ParseFloat(summary.Commodities, 64)
+
+	// Cache paper detection from account ID (avoids extra Flex call for DetectIsPaper)
+	accountID := strings.ToUpper(strings.TrimSpace(flex.FlexStatements.FlexStatement.AccountID))
+	if accountID != "" {
+		isPaper := strings.HasPrefix(accountID, "DU") || strings.HasPrefix(accountID, "DF")
+		i.cachedIsPaper = &isPaper
+	}
+
+	// Cache breakdown for GetBalanceByMarket (avoids 2nd Flex API call)
+	i.cachedBreakdown = nil
+	if stockVal != 0 {
+		i.cachedBreakdown = append(i.cachedBreakdown, &MarketBalance{
+			MarketType: MarketStocks, Equity: stockVal, AvailableMargin: cash,
+		})
+	}
+	if optionsVal != 0 {
+		i.cachedBreakdown = append(i.cachedBreakdown, &MarketBalance{
+			MarketType: MarketOptions, Equity: optionsVal,
+		})
+	}
+	if commoditiesVal != 0 {
+		i.cachedBreakdown = append(i.cachedBreakdown, &MarketBalance{
+			MarketType: MarketFutures, Equity: commoditiesVal,
+		})
+	}
+
+	return &Balance{
+		Available:     cash,
+		Equity:        total,
+		UnrealizedPnL: unrealized,
+		Currency:      currency,
+		BaseRates:     flexConversionRates(report, currency)[summary.ReportDate],
+	}, nil
+}
+
+// BalanceAsOf implements BalanceFreshnessProvider: the reportDate of the
+// summary the last GetBalance call returned. Zero when GetBalance has not run
+// or the statement carried no parsable date (fail open).
+func (i *IBKR) BalanceAsOf() time.Time {
+	return i.cachedBalanceAsOf
+}
+
+// GetBalanceByMarket returns per-asset-class equity breakdown from IBKR Flex.
+// GetBalanceByMarket returns cached breakdown from the last GetBalance call.
+// No additional Flex API call needed (avoids IBKR rate limit error 1018).
+func (i *IBKR) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
+	return i.cachedBreakdown, nil
+}
+
+func (i *IBKR) GetPositions(ctx context.Context) ([]*Position, error) {
+	report, err := i.statementReport(ctx, time.Time{})
+	if err != nil {
+		return nil, err
+	}
+	return i.parsePositionsFromReport(report)
+}
+
+func (i *IBKR) parsePositionsFromReport(report []byte) ([]*Position, error) {
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				OpenPositions struct {
+					OpenPosition []struct {
+						Symbol            string `xml:"symbol,attr"`
+						Position          string `xml:"position,attr"`
+						MarkPrice         string `xml:"markPrice,attr"`
+						CostBasisMoney    string `xml:"costBasisMoney,attr"`
+						FifoPnlUnrealized string `xml:"fifoPnlUnrealized,attr"`
+						AssetCategory     string `xml:"assetCategory,attr"`
+						LevelOfDetail     string `xml:"levelOfDetail,attr"`
+					} `xml:"OpenPosition"`
+				} `xml:"OpenPositions"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return nil, fmt.Errorf("parse flex positions: %w", err)
+	}
+
+	// With both "Summary" and "Lot" ticked each holding appears once per lot
+	// and once in total; the totals are the positions.
+	rows := flex.FlexStatements.FlexStatement.OpenPositions.OpenPosition
+	summaryOnly := false
+	for _, p := range rows {
+		summaryOnly = summaryOnly || strings.EqualFold(p.LevelOfDetail, "SUMMARY")
+	}
+
+	var positions []*Position
+	for _, p := range rows {
+		if summaryOnly && !strings.EqualFold(p.LevelOfDetail, "SUMMARY") {
+			continue
+		}
+		size, _ := strconv.ParseFloat(p.Position, 64)
+		if size == 0 {
+			continue
+		}
+
+		mark, _ := strconv.ParseFloat(p.MarkPrice, 64)
+		costBasis, _ := strconv.ParseFloat(p.CostBasisMoney, 64)
+		unrealized, _ := strconv.ParseFloat(p.FifoPnlUnrealized, 64)
+
+		side := "long"
+		if size < 0 {
+			side = "short"
+			size = -size
+		}
+
+		entryPrice := 0.0
+		if size > 0 {
+			entryPrice = costBasis / size
+		}
+
+		marketType := MarketStocks
+		switch p.AssetCategory {
+		case "FUT":
+			marketType = MarketFutures
+		case "OPT":
+			marketType = MarketOptions
+		case "CFD":
+			marketType = MarketCFD
+		case "CASH":
+			marketType = MarketForex
+		}
+
+		positions = append(positions, &Position{
+			Symbol:        p.Symbol,
+			Side:          side,
+			Size:          size,
+			EntryPrice:    entryPrice,
+			MarkPrice:     mark,
+			UnrealizedPnL: unrealized,
+			MarketType:    marketType,
+		})
+	}
+
+	return positions, nil
+}
+
+// GetCashflows returns deposits and withdrawals since the given date.
+// Uses IBKR Flex CashTransactions.
+func (i *IBKR) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
+	report, err := i.statementReport(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	return i.parseCashflowsFromReport(report, since)
+}
+
+// GetRawCashflowEntries returns every CashTransaction and every Transfer the
+// statement carries, the ones GetCashflows drops included. A position
+// transferred in from another broker moves no cash, so the filtered view
+// cannot tell it from a trading gain: the market value lands in equity and
+// scores as performance. This is the view that separates the two.
+func (i *IBKR) GetRawCashflowEntries(ctx context.Context, since time.Time) ([]RawBalanceOp, error) {
+	report, err := i.dailyStatement(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	return parseRawLedgerFromReport(report, since)
+}
+
+// GetRawStatement returns the Flex XML as IBKR sent it. The token is scrubbed
+// in case it was echoed back (CONN-002); nothing else is filtered, because a
+// filter is exactly what this is for.
+func (i *IBKR) GetRawStatement(ctx context.Context) ([]byte, string, error) {
+	report, err := i.dailyStatement(ctx, time.Time{})
+	if err != nil {
+		return nil, "", err
+	}
+	return []byte(scrubSecret(string(report), i.token)), "application/xml", nil
+}
+
+// GetRawStatementForPeriod fetches the statement for [from, to] instead of the
+// daily one. It stays out of flexReportCache on purpose: that cache feeds the
+// daily sync, and an old year someone asked for must not take the place of its
+// statement.
+func (i *IBKR) GetRawStatementForPeriod(ctx context.Context, from, to time.Time) ([]byte, string, error) {
+	report, err := i.fetchPeriodStatement(ctx, from, to)
+	if err != nil {
+		return nil, "", err
+	}
+	return []byte(scrubSecret(string(report), i.token)), "application/xml", nil
+}
+
+func (i *IBKR) fetchPeriodStatement(ctx context.Context, from, to time.Time) ([]byte, error) {
+	// Before the claim: a weekend has no statement to spend the token on.
+	if _, _, ok := statementPeriod(from, to); !ok {
+		return nil, ErrStatementUnavailable
+	}
+	if err := claimFlexTokenWaiting(ctx, i.token); err != nil {
+		return nil, err
+	}
+	report, err := i.requestStatement(ctx, from, to)
+	noteFlexOutcome(i.token, time.Now(), err)
+	return report, err
+}
+
+// GetHistoricalSnapshotsForPeriod is GetHistoricalSnapshots over [from, to],
+// any year back, uncached.
+func (i *IBKR) GetHistoricalSnapshotsForPeriod(ctx context.Context, from, to time.Time) ([]*HistoricalSnapshot, error) {
+	report, err := i.fetchPeriodStatement(ctx, from, to)
+	if err != nil {
+		return nil, err
+	}
+	n, err := i.narrow(report, true)
+	if err != nil {
+		return nil, err
+	}
+	// Shared with the daily syncs when a backfill runs beside them, so it
+	// leaves the connector's warnings to them.
+	all, _, err := i.historicalSnapshotsFromReport(n.report, from)
+	if err != nil {
+		return nil, err
+	}
+	out := all[:0]
+	for _, sn := range all {
+		if !sn.Date.After(to) {
+			out = append(out, sn)
+		}
+	}
+	return out, nil
+}
+
+func parseRawLedgerFromReport(report []byte, since time.Time) ([]RawBalanceOp, error) {
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				CashTransactions struct {
+					CashTransaction []struct {
+						Type     string `xml:"type,attr"`
+						Amount   string `xml:"amount,attr"`
+						Currency string `xml:"currency,attr"`
+						Symbol   string `xml:"symbol,attr"`
+						DateTime string `xml:"dateTime,attr"`
+					} `xml:"CashTransaction"`
+				} `xml:"CashTransactions"`
+				Transfers struct {
+					Transfer []struct {
+						Type           string `xml:"type,attr"`
+						Direction      string `xml:"direction,attr"`
+						CashTransfer   string `xml:"cashTransfer,attr"`
+						PositionAmount string `xml:"positionAmount,attr"`
+						Quantity       string `xml:"quantity,attr"`
+						AssetCategory  string `xml:"assetCategory,attr"`
+						Symbol         string `xml:"symbol,attr"`
+						Currency       string `xml:"currency,attr"`
+						DateTime       string `xml:"dateTime,attr"`
+						Date           string `xml:"date,attr"`
+					} `xml:"Transfer"`
+				} `xml:"Transfers"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return nil, fmt.Errorf("parse flex raw ledger: %w", err)
+	}
+
+	stmt := flex.FlexStatements.FlexStatement
+	ops := make([]RawBalanceOp, 0, len(stmt.CashTransactions.CashTransaction)+len(stmt.Transfers.Transfer))
+
+	for _, tx := range stmt.CashTransactions.CashTransaction {
+		ts, ok := parseFlexTimestamp(tx.DateTime)
+		if !ok || ts.Before(since) {
+			continue
+		}
+		amount, _ := strconv.ParseFloat(tx.Amount, 64)
+		ops = append(ops, RawBalanceOp{
+			Label:     "cash:" + tx.Type,
+			Delta:     amount,
+			Currency:  tx.Currency,
+			Symbol:    tx.Symbol,
+			Timestamp: ts,
+		})
+	}
+
+	for _, tr := range stmt.Transfers.Transfer {
+		raw := tr.DateTime
+		if raw == "" {
+			raw = tr.Date
+		}
+		ts, ok := parseFlexTimestamp(raw)
+		if !ok || ts.Before(since) {
+			continue
+		}
+		cash, _ := strconv.ParseFloat(tr.CashTransfer, 64)
+		posAmount, _ := strconv.ParseFloat(tr.PositionAmount, 64)
+		label := "transfer:" + tr.Type
+		if tr.Direction != "" {
+			label += "/" + tr.Direction
+		}
+		if tr.AssetCategory != "" {
+			label += "/" + tr.AssetCategory
+		}
+		ops = append(ops, RawBalanceOp{
+			Label:         label,
+			Delta:         cash,
+			PositionValue: posAmount,
+			Currency:      tr.Currency,
+			Symbol:        tr.Symbol,
+			Timestamp:     ts,
+		})
+	}
+
+	sort.Slice(ops, func(a, b int) bool { return ops[a].Timestamp.Before(ops[b].Timestamp) })
+	return ops, nil
+}
+
+// flexCapitalTypes are the CashTransaction types that move money across the
+// account boundary. Both spellings of the umbrella type are real: current
+// Flex statements write "Deposits & Withdrawals" (ampersand), older ones
+// "Deposits/Withdrawals" (slash). This parser matched only the slash, so an
+// ordinary wire deposit under the modern spelling was dropped without a
+// trace — the equity stepped up with no recorded inflow, and the step read
+// as a trading gain (a fresh account showed a +9,758 "gain" that was its
+// own funding, 2026-08-25).
+var flexCapitalTypes = map[string]bool{
+	"Deposits":               true,
+	"Withdrawals":            true,
+	"Deposits/Withdrawals":   true,
+	"Deposits & Withdrawals": true,
+}
+
+// flexPerformanceTypes are CashTransaction types that are returns or costs of
+// holding the account — income and charges, not capital. They are excluded
+// from cashflows ON PURPOSE: booking a dividend as a deposit would erase the
+// very return it represents. Named so an absent type is a decision, not an
+// accident. Vocabulary per IBKR Flex statements (CashAction).
+var flexPerformanceTypes = map[string]bool{
+	"Dividends":                    true,
+	"Payment In Lieu Of Dividends": true,
+	"Withholding Tax":              true,
+	"Broker Interest Paid":         true,
+	"Broker Interest Received":     true,
+	"Bond Interest Paid":           true,
+	"Bond Interest Received":       true,
+	"Other Fees":                   true,
+	"Commission Adjustments":       true,
+	"Advisor Fees":                 true,
+}
+
+// flexCashLevels tells which CashTransaction rows restate others. A query with
+// both "Summary" and "Detail" ticked under Cash Transactions emits every
+// movement once per level, and a multi-currency account adds BASE_SUMMARY
+// roll-ups on top. Summing all of them booked each deposit at double its size,
+// so every funding day scored the excess as a loss. A level is set aside only
+// when the statement also carries the rows it restates: a query that asked for
+// one level alone, or never asked for any, keeps every row.
+type flexCashLevels struct {
+	hasDetail bool
+	hasPlain  bool
+}
+
+func (l *flexCashLevels) see(levelOfDetail, currency string) {
+	l.hasDetail = l.hasDetail || strings.EqualFold(levelOfDetail, "DETAIL")
+	l.hasPlain = l.hasPlain || currency != "BASE_SUMMARY"
+}
+
+func (l flexCashLevels) restates(levelOfDetail, currency string) bool {
+	if currency == "BASE_SUMMARY" {
+		return l.hasPlain
+	}
+	return l.hasDetail && levelOfDetail != "" && !strings.EqualFold(levelOfDetail, "DETAIL")
+}
+
+// parseFlexTimestamp accepts the two timestamp shapes Flex emits.
+func parseFlexTimestamp(v string) (time.Time, bool) {
+	if ts, err := time.Parse("20060102;150405", v); err == nil {
+		return ts, true
+	}
+	if ts, err := time.Parse("20060102", v); err == nil {
+		return ts, true
+	}
+	return time.Time{}, false
+}
+
+// capitalFlowDate is the day a deposit or withdrawal enters the statement:
+// its reportDate, the day the equity moves. dateTime is when the wire was
+// initiated, a day or more before; it stands in for a query without the column.
+func capitalFlowDate(dateTime, reportDate string) string {
+	if reportDate != "" {
+		return reportDate
+	}
+	return dateTime
+}
+
+// CapabilityWarnings implements CapabilityWarner with the statement-shape
+// gaps found by the last Flex parse.
+func (i *IBKR) CapabilityWarnings() []string {
+	if i.currencyWarning == "" && i.statementWarning == "" {
+		return i.capabilityWarnings
+	}
+	out := append([]string{}, i.capabilityWarnings...)
+	for _, w := range []string{i.currencyWarning, i.statementWarning} {
+		if w != "" {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+func (i *IBKR) parseCashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, error) {
+	flows, warnings, err := cashflowsFromReport(report, since)
+	if err != nil {
+		return nil, err
+	}
+	i.capabilityWarnings = warnings
+	return flows, nil
+}
+
+// cashflowsFromReport reads the statement's capital flows since since, and the
+// cash types it could not classify as capability warnings. It writes nothing
+// on the connector, so a backfill can share it with the daily syncs.
+func cashflowsFromReport(report []byte, since time.Time) ([]*Cashflow, []string, error) {
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				CashTransactions struct {
+					CashTransaction []struct {
+						Type          string `xml:"type,attr"`
+						Amount        string `xml:"amount,attr"`
+						Currency      string `xml:"currency,attr"`
+						FXRateToBase  string `xml:"fxRateToBase,attr"`
+						DateTime      string `xml:"dateTime,attr"`
+						ReportDate    string `xml:"reportDate,attr"`
+						LevelOfDetail string `xml:"levelOfDetail,attr"`
+					} `xml:"CashTransaction"`
+				} `xml:"CashTransactions"`
+				Transfers struct {
+					Transfer []struct {
+						Type         string `xml:"type,attr"`
+						Direction    string `xml:"direction,attr"`
+						CashTransfer string `xml:"cashTransfer,attr"`
+						Currency     string `xml:"currency,attr"`
+						FXRateToBase string `xml:"fxRateToBase,attr"`
+						DateTime     string `xml:"dateTime,attr"`
+						Date         string `xml:"date,attr"`
+					} `xml:"Transfer"`
+				} `xml:"Transfers"`
+				CashReport struct {
+					Rows []flexCashReportRow `xml:"CashReportCurrency"`
+				} `xml:"CashReport"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return nil, nil, fmt.Errorf("parse flex cashflows: %w", err)
+	}
+	reportTransfers := dailyCashReportTransfers(flex.FlexStatements.FlexStatement.CashReport.Rows)
+
+	// Statement-shape diagnostic: types and counts ONLY, never amounts. A
+	// type in neither list above is money whose meaning we cannot state —
+	// dropping it silently is what turned a funding wire into a phantom
+	// gain, so it must at least leave a mark someone can find.
+	unknownTypes := map[string]int{}
+
+	rows := flex.FlexStatements.FlexStatement.CashTransactions.CashTransaction
+	var levels flexCashLevels
+	for _, tx := range rows {
+		levels.see(tx.LevelOfDetail, tx.Currency)
+	}
+	base := statementCurrency(report)
+
+	var cashflows []*Cashflow
+	for _, tx := range rows {
+		if levels.restates(tx.LevelOfDetail, tx.Currency) {
+			continue
+		}
+		ts, ok := parseFlexTimestamp(capitalFlowDate(tx.DateTime, tx.ReportDate))
+		if !ok || ts.Before(since) {
+			continue
+		}
+		amount, _ := strconv.ParseFloat(tx.Amount, 64)
+		if amount == 0 {
+			continue
+		}
+		if !flexCapitalTypes[tx.Type] {
+			if !flexPerformanceTypes[tx.Type] {
+				unknownTypes[tx.Type]++
+			}
+			continue
+		}
+		if reportTransfers.datesDeposits {
+			continue
+		}
+		// The singular spellings are directional by name; the umbrella
+		// spellings sign by amount. Either way the sign convention out of
+		// here is positive=deposit, negative=withdrawal.
+		if tx.Type == "Deposits" && amount < 0 {
+			amount = -amount
+		}
+		if tx.Type == "Withdrawals" && amount > 0 {
+			amount = -amount
+		}
+		cashflows = append(cashflows, inBaseCurrency(amount, tx.Currency, tx.FXRateToBase, base, ts))
+	}
+
+	// Transfers are the other funding channel: cash moved between accounts
+	// (INTERNAL, ACATS, ATON…) never appears under CashTransactions, so a
+	// user who funds this account from another one crosses the perimeter
+	// invisibly without this section. Only the cash component counts — a
+	// pure position transfer (cashTransfer 0) changes holdings, not cash,
+	// and its market value shows up through equity like any position.
+	for _, tr := range flex.FlexStatements.FlexStatement.Transfers.Transfer {
+		raw := tr.DateTime
+		if raw == "" {
+			raw = tr.Date
+		}
+		ts, ok := parseFlexTimestamp(raw)
+		if !ok || ts.Before(since) {
+			continue
+		}
+		if reportTransfers.covers(ts.Format("20060102")) {
+			continue
+		}
+		cash, _ := strconv.ParseFloat(tr.CashTransfer, 64)
+		if cash == 0 {
+			continue
+		}
+		switch tr.Direction {
+		case "IN":
+			if cash < 0 {
+				cash = -cash
+			}
+		case "OUT":
+			if cash > 0 {
+				cash = -cash
+			}
+		default:
+			unknownTypes["Transfer:"+tr.Direction]++
+			continue
+		}
+		cashflows = append(cashflows, inBaseCurrency(cash, tr.Currency, tr.FXRateToBase, base, ts))
+	}
+
+	cashflows = append(cashflows, reportTransfers.flows(since)...)
+
+	var warnings []string
+	for typ, n := range unknownTypes {
+		warnings = append(warnings, fmt.Sprintf("ibkr_unclassified_cash_type:%s(x%d)", typ, n))
+	}
+	sort.Strings(warnings)
+
+	return cashflows, warnings, nil
+}
+
+// GetHistoricalSnapshots returns the daily equity snapshots from since to
+// LastStatementDay, at least the daily window and at most a year, in one
+// statement. A zero since asks for the whole year.
+func (i *IBKR) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*HistoricalSnapshot, error) {
+	if since.IsZero() {
+		since = LastStatementDay(time.Now()).AddDate(0, 0, -(IBKRStatementMaxDays - 1))
+	}
+	report, err := i.statementReport(ctx, since)
+	if err != nil {
+		return nil, err
+	}
+	return i.parseHistoricalSnapshotsFromReport(report, since)
+}
+
+// parseHistoricalSnapshotsFromReport extracts daily equity snapshots from a
+// raw Flex XML payload. Split out from GetHistoricalSnapshots so callers can
+// replay a captured XML offline (fixture-based tests, debug tools) without
+// triggering an IBKR Flex generation cooldown.
+// flexDayTrades accumulates one day's trade activity from the Flex report,
+// split by direction so historical snapshots feed the long/short widgets.
+type flexDayTrades struct {
+	count       int
+	volume      float64
+	fees        float64
+	longTrades  int
+	shortTrades int
+	longVolume  float64
+	shortVolume float64
+}
+
+func aggregateFlexTradesByDate(trades []*Trade) map[string]flexDayTrades {
+	byDate := make(map[string]flexDayTrades)
+	for _, t := range trades {
+		dateKey := t.Timestamp.Format("20060102")
+		entry := byDate[dateKey]
+		entry.count++
+		notional := t.Notional()
+		entry.volume += notional
+		entry.fees += t.Fee
+		if t.Side == "sell" {
+			entry.shortTrades++
+			entry.shortVolume += notional
+		} else {
+			entry.longTrades++
+			entry.longVolume += notional
+		}
+		byDate[dateKey] = entry
+	}
+	return byDate
+}
+
+func (i *IBKR) parseHistoricalSnapshotsFromReport(report []byte, since time.Time) ([]*HistoricalSnapshot, error) {
+	snapshots, warnings, err := i.historicalSnapshotsFromReport(report, since)
+	if err != nil {
+		return nil, err
+	}
+	i.capabilityWarnings = warnings
+	return snapshots, nil
+}
+
+// historicalSnapshotsFromReport is parseHistoricalSnapshotsFromReport without
+// recording the capability warnings on the connector.
+func (i *IBKR) historicalSnapshotsFromReport(report []byte, since time.Time) ([]*HistoricalSnapshot, []string, error) {
+	// Parse all daily equity summaries with per-asset breakdown
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				EquitySummaryInBase struct {
+					EquitySummaryByReportDateInBase []struct {
+						ReportDate    string `xml:"reportDate,attr"`
+						Currency      string `xml:"currency,attr"`
+						Total         string `xml:"total,attr"`
+						Cash          string `xml:"cash,attr"`
+						Stock         string `xml:"stock,attr"`
+						Options       string `xml:"options,attr"`
+						Commodities   string `xml:"commodities,attr"`
+						UnrealizedPnL string `xml:"unrealizedPnL,attr"`
+					} `xml:"EquitySummaryByReportDateInBase"`
+				} `xml:"EquitySummaryInBase"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return nil, nil, fmt.Errorf("parse flex historical: %w", err)
+	}
+
+	// The NAVs below are in the account's base currency, which the sync
+	// converts to USD day by day. Same resolution as the live balance, so a
+	// reconstructed day and a live day of one account never disagree on it.
+	summaries := flex.FlexStatements.FlexStatement.EquitySummaryInBase.EquitySummaryByReportDateInBase
+	baseCurrency := ""
+	if n := len(summaries); n > 0 {
+		baseCurrency, _ = accountCurrency(summaries[n-1].Currency, report)
+	}
+
+	baseRates := flexConversionRates(report, baseCurrency)
+
+	// Parse cashflows grouped by date for deposit/withdrawal assignment
+	cashflows, warnings, _ := cashflowsFromReport(report, since)
+	type dayFlows struct {
+		deposits, withdrawals float64
+		flows                 []*Cashflow
+	}
+	cashflowsByDate := make(map[string]dayFlows)
+	for _, cf := range cashflows {
+		dateKey := cf.Timestamp.Format("20060102")
+		entry := cashflowsByDate[dateKey]
+		if cf.Amount > 0 {
+			entry.deposits += cf.Amount
+		} else {
+			entry.withdrawals += -cf.Amount
+		}
+		// Kept one by one: a USD wire into a EUR account is summed with the
+		// EUR ones above, and only the conversion, rate by rate, can tell
+		// them apart again.
+		entry.flows = append(entry.flows, cf)
+		cashflowsByDate[dateKey] = entry
+	}
+
+	// Parse trades grouped by date so daily snapshots carry trade count,
+	// notional volume and commission fees. Reuses parseTradesFromReport so
+	// the per-trade parsing logic stays in one place. Without this the
+	// analytics dashboard's per-day volume / trades-per-day widgets show 0
+	// for IBKR users (only the per-day equity walks).
+	trades, _ := i.parseTradesFromReport(report, since, time.Now().Add(24*time.Hour))
+	tradesByDate := aggregateFlexTradesByDate(trades)
+
+	var snapshots []*HistoricalSnapshot
+	for _, s := range summaries {
+		date, err := time.Parse("20060102", s.ReportDate)
+		if err != nil {
+			continue
+		}
+		if date.Before(since) {
+			continue
+		}
+
+		total, _ := strconv.ParseFloat(s.Total, 64)
+		if total == 0 {
+			continue // Skip zero-equity days
+		}
+		unrealized, _ := strconv.ParseFloat(s.UnrealizedPnL, 64)
+		stockVal, _ := strconv.ParseFloat(s.Stock, 64)
+		optionsVal, _ := strconv.ParseFloat(s.Options, 64)
+		commoditiesVal, _ := strconv.ParseFloat(s.Commodities, 64)
+		cashVal, _ := strconv.ParseFloat(s.Cash, 64)
+
+		// Build per-asset breakdown (TS parity: getHistoricalSummaries)
+		breakdown := make(map[string]*MarketBalance)
+		if stockVal != 0 {
+			breakdown[MarketStocks] = &MarketBalance{
+				MarketType:      MarketStocks,
+				Equity:          stockVal,
+				AvailableMargin: cashVal,
+			}
+		}
+		if optionsVal != 0 {
+			breakdown[MarketOptions] = &MarketBalance{
+				MarketType: MarketOptions,
+				Equity:     optionsVal,
+			}
+		}
+		if commoditiesVal != 0 {
+			breakdown[MarketFutures] = &MarketBalance{
+				MarketType: MarketFutures,
+				Equity:     commoditiesVal,
+			}
+		}
+
+		cf := cashflowsByDate[s.ReportDate]
+		tr := tradesByDate[s.ReportDate]
+		snapshots = append(snapshots, &HistoricalSnapshot{
+			Date:            time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC),
+			TotalEquity:     total,
+			RealizedBalance: total - unrealized,
+			Deposits:        cf.deposits,
+			Withdrawals:     cf.withdrawals,
+			TotalTrades:     tr.count,
+			TotalVolume:     tr.volume,
+			TotalFees:       tr.fees,
+			LongTrades:      tr.longTrades,
+			ShortTrades:     tr.shortTrades,
+			LongVolume:      tr.longVolume,
+			ShortVolume:     tr.shortVolume,
+			Breakdown:       breakdown,
+			Currency:        baseCurrency,
+			Cashflows:       cf.flows,
+			BaseRates:       baseRates[s.ReportDate],
+		})
+	}
+
+	return snapshots, warnings, nil
+}
+
+func (i *IBKR) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
+	report, err := i.statementReport(ctx, start)
+	if err != nil {
+		return nil, err
+	}
+	return i.parseTradesFromReport(report, start, end)
+}
+
+// inBaseCurrency states a flow in the currency the statement's equity is in,
+// at the rate IBKR itself used (fxRateToBase), so a EUR deposit into an account
+// based in USD moves the deposits by what it moved the equity. Without that
+// rate the flow keeps its own currency and the sync values it.
+func inBaseCurrency(amount float64, currency, fxRateToBase, base string, ts time.Time) *Cashflow {
+	rate, _ := strconv.ParseFloat(fxRateToBase, 64)
+	if base != "" && currency != "" && currency != base && currency != "BASE_SUMMARY" && rate > 0 {
+		return &Cashflow{Amount: amount * rate, Currency: base, Timestamp: ts}
+	}
+	return &Cashflow{Amount: amount, Currency: currency, Timestamp: ts}
+}
+
+// statementCurrency is the denomination of a statement's equity, declared or
+// inferred, empty when neither says.
+func statementCurrency(report []byte) string {
+	var flex struct {
+		FlexStatements struct {
+			FlexStatement struct {
+				EquitySummaryInBase struct {
+					Rows []struct {
+						Currency string `xml:"currency,attr"`
+					} `xml:"EquitySummaryByReportDateInBase"`
+				} `xml:"EquitySummaryInBase"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return ""
+	}
+	declared := ""
+	if rows := flex.FlexStatements.FlexStatement.EquitySummaryInBase.Rows; len(rows) > 0 {
+		declared = rows[len(rows)-1].Currency
+	}
+	ccy, _ := accountCurrency(declared, report)
+	return ccy
+}
+
+// flexConversionRates reads the statement's Conversion Rates section, keyed by
+// report date then currency: units of base per one unit of the currency. A
+// query without the section gives an empty map, and the sync falls back on its
+// own rates.
+func flexConversionRates(report []byte, base string) map[string]map[string]float64 {
+	var flex struct {
+		FlexStatements struct {
+			FlexStatement struct {
+				ConversionRates struct {
+					Rates []struct {
+						ReportDate   string `xml:"reportDate,attr"`
+						FromCurrency string `xml:"fromCurrency,attr"`
+						ToCurrency   string `xml:"toCurrency,attr"`
+						Rate         string `xml:"rate,attr"`
+					} `xml:"ConversionRate"`
+				} `xml:"ConversionRates"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+	out := map[string]map[string]float64{}
+	if err := xml.Unmarshal(report, &flex); err != nil || base == "" {
+		return out
+	}
+	for _, r := range flex.FlexStatements.FlexStatement.ConversionRates.Rates {
+		rate, _ := strconv.ParseFloat(r.Rate, 64)
+		if rate <= 0 || r.ToCurrency != base || r.FromCurrency == "" {
+			continue
+		}
+		day := strings.ReplaceAll(r.ReportDate, "-", "")
+		if out[day] == nil {
+			out[day] = map[string]float64{}
+		}
+		out[day][r.FromCurrency] = rate
+	}
+	return out
+}
+
+// accountCurrency answers what the figures in a statement are denominated in,
+// and whether that had to be inferred.
+//
+// The Currency field of Equity Summary is the answer when a query selects it.
+// Ours did not ask for it until 2026-09-16, so an existing account's statement
+// is simply silent, and silence has been read as dollars: accounts that can
+// hold nothing but euros have been served in dollars.
+//
+// The statement still knows. Money crossing the account boundary is recorded
+// in the currency the account is funded in, so when every deposit, withdrawal
+// and transfer in the report agrees on one currency, that is the denomination.
+// Disagreement means a multi-currency account, which this cannot resolve and
+// does not try to.
+func accountCurrency(declared string, report []byte) (ccy string, inferred bool) {
+	if declared != "" {
+		return declared, false
+	}
+
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				CashTransactions struct {
+					CashTransaction []struct {
+						Type          string `xml:"type,attr"`
+						Currency      string `xml:"currency,attr"`
+						LevelOfDetail string `xml:"levelOfDetail,attr"`
+					} `xml:"CashTransaction"`
+				} `xml:"CashTransactions"`
+				Transfers struct {
+					Transfer []struct {
+						CashTransfer string `xml:"cashTransfer,attr"`
+						Currency     string `xml:"currency,attr"`
+					} `xml:"Transfer"`
+				} `xml:"Transfers"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return "", false
+	}
+
+	stmt := flex.FlexStatements.FlexStatement
+	var levels flexCashLevels
+	for _, tx := range stmt.CashTransactions.CashTransaction {
+		levels.see(tx.LevelOfDetail, tx.Currency)
+	}
+	seen := ""
+	for _, tx := range stmt.CashTransactions.CashTransaction {
+		// BASE_SUMMARY is a roll-up, never a currency the account was funded in.
+		if !flexCapitalTypes[tx.Type] || tx.Currency == "BASE_SUMMARY" || levels.restates(tx.LevelOfDetail, tx.Currency) {
+			continue
+		}
+		if tx.Currency == "" {
+			continue
+		}
+		if seen != "" && seen != tx.Currency {
+			return "", false
+		}
+		seen = tx.Currency
+	}
+	for _, tr := range stmt.Transfers.Transfer {
+		cash, _ := strconv.ParseFloat(tr.CashTransfer, 64)
+		if cash == 0 || tr.Currency == "" {
+			continue
+		}
+		if seen != "" && seen != tr.Currency {
+			return "", false
+		}
+		seen = tr.Currency
+	}
+	if seen == "" {
+		return "", false
+	}
+	return seen, true
+}
+
+// flexDefaultOptionMultiplier stands in when a statement carries no Multiplier
+// attribute, which is every query built from our setup guide before it started
+// asking for the field. Listed equity and index options are 100 across the
+// board; a contract adjusted by a corporate action is not, and a future is
+// anything from 20 to 1000, which is why only options get a default. Being
+// wrong on the occasional adjusted contract beats being wrong on all of them,
+// and a statement that does carry the attribute always wins over this.
+const flexDefaultOptionMultiplier = 100
+
+func (i *IBKR) parseTradesFromReport(report []byte, start, end time.Time) ([]*Trade, error) {
+	var flex struct {
+		XMLName        xml.Name `xml:"FlexQueryResponse"`
+		FlexStatements struct {
+			FlexStatement struct {
+				Trades struct {
+					Trade []struct {
+						TradeID         string `xml:"tradeID,attr"`
+						Symbol          string `xml:"symbol,attr"`
+						BuySell         string `xml:"buySell,attr"`
+						TradePrice      string `xml:"tradePrice,attr"`
+						Quantity        string `xml:"quantity,attr"`
+						IbCommission    string `xml:"ibCommission,attr"`
+						Currency        string `xml:"currency,attr"`
+						DateTime        string `xml:"dateTime,attr"`
+						AssetCategory   string `xml:"assetCategory,attr"`
+						Multiplier      string `xml:"multiplier,attr"`
+						FifoPnlRealized string `xml:"fifoPnlRealized,attr"`
+						LevelOfDetail   string `xml:"levelOfDetail,attr"`
+					} `xml:"Trade"`
+				} `xml:"Trades"`
+			} `xml:"FlexStatement"`
+		} `xml:"FlexStatements"`
+	}
+
+	if err := xml.Unmarshal(report, &flex); err != nil {
+		return nil, fmt.Errorf("parse flex trades: %w", err)
+	}
+
+	// A query with every level ticked restates executions as orders and
+	// closed lots; when executions are present, only they are trades.
+	rows := flex.FlexStatements.FlexStatement.Trades.Trade
+	hasExecution := false
+	for _, t := range rows {
+		hasExecution = hasExecution || strings.EqualFold(t.LevelOfDetail, "EXECUTION")
+	}
+
+	var trades []*Trade
+	for _, t := range rows {
+		if hasExecution && t.LevelOfDetail != "" && !strings.EqualFold(t.LevelOfDetail, "EXECUTION") {
+			continue
+		}
+		// Parse datetime (format: YYYYMMDD;HHMMSS)
+		ts, err := time.Parse("20060102;150405", t.DateTime)
+		if err != nil {
+			continue
+		}
+
+		// Filter by date range
+		if ts.Before(start) || ts.After(end) {
+			continue
+		}
+
+		price, _ := strconv.ParseFloat(t.TradePrice, 64)
+		qty, _ := strconv.ParseFloat(t.Quantity, 64)
+		if qty < 0 {
+			qty = -qty
+		}
+		fee, _ := strconv.ParseFloat(t.IbCommission, 64)
+		if fee < 0 {
+			fee = -fee
+		}
+		pnl, _ := strconv.ParseFloat(t.FifoPnlRealized, 64)
+		// Absent unless the Flex query selects the Multiplier field, and
+		// absent on every cash instrument. Left at zero it means one.
+		multiplier, _ := strconv.ParseFloat(t.Multiplier, 64)
+		if multiplier <= 0 && t.AssetCategory == "OPT" {
+			multiplier = flexDefaultOptionMultiplier
+		}
+
+		side := "buy"
+		if t.BuySell == "SELL" {
+			side = "sell"
+		}
+
+		marketType := MarketStocks
+		switch t.AssetCategory {
+		case "FUT":
+			marketType = MarketFutures
+		case "OPT":
+			marketType = MarketOptions
+		case "CFD":
+			marketType = MarketCFD
+		case "CASH":
+			marketType = MarketForex
+		}
+
+		trades = append(trades, &Trade{
+			ID:          t.TradeID,
+			Symbol:      t.Symbol,
+			Side:        side,
+			Price:       price,
+			Quantity:    qty,
+			Multiplier:  multiplier,
+			Fee:         fee,
+			FeeCurrency: t.Currency,
+			RealizedPnL: pnl,
+			Timestamp:   ts,
+			MarketType:  marketType,
+		})
+	}
+
+	return trades, nil
+}

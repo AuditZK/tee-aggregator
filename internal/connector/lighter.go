@@ -1,0 +1,544 @@
+package connector
+
+import (
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const lighterAPI = "https://mainnet.zklighter.elliot.ai"
+
+// Lighter is a read-only DEX connector for the Lighter Protocol.
+// Credentials: apiKey is either
+//   - a read-only auth token "ro:<account_index>:single:<ts>:<sig>" — enables
+//     both balance and trade history (via /api/v1/export), or
+//   - an L1 wallet address "0x..." — enables balance/positions only, since
+//     /api/v1/export requires a signed token. Trade fetches return empty
+//     when only the wallet address is provided.
+type Lighter struct {
+	authToken     string
+	walletAddress string
+	accountIndex  *int
+	client        *http.Client
+	baseURL       string
+}
+
+// NewLighter creates a new Lighter connector.
+// Accepts either a "ro:<index>:..." auth token or a "0x..." wallet address
+// as creds.APIKey.
+func NewLighter(creds *Credentials) *Lighter {
+	token := strings.TrimSpace(creds.APIKey)
+
+	l := &Lighter{
+		baseURL: lighterAPI,
+		client:  &http.Client{Timeout: 30 * time.Second},
+	}
+
+	switch {
+	case strings.HasPrefix(strings.ToLower(token), "0x"):
+		// Wallet address form: account_index will be resolved on first
+		// fetchAccount() via the public /api/v1/account?by=l1_address endpoint.
+		l.walletAddress = token
+	default:
+		// Token form "ro:<index>:single:...": extract index directly.
+		l.authToken = token
+		if parts := strings.SplitN(token, ":", 3); len(parts) >= 2 {
+			if idx, err := strconv.Atoi(parts[1]); err == nil {
+				l.accountIndex = &idx
+			}
+		}
+	}
+
+	return l
+}
+
+func (l *Lighter) Exchange() string { return "lighter" }
+
+// lighterHistoryNeedsToken is the capability gap of a wallet-address
+// connection: balance and positions read fine, the trade history does not.
+const lighterHistoryNeedsToken = "lighter_history_needs_ro_token"
+
+// CapabilityWarnings implements CapabilityWarner. A wallet address reads the
+// account's balance and positions but not its fills, so its history can never
+// be rebuilt; the rebuilder refuses the address outright. Said here, on every
+// sync, the gap reaches sync_statuses and the dashboard banner, where the one
+// person who can fix it, by pasting a ro: token, will see it. It used to be a
+// 400 in the enclave's log and a connection recorded as completed.
+func (l *Lighter) CapabilityWarnings() []string {
+	if l.walletAddress == "" {
+		return nil
+	}
+	return []string{lighterHistoryNeedsToken}
+}
+
+// DetectIsPaper mirrors TS behavior: Lighter connector targets mainnet.
+func (l *Lighter) DetectIsPaper(_ context.Context) (bool, error) {
+	return false, nil
+}
+
+func (l *Lighter) TestConnection(ctx context.Context) error {
+	_, err := l.GetBalance(ctx)
+	return err
+}
+
+func (l *Lighter) GetBalance(ctx context.Context) (*Balance, error) {
+	account, err := l.fetchAccount(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	equity := parseFloatOrZero(account.TotalAssetValue)
+	available := parseFloatOrZero(account.AvailableBalance)
+	collateral := parseFloatOrZero(account.Collateral)
+
+	return &Balance{
+		Equity:        equity,
+		Available:     available,
+		UnrealizedPnL: equity - collateral,
+		Currency:      "USD",
+	}, nil
+}
+
+func (l *Lighter) GetPositions(ctx context.Context) ([]*Position, error) {
+	account, err := l.fetchAccount(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var positions []*Position
+	for _, p := range account.Positions {
+		size := parseFloatOrZero(p.Size)
+		if size == 0 {
+			continue
+		}
+
+		side := "long"
+		if p.Sign < 0 {
+			side = "short"
+		}
+
+		entryPx := parseFloatOrZero(p.AvgEntryPrice)
+		pnl := parseFloatOrZero(p.UnrealizedPnl)
+
+		positions = append(positions, &Position{
+			Symbol:        p.Symbol,
+			Side:          side,
+			Size:          size,
+			EntryPrice:    entryPx,
+			UnrealizedPnL: pnl,
+			MarketType:    MarketSwap,
+		})
+	}
+
+	return positions, nil
+}
+
+func (l *Lighter) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
+	// /api/v1/export requires a signed "ro:..." auth token. With only a wallet
+	// address we can still produce balance snapshots; trade history is just
+	// unavailable, so return an empty slice rather than erroring the whole sync.
+	if l.authToken == "" {
+		return nil, nil
+	}
+
+	accountIndex, err := l.getAccountIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Use /api/v1/export with auth token (new API)
+	csvRows, err := l.fetchExportTrades(ctx, accountIndex, start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	var trades []*Trade
+	for _, row := range csvRows {
+		ts, _ := time.Parse("2006-01-02 15:04:05", row.Date)
+		if ts.IsZero() || ts.Before(start) || ts.After(end) {
+			continue
+		}
+
+		side := "buy"
+		sLower := strings.ToLower(row.Side)
+		if strings.Contains(sLower, "short") || strings.Contains(sLower, "sell") {
+			side = "sell"
+		}
+
+		trades = append(trades, &Trade{
+			Symbol:      row.Market,
+			Side:        side,
+			Price:       row.Price,
+			Quantity:    row.Size,
+			Fee:         row.Fee,
+			FeeCurrency: "USDC",
+			RealizedPnL: row.ClosedPnL,
+			Timestamp:   ts.UTC(),
+			MarketType:  MarketSwap,
+		})
+	}
+
+	return trades, nil
+}
+
+type lighterAccountResponse struct {
+	Accounts []lighterAccount `json:"accounts"`
+}
+
+type lighterAccount struct {
+	Index            int               `json:"index"`
+	L1Address        string            `json:"l1_address"`
+	AvailableBalance string            `json:"available_balance"`
+	Collateral       string            `json:"collateral"`
+	TotalAssetValue  string            `json:"total_asset_value"`
+	Positions        []lighterPosition `json:"positions"`
+}
+
+type lighterPosition struct {
+	MarketID      int    `json:"market_id"`
+	Symbol        string `json:"symbol"`
+	Sign          int    `json:"sign"` // 1=long, -1=short
+	Size          string `json:"size"`
+	AvgEntryPrice string `json:"avg_entry_price"`
+	UnrealizedPnl string `json:"unrealized_pnl"`
+}
+
+type lighterExportRow struct {
+	Market    string
+	Side      string
+	Date      string
+	Price     float64
+	Size      float64
+	ClosedPnL float64
+	Fee       float64
+}
+
+func (l *Lighter) getAccountIndex(ctx context.Context) (int, error) {
+	if l.accountIndex != nil {
+		return *l.accountIndex, nil
+	}
+	account, err := l.fetchAccount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	l.accountIndex = &account.Index
+	return account.Index, nil
+}
+
+func (l *Lighter) fetchAccount(ctx context.Context) (*lighterAccount, error) {
+	switch {
+	case l.accountIndex != nil && *l.accountIndex > 0:
+		data, err := l.request(ctx, "/api/v1/account", map[string]string{
+			"by":    "index",
+			"value": strconv.Itoa(*l.accountIndex),
+		}, "")
+		if err != nil {
+			return nil, fmt.Errorf("lighter: fetch account index %d: %w", *l.accountIndex, err)
+		}
+		return decodeFirstAccount(data, fmt.Sprintf("index %d", *l.accountIndex))
+
+	case l.walletAddress != "":
+		data, err := l.request(ctx, "/api/v1/account", map[string]string{
+			"by":    "l1_address",
+			"value": l.walletAddress,
+		}, "")
+		if err != nil {
+			// CONN-003: the wallet address IS the credential for this connector,
+			// so error strings redact it to a short prefix/suffix — enough to
+			// correlate two runs without exposing the full address to log
+			// aggregators.
+			return nil, fmt.Errorf("lighter: lookup by l1_address %s: %w", walletPrefix(l.walletAddress), err)
+		}
+		account, err := decodeFirstAccount(data, "l1_address "+walletPrefix(l.walletAddress))
+		if err != nil {
+			return nil, err
+		}
+		idx := account.Index
+		l.accountIndex = &idx
+		return account, nil
+
+	default:
+		return nil, fmt.Errorf("lighter: credentials must be a ro:<index>:... token or an 0x... wallet address")
+	}
+}
+
+// decodeFirstAccount unmarshals a Lighter account response and returns the
+// first account. who names the lookup (index / l1_address) for error context.
+func decodeFirstAccount(data json.RawMessage, who string) (*lighterAccount, error) {
+	var resp lighterAccountResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("lighter: decode account response: %w", err)
+	}
+	if len(resp.Accounts) == 0 {
+		return nil, fmt.Errorf("lighter: no account found for %s", who)
+	}
+	return &resp.Accounts[0], nil
+}
+
+// fetchExportTrades uses /api/v1/export to get trade history as CSV.
+func (l *Lighter) fetchExportTrades(ctx context.Context, accountIndex int, start, end time.Time) ([]lighterExportRow, error) {
+	startMs := start.UnixMilli()
+	endMs := end.UnixMilli()
+
+	query := map[string]string{
+		"type":            "trade",
+		"account_index":   strconv.Itoa(accountIndex),
+		"start_timestamp": strconv.FormatInt(startMs, 10),
+		"end_timestamp":   strconv.FormatInt(endMs, 10),
+	}
+
+	data, err := l.request(ctx, "/api/v1/export", query, l.authToken)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		Code    int    `json:"code"`
+		DataURL string `json:"data_url"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Code == 22504 {
+		// No export data found — not an error, just no trades
+		return nil, nil
+	}
+	if resp.DataURL == "" {
+		return nil, fmt.Errorf("lighter export: no data_url (code=%d, msg=%s)", resp.Code, resp.Message)
+	}
+
+	// Download CSV from S3
+	return l.downloadCSV(ctx, resp.DataURL)
+}
+
+// assertPublicHTTPSURL refuses a download target that points anywhere but the
+// public internet. data_url comes back inside the Lighter API response, so a
+// compromised or MITM'd upstream would otherwise steer this GET at the
+// deployment's own network — the cloud metadata server on 169.254.169.254,
+// mt-bridge, the database. The host is not pinned to a vendor domain because
+// the export CDN is theirs to change; what must never be reachable is
+// anything that is not publicly routable.
+func assertPublicHTTPSURL(ctx context.Context, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("parse export url: %w", err)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("export url must be https, got scheme %q", u.Scheme)
+	}
+	if u.User != nil {
+		return fmt.Errorf("export url must not carry credentials")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("export url has no host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return assertPublicIP(ip)
+	}
+	// A dotless name only resolves inside the deployment's own DNS.
+	if !strings.Contains(host, ".") {
+		return fmt.Errorf("export url host %q is not a public name", host)
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return fmt.Errorf("resolve export host: %w", err)
+	}
+	if len(addrs) == 0 {
+		return fmt.Errorf("resolve export host %q: no address", host)
+	}
+	for _, a := range addrs {
+		if err := assertPublicIP(a.IP); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func assertPublicIP(ip net.IP) error {
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return fmt.Errorf("export url resolves to non-public address %s", ip)
+	}
+	return nil
+}
+
+// assertExportURL accepts a data_url that stays on the API origin we already
+// talk to, and otherwise requires a public https target. The export CDN is
+// Lighter's to change, so its host is not pinned; what must never be
+// reachable is anything that is not publicly routable.
+func (l *Lighter) assertExportURL(ctx context.Context, raw string) error {
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		if base, berr := url.Parse(l.baseURL); berr == nil && strings.EqualFold(base.Host, u.Host) {
+			return nil
+		}
+	}
+	return assertPublicHTTPSURL(ctx, raw)
+}
+
+func (l *Lighter) downloadCSV(ctx context.Context, csvURL string) ([]lighterExportRow, error) {
+	if err := l.assertExportURL(ctx, csvURL); err != nil {
+		return nil, fmt.Errorf("lighter export: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", csvURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := l.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("lighter CSV download: HTTP %d", resp.StatusCode)
+	}
+
+	// CONN-AUDIT-001: data_url is returned by the upstream API — cap the S3
+	// CSV stream so a hostile/compromised export URL can't bloat the heap.
+	reader := csv.NewReader(io.LimitReader(resp.Body, DefaultMaxResponseBytes))
+	// Header: Market,Side,Date,Trade Value,Size,Price,Closed PnL,Fee,Role,Type
+	header, err := reader.Read()
+	if err != nil {
+		return nil, fmt.Errorf("lighter CSV: read header: %w", err)
+	}
+
+	// Build column index map
+	colIdx := make(map[string]int)
+	for i, h := range header {
+		colIdx[strings.TrimSpace(h)] = i
+	}
+
+	var rows []lighterExportRow
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			continue
+		}
+
+		row := lighterExportRow{
+			Market:    csvCol(record, colIdx, "Market"),
+			Side:      csvCol(record, colIdx, "Side"),
+			Date:      csvCol(record, colIdx, "Date"),
+			Price:     csvColFloat(record, colIdx, "Price"),
+			Size:      csvColFloat(record, colIdx, "Size"),
+			ClosedPnL: csvColFloat(record, colIdx, "Closed PnL"),
+			Fee:       csvColFloat(record, colIdx, "Fee"),
+		}
+		rows = append(rows, row)
+	}
+
+	return rows, nil
+}
+
+func csvCol(record []string, idx map[string]int, col string) string {
+	if i, ok := idx[col]; ok && i < len(record) {
+		return strings.TrimSpace(record[i])
+	}
+	return ""
+}
+
+func csvColFloat(record []string, idx map[string]int, col string) float64 {
+	s := csvCol(record, idx, col)
+	if s == "" || s == "-" {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(s, 64)
+	return math.Abs(v)
+}
+
+// request issues a bounded GET to the Lighter API. A non-empty token is sent
+// as the authorization header (required by /api/v1/export). Retryable upstream
+// failures — network errors, 429, 5xx — are wrapped in ErrTransient so the
+// connection service defers credential validation to the scheduler instead of
+// rejecting a connection on a transient blip (CONN-02).
+func (l *Lighter) request(ctx context.Context, path string, query map[string]string, token string) (json.RawMessage, error) {
+	endpoint, err := url.Parse(l.baseURL + path)
+	if err != nil {
+		return nil, err
+	}
+	if len(query) > 0 {
+		q := endpoint.Query()
+		for k, v := range query {
+			q.Set(k, v)
+		}
+		endpoint.RawQuery = q.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("authorization", token)
+	}
+
+	resp, err := l.client.Do(req)
+	if err != nil {
+		// A transport failure is not a credential failure — tag it transient.
+		return nil, fmt.Errorf("%w: lighter request: %w", ErrTransient, err)
+	}
+
+	// CONN-AUDIT-001 + 002: bounded read + truncated body in errors.
+	data, err := ReadCappedBody(resp.Body, DefaultMaxResponseBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		if isRetryableStatus(resp.StatusCode) {
+			return nil, fmt.Errorf("%w: lighter API error %d: %s", ErrTransient, resp.StatusCode, TruncatedBody(data))
+		}
+		return nil, fmt.Errorf("lighter API error %d: %s", resp.StatusCode, TruncatedBody(data))
+	}
+
+	return data, nil
+}
+
+func parseFloatOrZero(value string) float64 {
+	result, _ := strconv.ParseFloat(value, 64)
+	return result
+}
+
+// GetBalanceByMarket returns swap market balance (Lighter is perps-only).
+func (l *Lighter) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance, error) {
+	bal, err := l.GetBalance(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if bal.Equity <= 0 {
+		return nil, nil
+	}
+	return []*MarketBalance{{
+		MarketType:      MarketSwap,
+		Equity:          bal.Equity,
+		AvailableMargin: bal.Available,
+	}}, nil
+}
+
+// walletPrefix returns a redacted form of an Ethereum-style address for use in
+// error messages and logs (CONN-003). Short addresses are returned as-is
+// because there is nothing meaningful to elide; full 0x... addresses are
+// collapsed to "0xAB...cdef" so operators can still correlate runs without
+// leaking the full wallet.
+func walletPrefix(addr string) string {
+	s := addr
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:6] + "..." + s[len(s)-4:]
+}
