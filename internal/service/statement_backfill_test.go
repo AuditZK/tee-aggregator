@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/repository"
 )
 
 func TestStatementWindowFrom(t *testing.T) {
@@ -87,10 +88,12 @@ type slowStatements struct {
 	missing  dayWindow
 	slowOver int
 	asked    []dayWindow
+	waits    []time.Duration
 }
 
-func (p *slowStatements) GetHistoricalSnapshotsForPeriod(_ context.Context, from, to time.Time) ([]*connector.HistoricalSnapshot, error) {
+func (p *slowStatements) GetHistoricalSnapshotsForPeriod(ctx context.Context, from, to time.Time) ([]*connector.HistoricalSnapshot, error) {
 	p.asked = append(p.asked, dayWindow{from: from, to: to})
+	p.waits = append(p.waits, connector.FlexPollBudgetOf(ctx))
 	if daysInWindow(from, to) > p.slowOver {
 		return nil, fmt.Errorf("%w after 20 polls", connector.ErrStatementStillGenerating)
 	}
@@ -218,5 +221,58 @@ func TestStatementMonthHalvedFailsOnAHole(t *testing.T) {
 	_, err := readMonth(t, p, m)
 	if err == nil || !strings.Contains(err.Error(), "has no day") {
 		t.Fatalf("hole in a halved month: %v, want a failure naming the empty period", err)
+	}
+}
+
+// A sync gives up on a statement after the default poll because a day depends
+// on it. A backfill asks for each of its statements with the longer wait.
+func TestStatementBackfillWaitsLongerThanASyncForAStatement(t *testing.T) {
+	if statementBackfillWait <= connector.FlexPollBudget() {
+		t.Fatalf("backfill wait %v does not outlast the default poll %v", statementBackfillWait, connector.FlexPollBudget())
+	}
+	m := dayWindow{from: isoDay("2026-03-01"), to: isoDay("2026-03-31")}
+	p := &slowStatements{first: isoDay("2026-01-01"), slowOver: 16}
+
+	if _, err := readMonth(t, p, m); err != nil {
+		t.Fatalf("month: %v", err)
+	}
+	for n, wait := range p.waits {
+		if wait != statementBackfillWait {
+			t.Fatalf("statement %d asked with a wait of %v, want %v", n, wait, statementBackfillWait)
+		}
+	}
+}
+
+type deadlineStatements struct {
+	deadline time.Time
+	hasOne   bool
+	ctxErr   error
+}
+
+func (p *deadlineStatements) GetHistoricalSnapshotsForPeriod(ctx context.Context, _, _ time.Time) ([]*connector.HistoricalSnapshot, error) {
+	p.deadline, p.hasOne = ctx.Deadline()
+	p.ctxErr = ctx.Err()
+	return nil, errors.New("synthetic: stop here")
+}
+
+// The admin route and the connect hook hand a full reconstruction a deadline
+// sized for a rebuilder call, or none: either way it runs on the backfill's.
+func TestReconstructFromStatementsRunsOnTheBackfillDeadline(t *testing.T) {
+	s := &SyncService{logger: zap.NewNop()}
+	connMeta := &repository.ExchangeConnection{UserUID: "user-uid-1", Exchange: "ibkr", Label: "main"}
+	p := &deadlineStatements{}
+
+	caller, cancel := context.WithTimeout(context.Background(), time.Minute)
+	cancel()
+	s.reconstructFromStatements(caller, connMeta, p, reconstructOpts{})
+
+	if !p.hasOne {
+		t.Fatal("full reconstruction ran without a deadline")
+	}
+	if left := time.Until(p.deadline); left < statementBackfillTimeout-time.Minute || left > statementBackfillTimeout {
+		t.Fatalf("deadline in %v, want the backfill's %v", left, statementBackfillTimeout)
+	}
+	if p.ctxErr != nil {
+		t.Fatalf("the caller's cancelled deadline reached the backfill: %v", p.ctxErr)
 	}
 }
