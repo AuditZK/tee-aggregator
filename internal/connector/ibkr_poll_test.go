@@ -47,3 +47,35 @@ func TestFlexPollBudget_OutlastsTheOvernightBatch(t *testing.T) {
 		t.Fatalf("poll budget %v: four minutes was too short at the 6h retry", got)
 	}
 }
+
+// A backfill waits longer than a sync for a statement: the poll goes on at
+// its last interval until the budget the caller gave.
+func TestPollFlexReport_WaitsOutTheCallersBudget(t *testing.T) {
+	saved := flexPollDelays
+	flexPollDelays = []time.Duration{time.Millisecond, time.Millisecond, 2 * time.Millisecond}
+	t.Cleanup(func() { flexPollDelays = saved })
+
+	stub := &flexInProgressTransport{}
+	i := &IBKR{token: "SYNTHETICPOLLTOKEN0002", queryID: "123456", client: &http.Client{Transport: stub}}
+
+	ctx := WithFlexPollBudget(context.Background(), 10*time.Millisecond)
+	_, err := i.pollFlexReport(ctx, flexURL(ibkrFlexWSGetURL, i.token, "REF43"))
+	if !errors.Is(err, ErrStatementStillGenerating) {
+		t.Fatalf("a statement never ready must still fail the poll: %v", err)
+	}
+	if got := stub.polls.Load(); got != 6 {
+		t.Fatalf("polled %d times, want the 3 usual and 3 more to reach the budget", got)
+	}
+}
+
+func TestFlexPollBudgetOf_NeverShortensThePoll(t *testing.T) {
+	if got := FlexPollBudgetOf(context.Background()); got != FlexPollBudget() {
+		t.Fatalf("no budget asked: %v, want the default %v", got, FlexPollBudget())
+	}
+	if got := FlexPollBudgetOf(WithFlexPollBudget(context.Background(), time.Second)); got != FlexPollBudget() {
+		t.Fatalf("a shorter budget: %v, want the default %v", got, FlexPollBudget())
+	}
+	if got := FlexPollBudgetOf(WithFlexPollBudget(context.Background(), time.Hour)); got != time.Hour {
+		t.Fatalf("a longer budget: %v, want it kept", got)
+	}
+}

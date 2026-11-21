@@ -31,6 +31,12 @@ const statementBackfillMaxReads = 80
 // the week IBKR itself cuts a statement to under load.
 const statementBackfillMinDays = 8
 
+// statementBackfillWait is how long a backfill waits for one statement. The
+// syncs give up after connector.FlexPollBudget because a day depends on them;
+// nothing waits on a backfill, and giving up that early failed it for good on
+// a week IBKR needed longer to generate.
+const statementBackfillWait = 30 * time.Minute
+
 // statementBackfillTimeout bounds one backfill's year: up to
 // statementBackfillMaxReads statements and the spacing between them.
 const statementBackfillTimeout = 2 * time.Hour
@@ -370,7 +376,7 @@ func nextBackfillCursor(days []*connector.HistoricalSnapshot, end time.Time) tim
 // daily reads go on meanwhile.
 func (s *SyncService) readStatementPeriod(ctx context.Context, provider connector.PeriodHistoryProvider, p dayWindow) ([]*connector.HistoricalSnapshot, error) {
 	for attempt := 0; ; attempt++ {
-		days, err := provider.GetHistoricalSnapshotsForPeriod(ctx, p.from, p.to)
+		days, err := provider.GetHistoricalSnapshotsForPeriod(connector.WithFlexPollBudget(ctx, statementBackfillWait), p.from, p.to)
 		retryAt, busy := connector.FlexRetryAt(err)
 		if !busy || attempt >= 5 {
 			return days, err
@@ -403,6 +409,12 @@ func (s *SyncService) reconstructFromStatements(ctx context.Context, connMeta *r
 	from, to := statementBackfillRange(time.Now())
 	if opts.window.isSet() {
 		from, to = opts.window.from, opts.window.to
+	} else {
+		// The caller's deadline is sized for a rebuilder call: a year read at
+		// statementBackfillWait a statement gets the backfill's own.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), statementBackfillTimeout)
+		defer cancel()
 	}
 	if err := s.backfillStatements(ctx, connMeta, provider, from, to, opts); err != nil {
 		s.logger.Error("statement reconstruction failed",

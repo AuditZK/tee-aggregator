@@ -653,8 +653,41 @@ func FlexPollBudget() time.Duration {
 	return total
 }
 
-func (i *IBKR) pollFlexReport(ctx context.Context, u string) ([]byte, error) {
+type flexPollBudgetKey struct{}
+
+// WithFlexPollBudget lets a read that nothing waits on outlast FlexPollBudget:
+// a week of one account was still generating after it on every attempt, three
+// attempts running, while the weeks around it came out in seconds.
+func WithFlexPollBudget(ctx context.Context, budget time.Duration) context.Context {
+	return context.WithValue(ctx, flexPollBudgetKey{}, budget)
+}
+
+// FlexPollBudgetOf is how long a statement asked under ctx may take to come out.
+func FlexPollBudgetOf(ctx context.Context) time.Duration {
+	if budget, ok := ctx.Value(flexPollBudgetKey{}).(time.Duration); ok && budget > FlexPollBudget() {
+		return budget
+	}
+	return FlexPollBudget()
+}
+
+// flexPollDelaysFor extends flexPollDelays at its last interval up to the
+// budget ctx carries.
+func flexPollDelaysFor(ctx context.Context) []time.Duration {
 	delays := flexPollDelays
+	total, budget := FlexPollBudget(), FlexPollBudgetOf(ctx)
+	if budget <= total || len(delays) == 0 {
+		return delays
+	}
+	step := delays[len(delays)-1]
+	out := append([]time.Duration(nil), delays...)
+	for ; total < budget; total += step {
+		out = append(out, step)
+	}
+	return out
+}
+
+func (i *IBKR) pollFlexReport(ctx context.Context, u string) ([]byte, error) {
+	delays := flexPollDelaysFor(ctx)
 	for _, sleep := range delays {
 		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 		if err != nil {
