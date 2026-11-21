@@ -58,7 +58,11 @@ var fxConvertible = map[string]bool{
 // that inventory would put a ~10% step between each such account's stored
 // EUR days and its first USD day, read by analytics as a return. They join
 // this list once their accounts are known and backfilled.
-var fxConvertedExchanges = map[string]bool{"ibkr": true, "ctrader": true}
+var fxConvertedExchanges = map[string]bool{
+	"ibkr": true, "ctrader": true,
+	// No Saxo day was ever stored unconverted, so there is no history to inventory.
+	"saxo": true, "saxo_sim": true,
+}
 
 func convertsExchange(exchange string) bool {
 	return fxConvertedExchanges[strings.ToLower(strings.TrimSpace(exchange))]

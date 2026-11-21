@@ -20,6 +20,7 @@ func TestAllConnectorsImplementInterface(t *testing.T) {
 	var _ Connector = (*Lighter)(nil)
 	var _ Connector = (*CTrader)(nil)
 	var _ Connector = (*IG)(nil)
+	var _ Connector = (*Saxo)(nil)
 	var _ Connector = (*MetaTrader)(nil)
 	var _ Connector = (*MockConnector)(nil)
 	var _ Connector = (*Bitget)(nil)
@@ -54,6 +55,9 @@ func TestOptionalInterfaces(t *testing.T) {
 		// IG funds overnight on CFD positions and books it as its own ledger
 		// row, so the funding fetcher is not swap-only.
 		{"IG", NewIG(&Credentials{APIKey: "k", APISecret: "s", Passphrase: "u"}, false), true, false, true, true},
+		// Saxo books capital from the transactions ledger and its interest,
+		// financing and fees as funding; SIM is the paper gateway.
+		{"Saxo", NewSaxo(&Credentials{APIKey: "a", APISecret: "r"}, true), true, false, true, true},
 		{"Mock", NewMock(), false, false, false, false},
 	}
 

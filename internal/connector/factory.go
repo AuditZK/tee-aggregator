@@ -75,6 +75,10 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 		return NewAlpaca(creds), nil
 	case "tradestation":
 		return NewTradeStation(creds), nil
+	case "saxo":
+		return NewSaxo(creds, false), nil
+	case "saxo_sim":
+		return NewSaxo(creds, true), nil
 
 	// DEX (read-only, wallet address)
 	case "hyperliquid":
@@ -133,6 +137,8 @@ func (f *Factory) SupportedExchanges() []string {
 		"ibkr",
 		"alpaca",
 		"tradestation",
+		"saxo",
+		"saxo_sim",
 		"hyperliquid",
 		"lighter",
 		"ctrader",
