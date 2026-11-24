@@ -373,7 +373,7 @@ type Credentials struct {
 	APISecret  string
 	Passphrase string // Optional, for exchanges like OKX
 
-	// DEX connectors (Hyperliquid, Lighter) - read-only, wallet address only
+	// DEX connectors (Hyperliquid, Lighter, Polymarket) - read-only, wallet address only
 	WalletAddress string
 
 	// OAuth connectors (cTrader)

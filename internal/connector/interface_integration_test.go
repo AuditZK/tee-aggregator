@@ -18,6 +18,7 @@ func TestAllConnectorsImplementInterface(t *testing.T) {
 	var _ Connector = (*TradeStation)(nil)
 	var _ Connector = (*Hyperliquid)(nil)
 	var _ Connector = (*Lighter)(nil)
+	var _ Connector = (*Polymarket)(nil)
 	var _ Connector = (*CTrader)(nil)
 	var _ Connector = (*IG)(nil)
 	var _ Connector = (*MetaTrader)(nil)
@@ -45,6 +46,7 @@ func TestOptionalInterfaces(t *testing.T) {
 		{"Alpaca", NewAlpaca(&Credentials{APIKey: "k", APISecret: "s"}), true, false, false, true},
 		{"Hyperliquid", NewHyperliquid(&Credentials{WalletAddress: "0x1"}), true, true, true, true},
 		{"Lighter", NewLighter(&Credentials{WalletAddress: "0x1"}), true, true, false, true},
+		{"Polymarket", NewPolymarket(&Credentials{WalletAddress: "0x1"}), true, false, false, true},
 		{"MEXC", NewMEXC(&Credentials{APIKey: "k", APISecret: "s"}), true, true, true, false},
 		// Bybit reads its capital flows from the unified transaction log, like
 		// the other crypto venues; without the fetcher every snapshot carried
