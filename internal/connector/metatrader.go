@@ -122,7 +122,8 @@ func (m *MetaTrader) TestConnection(ctx context.Context) error {
 // DetectIsPaper reports a demo account. The name the holder typed is checked
 // first; when it does not say demo, the broker's own account-info is read and
 // its reported server name and account type are checked too. A failed read
-// falls back to the typed-name answer, which is what this returned before.
+// is an error: the caller then keeps whatever verdict is stored instead of
+// writing "live" over a demo flag the bridge set on an earlier read.
 func (m *MetaTrader) DetectIsPaper(ctx context.Context) (bool, error) {
 	if mtServerNameLooksPaper(m.server) {
 		return true, nil
@@ -132,7 +133,7 @@ func (m *MetaTrader) DetectIsPaper(ctx context.Context) (bool, error) {
 	m.mu.Unlock()
 	if !read {
 		if _, err := m.fetchAccountInfo(ctx); err != nil {
-			return false, nil
+			return false, fmt.Errorf("mt5 account-info for paper check: %w", err)
 		}
 	}
 	m.mu.Lock()

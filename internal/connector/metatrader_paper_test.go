@@ -87,8 +87,8 @@ func TestMetaTraderDetectIsPaper(t *testing.T) {
 	}
 }
 
-// A bridge that cannot be reached leaves the answer to the typed name, as
-// before: no error, and a clean name reads as live.
+// A typed demo name decides without the bridge. A clean name with a bridge
+// that cannot be reached is an error, so the caller keeps the stored verdict.
 func TestMetaTraderDetectIsPaperFallsBackToTypedName(t *testing.T) {
 	bridge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
@@ -96,13 +96,14 @@ func TestMetaTraderDetectIsPaperFallsBackToTypedName(t *testing.T) {
 	defer bridge.Close()
 
 	for _, tc := range []struct {
-		server string
-		want   bool
-	}{{"Broker-Demo", true}, {"Broker-Live", false}} {
+		server  string
+		want    bool
+		wantErr bool
+	}{{"Broker-Demo", true, false}, {"Broker-Live", false, true}} {
 		mt := newTestMetaTrader(t, bridge.URL, tc.server)
 		got, err := mt.DetectIsPaper(context.Background())
-		if err != nil {
-			t.Fatalf("%s: DetectIsPaper: %v", tc.server, err)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("%s: DetectIsPaper error = %v, wantErr %v", tc.server, err, tc.wantErr)
 		}
 		if got != tc.want {
 			t.Fatalf("%s: DetectIsPaper = %v, want %v", tc.server, got, tc.want)
