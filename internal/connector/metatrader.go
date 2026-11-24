@@ -40,6 +40,29 @@ type MetaTrader struct {
 
 	mu        sync.Mutex
 	sessionID string
+
+	// What the bridge read from the broker's account-info frame, kept after the
+	// first account-info call so DetectIsPaper does not have to ask again.
+	// Empty when the bridge predates these fields.
+	accountInfoRead bool
+	reportedServer  string
+	accountType     string
+	company         string
+}
+
+// mtAccountInfo is the bridge's /account-info payload.
+type mtAccountInfo struct {
+	Balance       float64 `json:"balance"`
+	Equity        float64 `json:"equity"`
+	UnrealizedPnL float64 `json:"unrealized_pnl"`
+	Currency      string  `json:"currency"`
+	MarginFree    float64 `json:"margin_free"`
+	// Server is the server name the broker reports, not the one typed.
+	Server string `json:"server"`
+	// AccountType is "real" | "demo" | "contest" | "preliminary" | "unknown",
+	// read by the bridge from byte 0 of the MT5 account-info frame.
+	AccountType string `json:"account_type"`
+	Company     string `json:"company"`
 }
 
 // mtBridgeMinSecretLen is the floor CFG-005 enforces at boot; repeated here
@@ -96,26 +119,78 @@ func (m *MetaTrader) TestConnection(ctx context.Context) error {
 	return err
 }
 
-// DetectIsPaper checks if the MT server name contains "Demo" or "Trial" (case-insensitive).
-func (m *MetaTrader) DetectIsPaper(_ context.Context) (bool, error) {
-	lower := strings.ToLower(m.server)
-	return strings.Contains(lower, "demo") || strings.Contains(lower, "trial"), nil
+// DetectIsPaper reports a demo account. The name the holder typed is checked
+// first; when it does not say demo, the broker's own account-info is read and
+// its reported server name and account type are checked too. A failed read
+// is an error: the caller then keeps whatever verdict is stored instead of
+// writing "live" over a demo flag the bridge set on an earlier read.
+func (m *MetaTrader) DetectIsPaper(ctx context.Context) (bool, error) {
+	if mtServerNameLooksPaper(m.server) {
+		return true, nil
+	}
+	m.mu.Lock()
+	read := m.accountInfoRead
+	m.mu.Unlock()
+	if !read {
+		if _, err := m.fetchAccountInfo(ctx); err != nil {
+			return false, fmt.Errorf("mt5 account-info for paper check: %w", err)
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return mtIsPaper(m.server, m.reportedServer, m.accountType), nil
 }
 
-func (m *MetaTrader) GetBalance(ctx context.Context) (*Balance, error) {
+// mtServerNameLooksPaper is the original name check: "demo" or "trial" in the
+// server name, case-insensitive.
+func mtServerNameLooksPaper(server string) bool {
+	lower := strings.ToLower(server)
+	return strings.Contains(lower, "demo") || strings.Contains(lower, "trial")
+}
+
+// mtIsPaper combines every demo signal, and only ever adds to the name check.
+//
+// The typed server name alone could be bypassed: the bridge also accepts a raw
+// host or IP, which carries no "demo". The broker-reported server name closes
+// that. The account type comes from byte 0 of the MT5 account-info frame, with
+// the byte-to-name mapping taken from pymt5's reverse engineering of the Web
+// Terminal (0 real, 1 demo, 2 contest, 3 preliminary), not from MetaQuotes
+// documentation. Since 0 means real, a zeroed or misread frame also reads as
+// real, so "real" (or "unknown", or empty from an older bridge) never clears a
+// demo name: it can only add a demo verdict, never remove one.
+func mtIsPaper(typedServer, reportedServer, accountType string) bool {
+	if mtServerNameLooksPaper(typedServer) || mtServerNameLooksPaper(reportedServer) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(accountType)) {
+	case "demo", "contest", "preliminary":
+		return true
+	}
+	return false
+}
+
+// fetchAccountInfo reads /account-info and keeps the broker-reported fields.
+func (m *MetaTrader) fetchAccountInfo(ctx context.Context) (*mtAccountInfo, error) {
 	sessionID, err := m.ensureSession(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	var info struct {
-		Balance       float64 `json:"balance"`
-		Equity        float64 `json:"equity"`
-		UnrealizedPnL float64 `json:"unrealized_pnl"`
-		Currency      string  `json:"currency"`
-		MarginFree    float64 `json:"margin_free"`
-	}
+	var info mtAccountInfo
 	if err := m.callBridge(ctx, http.MethodGet, metatraderPathSessions+sessionID+"/account-info", nil, &info); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	m.accountInfoRead = true
+	m.reportedServer = strings.TrimSpace(info.Server)
+	m.accountType = strings.TrimSpace(info.AccountType)
+	m.company = strings.TrimSpace(info.Company)
+	m.mu.Unlock()
+	return &info, nil
+}
+
+func (m *MetaTrader) GetBalance(ctx context.Context) (*Balance, error) {
+	info, err := m.fetchAccountInfo(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -350,7 +425,7 @@ func (m *MetaTrader) callBridge(ctx context.Context, method, path string, body a
 // The bridge normalizes all balance deals (empty symbol, "Deposit", "Withdrawal",
 // "Bonus", "Credit") to "BALANCE" with a correct side based on profit sign, so
 // we only need to recognize the canonical form here.
-func isBalanceSymbol(symbol string, _ bool) bool {
+func isBalanceSymbol(symbol string) bool {
 	return symbol == "BALANCE"
 }
 
@@ -393,8 +468,7 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 
 	var cashflows []*Cashflow
 	for _, deal := range deals {
-		isDemo := strings.Contains(strings.ToLower(m.server), "demo")
-		if !isBalanceSymbol(deal.Symbol, isDemo) {
+		if !isBalanceSymbol(deal.Symbol) {
 			continue
 		}
 		ts, _ := time.Parse(time.RFC3339, deal.CloseTime)
