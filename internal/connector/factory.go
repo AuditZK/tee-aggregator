@@ -81,6 +81,8 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 		return NewHyperliquid(creds), nil
 	case "lighter":
 		return NewLighter(creds), nil
+	case "polymarket":
+		return NewPolymarket(creds), nil
 
 	// CFD/Forex brokers
 	case "ctrader":
@@ -135,6 +137,7 @@ func (f *Factory) SupportedExchanges() []string {
 		"tradestation",
 		"hyperliquid",
 		"lighter",
+		"polymarket",
 		"ctrader",
 		"ig",
 		"ig_demo",

@@ -17,6 +17,7 @@ func TestReconstructsEverySync(t *testing.T) {
 		"hyperliquid": false,
 		"mexc":        false,
 		"lighter":     false,
+		"polymarket":  false,
 		"alpaca":      false,
 		"bitget":      false,
 		"":            false,

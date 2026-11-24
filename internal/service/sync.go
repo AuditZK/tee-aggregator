@@ -143,6 +143,7 @@ var instantLedgerExchanges = map[string]bool{
 	"hyperliquid": true,
 	"ig":          true,
 	"okx":         true,
+	"polymarket":  true,
 }
 
 // lastLiveRead is when the sync that wrote the connection's latest snapshot
@@ -1998,7 +1999,7 @@ var ErrHistoryNotDeletable = errors.New("history reconstruction is not deletable
 // narrow contract and must not become a general gate.
 func historyReconstructedInEnclave(exchange string) bool {
 	switch strings.ToLower(exchange) {
-	case "ibkr", "ctrader":
+	case "ibkr", "ctrader", "polymarket":
 		return true
 	default:
 		return false
