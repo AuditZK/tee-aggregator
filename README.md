@@ -113,7 +113,8 @@ This is a full rewrite of the [TypeScript enclave](https://github.com/AuditZK/ze
 ║  │  - Native HTTP connectors (no CCXT)                  │ ║
 ║  │  - Binance, Bybit, OKX, Kraken, Deribit, MEXC       │ ║
 ║  │  - Bitget, KuCoin, Coinbase, Gate, BingX, Huobi      │ ║
-║  │  - IBKR (Flex Report), Alpaca, TradeStation          │ ║
+║  │  - IBKR (Flex Report), Alpaca, TradeStation,         │ ║
+║  │    tastytrade                                        │ ║
 ║  │  - Hyperliquid, Lighter, Polymarket (DEX)            │ ║
 ║  │  - cTrader, MetaTrader 4/5                           │ ║
 ║  └───────────────────────────────────────────────────────┘ ║

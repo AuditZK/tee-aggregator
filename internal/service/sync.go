@@ -3411,7 +3411,7 @@ func (a *aggregatedBreakdown) hasAnyEquity() bool {
 // assigned to this bucket so breakdown_by_market.global is never nil.
 func primaryMarketType(exchange string) string {
 	switch strings.ToLower(exchange) {
-	case "alpaca", "ibkr":
+	case "alpaca", "ibkr", "tastytrade":
 		return connector.MarketStocks
 	case "ctrader", "mt4", "mt5", "ig", "ig_demo":
 		return connector.MarketCFD
