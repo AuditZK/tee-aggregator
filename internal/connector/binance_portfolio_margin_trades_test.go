@@ -49,6 +49,11 @@ type binancePMActivityServer struct {
 	// fapiDenied refuses fapi on a classic account too: a key without the
 	// futures scope, which papi refuses as well.
 	fapiDenied bool
+	// wallets is the /sapi/v1/asset/wallet/balance answer; walletStatus,
+	// when set, replaces it with that status, and walletDelay holds it back.
+	wallets      string
+	walletStatus int
+	walletDelay  time.Duration
 
 	mu    sync.Mutex
 	calls []*url.URL
@@ -215,6 +220,20 @@ func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
 			default:
 				_, _ = w.Write([]byte(`{}`))
 			}
+		case p == "/sapi/v1/asset/wallet/balance":
+			if s.walletDelay > 0 {
+				select {
+				case <-time.After(s.walletDelay):
+				case <-r.Context().Done():
+					return
+				}
+			}
+			if s.walletStatus != 0 {
+				w.WriteHeader(s.walletStatus)
+				_, _ = w.Write([]byte(`{"code":-1003,"msg":"refused"}`))
+				return
+			}
+			_, _ = w.Write([]byte(s.wallets))
 		case strings.HasPrefix(p, "/sapi/v1/margin/"):
 			_, _ = w.Write([]byte(`{"totalNetAssetOfBtc":"0"}`))
 		case strings.HasPrefix(p, "/sapi/v1/simple-earn/"):
