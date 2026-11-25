@@ -401,7 +401,7 @@ type SyncService struct {
 	// keyed user|exchange|label, so a sync and an admin call never read the
 	// same year twice at once. Guarded by backfillMu.
 	backfillMu sync.Mutex
-	backfills  map[string]bool
+	backfills  map[string]*backfillClaim
 
 	// connectorGroup collapses concurrent builds of the SAME connector
 	// (E-M1, CONN-11 residue 2). getOrCreateConnector was check-then-create:
@@ -618,7 +618,6 @@ func (s *SyncService) SyncUser(ctx context.Context, userUID string) ([]*SyncResu
 		wg      sync.WaitGroup
 	)
 
-	ctx = withRetryGroup(ctx, userUID)
 	for _, conn := range connections {
 		wg.Add(1)
 		go func(c *repository.ExchangeConnection) {
@@ -702,7 +701,6 @@ func (s *SyncService) SyncExchange(ctx context.Context, userUID, exchange string
 		}
 	}
 
-	ctx = withRetryGroup(ctx, userUID)
 	results := make([]*SyncResult, 0, len(connections))
 	for _, conn := range connections {
 		results = append(results, s.syncConnection(ctx, conn))
@@ -844,7 +842,6 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 	if len(connections) == 0 {
 		return nil, fmt.Errorf(errFmtNoActiveConnections, userUID)
 	}
-	ctx = withRetryGroup(ctx, userUID)
 
 	// Phase 1: build snapshots with bounded concurrency.
 	var (
@@ -998,7 +995,7 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		if r.rateLimited() {
 			if conn := findConnection(connections, r.Exchange, r.Label); conn != nil {
 				s.recordRateLimitHit(ctx, conn)
-				s.scheduleDeferredRetry(ctx, conn, rateLimitRetryDelay)
+				s.scheduleDeferredRetry(conn, rateLimitRetryDelay)
 			}
 		}
 	}
@@ -1134,10 +1131,9 @@ func (s *SyncService) warnOnAberrantDailyMove(ctx context.Context, snap *reposit
 // the connection stays "due"). Dedup'd per connection ID so repeated 1018s don't
 // stack timers.
 //
-// The retry lands hours after analytics' nightly copy, so what it writes is
-// pinged to analytics: once per user, after the last retry the same pass armed
-// for that user (retryGroup, carried by ctx).
-func (s *SyncService) scheduleDeferredRetry(ctx context.Context, conn *repository.ExchangeConnection, delay time.Duration) {
+// The retry lands hours after analytics' nightly copy, so each retry that
+// writes pings analytics for its user (finishDeferredRetry).
+func (s *SyncService) scheduleDeferredRetry(conn *repository.ExchangeConnection, delay time.Duration) {
 	if conn == nil {
 		return
 	}
@@ -1151,8 +1147,6 @@ func (s *SyncService) scheduleDeferredRetry(ctx context.Context, conn *repositor
 	}
 	delay += time.Duration(len(s.deferredRetries)) * deferredRetrySpacing
 	s.deferredRetries[conn.ID] = true
-	group := retryGroupFor(ctx, conn.UserUID)
-	group.pending++
 	after := s.deferAfter
 	s.deferMu.Unlock()
 	if after == nil {
@@ -1168,7 +1162,7 @@ func (s *SyncService) scheduleDeferredRetry(ctx context.Context, conn *repositor
 
 	after(delay, func() {
 		wrote := false
-		defer func() { s.finishDeferredRetry(conn.ID, group, wrote) }()
+		defer func() { s.finishDeferredRetry(conn, wrote) }()
 		wrote = s.retryConnectionDeferred(conn)
 	})
 }
@@ -1410,7 +1404,7 @@ func (s *SyncService) deferStatement(ctx context.Context, conn connector.Connect
 	)
 	s.collectCapabilityWarnings(conn, connMeta, result)
 	s.recordRateLimitHit(ctx, connMeta)
-	s.scheduleDeferredRetry(ctx, connMeta, rateLimitRetryDelay)
+	s.scheduleDeferredRetry(connMeta, rateLimitRetryDelay)
 }
 
 // statementNotPublishedReason states, for sync_statuses, the statement IBKR
@@ -1874,19 +1868,15 @@ func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, excha
 }
 
 // reconstructHistoryFor pings analytics once when it ends, whatever it wrote,
-// unless it was a dry run or a statement backfill already running for the
-// connection owns the ping (startStatementBackfill). At connect it is also the
-// ping for the live row the first sync left to it (SyncConnectionOnConnect):
-// pinging only after a successful write left that row unmirrored whenever the
-// rebuild failed or the exchange had none, until the nightly copy.
+// unless it was a dry run. At connect it is also the ping for the live row the
+// first sync left to it (SyncConnectionOnConnect): pinging only after a
+// successful write left that row unmirrored whenever the rebuild failed or the
+// exchange had none, until the nightly copy. When a statement backfill is
+// already running it reads nothing itself and still pings; the backfill pings
+// again once it ends (startStatementBackfill).
 func (s *SyncService) reconstructHistoryFor(ctx context.Context, userUID, exchange, label string, opts reconstructOpts) {
-	backfillOwnsPing := false
 	if !opts.dryRun {
-		defer func() {
-			if !backfillOwnsPing {
-				s.notifyHistoryRebuilt(context.WithoutCancel(ctx), userUID)
-			}
-		}()
+		defer s.notifyHistoryRebuilt(context.WithoutCancel(ctx), userUID)
 	}
 	connMeta, err := s.connSvc.GetActiveConnectionByLabel(ctx, userUID, exchange, label)
 	if err != nil {
@@ -1917,7 +1907,7 @@ func (s *SyncService) reconstructHistoryFor(ctx context.Context, userUID, exchan
 		)
 		return
 	}
-	backfillOwnsPing = s.reconstructHistory(ctx, connMeta, conn, creds, opts)
+	s.reconstructHistory(ctx, connMeta, conn, creds, opts)
 }
 
 // reconstructHistory routes a freshly built connection to its history
@@ -1929,14 +1919,13 @@ func (s *SyncService) reconstructHistoryFor(ctx context.Context, userUID, exchan
 // the decision that governs whether credentials leave the enclave — is
 // unit-testable without a DB-backed ConnectionService.
 //
-// It does not ping analytics; its caller does (reconstructHistoryFor). It
-// reports whether a statement backfill already running for the connection
-// owns that ping.
-func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, creds *Credentials, opts reconstructOpts) (backfillOwnsPing bool) {
+// It does not ping analytics; its caller does (reconstructHistoryFor).
+func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, creds *Credentials, opts reconstructOpts) {
 	if pp, ok := conn.(connector.PeriodHistoryProvider); ok {
 		// A statement broker reads its year a month at a time (the statement
 		// backfill); a window reads only its own days.
-		return s.reconstructFromStatements(ctx, connMeta, pp, opts)
+		s.reconstructFromStatements(ctx, connMeta, pp, opts)
+		return
 	}
 	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
 		// IBKR (and any future ZK-native provider) keeps the in-enclave path:
@@ -1947,7 +1936,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 		// and there is no SyncResult to hang a warning on here — the caller is
 		// the post-create hook, not a sync.
 		_ = s.syncFromHistoricalProvider(ctx, connMeta, hsp, time.Time{}, opts)
-		return false
+		return
 	}
 
 	// SEC-ZK-001: fallback for non-ZK exchanges (Hyperliquid, Lighter, …) —
@@ -1964,7 +1953,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 			zap.String("user_uid", connMeta.UserUID),
 			zap.String("exchange", connMeta.Exchange),
 		)
-		return false
+		return
 	}
 	// Dispatch only what the deployed rebuilder registers. Without this gate an
 	// unsupported exchange still shipped plaintext credentials out of the
@@ -1977,7 +1966,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 			zap.String("user_uid", connMeta.UserUID),
 			zap.String("exchange", connMeta.Exchange),
 		)
-		return false
+		return
 	}
 	// Anchor: the freshest live row when one exists (the connect hook runs the
 	// first live sync before this dispatch). The MTM-walk rebuilders calibrate
@@ -2022,7 +2011,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 			zap.String("exchange", connMeta.Exchange),
 			zap.Error(err),
 		)
-		return false
+		return
 	}
 	s.logger.Info("history backfill: rebuilder returned snapshots",
 		zap.String("user_uid", connMeta.UserUID),
@@ -2034,7 +2023,6 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 	opts.coveredFrom = res.CoveredFrom
 	firstSync := s.isFirstSync(ctx, connMeta)
 	s.persistHistoricalSnapshots(ctx, connMeta, res.Snapshots, firstSync, sourceExternalRebuilder, opts)
-	return false
 }
 
 // externalRebuilderExchanges lists the exchanges the deployed rebuilder

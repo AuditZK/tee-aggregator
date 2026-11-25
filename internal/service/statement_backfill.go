@@ -105,27 +105,62 @@ func (s *SyncService) historyBackfilled(ctx context.Context, connMeta *repositor
 	return done
 }
 
+// backfillClaim is a running backfill of one connection, or another read that
+// holds its claim (a deep or admin reconstruction, a dry run of either).
+type backfillClaim struct {
+	// pingOwed is set by a sync that found the claim held when it went to
+	// start the backfill: it wrote a live row and left its analytics ping to
+	// the backfill (wantsAnalyticsNotify), which this holder may not be.
+	pingOwed bool
+}
+
+func backfillKey(connMeta *repository.ExchangeConnection) string {
+	return connMeta.UserUID + "|" + strings.ToLower(connMeta.Exchange) + "|" + connMeta.Label
+}
+
 // claimBackfill marks a connection's backfill as running, or reports that one
 // already is.
 func (s *SyncService) claimBackfill(connMeta *repository.ExchangeConnection) bool {
-	key := connMeta.UserUID + "|" + strings.ToLower(connMeta.Exchange) + "|" + connMeta.Label
+	return s.claimBackfillOrOwe(connMeta, false)
+}
+
+// claimBackfillOrOwe claims the connection's backfill; when the claim is held,
+// owe marks it as owing the caller's analytics ping, in the same critical
+// section, so the holder cannot release in between.
+func (s *SyncService) claimBackfillOrOwe(connMeta *repository.ExchangeConnection, owe bool) bool {
+	key := backfillKey(connMeta)
 	s.backfillMu.Lock()
 	defer s.backfillMu.Unlock()
 	if s.backfills == nil {
-		s.backfills = make(map[string]bool)
+		s.backfills = make(map[string]*backfillClaim)
 	}
-	if s.backfills[key] {
+	if held := s.backfills[key]; held != nil {
+		held.pingOwed = held.pingOwed || owe
 		return false
 	}
-	s.backfills[key] = true
+	s.backfills[key] = &backfillClaim{}
 	return true
 }
 
+// releaseBackfill frees the claim and sends the analytics ping a sync left to
+// it, if one did. Every sync that saw the claim held wrote before this.
 func (s *SyncService) releaseBackfill(connMeta *repository.ExchangeConnection) {
-	key := connMeta.UserUID + "|" + strings.ToLower(connMeta.Exchange) + "|" + connMeta.Label
+	if s.freeBackfill(connMeta) {
+		s.notifyAnalyticsAsync(connMeta.UserUID, "a sync's ping left to a backfill claim")
+	}
+}
+
+// freeBackfill frees the claim and reports whether a sync left its analytics
+// ping to it.
+func (s *SyncService) freeBackfill(connMeta *repository.ExchangeConnection) (pingOwed bool) {
+	key := backfillKey(connMeta)
 	s.backfillMu.Lock()
+	defer s.backfillMu.Unlock()
+	if held := s.backfills[key]; held != nil {
+		pingOwed = held.pingOwed
+	}
 	delete(s.backfills, key)
-	s.backfillMu.Unlock()
+	return pingOwed
 }
 
 // startBackfillIfDue starts the statement backfill a sync found due, once the
@@ -146,13 +181,20 @@ func (s *SyncService) startBackfillIfDue(connMeta *repository.ExchangeConnection
 // that found it running, left their own ping to it (wantsAnalyticsNotify), and
 // a failed year still leaves their live rows to mirror. The ping follows the
 // release of the claim, so every sync that saw the claim held wrote before it.
+// When another read holds the claim, the sync's ping is owed to that read
+// instead (releaseBackfill): a dry run or a failed deep reconstruction would
+// not send one of its own.
 func (s *SyncService) startStatementBackfill(connMeta *repository.ExchangeConnection) {
-	if !s.claimBackfill(connMeta) {
+	if !s.claimBackfillOrOwe(connMeta, true) {
 		return
 	}
 	go func() {
-		defer s.notifyHistoryRebuilt(context.Background(), connMeta.UserUID)
-		defer s.releaseBackfill(connMeta)
+		defer func() {
+			// This one pings whatever a sync left owed: freeBackfill, not
+			// releaseBackfill, so the ping goes out once.
+			s.freeBackfill(connMeta)
+			s.notifyHistoryRebuilt(context.Background(), connMeta.UserUID)
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), statementBackfillTimeout)
 		defer cancel()
 		creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
@@ -398,16 +440,17 @@ func (s *SyncService) readStatementPeriod(ctx context.Context, provider connecto
 }
 
 // reconstructFromStatements is the connect-time and admin reconstruction of a
-// statement broker: the full backfill, or only the days of opts.window. It
-// reports whether it left the analytics ping to a backfill already running.
-func (s *SyncService) reconstructFromStatements(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.PeriodHistoryProvider, opts reconstructOpts) (backfillOwnsPing bool) {
+// statement broker: the full backfill, or only the days of opts.window. Its
+// caller pings analytics when it returns (reconstructHistoryFor), skipped or
+// not.
+func (s *SyncService) reconstructFromStatements(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.PeriodHistoryProvider, opts reconstructOpts) {
 	if !s.claimBackfill(connMeta) {
 		s.logger.Info("statement backfill already running, reconstruction skipped",
 			zap.String("user_uid", connMeta.UserUID),
 			zap.String("exchange", connMeta.Exchange),
 			zap.String("label", connMeta.Label),
 		)
-		return true
+		return
 	}
 	defer s.releaseBackfill(connMeta)
 
@@ -429,5 +472,4 @@ func (s *SyncService) reconstructFromStatements(ctx context.Context, connMeta *r
 			zap.Error(err),
 		)
 	}
-	return false
 }

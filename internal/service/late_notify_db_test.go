@@ -186,9 +186,10 @@ func TestDBDeferredRetryThatStillFailsDoesNotNotify(t *testing.T) {
 	}
 }
 
-// Two accounts of one user, both retried from the same pass: one ping, after
-// the second retry has written.
-func TestDBDeferredRetriesOfOneUserNotifyOnce(t *testing.T) {
+// Two accounts of one user, both retried from the same pass. Each retry that
+// wrote pings as it ends: holding the ping for the user's last retry lost it
+// whenever a restart dropped that retry's timer.
+func TestDBEachDeferredRetryThatWritesNotifies(t *testing.T) {
 	h := newDBHarness(t)
 	sink := newPingSink(t)
 	wirePings(h.sync, sink)
@@ -215,20 +216,31 @@ func TestDBDeferredRetriesOfOneUserNotifyOnce(t *testing.T) {
 		c.setBalanceErr(nil)
 	}
 
-	var bothAtPing atomic.Bool
+	var rowsAtPing []int
+	var mu sync.Mutex
 	sink.setOnHit(func(string) {
-		bothAtPing.Store(h.hasDay("binance", "cto", startOfTodayUTC()) && h.hasDay("binance", "pea", startOfTodayUTC()))
+		n := 0
+		for _, label := range []string{"cto", "pea"} {
+			if h.hasDay("binance", label, startOfTodayUTC()) {
+				n++
+			}
+		}
+		mu.Lock()
+		rowsAtPing = append(rowsAtPing, n)
+		mu.Unlock()
 	})
 	retries.run(t, 0)
-	if n := sink.count(dbUser); n != 0 {
-		t.Fatalf("%d pings before the user's last retry ended, want none yet", n)
+	if n := sink.count(dbUser); n != 1 {
+		t.Fatalf("%d pings after the first retry wrote, want 1 without waiting for the second", n)
 	}
 	retries.run(t, 1)
-	if n := sink.count(dbUser); n != 1 {
-		t.Fatalf("%d pings after both retries wrote, want exactly 1", n)
+	if n := sink.count(dbUser); n != 2 {
+		t.Fatalf("%d pings after both retries wrote, want 2", n)
 	}
-	if !bothAtPing.Load() {
-		t.Fatal("the ping went out before both accounts' rows were written")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(rowsAtPing) != 2 || rowsAtPing[0] != 1 || rowsAtPing[1] != 2 {
+		t.Fatalf("rows written at each ping %v, want [1 2]: each ping after its own retry's row", rowsAtPing)
 	}
 }
 
@@ -467,5 +479,106 @@ func TestDBDeletingRebuiltHistoryNotifies(t *testing.T) {
 	}
 	if n := sink.count(dbUser); n != 1 {
 		t.Fatalf("%d pings after a deletion of nothing, want still 1", n)
+	}
+}
+
+// newBackfillDueIBKR is a not-yet-backfilled IBKR connection whose sync writes
+// a live row and goes to start the year's backfill.
+func newBackfillDueIBKR(t *testing.T) (*dbHarness, *pingSink, *repository.ExchangeConnection) {
+	t.Helper()
+	withoutBackfillSpacing(t)
+	h := newDBHarness(t)
+	h.seedConnection(t, "ibkr", "main", dbKey, dbSecret)
+	h.sync.SetFXSource(stubFX{})
+	sink := newPingSink(t)
+	wirePings(h.sync, sink)
+	asOf := lastExpectedStatementDate(startOfTodayUTC())
+	h.plant(dbKey, dbSecret, newPeriodicAccount(asOf.AddDate(0, 0, -60), asOf))
+	return h, sink, h.connection(t, "ibkr", "main")
+}
+
+// A sync whose backfill is due leaves its ping to the backfill. When another
+// read holds the backfill's claim (a dry run, a deep reconstruction that then
+// fails), that read may never ping: the claim owes the sync's ping, and its
+// release sends it.
+func TestDBSyncPingLeftToAHeldClaimGoesOutOnRelease(t *testing.T) {
+	h, sink, connMeta := newBackfillDueIBKR(t)
+	if !h.sync.claimBackfill(connMeta) { // the read that holds the claim
+		t.Fatal("claim refused")
+	}
+
+	res := h.sync.SyncConnectionScheduledByLabel(h.ctx, dbUser, "ibkr", "main")
+	if !res.Success || !res.backfillDue {
+		t.Fatalf("sync: %+v, want a live row with the backfill due", res)
+	}
+	if n := sink.count(dbUser); n != 0 {
+		t.Fatalf("%d pings while the claim is held, want none yet", n)
+	}
+
+	var liveAtPing atomic.Bool
+	sink.setOnHit(func(string) { liveAtPing.Store(h.hasDay("ibkr", "main", startOfTodayUTC())) })
+	h.sync.releaseBackfill(connMeta) // the holder ends without a ping of its own
+	if n := sink.count(dbUser); n != 1 {
+		t.Fatalf("%d pings once the claim is released, want the 1 the sync left", n)
+	}
+	if !liveAtPing.Load() {
+		t.Fatal("the ping went out before the sync's live row was written")
+	}
+}
+
+// A reconstruction that finds the backfill running reads nothing itself, and
+// pings all the same: at connect, the first sync's live row waits on it.
+func TestDBReconstructionSkippedForARunningBackfillStillPings(t *testing.T) {
+	h, sink, connMeta := newBackfillDueIBKR(t)
+	if !h.sync.claimBackfill(connMeta) { // the backfill already running
+		t.Fatal("claim refused")
+	}
+
+	h.sync.ReconstructHistoryOnConnect(h.ctx, dbUser, "ibkr", "main")
+	if n := sink.count(dbUser); n != 1 {
+		t.Fatalf("%d pings from a reconstruction that found the backfill running, want 1", n)
+	}
+	if !h.backfillRunning(connMeta) {
+		t.Fatal("the skipped reconstruction released a claim it never held")
+	}
+	h.sync.releaseBackfill(connMeta)
+	if n := sink.count(dbUser); n != 1 {
+		t.Fatalf("%d pings after the release, want still 1: no sync left one", n)
+	}
+}
+
+// The first sync of a EUR account converts its stored days to USD before it
+// writes (ensureStoredConverted). Rewriting them is a change analytics hears
+// of, through ConvertStoredToUSD, even from a midnight pass that lands before
+// the nightly copy and sends no ping of its own.
+func TestDBStoredDaysConvertedDuringASyncNotify(t *testing.T) {
+	h := newDBHarness(t)
+	h.seedConnection(t, "ctrader", "eur", dbKey, dbSecret)
+	today := startOfTodayUTC()
+	h.sync.SetFXSource(eurRates(today))
+	h.storeEURDay(t, "eur", today.AddDate(0, 0, -2), 1000, 1000)
+	h.storeEURDay(t, "eur", today.AddDate(0, 0, -1), 1000, 0)
+	h.plant(dbKey, dbSecret, &scriptedConnector{
+		exchange: "ctrader",
+		balances: []connector.Balance{{Equity: 1000, Available: 1000, Currency: "EUR"}},
+	})
+	sink := newPingSink(t)
+	wirePings(h.sync, sink)
+	var convertedAtPing atomic.Bool
+	sink.setOnHit(func(string) {
+		d, err := h.snaps.GetByUserExchangeLabelAndDate(h.ctx, dbUser, "ctrader", "eur", today.AddDate(0, 0, -2))
+		convertedAtPing.Store(err == nil && approx(d.TotalEquity, 1130))
+	})
+	atClock(t, today.Add(5*time.Minute))
+
+	results, err := h.sync.SyncUserScheduledDueAtomic(h.ctx, dbUser, time.Now().UTC())
+	if err != nil || len(results) != 1 || !results[0].Success {
+		t.Fatalf("midnight pass: err %v, results %+v", err, results)
+	}
+	if n := sink.count(dbUser); n != 1 {
+		t.Fatalf("%d pings for a pass that rewrote the stored days, want 1", n)
+	}
+	if !convertedAtPing.Load() {
+		t.Fatal("the ping went out before the stored days were converted")
 	}
 }
