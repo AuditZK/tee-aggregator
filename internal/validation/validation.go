@@ -11,7 +11,7 @@ const (
 	maxUserUIDLen          = 100
 	maxExchangeLen         = 50
 	maxLabelLen            = 100
-	maxAPIKeyLen           = 500
+	maxAPIKeyLen           = 2048 // a tastytrade refresh token is a signed JWT
 	maxAPISecretLen        = 500
 	maxPassphraseLen       = 500
 	maxTimestampRangeYears = 5
@@ -234,7 +234,7 @@ type ReportRequest struct {
 	StartDate    string
 	EndDate      string
 	Benchmark    string
-	BaseCurrency string // ISO code, empty = USD
+	BaseCurrency string  // ISO code, empty = USD
 	RiskFreeRate float64 // annual %, e.g. 2.5
 }
 

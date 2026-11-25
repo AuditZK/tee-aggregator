@@ -92,8 +92,11 @@ func TestValidateAPIKey(t *testing.T) {
 	if err := ValidateAPIKey("normal-key"); err != nil {
 		t.Error("normal key should be valid")
 	}
-	if err := ValidateAPIKey(strings.Repeat("x", 501)); err == nil {
-		t.Error("key > 500 chars should be invalid")
+	if err := ValidateAPIKey(strings.Repeat("x", 900)); err != nil {
+		t.Errorf("a JWT-sized key should be valid: %v", err)
+	}
+	if err := ValidateAPIKey(strings.Repeat("x", 2049)); err == nil {
+		t.Error("key > 2048 chars should be invalid")
 	}
 }
 

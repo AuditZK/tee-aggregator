@@ -116,6 +116,7 @@ This is a full rewrite of the [TypeScript enclave](https://github.com/AuditZK/ze
 ║  │  - IBKR (Flex Report), Alpaca, TradeStation          │ ║
 ║  │  - Hyperliquid, Lighter, Polymarket (DEX)            │ ║
 ║  │  - cTrader, MetaTrader 4/5                           │ ║
+║  │  - tastytrade (OAuth)                                │ ║
 ║  └───────────────────────────────────────────────────────┘ ║
 ║                                                             ║
 ║  ┌───────────────────────────────────────────────────────┐ ║
