@@ -57,6 +57,9 @@ type Binance struct {
 	// activityNotes carries the markers the last GetTrades/GetFundingFees
 	// raised (pm_trades_unreadable).
 	activityNotes noteList
+	// papiPacer keeps the papi weight this connector spends under
+	// binancePapiBudgetPerMinute.
+	papiPacer binanceWeightPacer
 }
 
 // Binance wallet names. Their own vocabulary, not market types: cross and
@@ -684,7 +687,7 @@ func (b *Binance) getFuturesBalanceFromBalanceEndpoint(ctx context.Context) (*Ba
 func (b *Binance) GetPositions(ctx context.Context) ([]*Position, error) {
 	if b.portfolioMarginVerdict() == binancePMYes {
 		// fapi refuses a Portfolio Margin key: asking it first is a wasted call.
-		body, err := b.doRequest(ctx, "GET", binancePortfolioMarginAPI, "/papi/v1/um/positionRisk", url.Values{}, true)
+		body, err := b.papiGet(ctx, "/papi/v1/um/positionRisk", url.Values{})
 		if err != nil {
 			return nil, err
 		}
@@ -693,7 +696,7 @@ func (b *Binance) GetPositions(ctx context.Context) ([]*Position, error) {
 	params := url.Values{}
 	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v2/positionRisk", params, true)
 	if isBinancePermissionRefusal(err) {
-		if pmBody, pmErr := b.doRequest(ctx, "GET", binancePortfolioMarginAPI, "/papi/v1/um/positionRisk", url.Values{}, true); pmErr == nil {
+		if pmBody, pmErr := b.papiGet(ctx, "/papi/v1/um/positionRisk", url.Values{}); pmErr == nil {
 			body, err = pmBody, nil
 		}
 	}

@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -42,8 +43,12 @@ type binancePMActivityServer struct {
 	umFills, cmFills, mFills []pmFill
 	// crossAssets are the /papi/v1/balance assets holding cross margin.
 	crossAssets []string
-	// unlisted are the spot symbols margin/myTrades answers -1121 for.
-	unlisted []string
+	// marginErrors are the answers margin/myTrades gives a symbol instead of
+	// its fills: status and body.
+	marginErrors map[string]pmError
+	// fapiDenied refuses fapi on a classic account too: a key without the
+	// futures scope, which papi refuses as well.
+	fapiDenied bool
 
 	mu    sync.Mutex
 	calls []*url.URL
@@ -154,7 +159,7 @@ func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
 		case p == "/api/v3/account":
 			_, _ = w.Write([]byte(`{"balances":[{"asset":"USDT","free":"100","locked":"0"}]}`))
 		case strings.HasPrefix(p, "/fapi/"), strings.HasPrefix(p, "/dapi/"):
-			if s.portfolioMargin {
+			if s.portfolioMargin || s.fapiDenied {
 				denied()
 				return
 			}
@@ -201,9 +206,9 @@ func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
 			case "/papi/v1/cm/userTrades":
 				write(s.fills(q, s.cmFills))
 			case "/papi/v1/margin/myTrades":
-				if slices.Contains(s.unlisted, q.Get("symbol")) {
-					w.WriteHeader(http.StatusBadRequest)
-					_, _ = w.Write([]byte(`{"code":-1121,"msg":"Invalid symbol."}`))
+				if e, ok := s.marginErrors[q.Get("symbol")]; ok {
+					w.WriteHeader(e.status)
+					_, _ = w.Write([]byte(e.body))
 					return
 				}
 				write(s.fills(q, s.mFills))
@@ -238,7 +243,7 @@ func pmAccountWithActivity() *binancePMActivityServer {
 		portfolioMargin: true,
 		umPositions:     []string{"BTCUSDT"},
 		// ETHUSDT was opened and closed inside the day: only its income
-		// names it. 1000PEPEUSDT has no spot pair.
+		// names it, as it does 1000PEPEUSDT.
 		umIncome: []pmIncomeRow{
 			{symbol: "ETHUSDT", incomeType: "COMMISSION", income: "-0.6", asset: "USDT", time: at(3), tranID: 1},
 			{symbol: "1000PEPEUSDT", incomeType: "COMMISSION", income: "-0.1", asset: "USDT", time: at(4), tranID: 2},
@@ -258,7 +263,6 @@ func pmAccountWithActivity() *binancePMActivityServer {
 			{symbol: "BTCUSD_PERP", time: at(5), row: map[string]any{"id": 21, "pair": "BTCUSD", "side": "BUY", "price": "50000", "qty": "10", "baseQty": "0.02", "commission": "0.00001", "commissionAsset": "BTC", "marginAsset": "BTC", "realizedPnl": "0"}},
 		},
 		crossAssets: []string{"ETH"},
-		unlisted:    []string{"1000PEPEUSDT"},
 		mFills: []pmFill{
 			{symbol: "ETHUSDT", time: at(7), row: map[string]any{"id": 31, "isBuyer": true, "price": "3000", "qty": "0.1", "commission": "0.0001", "commissionAsset": "ETH"}},
 		},
@@ -306,8 +310,8 @@ func TestBinance_PortfolioMargin_TradesFromUMCMAndMargin(t *testing.T) {
 	if got := srv.symbolsAsked("/papi/v1/cm/userTrades"); !slices.Equal(got, []string{"BTCUSD_PERP"}) {
 		t.Fatalf("COIN-M symbols asked = %v", got)
 	}
-	if got := srv.symbolsAsked("/papi/v1/margin/myTrades"); !slices.Equal(got, []string{"1000PEPEUSDT", "BTCUSDT", "ETHUSDC", "ETHUSDT"}) {
-		t.Fatalf("margin symbols asked = %v, want ETH against USDT and USDC plus the income's pairs", got)
+	if got := srv.symbolsAsked("/papi/v1/margin/myTrades"); !slices.Equal(got, []string{"ETHUSDC", "ETHUSDT"}) {
+		t.Fatalf("margin symbols asked = %v, want only the held asset ETH against USDT and USDC", got)
 	}
 	if n := srv.count("/fapi/v1/userTrades"); n != 0 {
 		t.Fatalf("fapi userTrades called %d times on a portfolio margin account", n)
@@ -450,8 +454,8 @@ func TestBinance_NonPortfolioMargin_NoPapiCalls(t *testing.T) {
 		t.Fatalf("GetPositions: %v", err)
 	}
 	fees, err := b.GetFundingFees(ctx, []string{"BTCUSDT"}, pmDay)
-	if err != nil || fees != nil {
-		t.Fatalf("GetFundingFees = %v, %v; want nothing", fees, err)
+	if !errors.Is(err, ErrFundingNotRead) || fees != nil {
+		t.Fatalf("GetFundingFees = %v, %v; want ErrFundingNotRead: no funding is read", fees, err)
 	}
 	if n := srv.countPrefix("/papi/"); n != 0 {
 		t.Fatalf("%d papi calls on a classic account, want 0", n)
@@ -469,10 +473,161 @@ func TestBinance_NonPortfolioMargin_NoPapiCalls(t *testing.T) {
 	if _, err := b2.GetTrades(ctx, pmDay, pmDay.Add(24*time.Hour)); err != nil {
 		t.Fatalf("GetTrades: %v", err)
 	}
-	if _, err := b2.GetFundingFees(ctx, nil, pmDay); err != nil {
+	if _, err := b2.GetFundingFees(ctx, nil, pmDay); !errors.Is(err, ErrFundingNotRead) {
 		t.Fatalf("GetFundingFees: %v", err)
 	}
 	if n := srv2.countPrefix("/papi/"); n != 0 {
 		t.Fatalf("%d papi calls on a classic account read without a balance first, want 0", n)
+	}
+}
+
+// pmError is a refusal the papi fake answers instead of a page.
+type pmError struct {
+	status int
+	body   string
+}
+
+// One pair the venue refuses for good (-1100 here) costs that pair only: the
+// UM, COIN-M and other margin fills still count, and no marker is raised.
+func TestBinance_PortfolioMargin_OneMarginPairRefusedKeepsTheRest(t *testing.T) {
+	srv := pmAccountWithActivity()
+	srv.crossAssets = []string{"ETH", "SOL"}
+	srv.marginErrors = map[string]pmError{
+		"SOLUSDT": {http.StatusBadRequest, `{"code":-1100,"msg":"Illegal characters found in parameter 'symbol'."}`},
+		"SOLUSDC": {http.StatusBadRequest, `{"code":-1121,"msg":"Invalid symbol."}`},
+	}
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	trades, err := b.GetTrades(context.Background(), pmDay, pmDay.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	if len(trades) != 5 {
+		t.Fatalf("trades = %d, want the 5 fills of the pairs that answered", len(trades))
+	}
+	if got := srv.symbolsAsked("/papi/v1/margin/myTrades"); !slices.Equal(got, []string{"ETHUSDC", "ETHUSDT", "SOLUSDC", "SOLUSDT"}) {
+		t.Fatalf("margin symbols asked = %v", got)
+	}
+	if slices.Contains(b.CapabilityWarnings(), binancePMTradesUnreadable) {
+		t.Fatal("a refused pair raised the marker")
+	}
+}
+
+// A ban is not a refusal of the pair: the read stops and the gap is marked.
+func TestBinance_PortfolioMargin_BannedMarginPairRaisesMarker(t *testing.T) {
+	srv := pmAccountWithActivity()
+	srv.marginErrors = map[string]pmError{
+		"ETHUSDC": {http.StatusTeapot, `{"code":-1003,"msg":"Way too many requests; IP banned."}`},
+	}
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if _, err := b.GetTrades(context.Background(), pmDay, pmDay.Add(24*time.Hour)); err == nil {
+		t.Fatal("GetTrades hid the ban")
+	}
+	if !slices.Contains(b.CapabilityWarnings(), binancePMTradesUnreadable) {
+		t.Fatalf("warnings = %v, want %s", b.CapabilityWarnings(), binancePMTradesUnreadable)
+	}
+}
+
+// An exact day is one call per COIN-M and per margin symbol, the margin one
+// stopping 1 ms short of the next day ("less than 24 hours").
+func TestBinance_PortfolioMargin_ExactDayIsOneCallPerSymbol(t *testing.T) {
+	srv := &binancePMActivityServer{portfolioMargin: true, cmPositions: []string{"BTCUSD_PERP"}, crossAssets: []string{"ETH"}}
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if _, err := b.GetTrades(context.Background(), pmDay, pmDay.Add(24*time.Hour)); err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	if n := srv.count("/papi/v1/cm/userTrades"); n != 1 {
+		t.Fatalf("COIN-M calls = %d, want 1", n)
+	}
+	if n := srv.count("/papi/v1/margin/myTrades"); n != 2 {
+		t.Fatalf("margin calls = %d, want 2 (ETHUSDT, ETHUSDC)", n)
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	want := strconv.FormatInt(pmDay.Add(24*time.Hour-time.Millisecond).UnixMilli(), 10)
+	for _, u := range srv.calls {
+		if u.Path == "/papi/v1/margin/myTrades" && u.Query().Get("endTime") != want {
+			t.Fatalf("margin endTime = %s, want %s", u.Query().Get("endTime"), want)
+		}
+	}
+}
+
+// A long read spends its papi weight minute by minute instead of all at once.
+func TestBinance_PortfolioMargin_PapiPacedUnderBudget(t *testing.T) {
+	srv := &binancePMActivityServer{portfolioMargin: true, umPositions: []string{"BTCUSDT"}, cmPositions: []string{"BTCUSD_PERP"}}
+	b := srv.connector(t)
+	clock := pmDay
+	var slept []time.Duration
+	b.papiPacer.budget = 100
+	b.papiPacer.now = func() time.Time { return clock }
+	b.papiPacer.sleep = func(_ context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		clock = clock.Add(d)
+		return nil
+	}
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if _, err := b.GetTrades(context.Background(), pmDay, pmDay.Add(20*24*time.Hour)); err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	srv.mu.Lock()
+	spent := 0
+	for _, u := range srv.calls {
+		if strings.HasPrefix(u.Path, "/papi/") {
+			spent += binancePapiWeights[u.Path]
+		}
+	}
+	srv.mu.Unlock()
+	// 20 COIN-M calls alone weigh 400: at 100 a minute that is at least four
+	// waits, each no longer than the rest of its minute.
+	if minWaits := (spent+99)/100 - 1; len(slept) < minWaits {
+		t.Fatalf("waited %d times for %d weight at 100/min, want at least %d", len(slept), spent, minWaits)
+	}
+	for _, d := range slept {
+		if d <= 0 || d > time.Minute {
+			t.Fatalf("waited %v, want within one minute", d)
+		}
+	}
+}
+
+func TestBinance_PapiPacer_StopsOnCancelledContext(t *testing.T) {
+	p := &binanceWeightPacer{budget: 10}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := p.wait(ctx, 10); err != nil {
+		t.Fatalf("first wait: %v", err)
+	}
+	cancel()
+	if err := p.wait(ctx, 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("wait over budget on a cancelled context = %v, want context.Canceled", err)
+	}
+}
+
+// A classic key without the futures scope: fapi and papi both refuse. The
+// balance read settles that once, and the trade read then asks papi nothing.
+func TestBinance_SpotOnlyKey_NoPapiCallsInGetTrades(t *testing.T) {
+	srv := &binancePMActivityServer{portfolioMargin: false, fapiDenied: true}
+	b := srv.connector(t)
+	ctx := context.Background()
+	if _, err := b.GetBalance(ctx); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	before := srv.countPrefix("/papi/")
+	if _, err := b.GetTrades(ctx, pmDay, pmDay.Add(24*time.Hour)); err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	if _, err := b.GetFundingFees(ctx, nil, pmDay); !errors.Is(err, ErrFundingNotRead) {
+		t.Fatalf("GetFundingFees err = %v, want ErrFundingNotRead", err)
+	}
+	if n := srv.countPrefix("/papi/") - before; n != 0 {
+		t.Fatalf("%d papi calls after the balance read, want 0", n)
 	}
 }

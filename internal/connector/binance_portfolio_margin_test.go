@@ -25,7 +25,7 @@ func (s *binancePMServer) hit(prefix string) bool {
 
 // newBinancePMConnector serves a spot wallet of 100 USDT and a cross margin
 // read worth 2 BTC at 50000. futures is "ok" or "denied"; papi is "ok",
-// "denied" or "throttled".
+// "denied", "throttled" or "banned" (418).
 func newBinancePMConnector(t *testing.T, futures, papi string) (*Binance, *binancePMServer) {
 	t.Helper()
 	state := &binancePMServer{}
@@ -48,6 +48,9 @@ func newBinancePMConnector(t *testing.T, futures, papi string) (*Binance, *binan
 			switch {
 			case papi == "denied":
 				denied(w)
+			case papi == "banned":
+				w.WriteHeader(http.StatusTeapot)
+				_, _ = w.Write([]byte(`{"code":-1003,"msg":"Way too many requests; IP banned."}`))
 			case papi == "throttled":
 				w.WriteHeader(http.StatusTooManyRequests)
 				_, _ = w.Write([]byte(`{"code":-1003,"msg":"Too many requests"}`))
@@ -166,5 +169,15 @@ func TestBinance_PortfolioMargin_PositionsFromPapi(t *testing.T) {
 	}
 	if len(pos) != 1 || pos[0].Side != "short" || pos[0].Size != 0.5 || pos[0].UnrealizedPnL != 500 {
 		t.Fatalf("positions = %+v, want one 0.5 short with 500 unrealized", pos)
+	}
+}
+
+// A 418 ban on papi says nothing about the account: read as "not Portfolio
+// Margin", a PM account's equity would be written without its futures pool.
+func TestBinance_PortfolioMargin_BannedPapiFailsTheSync(t *testing.T) {
+	b, _ := newBinancePMConnector(t, "denied", "banned")
+
+	if _, err := b.GetBalance(context.Background()); !errors.Is(err, ErrTransient) {
+		t.Fatalf("err = %v, want ErrTransient", err)
 	}
 }

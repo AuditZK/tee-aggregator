@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
@@ -23,7 +24,7 @@ func isBinancePermissionRefusal(err error) bool {
 // getPortfolioMarginBalance reads a Portfolio Margin account, which pools the
 // cross margin, USDⓈ-M and COIN-M wallets into one equity in USD.
 func (b *Binance) getPortfolioMarginBalance(ctx context.Context, priceMap map[string]float64) (*Balance, error) {
-	body, err := b.doRequest(ctx, "GET", binancePortfolioMarginAPI, "/papi/v1/account", url.Values{}, true)
+	body, err := b.papiGet(ctx, "/papi/v1/account", url.Values{})
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +53,7 @@ func (b *Binance) getPortfolioMarginBalance(ctx context.Context, priceMap map[st
 	openOrderMargin, _ := strconv.ParseFloat(acct.TotalMarginOpenLoss, 64)
 	available := max(equity-initialMargin-openOrderMargin, 0)
 
-	body, err = b.doRequest(ctx, "GET", binancePortfolioMarginAPI, "/papi/v1/balance", url.Values{}, true)
+	body, err = b.papiGet(ctx, "/papi/v1/balance", url.Values{})
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +87,13 @@ func (b *Binance) portfolioMarginAfterRefusal(ctx context.Context, futuresErr er
 		return nil, nil
 	}
 	pm, err := b.getPortfolioMarginBalance(ctx, priceMap)
-	if errors.Is(err, ErrTransient) {
+	if isBinanceThrottled(err) {
+		// A 418 IP ban is a permanent status to retryHTTP, but it says
+		// nothing about the account: read as "not Portfolio Margin", a real
+		// PM account would be written that day without its futures pool.
+		if !errors.Is(err, ErrTransient) {
+			err = fmt.Errorf("%w: %w", ErrTransient, err)
+		}
 		return nil, err
 	}
 	if err != nil {
