@@ -128,8 +128,11 @@ type Config struct {
 	MTBridgeHMACSecret string
 
 	// HistorySyncNotifyURL, when set, is the base URL the enclave POSTs a
-	// best-effort "history rebuilt" ping to after a connection's historical
-	// backfill completes. The enclave appends the userUID to the path
+	// best-effort ping to whenever a user's snapshots change outside the
+	// midnight pass analytics' nightly copy reads: a historical backfill or
+	// reconstruction, a deferred rate-limit retry, a manual or connect-time
+	// sync, a midnight pass that lands after 00:14 UTC, an admin rewrite of
+	// stored rows. The enclave appends the userUID to the path
 	// (<url>/<userUID>). It carries NO credentials and triggers nothing
 	// inside the enclave — it only lets a downstream service (analytics)
 	// run a per-user sync without waiting for its daily cron. Empty = no-op.

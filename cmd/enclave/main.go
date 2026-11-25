@@ -370,8 +370,11 @@ func main() {
 		// snapshot nor a status row before midnight — the same cold-start
 		// failure, re-entered by a door nobody had looked at. A snapshot
 		// crosses no perimeter, so it is not gated on anything.
-		connSvc.SetPostCreateSyncHook(func(ctx context.Context, userUID, exchange, label string) {
-			if r := syncSvc.SyncConnectionScheduledByLabel(ctx, userUID, exchange, label); r != nil && r.Error != "" {
+		//
+		// Analytics hears of that snapshot right away unless the rebuild below
+		// follows it: the rebuild pings once it ends, whatever it wrote.
+		connSvc.SetPostCreateSyncHook(func(ctx context.Context, userUID, exchange, label string, rebuildFollows bool) {
+			if r := syncSvc.SyncConnectionOnConnect(ctx, userUID, exchange, label, rebuildFollows); r != nil && r.Error != "" {
 				logger.Warn("first live sync after connect failed; daily pass will retry",
 					zap.String("user_uid", userUID),
 					zap.String("exchange", exchange),

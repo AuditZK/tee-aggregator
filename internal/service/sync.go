@@ -393,6 +393,9 @@ type SyncService struct {
 	deferredRetries map[string]bool
 	// deferAfter stands in for time.AfterFunc in tests.
 	deferAfter func(time.Duration, func())
+	// notifyRun runs a late-write analytics ping (notifyAnalyticsAsync); nil
+	// = a goroutine of its own. Tests run it inline.
+	notifyRun func(func())
 
 	// backfills holds the connections whose statement backfill is running,
 	// keyed user|exchange|label, so a sync and an admin call never read the
@@ -591,6 +594,10 @@ type SyncResult struct {
 	// run; the caller starts it once the snapshot is saved
 	// (startBackfillIfDue).
 	backfillDue bool
+	// historyWritten marks a sync whose every-sync reconstruction wrote days,
+	// whatever became of the live row after it: those days are as new to
+	// analytics as the row would have been.
+	historyWritten bool
 }
 
 // SyncUser synchronizes all exchanges for a user (manual sync).
@@ -611,6 +618,7 @@ func (s *SyncService) SyncUser(ctx context.Context, userUID string) ([]*SyncResu
 		wg      sync.WaitGroup
 	)
 
+	ctx = withRetryGroup(ctx, userUID)
 	for _, conn := range connections {
 		wg.Add(1)
 		go func(c *repository.ExchangeConnection) {
@@ -646,6 +654,10 @@ func (s *SyncService) SyncUser(ctx context.Context, userUID string) ([]*SyncResu
 	}
 
 	wg.Wait()
+	// A manual sync writes a connection's first snapshot, at any hour.
+	if wantsAnalyticsNotify(results...) {
+		s.notifyAnalyticsAsync(userUID, "manual sync")
+	}
 	return results, nil
 }
 
@@ -690,9 +702,13 @@ func (s *SyncService) SyncExchange(ctx context.Context, userUID, exchange string
 		}
 	}
 
+	ctx = withRetryGroup(ctx, userUID)
 	results := make([]*SyncResult, 0, len(connections))
 	for _, conn := range connections {
 		results = append(results, s.syncConnection(ctx, conn))
+	}
+	if wantsAnalyticsNotify(results...) {
+		s.notifyAnalyticsAsync(userUID, "manual sync")
 	}
 	return aggregateSyncResults(userUID, exchange, results)
 }
@@ -708,7 +724,31 @@ func (s *SyncService) SyncExchange(ctx context.Context, userUID, exchange string
 // Uses connSvc.repo.GetByUserExchangeLabel directly (TRIM-tolerant exact
 // lookup) instead of GetActiveConnections + filter, so a fresh capability
 // detection on the underlying pool can't mask a real row.
+//
+// It runs at any hour (admin sync-connection), so analytics is told about
+// what it wrote.
 func (s *SyncService) SyncConnectionScheduledByLabel(ctx context.Context, userUID, exchange, label string) *SyncResult {
+	result := s.syncConnectionByLabel(ctx, userUID, exchange, label)
+	if wantsAnalyticsNotify(result) {
+		s.notifyAnalyticsAsync(userUID, "connection re-synced")
+	}
+	return result
+}
+
+// SyncConnectionOnConnect takes a new or re-authorized connection's first live
+// snapshot: the post-create hook's sync. Analytics is told about it now unless
+// a history rebuild follows (rebuildFollows), or the statement backfill this
+// sync starts: either pings once it ends, and a ping before that would publish
+// the connection as imported with a single live day.
+func (s *SyncService) SyncConnectionOnConnect(ctx context.Context, userUID, exchange, label string, rebuildFollows bool) *SyncResult {
+	result := s.syncConnectionByLabel(ctx, userUID, exchange, label)
+	if !rebuildFollows && wantsAnalyticsNotify(result) {
+		s.notifyAnalyticsAsync(userUID, "first sync after connect")
+	}
+	return result
+}
+
+func (s *SyncService) syncConnectionByLabel(ctx context.Context, userUID, exchange, label string) *SyncResult {
 	conn, err := s.connSvc.GetActiveConnectionByLabel(ctx, userUID, exchange, label)
 	if err != nil {
 		return &SyncResult{
@@ -804,6 +844,7 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 	if len(connections) == 0 {
 		return nil, fmt.Errorf(errFmtNoActiveConnections, userUID)
 	}
+	ctx = withRetryGroup(ctx, userUID)
 
 	// Phase 1: build snapshots with bounded concurrency.
 	var (
@@ -957,9 +998,16 @@ func (s *SyncService) SyncUserScheduledDueAtomic(ctx context.Context, userUID st
 		if r.rateLimited() {
 			if conn := findConnection(connections, r.Exchange, r.Label); conn != nil {
 				s.recordRateLimitHit(ctx, conn)
-				s.scheduleDeferredRetry(conn, rateLimitRetryDelay)
+				s.scheduleDeferredRetry(ctx, conn, rateLimitRetryDelay)
 			}
 		}
+	}
+
+	// The pass is analytics' nightly input only while it lands before the
+	// nightly copy. One that runs past it, on a night of slow statements, or
+	// that an operator starts by hand (admin sync-now), says what it wrote.
+	if lateForNightlyAnalytics(lateWriteClock()) && wantsAnalyticsNotify(results...) {
+		s.notifyAnalyticsAsync(userUID, "scheduled pass after the nightly copy")
 	}
 
 	return results, nil
@@ -1085,7 +1133,11 @@ func (s *SyncService) warnOnAberrantDailyMove(ctx context.Context, snap *reposit
 // is lost, and the next daily pass retries (a failed sync records no status, so
 // the connection stays "due"). Dedup'd per connection ID so repeated 1018s don't
 // stack timers.
-func (s *SyncService) scheduleDeferredRetry(conn *repository.ExchangeConnection, delay time.Duration) {
+//
+// The retry lands hours after analytics' nightly copy, so what it writes is
+// pinged to analytics: once per user, after the last retry the same pass armed
+// for that user (retryGroup, carried by ctx).
+func (s *SyncService) scheduleDeferredRetry(ctx context.Context, conn *repository.ExchangeConnection, delay time.Duration) {
 	if conn == nil {
 		return
 	}
@@ -1099,6 +1151,8 @@ func (s *SyncService) scheduleDeferredRetry(conn *repository.ExchangeConnection,
 	}
 	delay += time.Duration(len(s.deferredRetries)) * deferredRetrySpacing
 	s.deferredRetries[conn.ID] = true
+	group := retryGroupFor(ctx, conn.UserUID)
+	group.pending++
 	after := s.deferAfter
 	s.deferMu.Unlock()
 	if after == nil {
@@ -1113,12 +1167,9 @@ func (s *SyncService) scheduleDeferredRetry(conn *repository.ExchangeConnection,
 	)
 
 	after(delay, func() {
-		defer func() {
-			s.deferMu.Lock()
-			delete(s.deferredRetries, conn.ID)
-			s.deferMu.Unlock()
-		}()
-		s.retryConnectionDeferred(conn)
+		wrote := false
+		defer func() { s.finishDeferredRetry(conn.ID, group, wrote) }()
+		wrote = s.retryConnectionDeferred(conn)
 	})
 }
 
@@ -1130,14 +1181,18 @@ var deferredRetryTimeout = connector.FlexPollBudget() + 5*time.Minute
 // retryConnectionDeferred re-syncs one connection out-of-band and saves its
 // snapshot independently of the daily batch. It never schedules another deferral:
 // one retry per daily cycle bounds the work, and if it still fails the next daily
-// pass picks the connection up.
-func (s *SyncService) retryConnectionDeferred(conn *repository.ExchangeConnection) {
+// pass picks the connection up. Reports whether it wrote rows analytics has to
+// hear about (wantsAnalyticsNotify).
+func (s *SyncService) retryConnectionDeferred(conn *repository.ExchangeConnection) (wrote bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), deferredRetryTimeout)
 	defer cancel()
 
 	attempt := time.Now().UTC()
 	result := s.buildConnectionSnapshot(ctx, conn)
 	defer s.startBackfillIfDue(conn, result)
+	// Decided once the save below is settled, on every return: the every-sync
+	// reconstruction can have written days before a live read that failed.
+	defer func() { wrote = wantsAnalyticsNotify(result) }()
 	if result.Error != "" {
 		s.logger.Warn("deferred rate-limit retry still failing",
 			zap.String("user_uid", conn.UserUID),
@@ -1166,6 +1221,7 @@ func (s *SyncService) retryConnectionDeferred(conn *repository.ExchangeConnectio
 		zap.String("exchange", conn.Exchange),
 		zap.String("label", conn.Label),
 	)
+	return
 }
 
 // buildConnectionSnapshot builds a snapshot without saving (for atomic batch).
@@ -1188,6 +1244,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	}
 	rebuilt, backfill, rerr := s.reconstructIfEverySync(ctx, connMeta, conn, result)
 	result.backfillDue = backfill
+	result.historyWritten = len(rebuilt) > 0
 	if errors.Is(rerr, connector.ErrStatementNotPublished) {
 		s.deferStatement(ctx, conn, connMeta, result, statementNotPublishedReason())
 		return result
@@ -1353,7 +1410,7 @@ func (s *SyncService) deferStatement(ctx context.Context, conn connector.Connect
 	)
 	s.collectCapabilityWarnings(conn, connMeta, result)
 	s.recordRateLimitHit(ctx, connMeta)
-	s.scheduleDeferredRetry(connMeta, rateLimitRetryDelay)
+	s.scheduleDeferredRetry(ctx, connMeta, rateLimitRetryDelay)
 }
 
 // statementNotPublishedReason states, for sync_statuses, the statement IBKR
@@ -1816,7 +1873,21 @@ func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, excha
 	return out
 }
 
+// reconstructHistoryFor pings analytics once when it ends, whatever it wrote,
+// unless it was a dry run or a statement backfill already running for the
+// connection owns the ping (startStatementBackfill). At connect it is also the
+// ping for the live row the first sync left to it (SyncConnectionOnConnect):
+// pinging only after a successful write left that row unmirrored whenever the
+// rebuild failed or the exchange had none, until the nightly copy.
 func (s *SyncService) reconstructHistoryFor(ctx context.Context, userUID, exchange, label string, opts reconstructOpts) {
+	backfillOwnsPing := false
+	if !opts.dryRun {
+		defer func() {
+			if !backfillOwnsPing {
+				s.notifyHistoryRebuilt(context.WithoutCancel(ctx), userUID)
+			}
+		}()
+	}
 	connMeta, err := s.connSvc.GetActiveConnectionByLabel(ctx, userUID, exchange, label)
 	if err != nil {
 		s.logger.Error("history backfill: connection lookup failed",
@@ -1846,7 +1917,7 @@ func (s *SyncService) reconstructHistoryFor(ctx context.Context, userUID, exchan
 		)
 		return
 	}
-	s.reconstructHistory(ctx, connMeta, conn, creds, opts)
+	backfillOwnsPing = s.reconstructHistory(ctx, connMeta, conn, creds, opts)
 }
 
 // reconstructHistory routes a freshly built connection to its history
@@ -1857,12 +1928,15 @@ func (s *SyncService) reconstructHistoryFor(ctx context.Context, userUID, exchan
 // (SEC-ZK-001). Split from ReconstructHistoryOnConnect so this routing —
 // the decision that governs whether credentials leave the enclave — is
 // unit-testable without a DB-backed ConnectionService.
-func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, creds *Credentials, opts reconstructOpts) {
+//
+// It does not ping analytics; its caller does (reconstructHistoryFor). It
+// reports whether a statement backfill already running for the connection
+// owns that ping.
+func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *repository.ExchangeConnection, conn connector.Connector, creds *Credentials, opts reconstructOpts) (backfillOwnsPing bool) {
 	if pp, ok := conn.(connector.PeriodHistoryProvider); ok {
 		// A statement broker reads its year a month at a time (the statement
 		// backfill); a window reads only its own days.
-		s.reconstructFromStatements(ctx, connMeta, pp, opts)
-		return
+		return s.reconstructFromStatements(ctx, connMeta, pp, opts)
 	}
 	if hsp, ok := conn.(connector.HistoricalSnapshotProvider); ok {
 		// IBKR (and any future ZK-native provider) keeps the in-enclave path:
@@ -1873,8 +1947,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 		// and there is no SyncResult to hang a warning on here — the caller is
 		// the post-create hook, not a sync.
 		_ = s.syncFromHistoricalProvider(ctx, connMeta, hsp, time.Time{}, opts)
-		s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
-		return
+		return false
 	}
 
 	// SEC-ZK-001: fallback for non-ZK exchanges (Hyperliquid, Lighter, …) —
@@ -1891,7 +1964,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 			zap.String("user_uid", connMeta.UserUID),
 			zap.String("exchange", connMeta.Exchange),
 		)
-		return
+		return false
 	}
 	// Dispatch only what the deployed rebuilder registers. Without this gate an
 	// unsupported exchange still shipped plaintext credentials out of the
@@ -1904,7 +1977,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 			zap.String("user_uid", connMeta.UserUID),
 			zap.String("exchange", connMeta.Exchange),
 		)
-		return
+		return false
 	}
 	// Anchor: the freshest live row when one exists (the connect hook runs the
 	// first live sync before this dispatch). The MTM-walk rebuilders calibrate
@@ -1949,7 +2022,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 			zap.String("exchange", connMeta.Exchange),
 			zap.Error(err),
 		)
-		return
+		return false
 	}
 	s.logger.Info("history backfill: rebuilder returned snapshots",
 		zap.String("user_uid", connMeta.UserUID),
@@ -1961,7 +2034,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 	opts.coveredFrom = res.CoveredFrom
 	firstSync := s.isFirstSync(ctx, connMeta)
 	s.persistHistoricalSnapshots(ctx, connMeta, res.Snapshots, firstSync, sourceExternalRebuilder, opts)
-	s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
+	return false
 }
 
 // externalRebuilderExchanges lists the exchanges the deployed rebuilder
@@ -2117,6 +2190,11 @@ func (s *SyncService) DeleteRebuiltHistory(ctx context.Context, userUID, exchang
 		zap.String("user_uid", userUID),
 		zap.String("exchange", exchange),
 		zap.Int64("snapshots", deleted))
+	// Analytics' mirror prunes the rows on its next copy; until then the
+	// deleted days stay in the user's stats.
+	if deleted > 0 {
+		s.notifyAnalyticsAsync(userUID, "rebuilt history deleted")
+	}
 	return deleted, nil
 }
 

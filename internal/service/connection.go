@@ -44,8 +44,9 @@ type ConnectionService struct {
 	factory    *connector.Factory
 	// postCreateSyncHook fires after EVERY successful Create. It takes the
 	// connection's first live snapshot and writes its sync_statuses row.
+	// rebuildFollows says whether postCreateRebuildHook runs after it.
 	// Nil = no-op.
-	postCreateSyncHook func(ctx context.Context, userUID, exchange, label string)
+	postCreateSyncHook func(ctx context.Context, userUID, exchange, label string, rebuildFollows bool)
 	// postCreateRebuildHook fires only when the caller opted into a history
 	// rebuild (SEC-ZK-001 / SEC-08). Nil = no-op.
 	postCreateRebuildHook func(ctx context.Context, userUID, exchange, label string)
@@ -82,8 +83,10 @@ func (s *ConnectionService) SetFactory(f *connector.Factory) {
 // door. Taking a snapshot is not credential egress, so nothing gates it.
 //
 // The hook receives a fresh background context (the request context is
-// cancelled by the time the goroutine runs).
-func (s *ConnectionService) SetPostCreateSyncHook(fn func(ctx context.Context, userUID, exchange, label string)) {
+// cancelled by the time the goroutine runs), and whether the history rebuild
+// runs after it: that rebuild pings analytics once it ends, so the first
+// snapshot leaves the ping to it rather than publish a one-day history first.
+func (s *ConnectionService) SetPostCreateSyncHook(fn func(ctx context.Context, userUID, exchange, label string, rebuildFollows bool)) {
 	s.postCreateSyncHook = fn
 }
 
@@ -383,7 +386,7 @@ func (s *ConnectionService) dispatchPostCreateHooks(userUID, exchange, label str
 	go func() {
 		hookCtx := context.Background()
 		if s.postCreateSyncHook != nil {
-			s.postCreateSyncHook(hookCtx, userUID, exchange, label)
+			s.postCreateSyncHook(hookCtx, userUID, exchange, label, runRebuild)
 		}
 		if runRebuild {
 			s.postCreateRebuildHook(hookCtx, userUID, exchange, label)

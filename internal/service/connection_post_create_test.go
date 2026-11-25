@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,13 @@ func newHookRecorder() *hookRecorder { return &hookRecorder{order: make(chan str
 func (h *hookRecorder) hook(name string) func(context.Context, string, string, string) {
 	return func(_ context.Context, userUID, exchange, label string) {
 		h.order <- name + ":" + userUID + "/" + exchange + "/" + label
+	}
+}
+
+// syncHook also records whether the sync was told a rebuild follows it.
+func (h *hookRecorder) syncHook(name string) func(context.Context, string, string, string, bool) {
+	return func(_ context.Context, userUID, exchange, label string, rebuildFollows bool) {
+		h.order <- fmt.Sprintf("%s:%s/%s/%s rebuildFollows=%v", name, userUID, exchange, label, rebuildFollows)
 	}
 }
 
@@ -54,13 +62,13 @@ func (h *hookRecorder) expectNothingMore(t *testing.T) {
 func TestDispatchPostCreateHooks_SyncRunsWithoutRebuildOptIn(t *testing.T) {
 	rec := newHookRecorder()
 	svc := &ConnectionService{
-		postCreateSyncHook:    rec.hook("sync"),
+		postCreateSyncHook:    rec.syncHook("sync"),
 		postCreateRebuildHook: rec.hook("rebuild"),
 	}
 
 	svc.dispatchPostCreateHooks("user-1", "ctrader", "cTrader Account", false)
 
-	rec.next(t, "sync:user-1/ctrader/cTrader Account")
+	rec.next(t, "sync:user-1/ctrader/cTrader Account rebuildFollows=false")
 	rec.expectNothingMore(t)
 }
 
@@ -70,15 +78,16 @@ func TestDispatchPostCreateHooks_SyncRunsWithoutRebuildOptIn(t *testing.T) {
 func TestDispatchPostCreateHooks_RebuildStaysOptIn(t *testing.T) {
 	rec := newHookRecorder()
 	svc := &ConnectionService{
-		postCreateSyncHook:    rec.hook("sync"),
+		postCreateSyncHook:    rec.syncHook("sync"),
 		postCreateRebuildHook: rec.hook("rebuild"),
 	}
 
 	svc.dispatchPostCreateHooks("user-1", "ctrader", "cTrader Account", true)
 
 	// Order matters: the snapshot the sync writes is the equity anchor the
-	// rebuild dispatch reads (EndEquityOverride, 2026-08-04).
-	rec.next(t, "sync:user-1/ctrader/cTrader Account")
+	// rebuild dispatch reads (EndEquityOverride, 2026-08-04). The sync is told
+	// the rebuild follows, and leaves the analytics ping to it.
+	rec.next(t, "sync:user-1/ctrader/cTrader Account rebuildFollows=true")
 	rec.next(t, "rebuild:user-1/ctrader/cTrader Account")
 	rec.expectNothingMore(t)
 }
@@ -86,11 +95,12 @@ func TestDispatchPostCreateHooks_RebuildStaysOptIn(t *testing.T) {
 // A deployment with no rebuild hook wired must still take the first snapshot.
 func TestDispatchPostCreateHooks_SyncOnlyDeployment(t *testing.T) {
 	rec := newHookRecorder()
-	svc := &ConnectionService{postCreateSyncHook: rec.hook("sync")}
+	svc := &ConnectionService{postCreateSyncHook: rec.syncHook("sync")}
 
 	svc.dispatchPostCreateHooks("user-1", "mt5", "Exness", true)
 
-	rec.next(t, "sync:user-1/mt5/Exness")
+	// No rebuild hook wired, so none follows, whatever the request asked.
+	rec.next(t, "sync:user-1/mt5/Exness rebuildFollows=false")
 	rec.expectNothingMore(t)
 }
 
