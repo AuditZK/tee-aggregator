@@ -67,6 +67,8 @@ func (f *Factory) Create(creds *Credentials) (Connector, error) {
 		return NewBingX(creds), nil
 	case "huobi":
 		return NewHuobi(creds), nil
+	case "bitstamp":
+		return NewBitstamp(creds), nil
 
 	// Traditional brokers
 	case "ibkr":
@@ -136,6 +138,7 @@ func (f *Factory) SupportedExchanges() []string {
 		"gate",
 		"bingx",
 		"huobi",
+		"bitstamp",
 		"ibkr",
 		"alpaca",
 		"tradestation",

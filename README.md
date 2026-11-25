@@ -112,7 +112,8 @@ This is a full rewrite of the [TypeScript enclave](https://github.com/AuditZK/ze
 ║  │  Exchange Connectors (internal/connector)             │ ║
 ║  │  - Native HTTP connectors (no CCXT)                  │ ║
 ║  │  - Binance, Bybit, OKX, Kraken, Deribit, MEXC       │ ║
-║  │  - Bitget, KuCoin, Coinbase, Gate, BingX, Huobi      │ ║
+║  │  - Bitget, KuCoin, Coinbase, Gate, BingX, Huobi,     │ ║
+║  │    Bitstamp                                          │ ║
 ║  │  - IBKR (Flex Report), Alpaca, TradeStation          │ ║
 ║  │  - Hyperliquid, Lighter, Polymarket, predict.fun     │ ║
 ║  │  - cTrader, MetaTrader 4/5                           │ ║

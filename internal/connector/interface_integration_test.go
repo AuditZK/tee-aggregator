@@ -32,6 +32,7 @@ func TestAllConnectorsImplementInterface(t *testing.T) {
 	var _ Connector = (*Gate)(nil)
 	var _ Connector = (*BingX)(nil)
 	var _ Connector = (*Huobi)(nil)
+	var _ Connector = (*Bitstamp)(nil)
 }
 
 // TestOptionalInterfaces verifies which connectors implement optional interfaces

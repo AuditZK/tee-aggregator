@@ -238,7 +238,7 @@ func TestAllExchangesAreNative(t *testing.T) {
 	factory := NewFactory()
 	allExchanges := []string{
 		"binance", "bybit", "okx", "kraken", "deribit",
-		"mexc", "bitget", "kucoin", "coinbase", "gate", "bingx", "huobi",
+		"mexc", "bitget", "kucoin", "coinbase", "gate", "bingx", "huobi", "bitstamp",
 		"ibkr", "alpaca", "tradestation",
 		"hyperliquid", "lighter", "polymarket", "predictfun",
 		"ctrader", "mt4", "mt5",
