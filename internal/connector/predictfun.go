@@ -70,16 +70,23 @@ func (p *PredictFun) DetectIsPaper(_ context.Context) (bool, error) { return fal
 // predict.fun. The venue answers any address, so the signer wallet pasted in
 // place of the Predict account would otherwise connect and track a zero.
 func (p *PredictFun) TestConnection(ctx context.Context) error {
-	bal, err := p.GetBalance(ctx)
-	if err != nil {
+	if _, err := p.GetBalance(ctx); err != nil {
 		return err
 	}
 	points, err := p.pnlSeries(ctx, "all")
 	if err != nil {
 		return err
 	}
-	if len(points) == 0 && bal.Equity <= 0 {
-		return errors.New("predict.fun: invalid credentials, no Predict account activity at this address; use the Predict account address from the portfolio page")
+	if len(points) > 0 {
+		return nil
+	}
+	// A USDT balance proves nothing: any BNB Chain wallet holds some, the sign-in wallet first.
+	positions, err := p.fetchPositions(ctx)
+	if err != nil {
+		return err
+	}
+	if len(positions) == 0 {
+		return errors.New("predict.fun: invalid credentials, no Predict account activity at this address; use the Predict account address from the portfolio page, once it has traded")
 	}
 	return nil
 }
