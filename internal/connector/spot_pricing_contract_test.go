@@ -65,6 +65,20 @@ func TestSpotPricingOutage_FailsTheBalance(t *testing.T) {
 			},
 		},
 		{
+			name: "bitstamp",
+			routes: map[string]func(w http.ResponseWriter){
+				"/api/v2/account_balances/":   body(`[{"currency":"btc","total":"2","available":"2","reserved":"0"}]`),
+				"/api/v2/earn/subscriptions/": body(`[]`),
+				"/api/v2/open_positions/":     body(`[]`),
+				"/api/v2/ticker/":             down(http.StatusServiceUnavailable),
+			},
+			connect: func(_ *testing.T, srv *httptest.Server) Connector {
+				c := NewBitstamp(&Credentials{APIKey: "k", APISecret: "s"})
+				c.baseURL = srv.URL
+				return c
+			},
+		},
+		{
 			name: "gate",
 			routes: map[string]func(w http.ResponseWriter){
 				"/api/v4/spot/accounts": body(`[{"currency":"BTC","available":"1","locked":"0"}]`),
@@ -140,6 +154,7 @@ var spotPricingOutagePinnedBy = map[string]string{
 	"coinbase":    "TestSpotPricingOutage_FailsTheBalance",
 	"gate":        "TestSpotPricingOutage_FailsTheBalance",
 	"huobi":       "TestSpotPricingOutage_FailsTheBalance",
+	"bitstamp":    "TestSpotPricingOutage_FailsTheBalance",
 	"kucoin":      "TestSpotPricingOutage_FailsTheBalance",
 	"kraken":      "TestSpotPricingOutage_FailsTheBalance",
 	"bitget":      "TestBitgetGetBalance_PriceMapDownFailsTransient",
