@@ -60,6 +60,9 @@ type Binance struct {
 	// papiPacer keeps the papi weight this connector spends under
 	// binancePapiBudgetPerMinute.
 	papiPacer binanceWeightPacer
+	// walletCheckTimeout bounds the one wallet-valuation call GetBalance
+	// makes; zero means binanceWalletCheckTimeout.
+	walletCheckTimeout time.Duration
 }
 
 // Binance wallet names. Their own vocabulary, not market types: cross and
@@ -337,6 +340,13 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	if futures != nil {
 		total.Available += futures.Available
 	}
+
+	// Options is left out: most accounts never opened it, and its refusal
+	// would switch the total check off for nearly everyone.
+	checkTotal := !slices.ContainsFunc(b.coverage, func(c WalletCoverage) bool {
+		return c.Status == WalletUnreadable && c.Wallet != binanceWalletOption
+	})
+	b.capabilityWarnings = append(b.capabilityWarnings, b.walletCoverageMarkers(ctx, total.Equity, total.UnrealizedPnL, checkTotal)...)
 
 	return total, nil
 }
