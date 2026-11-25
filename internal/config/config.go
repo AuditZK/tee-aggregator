@@ -147,6 +147,17 @@ type Config struct {
 	CTraderClientID     string
 	CTraderClientSecret string
 
+	// SaxoAppKey / SaxoAppSecret are the Saxo application credentials every
+	// token refresh signs with; SaxoRedirectURI is sent along when set, for an
+	// app registered to require it. Read by the connector itself, mirrored here
+	// so the boot can say they are missing: without them every Saxo connect is
+	// refused as not configured, and a stored connection dies within the hour
+	// its refresh token lives. Parsed from SAXO_APP_KEY / SAXO_APP_SECRET /
+	// SAXO_REDIRECT_URI.
+	SaxoAppKey      string
+	SaxoAppSecret   string
+	SaxoRedirectURI string
+
 	// HistorySyncNotifyToken, when set, is sent as X-Internal-Token on the
 	// post-rebuild ping to HistorySyncNotifyURL. The endpoint it targets is a
 	// per-user sync trigger that nginx exposes; without a shared secret it is
@@ -279,6 +290,10 @@ func Load() *Config {
 
 		CTraderClientID:     strings.TrimSpace(getEnv("CTRADER_CLIENT_ID", "")),
 		CTraderClientSecret: strings.TrimSpace(getEnv("CTRADER_CLIENT_SECRET", "")),
+
+		SaxoAppKey:      strings.TrimSpace(getEnv("SAXO_APP_KEY", "")),
+		SaxoAppSecret:   strings.TrimSpace(getEnv("SAXO_APP_SECRET", "")),
+		SaxoRedirectURI: strings.TrimSpace(getEnv("SAXO_REDIRECT_URI", "")),
 
 		MTBridgeURL:        strings.TrimRight(strings.TrimSpace(getEnv("MT_BRIDGE_URL", "")), "/"),
 		MTBridgeHMACSecret: strings.TrimSpace(getEnv("MT_BRIDGE_HMAC_SECRET", "")),

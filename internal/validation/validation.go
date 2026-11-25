@@ -11,13 +11,17 @@ const (
 	maxUserUIDLen          = 100
 	maxExchangeLen         = 50
 	maxLabelLen            = 100
-	maxAPIKeyLen           = 500
-	maxAPISecretLen        = 500
 	maxPassphraseLen       = 500
 	maxTimestampRangeYears = 5
 	maxFutureTimestampSkew = 24 * time.Hour
 	minSyncIntervalMinutes = 5
 	maxSyncIntervalMinutes = 10080 // 7 days
+)
+
+// An OAuth access token is a JWT, and a Saxo one runs past 1 KB.
+const (
+	maxAPIKeyLen    = 4096
+	maxAPISecretLen = 4096
 )
 
 var (

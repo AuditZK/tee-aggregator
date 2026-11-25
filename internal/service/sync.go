@@ -3307,6 +3307,9 @@ func (s *SyncService) getOrCreateConnector(exchange, userUID, label string, cred
 				return s.connSvc.GuardBrokerAccounts(ctx, userUID, exchange, label, accounts, past)
 			})
 		}
+		if rg, ok := conn.(connector.RefreshGuarded); ok && s.connSvc != nil && isTokenGuarded(exchange) {
+			rg.SetRefreshGuard(s.connSvc.TokenGuard(userUID, exchange, label))
+		}
 
 		if s.connCache != nil {
 			s.connCache.Put(exchange, userUID, credsHash, conn)
@@ -3411,7 +3414,7 @@ func (a *aggregatedBreakdown) hasAnyEquity() bool {
 // assigned to this bucket so breakdown_by_market.global is never nil.
 func primaryMarketType(exchange string) string {
 	switch strings.ToLower(exchange) {
-	case "alpaca", "ibkr":
+	case "alpaca", "ibkr", "saxo", "saxo_sim":
 		return connector.MarketStocks
 	case "ctrader", "mt4", "mt5", "ig", "ig_demo":
 		return connector.MarketCFD
@@ -3444,6 +3447,8 @@ func fundingMarketType(exchange string) string {
 	switch strings.ToLower(exchange) {
 	case "ig", "ig_demo", "ctrader", "mt4", "mt5":
 		return connector.MarketCFD
+	case "saxo", "saxo_sim":
+		return primaryMarketType(exchange)
 	default:
 		return connector.MarketSwap
 	}
