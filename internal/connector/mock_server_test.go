@@ -194,6 +194,7 @@ func TestFactoryCreatesNativeConnectors(t *testing.T) {
 		{"hyperliquid", "*connector.Hyperliquid"},
 		{"lighter", "*connector.Lighter"},
 		{"polymarket", "*connector.Polymarket"},
+		{"predictfun", "*connector.PredictFun"},
 		{"mock", "*connector.Mock"},
 	}
 
@@ -238,7 +239,7 @@ func TestAllExchangesAreNative(t *testing.T) {
 		"binance", "bybit", "okx", "kraken", "deribit",
 		"mexc", "bitget", "kucoin", "coinbase", "gate", "bingx", "huobi",
 		"ibkr", "alpaca", "tradestation",
-		"hyperliquid", "lighter", "polymarket",
+		"hyperliquid", "lighter", "polymarket", "predictfun",
 		"ctrader", "mt4", "mt5",
 		"mock",
 	}

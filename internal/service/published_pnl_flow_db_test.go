@@ -1,0 +1,122 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"math"
+	"testing"
+	"time"
+
+	"github.com/trackrecord/enclave/internal/connector"
+	"github.com/trackrecord/enclave/internal/repository"
+)
+
+// pnlConnector reports no cashflows, only a cumulative PnL, the way predict.fun
+// does.
+type pnlConnector struct {
+	scriptedConnector
+	pnlAt  func(time.Time) (float64, error)
+	asked  []time.Time
+	pnlNow float64
+}
+
+func (c *pnlConnector) CumulativePnL(_ context.Context, at time.Time) (float64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if at.IsZero() {
+		return c.pnlNow, nil
+	}
+	c.asked = append(c.asked, at)
+	return c.pnlAt(at)
+}
+
+func TestDBFlowsFromPublishedPnL(t *testing.T) {
+	today := startOfTodayUTC()
+	yesterday := today.Add(-24 * time.Hour)
+	cases := []struct {
+		name        string
+		prevEquity  float64
+		equity      float64
+		pnlBefore   float64
+		pnlNow      float64
+		pnlErr      error
+		deposits    float64
+		withdrawals float64
+	}{
+		{name: "equity moved with the pnl", prevEquity: 1000, equity: 1080, pnlBefore: 300, pnlNow: 380},
+		{name: "drift between the hourly point and the read is noise", prevEquity: 1000, equity: 1082, pnlBefore: 300, pnlNow: 380},
+		{name: "a withdrawal the venue never reported", prevEquity: 1000, equity: 600, pnlBefore: 300, pnlNow: 350, withdrawals: 450},
+		{name: "a deposit on a losing day", prevEquity: 1000, equity: 1900, pnlBefore: 300, pnlNow: 280, deposits: 920},
+		{name: "a pnl the venue cannot state books nothing", prevEquity: 1000, equity: 600, pnlErr: connector.ErrPnLNotCovered},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newDBHarness(t)
+			h.seedConnection(t, "predictfun", "main", dbKey, dbSecret)
+			if err := h.snaps.Upsert(h.ctx, &repository.Snapshot{
+				UserUID: dbUser, Exchange: "predictfun", Label: "main", Timestamp: yesterday,
+				TotalEquity: tc.prevEquity, RealizedBalance: tc.prevEquity,
+			}); err != nil {
+				t.Fatalf("seed yesterday: %v", err)
+			}
+			c := &pnlConnector{
+				scriptedConnector: scriptedConnector{exchange: "predictfun", balances: []connector.Balance{{Equity: tc.equity, Available: tc.equity}}},
+				pnlNow:            tc.pnlNow,
+				pnlAt: func(time.Time) (float64, error) {
+					return tc.pnlBefore, tc.pnlErr
+				},
+			}
+			h.plant(dbKey, dbSecret, c)
+
+			if res := h.sync.SyncConnectionScheduledByLabel(h.ctx, dbUser, "predictfun", "main"); !res.Success {
+				t.Fatalf("sync failed: %+v", res)
+			}
+			snap := h.snapshotToday(t, "predictfun", "main")
+			if math.Abs(snap.Deposits-tc.deposits) > 1e-6 || math.Abs(snap.Withdrawals-tc.withdrawals) > 1e-6 {
+				t.Errorf("deposits, withdrawals = %v, %v, want %v, %v", snap.Deposits, snap.Withdrawals, tc.deposits, tc.withdrawals)
+			}
+			if len(c.asked) != 1 || !c.asked[0].Equal(yesterday) {
+				t.Errorf("pnl asked at %v, want the previous row's read at %v", c.asked, yesterday)
+			}
+		})
+	}
+}
+
+func TestDBFlowsFromPublishedPnL_ConnectRowIsReadAtItsSyncInstant(t *testing.T) {
+	h := newDBHarness(t)
+	h.seedConnection(t, "predictfun", "main", dbKey, dbSecret)
+	yesterday := startOfTodayUTC().Add(-24 * time.Hour)
+	connected := yesterday.Add(14*time.Hour + 5*time.Minute)
+	if err := h.snaps.Upsert(h.ctx, &repository.Snapshot{
+		UserUID: dbUser, Exchange: "predictfun", Label: "main", Timestamp: yesterday,
+		TotalEquity: 1000, RealizedBalance: 1000, Deposits: 1000,
+	}); err != nil {
+		t.Fatalf("seed connect-day row: %v", err)
+	}
+	if err := h.statuses.Upsert(h.ctx, &repository.SyncStatus{
+		UserUID: dbUser, Exchange: "predictfun", Label: "main", LastSyncTime: &connected, Status: "completed",
+	}); err != nil {
+		t.Fatalf("seed connect-day status: %v", err)
+	}
+	c := &pnlConnector{
+		scriptedConnector: scriptedConnector{exchange: "predictfun", balances: []connector.Balance{{Equity: 1100, Available: 1100}}},
+		pnlNow:            500,
+		pnlAt: func(at time.Time) (float64, error) {
+			if at.Before(connected) {
+				return 0, errors.New("asked before the connect read")
+			}
+			return 400, nil
+		},
+	}
+	h.plant(dbKey, dbSecret, c)
+
+	if res := h.sync.SyncConnectionScheduledByLabel(h.ctx, dbUser, "predictfun", "main"); !res.Success {
+		t.Fatalf("sync failed: %+v", res)
+	}
+	if snap := h.snapshotToday(t, "predictfun", "main"); snap.Deposits != 0 || snap.Withdrawals != 0 {
+		t.Errorf("deposits, withdrawals = %v, %v, want none: the day's PnL explains the move", snap.Deposits, snap.Withdrawals)
+	}
+	if len(c.asked) != 1 || !c.asked[0].Equal(connected) {
+		t.Errorf("pnl asked at %v, want the connect read at %v", c.asked, connected)
+	}
+}

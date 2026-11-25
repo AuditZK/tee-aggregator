@@ -80,6 +80,9 @@ services:
     #     must still boot) but the boot logs an Error and every cTrader connect
     #     is refused with "not configured on the enclave" instead of the
     #     "invalid credentials" it used to blame the user for (G-M7).
+    #   PREDICTFUN_API_KEY — the predict.fun application key. Not fatal when
+    #     missing; the boot logs an Error and every predict.fun connect is
+    #     refused as "not configured on the enclave".
     #   HISTORY_SYNC_NOTIFY_URL / HISTORY_SYNC_NOTIFY_TOKEN — the post-rebuild
     #     ping to analytics (<url>/<userUid>). The token is sent as
     #     X-Internal-Token; set the SAME value on the receiving service. Leave

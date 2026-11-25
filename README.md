@@ -114,7 +114,7 @@ This is a full rewrite of the [TypeScript enclave](https://github.com/AuditZK/ze
 ║  │  - Binance, Bybit, OKX, Kraken, Deribit, MEXC       │ ║
 ║  │  - Bitget, KuCoin, Coinbase, Gate, BingX, Huobi      │ ║
 ║  │  - IBKR (Flex Report), Alpaca, TradeStation          │ ║
-║  │  - Hyperliquid, Lighter, Polymarket (DEX)            │ ║
+║  │  - Hyperliquid, Lighter, Polymarket, predict.fun     │ ║
 ║  │  - cTrader, MetaTrader 4/5                           │ ║
 ║  └───────────────────────────────────────────────────────┘ ║
 ║                                                             ║
