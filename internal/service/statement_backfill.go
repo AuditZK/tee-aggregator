@@ -141,11 +141,17 @@ func (s *SyncService) startBackfillIfDue(connMeta *repository.ExchangeConnection
 // startStatementBackfill reads the connection's year in the background. It
 // shares the cached connector with the daily syncs: its period reads write
 // nothing on it.
+//
+// It pings analytics however it ends: the sync that started it, and any sync
+// that found it running, left their own ping to it (wantsAnalyticsNotify), and
+// a failed year still leaves their live rows to mirror. The ping follows the
+// release of the claim, so every sync that saw the claim held wrote before it.
 func (s *SyncService) startStatementBackfill(connMeta *repository.ExchangeConnection) {
 	if !s.claimBackfill(connMeta) {
 		return
 	}
 	go func() {
+		defer s.notifyHistoryRebuilt(context.Background(), connMeta.UserUID)
 		defer s.releaseBackfill(connMeta)
 		ctx, cancel := context.WithTimeout(context.Background(), statementBackfillTimeout)
 		defer cancel()
@@ -182,9 +188,7 @@ func (s *SyncService) startStatementBackfill(connMeta *repository.ExchangeConnec
 				zap.Error(err),
 				zap.String("hint", "retried by the connection's next sync"),
 			)
-			return
 		}
-		s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
 	}()
 }
 
@@ -394,15 +398,16 @@ func (s *SyncService) readStatementPeriod(ctx context.Context, provider connecto
 }
 
 // reconstructFromStatements is the connect-time and admin reconstruction of a
-// statement broker: the full backfill, or only the days of opts.window.
-func (s *SyncService) reconstructFromStatements(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.PeriodHistoryProvider, opts reconstructOpts) {
+// statement broker: the full backfill, or only the days of opts.window. It
+// reports whether it left the analytics ping to a backfill already running.
+func (s *SyncService) reconstructFromStatements(ctx context.Context, connMeta *repository.ExchangeConnection, provider connector.PeriodHistoryProvider, opts reconstructOpts) (backfillOwnsPing bool) {
 	if !s.claimBackfill(connMeta) {
 		s.logger.Info("statement backfill already running, reconstruction skipped",
 			zap.String("user_uid", connMeta.UserUID),
 			zap.String("exchange", connMeta.Exchange),
 			zap.String("label", connMeta.Label),
 		)
-		return
+		return true
 	}
 	defer s.releaseBackfill(connMeta)
 
@@ -423,7 +428,6 @@ func (s *SyncService) reconstructFromStatements(ctx context.Context, connMeta *r
 			zap.String("label", connMeta.Label),
 			zap.Error(err),
 		)
-		return
 	}
-	s.notifyHistoryRebuilt(ctx, connMeta.UserUID)
+	return false
 }

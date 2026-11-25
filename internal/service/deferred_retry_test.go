@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -21,9 +22,9 @@ func TestDeferredRetriesOfOnePassFireApart(t *testing.T) {
 	cto := &repository.ExchangeConnection{ID: "conn-cto", Exchange: "ibkr", Label: "cto"}
 	pea := &repository.ExchangeConnection{ID: "conn-pea", Exchange: "ibkr", Label: "pea"}
 
-	s.scheduleDeferredRetry(cto, rateLimitRetryDelay)
-	s.scheduleDeferredRetry(pea, rateLimitRetryDelay)
-	s.scheduleDeferredRetry(cto, rateLimitRetryDelay)
+	s.scheduleDeferredRetry(context.Background(), cto, rateLimitRetryDelay)
+	s.scheduleDeferredRetry(context.Background(), pea, rateLimitRetryDelay)
+	s.scheduleDeferredRetry(context.Background(), cto, rateLimitRetryDelay)
 
 	if len(delays) != 2 {
 		t.Fatalf("armed %d retries, want 2 (one per connection)", len(delays))
@@ -44,14 +45,14 @@ func TestFiredDeferredRetryFreesItsSlot(t *testing.T) {
 		logger:     zap.NewNop(),
 		deferAfter: func(d time.Duration, _ func()) { delays = append(delays, d) },
 	}
-	s.scheduleDeferredRetry(&repository.ExchangeConnection{ID: "conn-a"}, rateLimitRetryDelay)
+	s.scheduleDeferredRetry(context.Background(), &repository.ExchangeConnection{ID: "conn-a"}, rateLimitRetryDelay)
 
 	// What the timer's own cleanup does once the retry has run.
 	s.deferMu.Lock()
 	delete(s.deferredRetries, "conn-a")
 	s.deferMu.Unlock()
 
-	s.scheduleDeferredRetry(&repository.ExchangeConnection{ID: "conn-b"}, rateLimitRetryDelay)
+	s.scheduleDeferredRetry(context.Background(), &repository.ExchangeConnection{ID: "conn-b"}, rateLimitRetryDelay)
 	if delays[1] != rateLimitRetryDelay {
 		t.Fatalf("retry after a fired one delayed %v, want %v", delays[1], rateLimitRetryDelay)
 	}

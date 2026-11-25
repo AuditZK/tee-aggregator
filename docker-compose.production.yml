@@ -83,8 +83,9 @@ services:
     #   PREDICTFUN_API_KEY — the predict.fun application key. Not fatal when
     #     missing; the boot logs an Error and every predict.fun connect is
     #     refused as "not configured on the enclave".
-    #   HISTORY_SYNC_NOTIFY_URL / HISTORY_SYNC_NOTIFY_TOKEN — the post-rebuild
-    #     ping to analytics (<url>/<userUid>). The token is sent as
+    #   HISTORY_SYNC_NOTIFY_URL / HISTORY_SYNC_NOTIFY_TOKEN — the ping to
+    #     analytics (<url>/<userUid>) after a rebuild, a deferred retry or any
+    #     other write its 00:15 UTC copy misses. The token is sent as
     #     X-Internal-Token; set the SAME value on the receiving service. Leave
     #     both unset to disable the ping, or set only the URL to keep the
     #     current unauthenticated behaviour while the receiver catches up (C6).

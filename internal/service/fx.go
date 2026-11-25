@@ -395,7 +395,7 @@ func (s *SyncService) convertLive(ctx context.Context, conn connector.Connector,
 		zap.String("label", connMeta.Label),
 		zap.String("reason", reason),
 	)
-	s.scheduleDeferredRetry(connMeta, rateLimitRetryDelay)
+	s.scheduleDeferredRetry(ctx, connMeta, rateLimitRetryDelay)
 	return liveFX{}, false
 }
 
