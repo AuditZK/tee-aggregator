@@ -190,6 +190,14 @@ func UnreadableWallets(coverage []WalletCoverage) []string {
 	return missed
 }
 
+// CumulativePnLProvider is a venue that publishes an account's cumulative PnL
+// but none of its deposits and withdrawals. The sync books as capital flow
+// what moved the equity between two reads without moving that PnL.
+type CumulativePnLProvider interface {
+	// CumulativePnL returns the PnL in USD at a moment, or now for a zero time.
+	CumulativePnL(ctx context.Context, at time.Time) (float64, error)
+}
+
 // FundingFee represents a single funding fee payment on a perpetual/swap position.
 type FundingFee struct {
 	Amount    float64   `json:"amount"`
@@ -373,7 +381,7 @@ type Credentials struct {
 	APISecret  string
 	Passphrase string // Optional, for exchanges like OKX
 
-	// DEX connectors (Hyperliquid, Lighter, Polymarket) - read-only, wallet address only
+	// DEX connectors (Hyperliquid, Lighter, Polymarket, predict.fun) - read-only, wallet address only
 	WalletAddress string
 
 	// OAuth connectors (cTrader)

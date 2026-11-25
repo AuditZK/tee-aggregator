@@ -55,6 +55,7 @@ var connectFailureMarkers = []struct {
 
 	// Enclave-side configuration, not the user's secret.
 	{"ctrader_client_id", ConnectFailureNotConfigured},
+	{"not configured on the enclave", ConnectFailureNotConfigured},
 	{"ctrader client credentials", ConnectFailureNotConfigured},
 
 	// A valid login with nothing behind it.

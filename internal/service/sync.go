@@ -144,6 +144,7 @@ var instantLedgerExchanges = map[string]bool{
 	"ig":          true,
 	"okx":         true,
 	"polymarket":  true,
+	"predictfun":  true,
 }
 
 // lastLiveRead is when the sync that wrote the connection's latest snapshot
@@ -1223,6 +1224,9 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	}
 
 	deposits, withdrawals := s.reconcileCapitalFlow(ctx, connMeta, startOfDay, act.trades, balance.Equity, balance.UnrealizedPnL, act.fundingCharges, act.deposits, act.withdrawals)
+	if pp, ok := conn.(connector.CumulativePnLProvider); ok {
+		deposits, withdrawals = s.flowsFromPublishedPnL(ctx, pp, connMeta, startOfDay, balance.Equity)
+	}
 	// UX-001: the first snapshot of a connection that reported no cashflow
 	// books the balance it already holds as a deposit, so its returns have a
 	// base and the equity curve an inception marker.
@@ -1674,6 +1678,62 @@ func (s *SyncService) reconcileCapitalFlow(
 		)
 	}
 	return dep, wd
+}
+
+// publishedPnLNoise is the share of equity below which a derived flow is read
+// as noise. The venue's PnL comes in hourly points and the read lands minutes
+// after one, so an active account drifts a few dollars between the two; booked,
+// that drift is a deposit or a withdrawal every day.
+const publishedPnLNoise = 0.0025
+
+// flowsFromPublishedPnL derives the capital flows of a venue that reports none:
+// whatever moved the equity since the previous read without moving the PnL the
+// venue publishes. The previous read is the latest stored row, at the instant
+// its sync read the account when that is known, since the connect-time row is
+// stamped at midnight but read hours later.
+//
+// A first sync has no previous read and leaves the inception rule to book the
+// starting equity. A PnL the venue cannot state at that instant books nothing
+// and says so, rather than turning the whole move into a flow.
+func (s *SyncService) flowsFromPublishedPnL(ctx context.Context, pp connector.CumulativePnLProvider, connMeta *repository.ExchangeConnection, startOfDay time.Time, equity float64) (deposits, withdrawals float64) {
+	prev, err := s.snapshotRepo.GetLatestByUserExchangeLabelBefore(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, startOfDay)
+	if err != nil || prev == nil {
+		return 0, 0
+	}
+	measured := prev.Timestamp.UTC()
+	if read := s.lastLiveRead(ctx, connMeta); read != nil && !read.Before(measured) && read.Before(measured.Add(24*time.Hour)) && read.Before(startOfDay) {
+		measured = *read
+	}
+	before, err := pp.CumulativePnL(ctx, measured)
+	if err == nil {
+		var now float64
+		if now, err = pp.CumulativePnL(ctx, time.Time{}); err == nil {
+			deposits, withdrawals = InferCapitalFlow(
+				ReconInputs{SettledBalance: prev.TotalEquity},
+				ReconInputs{SettledBalance: equity, RealizedPnL: now - before},
+				math.Max(reconThreshold(equity), publishedPnLNoise*math.Abs(equity)),
+			)
+		}
+	}
+	if err != nil {
+		s.logger.Warn("capital flow not derived; the window books no deposit or withdrawal",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Error(err),
+		)
+		return 0, 0
+	}
+	if deposits != 0 || withdrawals != 0 {
+		s.logger.Info("capital flow derived from the published pnl",
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Time("previous_read", measured),
+			zap.Float64("deposits", deposits),
+			zap.Float64("withdrawals", withdrawals),
+		)
+	}
+	return deposits, withdrawals
 }
 
 // enrichBreakdownWithBalances populates equity and available_margin per market

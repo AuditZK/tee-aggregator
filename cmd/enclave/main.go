@@ -428,6 +428,12 @@ func main() {
 		)
 	}
 
+	if cfg.PredictFunAPIKey == "" {
+		logger.Error("predict.fun is not configured; every predict.fun connect and sync will be refused",
+			zap.String("hint", "set PREDICTFUN_API_KEY in the enclave environment, or ignore this if predict.fun is not offered"),
+		)
+	}
+
 	// 11c. Wire HTTP proxy for geo-restricted exchanges (e.g. Binance from EU).
 	// Set EXCHANGE_HTTP_PROXY=socks5://user:pass@host:port (or http://)
 	// and PROXY_EXCHANGES=binance (comma-separated, default: binance).
