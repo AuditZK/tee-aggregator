@@ -208,12 +208,23 @@ func TestPredictFun_Refusals(t *testing.T) {
 			t.Fatalf("error = %v, want a refusal that says where the address is", err)
 		}
 	})
-	t.Run("a funded account that has not traded yet connects", func(t *testing.T) {
+	t.Run("a wallet holding USDT but no Predict activity is refused", func(t *testing.T) {
 		p, fake := newPredictFunFake(t, map[string]string{
 			predictFunTestPositions:                                `{"success":true,"cursor":null,"data":[]}`,
 			"/account/" + predictFunTestWallet + "/pnl?period=all": `{"success":true,"data":{"period":"all","points":[]}}`,
 		})
 		fake.cashWei = "de0b6b3a7640000"
+		if err := p.TestConnection(context.Background()); ClassifyConnectFailure(err) != ConnectFailureCredentials {
+			t.Fatalf("error = %v, want a refusal: a sign-in wallet holds USDT too", err)
+		}
+	})
+	t.Run("an account with an open position but no PnL point yet connects", func(t *testing.T) {
+		p, _ := newPredictFunFake(t, map[string]string{
+			predictFunTestPositions: `{"success":true,"cursor":null,"data":[
+				{"amount":"100000000000000000000","averageBuyPriceUsd":"0.40","pnlUsd":"0","valueUsd":"40","market":{"categorySlug":"rain-tomorrow"},"outcome":{"name":"Yes"}}
+			]}`,
+			"/account/" + predictFunTestWallet + "/pnl?period=all": `{"success":true,"data":{"period":"all","points":[]}}`,
+		})
 		if err := p.TestConnection(context.Background()); err != nil {
 			t.Fatalf("TestConnection: %v", err)
 		}
