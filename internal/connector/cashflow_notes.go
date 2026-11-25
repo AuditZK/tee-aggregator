@@ -20,6 +20,15 @@ func (n *noteList) set(marks []string) {
 	n.marks = marks
 }
 
+// add appends mark unless the list already holds it.
+func (n *noteList) add(mark string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !slices.Contains(n.marks, mark) {
+		n.marks = append(n.marks, mark)
+	}
+}
+
 func (n *noteList) get() []string {
 	n.mu.Lock()
 	defer n.mu.Unlock()

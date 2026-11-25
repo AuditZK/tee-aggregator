@@ -1,0 +1,478 @@
+package connector
+
+import (
+	"context"
+	"encoding/json"
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// pmFill is a fill the papi fake serves on one list, keyed by symbol.
+type pmFill struct {
+	symbol string
+	time   time.Time
+	row    map[string]any
+}
+
+// pmIncomeRow is an income row the papi fake serves.
+type pmIncomeRow struct {
+	symbol, incomeType, income, asset string
+	time                              time.Time
+	tranID                            int64
+}
+
+// binancePMActivityServer fakes a Binance account for the activity reads. In
+// Portfolio Margin fapi refuses the key with -2015 and papi answers; out of
+// it fapi answers and papi refuses.
+type binancePMActivityServer struct {
+	portfolioMargin bool
+	// failUMFills makes /papi/v1/um/userTrades refuse every call.
+	failUMFills bool
+
+	umPositions, cmPositions []string
+	umIncome, cmIncome       []pmIncomeRow
+	umFills, cmFills, mFills []pmFill
+	// crossAssets are the /papi/v1/balance assets holding cross margin.
+	crossAssets []string
+	// unlisted are the spot symbols margin/myTrades answers -1121 for.
+	unlisted []string
+
+	mu    sync.Mutex
+	calls []*url.URL
+}
+
+func (s *binancePMActivityServer) count(path string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, u := range s.calls {
+		if u.Path == path {
+			n++
+		}
+	}
+	return n
+}
+
+func (s *binancePMActivityServer) countPrefix(prefix string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, u := range s.calls {
+		if strings.HasPrefix(u.Path, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+func (s *binancePMActivityServer) symbolsAsked(path string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, u := range s.calls {
+		if u.Path == path && !slices.Contains(out, u.Query().Get("symbol")) {
+			out = append(out, u.Query().Get("symbol"))
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func inRange(q url.Values, t time.Time) bool {
+	from, _ := strconv.ParseInt(q.Get("startTime"), 10, 64)
+	to, _ := strconv.ParseInt(q.Get("endTime"), 10, 64)
+	ms := t.UnixMilli()
+	return ms >= from && ms <= to
+}
+
+func (s *binancePMActivityServer) fills(q url.Values, fills []pmFill) []map[string]any {
+	out := []map[string]any{}
+	for _, f := range fills {
+		if f.symbol == q.Get("symbol") && inRange(q, f.time) {
+			row := map[string]any{"symbol": f.symbol, "time": f.time.UnixMilli()}
+			for k, v := range f.row {
+				row[k] = v
+			}
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+func (s *binancePMActivityServer) income(q url.Values, rows []pmIncomeRow) []map[string]any {
+	out := []map[string]any{}
+	for _, r := range rows {
+		if t := q.Get("incomeType"); t != "" && t != r.incomeType {
+			continue
+		}
+		if inRange(q, r.time) {
+			out = append(out, map[string]any{
+				"symbol": r.symbol, "incomeType": r.incomeType, "income": r.income,
+				"asset": r.asset, "time": r.time.UnixMilli(), "tranId": r.tranID,
+			})
+		}
+	}
+	return out
+}
+
+func positions(symbols []string) []map[string]any {
+	out := []map[string]any{}
+	for _, s := range symbols {
+		out = append(out, map[string]any{"symbol": s, "positionAmt": "-0.5", "entryPrice": "51000", "markPrice": "50000", "unRealizedProfit": "500"})
+	}
+	return out
+}
+
+func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.calls = append(s.calls, r.URL)
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		q := r.URL.Query()
+		denied := func() {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}`))
+		}
+		write := func(v any) {
+			body, _ := json.Marshal(v)
+			_, _ = w.Write(body)
+		}
+		p := r.URL.Path
+		switch {
+		case strings.Contains(p, "/api/v3/ticker"):
+			_, _ = w.Write([]byte(`[{"symbol":"BTCUSDT","price":"50000"},{"symbol":"ETHUSDT","price":"3000"}]`))
+		case p == "/api/v3/account":
+			_, _ = w.Write([]byte(`{"balances":[{"asset":"USDT","free":"100","locked":"0"}]}`))
+		case strings.HasPrefix(p, "/fapi/"), strings.HasPrefix(p, "/dapi/"):
+			if s.portfolioMargin {
+				denied()
+				return
+			}
+			switch p {
+			case "/fapi/v2/account":
+				_, _ = w.Write([]byte(`{"totalMarginBalance":"700","totalUnrealizedProfit":"0","availableBalance":"600"}`))
+			case "/fapi/v1/userTrades":
+				_, _ = w.Write([]byte(`[{"id":1,"symbol":"BTCUSDT","price":"50000","qty":"0.01","commission":"0.2","commissionAsset":"USDT","time":` +
+					strconv.FormatInt(q2ms(q), 10) + `,"side":"BUY","realizedPnl":"0"}]`))
+			case "/dapi/v1/balance", "/fapi/v2/positionRisk":
+				_, _ = w.Write([]byte(`[]`))
+			default:
+				_, _ = w.Write([]byte(`{}`))
+			}
+		case strings.HasPrefix(p, "/papi/"):
+			if !s.portfolioMargin {
+				denied()
+				return
+			}
+			switch p {
+			case "/papi/v1/account":
+				_, _ = w.Write([]byte(`{"accountEquity":"4800","actualEquity":"5000","accountInitialMargin":"0","totalMarginOpenLoss":"0"}`))
+			case "/papi/v1/balance":
+				rows := []map[string]any{{"asset": "BNB", "crossMarginAsset": "0", "crossMarginBorrowed": "0"}}
+				for _, a := range s.crossAssets {
+					rows = append(rows, map[string]any{"asset": a, "crossMarginAsset": "2", "crossMarginBorrowed": "0", "umUnrealizedPNL": "0", "cmUnrealizedPNL": "0"})
+				}
+				write(rows)
+			case "/papi/v1/um/positionRisk":
+				write(positions(s.umPositions))
+			case "/papi/v1/cm/positionRisk":
+				write(positions(s.cmPositions))
+			case "/papi/v1/um/income":
+				write(s.income(q, s.umIncome))
+			case "/papi/v1/cm/income":
+				write(s.income(q, s.cmIncome))
+			case "/papi/v1/um/userTrades":
+				if s.failUMFills {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"code":-1000,"msg":"An unknown error occurred while processing the request."}`))
+					return
+				}
+				write(s.fills(q, s.umFills))
+			case "/papi/v1/cm/userTrades":
+				write(s.fills(q, s.cmFills))
+			case "/papi/v1/margin/myTrades":
+				if slices.Contains(s.unlisted, q.Get("symbol")) {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"code":-1121,"msg":"Invalid symbol."}`))
+					return
+				}
+				write(s.fills(q, s.mFills))
+			default:
+				_, _ = w.Write([]byte(`{}`))
+			}
+		case strings.HasPrefix(p, "/sapi/v1/margin/"):
+			_, _ = w.Write([]byte(`{"totalNetAssetOfBtc":"0"}`))
+		case strings.HasPrefix(p, "/sapi/v1/simple-earn/"):
+			_, _ = w.Write([]byte(`{"rows":[],"total":0}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	target, _ := url.Parse(srv.URL)
+	return NewBinanceWithClient(&Credentials{APIKey: "k", APISecret: "s"},
+		&http.Client{Transport: hostRewriter{base: http.DefaultTransport, target: target}})
+}
+
+// q2ms places the fake fapi fill at the start of the asked range.
+func q2ms(q url.Values) int64 {
+	v, _ := strconv.ParseInt(q.Get("startTime"), 10, 64)
+	return v
+}
+
+var pmDay = time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+
+func pmAccountWithActivity() *binancePMActivityServer {
+	at := func(h int) time.Time { return pmDay.Add(time.Duration(h) * time.Hour) }
+	return &binancePMActivityServer{
+		portfolioMargin: true,
+		umPositions:     []string{"BTCUSDT"},
+		// ETHUSDT was opened and closed inside the day: only its income
+		// names it. 1000PEPEUSDT has no spot pair.
+		umIncome: []pmIncomeRow{
+			{symbol: "ETHUSDT", incomeType: "COMMISSION", income: "-0.6", asset: "USDT", time: at(3), tranID: 1},
+			{symbol: "1000PEPEUSDT", incomeType: "COMMISSION", income: "-0.1", asset: "USDT", time: at(4), tranID: 2},
+			{symbol: "BTCUSDT", incomeType: "FUNDING_FEE", income: "-1.5", asset: "USDT", time: at(8), tranID: 3},
+			{symbol: "", incomeType: "TRANSFER", income: "100", asset: "USDT", time: at(1), tranID: 4},
+		},
+		cmIncome: []pmIncomeRow{
+			{symbol: "BTCUSD_PERP", incomeType: "COMMISSION", income: "-0.00001", asset: "BTC", time: at(5), tranID: 1},
+			{symbol: "BTCUSD_PERP", incomeType: "FUNDING_FEE", income: "-0.0001", asset: "BTC", time: at(16), tranID: 2},
+		},
+		umFills: []pmFill{
+			{symbol: "BTCUSDT", time: at(2), row: map[string]any{"id": 11, "side": "SELL", "price": "50000", "qty": "0.5", "commission": "5", "commissionAsset": "USDT", "realizedPnl": "0"}},
+			{symbol: "ETHUSDT", time: at(3), row: map[string]any{"id": 12, "side": "BUY", "price": "3000", "qty": "1", "commission": "0.6", "commissionAsset": "USDT", "realizedPnl": "0"}},
+			{symbol: "ETHUSDT", time: at(6), row: map[string]any{"id": 13, "side": "SELL", "price": "3100", "qty": "1", "commission": "0.62", "commissionAsset": "USDT", "realizedPnl": "100"}},
+		},
+		cmFills: []pmFill{
+			{symbol: "BTCUSD_PERP", time: at(5), row: map[string]any{"id": 21, "pair": "BTCUSD", "side": "BUY", "price": "50000", "qty": "10", "baseQty": "0.02", "commission": "0.00001", "commissionAsset": "BTC", "marginAsset": "BTC", "realizedPnl": "0"}},
+		},
+		crossAssets: []string{"ETH"},
+		unlisted:    []string{"1000PEPEUSDT"},
+		mFills: []pmFill{
+			{symbol: "ETHUSDT", time: at(7), row: map[string]any{"id": 31, "isBuyer": true, "price": "3000", "qty": "0.1", "commission": "0.0001", "commissionAsset": "ETH"}},
+		},
+	}
+}
+
+func TestBinance_PortfolioMargin_TradesFromUMCMAndMargin(t *testing.T) {
+	srv := pmAccountWithActivity()
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+
+	trades, err := b.GetTrades(context.Background(), pmDay, pmDay.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	byID := map[string]*Trade{}
+	for _, tr := range trades {
+		byID[tr.MarketType+":"+tr.ID] = tr
+	}
+	if len(trades) != 5 {
+		t.Fatalf("trades = %d (%v), want 5: one BTCUSDT and two ETHUSDT UM fills, one COIN-M, one margin", len(trades), byID)
+	}
+	for _, id := range []string{"swap:11", "swap:12", "swap:13", "swap:21", "spot:31"} {
+		if byID[id] == nil {
+			t.Fatalf("fill %s missing from %v", id, byID)
+		}
+	}
+	if um := byID["swap:13"]; um.Side != "sell" || um.Fee != 0.62 || um.FeeCurrency != "USDT" || um.RealizedPnL != 100 || um.Notional() != 3100 {
+		t.Fatalf("UM fill = %+v", um)
+	}
+	// 10 contracts of 100 USD = 0.02 BTC at 50000; the BTC fee valued at the
+	// fill price.
+	if cm := byID["swap:21"]; cm.Notional() != 1000 || math.Abs(cm.Fee-0.5) > 1e-9 || cm.FeeCurrency != "USD" || cm.Side != "buy" {
+		t.Fatalf("COIN-M fill = %+v, want 1000 notional and a 0.5 USD fee", cm)
+	}
+	if m := byID["spot:31"]; m.Side != "buy" || m.Notional() != 300 || m.Fee != 0.0001 || m.FeeCurrency != "ETH" {
+		t.Fatalf("margin fill = %+v", m)
+	}
+
+	if got := srv.symbolsAsked("/papi/v1/um/userTrades"); !slices.Equal(got, []string{"1000PEPEUSDT", "BTCUSDT", "ETHUSDT"}) {
+		t.Fatalf("UM symbols asked = %v", got)
+	}
+	if got := srv.symbolsAsked("/papi/v1/cm/userTrades"); !slices.Equal(got, []string{"BTCUSD_PERP"}) {
+		t.Fatalf("COIN-M symbols asked = %v", got)
+	}
+	if got := srv.symbolsAsked("/papi/v1/margin/myTrades"); !slices.Equal(got, []string{"1000PEPEUSDT", "BTCUSDT", "ETHUSDC", "ETHUSDT"}) {
+		t.Fatalf("margin symbols asked = %v, want ETH against USDT and USDC plus the income's pairs", got)
+	}
+	if n := srv.count("/fapi/v1/userTrades"); n != 0 {
+		t.Fatalf("fapi userTrades called %d times on a portfolio margin account", n)
+	}
+	if n := srv.count("/papi/v1/account"); n != 1 {
+		t.Fatalf("papi account read %d times, want once (the balance read): the verdict is cached", n)
+	}
+	if w := b.CapabilityWarnings(); slices.Contains(w, binancePMTradesUnreadable) {
+		t.Fatalf("warnings = %v after a clean read", w)
+	}
+}
+
+func TestBinance_PortfolioMargin_VerdictProbedOnceWithoutBalanceRead(t *testing.T) {
+	srv := pmAccountWithActivity()
+	b := srv.connector(t)
+	for range 2 {
+		trades, err := b.GetTrades(context.Background(), pmDay, pmDay.Add(24*time.Hour))
+		if err != nil || len(trades) != 5 {
+			t.Fatalf("GetTrades = %d trades, %v; want 5", len(trades), err)
+		}
+	}
+	if n := srv.count("/papi/v1/account"); n != 1 {
+		t.Fatalf("papi probed %d times over two reads, want 1", n)
+	}
+	if n := srv.count("/fapi/v1/userTrades"); n != 1 {
+		t.Fatalf("fapi userTrades called %d times, want 1 (the read that found the refusal)", n)
+	}
+}
+
+func TestBinance_PortfolioMargin_FillWindows(t *testing.T) {
+	srv := &binancePMActivityServer{portfolioMargin: true, umPositions: []string{"BTCUSDT"}, cmPositions: []string{"BTCUSD_PERP"}}
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if _, err := b.GetTrades(context.Background(), pmDay, pmDay.Add(20*24*time.Hour)); err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	// UM: 7 + 7 + 6 days. COIN-M: twenty 24-hour windows. UM income: 7-day
+	// windows; COIN-M income: one 200-day window. Margin: BTCUSDT is not in
+	// the income and no cross asset is held, so nothing is asked.
+	for path, want := range map[string]int{
+		"/papi/v1/um/userTrades":   3,
+		"/papi/v1/cm/userTrades":   20,
+		"/papi/v1/um/income":       3,
+		"/papi/v1/cm/income":       1,
+		"/papi/v1/margin/myTrades": 0,
+	} {
+		if n := srv.count(path); n != want {
+			t.Errorf("%s called %d times over 20 days, want %d", path, n, want)
+		}
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	for _, u := range srv.calls {
+		q := u.Query()
+		from, _ := strconv.ParseInt(q.Get("startTime"), 10, 64)
+		to, _ := strconv.ParseInt(q.Get("endTime"), 10, 64)
+		span := time.Duration(to-from) * time.Millisecond
+		if (u.Path == "/papi/v1/um/userTrades" && span > 7*24*time.Hour) || (u.Path == "/papi/v1/cm/userTrades" && span > 24*time.Hour) {
+			t.Fatalf("%s asked for %v, over its cap", u.Path, span)
+		}
+	}
+}
+
+func TestBinance_PortfolioMargin_FundingFeesFromIncome(t *testing.T) {
+	now := time.Now().UTC()
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	srv := &binancePMActivityServer{
+		portfolioMargin: true,
+		umIncome: []pmIncomeRow{
+			{symbol: "BTCUSDT", incomeType: "FUNDING_FEE", income: "-1.5", asset: "USDT", time: day.Add(-16 * time.Hour), tranID: 1},
+			{symbol: "BTCUSDT", incomeType: "FUNDING_FEE", income: "0.5", asset: "USDT", time: day.Add(-8 * time.Hour), tranID: 2},
+			{symbol: "BTCUSDT", incomeType: "COMMISSION", income: "-9", asset: "USDT", time: day.Add(-8 * time.Hour), tranID: 3},
+			// The day before the window.
+			{symbol: "BTCUSDT", incomeType: "FUNDING_FEE", income: "-7", asset: "USDT", time: day.Add(-30 * time.Hour), tranID: 4},
+		},
+		cmIncome: []pmIncomeRow{
+			{symbol: "BTCUSD_PERP", incomeType: "FUNDING_FEE", income: "-0.0001", asset: "BTC", time: day.Add(-4 * time.Hour), tranID: 1},
+		},
+	}
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	fees, err := b.GetFundingFees(context.Background(), nil, day.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("GetFundingFees: %v", err)
+	}
+	sum := 0.0
+	for _, f := range fees {
+		sum += f.Amount
+	}
+	// -1.5 + 0.5 USDT, and 0.0001 BTC at 50000 = -5.
+	if len(fees) != 3 || math.Abs(sum-(-6)) > 1e-9 {
+		t.Fatalf("funding = %d rows summing %v, want 3 rows summing -6", len(fees), sum)
+	}
+}
+
+func TestBinance_PortfolioMargin_UnreadableFillsRaiseMarker(t *testing.T) {
+	srv := pmAccountWithActivity()
+	srv.failUMFills = true
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if _, err := b.GetTrades(context.Background(), pmDay, pmDay.Add(24*time.Hour)); err == nil {
+		t.Fatal("GetTrades hid the papi failure")
+	}
+	if !slices.Contains(b.CapabilityWarnings(), binancePMTradesUnreadable) {
+		t.Fatalf("warnings = %v, want %s", b.CapabilityWarnings(), binancePMTradesUnreadable)
+	}
+	// The next clean read clears it.
+	srv.failUMFills = false
+	if _, err := b.GetTrades(context.Background(), pmDay, pmDay.Add(24*time.Hour)); err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	if slices.Contains(b.CapabilityWarnings(), binancePMTradesUnreadable) {
+		t.Fatal("marker kept after a clean read")
+	}
+}
+
+// A classic account must issue exactly the requests it did before Portfolio
+// Margin activity existed: not one papi call, and the same fapi fills.
+func TestBinance_NonPortfolioMargin_NoPapiCalls(t *testing.T) {
+	srv := &binancePMActivityServer{portfolioMargin: false}
+	b := srv.connector(t)
+	ctx := context.Background()
+	if _, err := b.GetBalance(ctx); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	trades, err := b.GetTrades(ctx, pmDay, pmDay.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	if len(trades) != 1 || trades[0].MarketType != MarketSwap || trades[0].ID != "1" {
+		t.Fatalf("trades = %+v, want the one fapi fill", trades)
+	}
+	if _, err := b.GetPositions(ctx); err != nil {
+		t.Fatalf("GetPositions: %v", err)
+	}
+	fees, err := b.GetFundingFees(ctx, []string{"BTCUSDT"}, pmDay)
+	if err != nil || fees != nil {
+		t.Fatalf("GetFundingFees = %v, %v; want nothing", fees, err)
+	}
+	if n := srv.countPrefix("/papi/"); n != 0 {
+		t.Fatalf("%d papi calls on a classic account, want 0", n)
+	}
+	if n := srv.count("/fapi/v1/userTrades"); n != 1 {
+		t.Fatalf("fapi userTrades called %d times, want 1", n)
+	}
+	if n := srv.count("/api/v3/myTrades"); n != 0 {
+		t.Fatalf("spot myTrades called %d times, want 0 (only USDT held)", n)
+	}
+
+	// Same without a balance read first (the recount path).
+	srv2 := &binancePMActivityServer{portfolioMargin: false}
+	b2 := srv2.connector(t)
+	if _, err := b2.GetTrades(ctx, pmDay, pmDay.Add(24*time.Hour)); err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	if _, err := b2.GetFundingFees(ctx, nil, pmDay); err != nil {
+		t.Fatalf("GetFundingFees: %v", err)
+	}
+	if n := srv2.countPrefix("/papi/"); n != 0 {
+		t.Fatalf("%d papi calls on a classic account read without a balance first, want 0", n)
+	}
+}
