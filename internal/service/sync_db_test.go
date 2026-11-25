@@ -153,6 +153,10 @@ type scriptedConnector struct {
 	// cashflowWarning is raised only while the cashflows are read, the way
 	// Bybit and OKX find their gaps.
 	cashflowWarning string
+	// tradesErr fails the trade read, raising tradesWarning the way Binance
+	// raises pm_trades_unreadable.
+	tradesErr     error
+	tradesWarning string
 
 	mu    sync.Mutex
 	reads int
@@ -180,7 +184,12 @@ func (c *scriptedConnector) GetPositions(context.Context) ([]*connector.Position
 }
 
 func (c *scriptedConnector) GetTrades(context.Context, time.Time, time.Time) ([]*connector.Trade, error) {
-	return nil, nil
+	if c.tradesWarning != "" {
+		c.mu.Lock()
+		c.warnings = append(c.warnings, c.tradesWarning)
+		c.mu.Unlock()
+	}
+	return nil, c.tradesErr
 }
 
 func (c *scriptedConnector) TestConnection(context.Context) error { return nil }
@@ -270,6 +279,31 @@ func TestDBWarningsFoundWhileReadingCashflowsReachTheStatus(t *testing.T) {
 			}
 			if st := h.status(t, "bybit", "main"); st.ErrorMessage != "warning: funding_wallet_unreadable" {
 				t.Errorf("errorMessage = %q, want the warning raised during the cashflow read", st.ErrorMessage)
+			}
+		})
+	}
+}
+
+func TestDBFailedTradeReadKeepsTheSyncAndStoresTheMarker(t *testing.T) {
+	for _, p := range syncPaths {
+		t.Run(p.name, func(t *testing.T) {
+			h := newDBHarness(t)
+			h.seedConnection(t, "binance", "main", dbKey, dbSecret)
+			h.plant(dbKey, dbSecret, &scriptedConnector{
+				exchange:      "binance",
+				balances:      []connector.Balance{{Equity: 1000, Available: 1000}},
+				tradesErr:     errors.New("portfolio margin trades: UM fills BTCUSDT: -1000"),
+				tradesWarning: "pm_trades_unreadable",
+			})
+
+			if res := p.run(h, "binance", "main"); !res.Success {
+				t.Fatalf("sync failed: %+v", res)
+			}
+			if snap := h.snapshotToday(t, "binance", "main"); snap.TotalEquity != 1000 {
+				t.Errorf("equity = %v, want the snapshot written at 1000", snap.TotalEquity)
+			}
+			if st := h.status(t, "binance", "main"); st.Status != "completed" || st.ErrorMessage != "warning: pm_trades_unreadable" {
+				t.Errorf("status = %q / %q, want completed with the trades marker", st.Status, st.ErrorMessage)
 			}
 		})
 	}

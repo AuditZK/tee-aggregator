@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"math"
 	"testing"
 	"time"
@@ -136,5 +137,39 @@ func TestRecountDayKeepsARowWhoseGlobalDisagrees(t *testing.T) {
 	d := (&SyncService{}).recountDay(rows, 1, "binance", []string{connector.MarketSwap}, nil, nil, false)
 	if d.Kept == "" || d.breakdown != nil {
 		t.Fatalf("disagreeing row rewritten: %+v", d)
+	}
+}
+
+// A classic Binance account reads no funding: its recount must keep the swap
+// funding a row stores, not write the empty read over it as zero.
+func TestRecountKeepsStoredFundingOfAClassicBinanceAccount(t *testing.T) {
+	// No balance read and no fapi refusal seen: the connector is not in
+	// Portfolio Margin, and answers without calling the venue.
+	conn := connector.NewBinance(&connector.Credentials{APIKey: "k", APISecret: "s"})
+	funding, readsFunding, err := recountFunding(context.Background(), conn, time.Now().Add(-24*time.Hour))
+	if err != nil || readsFunding || funding != nil {
+		t.Fatalf("recountFunding = %v, %v, %v; want not read", funding, readsFunding, err)
+	}
+
+	d1 := time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC)
+	d2 := d1.Add(24 * time.Hour)
+	stored := &repository.MarketBreakdown{
+		Swap:   &repository.MarketMetrics{Equity: 950, Trades: 1, Volume: 100, TradingFees: 0.04, FundingFees: 1.5},
+		Global: &repository.MarketMetrics{Equity: 950, Trades: 1, Volume: 100, TradingFees: 0.04, FundingFees: 1.5},
+	}
+	rows := []*repository.Snapshot{
+		{Timestamp: d1, TotalEquity: 900, FromExternalRebuilder: true},
+		{ID: "live", Timestamp: d2, TotalEquity: 950, Breakdown: stored},
+	}
+	trades := []*connector.Trade{
+		{ID: "a", Price: 100, Quantity: 1, Fee: 0.04, Side: "buy", MarketType: connector.MarketSwap, Timestamp: d1.Add(time.Hour)},
+		{ID: "b", Price: 100, Quantity: 1, Fee: 0.04, Side: "sell", MarketType: connector.MarketSwap, Timestamp: d1.Add(2 * time.Hour)},
+	}
+	d := (&SyncService{}).recountDay(rows, 1, "binance", []string{connector.MarketSwap}, trades, funding, readsFunding)
+	if d.breakdown.Swap.Trades != 2 {
+		t.Fatalf("swap trades = %d, want the 2 fills recounted", d.breakdown.Swap.Trades)
+	}
+	if d.breakdown.Swap.FundingFees != 1.5 || d.NewFundingFees != 1.5 {
+		t.Fatalf("funding = %v / %v, want the stored 1.5 kept", d.breakdown.Swap.FundingFees, d.NewFundingFees)
 	}
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -100,12 +101,9 @@ func (s *SyncService) RecountActivity(ctx context.Context, userUID, exchange, la
 	if err != nil {
 		return nil, fmt.Errorf("read trades: %w", err)
 	}
-	var funding []*connector.FundingFee
-	ff, readsFunding := conn.(connector.FundingFeesFetcher)
-	if readsFunding {
-		if funding, err = ff.GetFundingFees(ctx, nil, since); err != nil {
-			return nil, fmt.Errorf("read funding: %w", err)
-		}
+	funding, readsFunding, err := recountFunding(ctx, conn, since)
+	if err != nil {
+		return nil, err
 	}
 
 	var out []RecountDay
@@ -173,6 +171,25 @@ func (s *SyncService) recountSource(ctx context.Context, userUID, exchange, labe
 // reconstructed, or when its global entry does not add up to its markets: a
 // row written before the per-market breakdown existed, which a recount would
 // double.
+// recountFunding reads the funding since since, and whether it was read at
+// all: a connector that reads no funding for this account (Binance outside
+// Portfolio Margin answers ErrFundingNotRead) leaves the stored funding as
+// it is, where an empty read would write zero over it.
+func recountFunding(ctx context.Context, conn connector.Connector, since time.Time) ([]*connector.FundingFee, bool, error) {
+	ff, ok := conn.(connector.FundingFeesFetcher)
+	if !ok {
+		return nil, false, nil
+	}
+	funding, err := ff.GetFundingFees(ctx, nil, since)
+	if errors.Is(err, connector.ErrFundingNotRead) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("read funding: %w", err)
+	}
+	return funding, true, nil
+}
+
 func (s *SyncService) recountDay(rows []*repository.Snapshot, i int, exchange string, markets []string, trades []*connector.Trade, funding []*connector.FundingFee, readsFunding bool) RecountDay {
 	r := rows[i]
 	day := r.Timestamp.UTC()

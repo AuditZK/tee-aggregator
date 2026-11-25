@@ -210,6 +210,12 @@ type FundingFeesFetcher interface {
 	GetFundingFees(ctx context.Context, symbols []string, since time.Time) ([]*FundingFee, error)
 }
 
+// ErrFundingNotRead is what a FundingFeesFetcher answers for an account it
+// reads no funding on (a classic Binance account: only Portfolio Margin
+// funding is read). It is not a zero: a caller rewriting stored funding
+// must keep what it holds.
+var ErrFundingNotRead = errors.New("funding not read for this account")
+
 // Connectors that hold a long-lived resource — a WebSocket with its read loop
 // and heartbeat, a pooled session — implement io.Closer. The connector cache
 // calls it whenever an instance leaves the cache (LRU eviction, TTL cleanup,

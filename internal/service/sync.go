@@ -1381,7 +1381,20 @@ type liveActivity struct {
 func (s *SyncService) readActivity(ctx context.Context, conn connector.Connector, connMeta *repository.ExchangeConnection, from, now time.Time, booked rebuiltDays) liveActivity {
 	var act liveActivity
 	var swapSymbols []string
-	act.trades, _ = conn.GetTrades(ctx, from, now)
+	// A connector may hand back the fills it read before failing; they are
+	// kept. The gap itself reaches the sync status through the connector's
+	// CapabilityWarner marker (Binance Portfolio Margin: pm_trades_unreadable).
+	trades, terr := conn.GetTrades(ctx, from, now)
+	if terr != nil {
+		s.logger.Warn("trade fetch failed; the window's trades, volume and fees may be short",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Int("trades_read", len(trades)),
+			zap.Error(terr),
+		)
+	}
+	act.trades = trades
 	act.trades = slices.DeleteFunc(act.trades, func(t *connector.Trade) bool { return booked.has(t.Timestamp) })
 	for _, t := range act.trades {
 		if t.MarketType == connector.MarketSwap {

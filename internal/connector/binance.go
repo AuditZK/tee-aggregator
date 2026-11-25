@@ -49,6 +49,17 @@ type Binance struct {
 	coverage []WalletCoverage
 	// cashflowNotes carries the markers the last GetCashflows raised.
 	cashflowNotes noteList
+	// pmVerdict is whether the account runs in Portfolio Margin, as the last
+	// GetBalance (or the first activity read, when none ran) found it. Every
+	// activity read keys off it, so one sync probes papi at most once and an
+	// account fapi answers never reaches papi at all.
+	pmVerdict binancePMVerdict
+	// activityNotes carries the markers the last GetTrades/GetFundingFees
+	// raised (pm_trades_unreadable).
+	activityNotes noteList
+	// papiPacer keeps the papi weight this connector spends under
+	// binancePapiBudgetPerMinute.
+	papiPacer binanceWeightPacer
 }
 
 // Binance wallet names. Their own vocabulary, not market types: cross and
@@ -232,6 +243,10 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	} else {
 		b.noteWallet(binanceWalletUM, ferr)
 	}
+	b.pmVerdict = binancePMNo
+	if portfolioMargin {
+		b.pmVerdict = binancePMYes
+	}
 
 	if !portfolioMargin {
 		if eq, cerr := b.getCoinMFuturesEquity(ctx, priceMap); cerr == nil {
@@ -340,7 +355,8 @@ func (b *Binance) CapabilityWarnings() []string {
 	b.mu.Lock()
 	out := slices.Clone(b.capabilityWarnings)
 	b.mu.Unlock()
-	return append(out, b.cashflowNotes.get()...)
+	out = append(out, b.cashflowNotes.get()...)
+	return append(out, b.activityNotes.get()...)
 }
 
 // getSpotBalance values the spot wallet. A flexible Earn position also shows
@@ -669,17 +685,30 @@ func (b *Binance) getFuturesBalanceFromBalanceEndpoint(ctx context.Context) (*Ba
 }
 
 func (b *Binance) GetPositions(ctx context.Context) ([]*Position, error) {
+	if b.portfolioMarginVerdict() == binancePMYes {
+		// fapi refuses a Portfolio Margin key: asking it first is a wasted call.
+		body, err := b.papiGet(ctx, "/papi/v1/um/positionRisk", url.Values{})
+		if err != nil {
+			return nil, err
+		}
+		return parseBinancePositions(body)
+	}
 	params := url.Values{}
 	body, err := b.doRequest(ctx, "GET", binanceFuturesAPI, "/fapi/v2/positionRisk", params, true)
 	if isBinancePermissionRefusal(err) {
-		if pmBody, pmErr := b.doRequest(ctx, "GET", binancePortfolioMarginAPI, "/papi/v1/um/positionRisk", url.Values{}, true); pmErr == nil {
+		if pmBody, pmErr := b.papiGet(ctx, "/papi/v1/um/positionRisk", url.Values{}); pmErr == nil {
 			body, err = pmBody, nil
 		}
 	}
 	if err != nil {
 		return nil, err
 	}
+	return parseBinancePositions(body)
+}
 
+// parseBinancePositions reads a positionRisk answer, fapi's and papi's UM one
+// sharing the shape.
+func parseBinancePositions(body []byte) ([]*Position, error) {
 	var resp []struct {
 		Symbol           string `json:"symbol"`
 		PositionAmt      string `json:"positionAmt"`
@@ -724,8 +753,13 @@ func (b *Binance) GetPositions(ctx context.Context) ([]*Position, error) {
 	return positions, nil
 }
 
+// GetTrades reads the spot fills, then the UM fills from fapi or, on a
+// Portfolio Margin account, the UM, COIN-M and margin fills from papi. A
+// failed papi read returns the fills read so far with the error, and raises
+// pm_trades_unreadable: the sync keeps the day, and the gap is on record.
 func (b *Binance) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
 	var allTrades []*Trade
+	b.activityNotes.set(nil)
 
 	// Spot trades
 	spotTrades, err := b.getSpotTrades(ctx, start, end)
@@ -733,12 +767,25 @@ func (b *Binance) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade
 		allTrades = append(allTrades, spotTrades...)
 	}
 
-	// Futures trades
-	futuresTrades, err := b.getFuturesTrades(ctx, start, end)
-	if err == nil {
-		allTrades = append(allTrades, futuresTrades...)
+	verdict := b.portfolioMarginVerdict()
+	if verdict != binancePMYes {
+		// Futures trades
+		futuresTrades, err := b.getFuturesTrades(ctx, start, end)
+		if err == nil {
+			allTrades = append(allTrades, futuresTrades...)
+			return allTrades, nil
+		}
+		if verdict == binancePMNo || !b.probePortfolioMargin(ctx, err) {
+			return allTrades, nil
+		}
 	}
 
+	pmTrades, err := b.getPortfolioMarginTrades(ctx, start, end)
+	allTrades = append(allTrades, pmTrades...)
+	if err != nil {
+		b.activityNotes.add(binancePMTradesUnreadable)
+		return allTrades, fmt.Errorf("portfolio margin trades: %w", err)
+	}
 	return allTrades, nil
 }
 
@@ -788,21 +835,29 @@ func (b *Binance) getSpotTradesForSymbol(ctx context.Context, symbol string, sta
 		return nil, err
 	}
 
-	var resp []struct {
-		ID              int64  `json:"id"`
-		Symbol          string `json:"symbol"`
-		Price           string `json:"price"`
-		Qty             string `json:"qty"`
-		Commission      string `json:"commission"`
-		CommissionAsset string `json:"commissionAsset"`
-		Time            int64  `json:"time"`
-		IsBuyer         bool   `json:"isBuyer"`
-	}
-
+	var resp []binanceSpotFill
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
+	return binanceSpotFillTrades(resp), nil
+}
 
+// binanceSpotFill is one fill of /api/v3/myTrades, the shape papi's
+// /papi/v1/margin/myTrades shares.
+type binanceSpotFill struct {
+	ID              int64  `json:"id"`
+	Symbol          string `json:"symbol"`
+	Price           string `json:"price"`
+	Qty             string `json:"qty"`
+	Commission      string `json:"commission"`
+	CommissionAsset string `json:"commissionAsset"`
+	Time            int64  `json:"time"`
+	IsBuyer         bool   `json:"isBuyer"`
+}
+
+// binanceSpotFillTrades maps spot-shaped fills into the spot market, the fee
+// left in its commission asset as the spot path always has.
+func binanceSpotFillTrades(resp []binanceSpotFill) []*Trade {
 	var trades []*Trade
 	for _, t := range resp {
 		price, _ := strconv.ParseFloat(t.Price, 64)
@@ -827,7 +882,7 @@ func (b *Binance) getSpotTradesForSymbol(ctx context.Context, symbol string, sta
 		})
 	}
 
-	return trades, nil
+	return trades
 }
 
 // userTrades returns at most 1000 fills per call and refuses a range wider
@@ -856,34 +911,48 @@ type binanceFuturesFill struct {
 // to continue from, so the range is halved until each half fits, the halves
 // sharing their midpoint and the fill id dropping the overlap.
 func (b *Binance) getFuturesTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
-	seen := map[int64]bool{}
-	var fills []binanceFuturesFill
+	fills, err := readBinanceWindows(start, end, binanceFillWindow, binanceFillPageLimit, "binance futures fills",
+		func(from, to time.Time) ([]binanceFuturesFill, error) { return b.futuresFillPage(ctx, from, to) },
+		func(f binanceFuturesFill) string { return strconv.FormatInt(f.ID, 10) })
+	if err != nil {
+		return nil, err
+	}
+	return binanceUMFillTrades(fills), nil
+}
+
+// readBinanceWindows reads [start, end] through a call that refuses a range
+// wider than window and returns at most limit rows with no cursor. A page
+// that comes back full is not the whole range: it is halved until each half
+// fits, the halves sharing their midpoint and key dropping the overlap.
+func readBinanceWindows[T any](start, end time.Time, window time.Duration, limit int, what string, page func(from, to time.Time) ([]T, error), key func(T) string) ([]T, error) {
+	seen := map[string]bool{}
+	var rows []T
 	var read func(from, to time.Time) error
 	read = func(from, to time.Time) error {
-		page, err := b.futuresFillPage(ctx, from, to)
+		got, err := page(from, to)
 		if err != nil {
 			return err
 		}
-		if len(page) >= binanceFillPageLimit && to.Sub(from) > binanceMinFillSplit {
+		if len(got) >= limit && to.Sub(from) > binanceMinFillSplit {
 			mid := from.Add(to.Sub(from) / 2)
 			if err := read(from, mid); err != nil {
 				return err
 			}
 			return read(mid, to)
 		}
-		if len(page) >= binanceFillPageLimit {
-			return fmt.Errorf("read binance futures fills: more than %d in one second", binanceFillPageLimit)
+		if len(got) >= limit {
+			return fmt.Errorf("read %s: more than %d in one second", what, limit)
 		}
-		for _, f := range page {
-			if !seen[f.ID] {
-				seen[f.ID] = true
-				fills = append(fills, f)
+		for _, r := range got {
+			if k := key(r); !seen[k] {
+				seen[k] = true
+				rows = append(rows, r)
 			}
 		}
 		return nil
 	}
-	for winStart := start; winStart.Before(end); winStart = winStart.Add(binanceFillWindow) {
-		winEnd := winStart.Add(binanceFillWindow)
+	for winStart := start; winStart.Before(end); winStart = winStart.Add(window) {
+		winEnd := winStart.Add(window)
 		if winEnd.After(end) {
 			winEnd = end
 		}
@@ -891,7 +960,12 @@ func (b *Binance) getFuturesTrades(ctx context.Context, start, end time.Time) ([
 			return nil, err
 		}
 	}
+	return rows, nil
+}
 
+// binanceUMFillTrades maps USDⓈ-M fills, fapi's or papi's, into the swap
+// market.
+func binanceUMFillTrades(fills []binanceFuturesFill) []*Trade {
 	trades := make([]*Trade, 0, len(fills))
 	for _, t := range fills {
 		price, _ := strconv.ParseFloat(t.Price, 64)
@@ -912,7 +986,7 @@ func (b *Binance) getFuturesTrades(ctx context.Context, start, end time.Time) ([
 			MarketType:  "swap",
 		})
 	}
-	return trades, nil
+	return trades
 }
 
 func (b *Binance) futuresFillPage(ctx context.Context, from, to time.Time) ([]binanceFuturesFill, error) {
