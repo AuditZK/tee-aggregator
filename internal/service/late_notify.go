@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/trackrecord/enclave/internal/repository"
 )
 
 // Analytics learns of new snapshots in two ways: its nightly job
@@ -37,9 +39,11 @@ func lateForNightlyAnalytics(t time.Time) bool {
 // wantsAnalyticsNotify reports whether a pass's results call for the ping: a
 // row written, live or by the every-sync reconstruction, for a connection
 // whose statement backfill is not starting behind it. That backfill pings when
-// it ends (startStatementBackfill), and a ping before it would publish the
-// connection as imported with a single live day: analytics marks a connection
-// historically complete on its first mirrored row.
+// it ends (startStatementBackfill), or the release of its claim does when
+// another read holds it (releaseBackfill). A ping before it would show the
+// connection with a single live day while its year is read: analytics marks a
+// connection that asked for no import historically complete on its first
+// mirrored row.
 func wantsAnalyticsNotify(results ...*SyncResult) bool {
 	for _, r := range results {
 		if r != nil && (r.Success || r.historyWritten) && !r.backfillDue {
@@ -69,45 +73,16 @@ func (s *SyncService) notifyAnalyticsAsync(userUID, reason string) {
 	run(func() { s.notifyHistoryRebuilt(context.Background(), userUID) })
 }
 
-// retryGroup gathers the deferred retries one pass armed for one user, so
-// analytics hears once, after the last of them, instead of once per
-// connection: two IBKR accounts on one Flex token are retried five minutes
-// apart (deferredRetrySpacing). Guarded by SyncService.deferMu.
-type retryGroup struct {
-	userUID string
-	pending int
-	wrote   bool
-}
-
-type retryGroupKey struct{}
-
-// withRetryGroup gives the deferred retries a pass arms for userUID one group.
-func withRetryGroup(ctx context.Context, userUID string) context.Context {
-	return context.WithValue(ctx, retryGroupKey{}, &retryGroup{userUID: userUID})
-}
-
-// retryGroupFor is the pass's group for a retry of userUID's connection, or a
-// group of its own when the retry was armed outside a pass.
-func retryGroupFor(ctx context.Context, userUID string) *retryGroup {
-	if g, ok := ctx.Value(retryGroupKey{}).(*retryGroup); ok && g.userUID == userUID {
-		return g
-	}
-	return &retryGroup{userUID: userUID}
-}
-
-// finishDeferredRetry frees the connection's retry slot and, when it is the
-// last retry of its group to end and one of them wrote, pings analytics.
-func (s *SyncService) finishDeferredRetry(connID string, g *retryGroup, wrote bool) {
+// finishDeferredRetry frees the connection's retry slot and pings analytics
+// when the retry wrote. Each retry pings for itself: the timers live in
+// memory, so a ping held for a user's last retry was lost with any retry that
+// a restart dropped, and two retries of one user fire minutes apart anyway
+// (deferredRetrySpacing).
+func (s *SyncService) finishDeferredRetry(conn *repository.ExchangeConnection, wrote bool) {
 	s.deferMu.Lock()
-	delete(s.deferredRetries, connID)
-	g.pending--
-	g.wrote = g.wrote || wrote
-	ping := g.pending == 0 && g.wrote
-	if g.pending == 0 {
-		g.wrote = false
-	}
+	delete(s.deferredRetries, conn.ID)
 	s.deferMu.Unlock()
-	if ping {
-		s.notifyAnalyticsAsync(g.userUID, "deferred retry")
+	if wrote {
+		s.notifyAnalyticsAsync(conn.UserUID, "deferred retry")
 	}
 }

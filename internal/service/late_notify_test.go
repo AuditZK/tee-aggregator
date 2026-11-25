@@ -1,7 +1,6 @@
 package service
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -9,6 +8,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/trackrecord/enclave/internal/repository"
 )
 
 // pingSink stands in for analytics' POST /api/v1/sync/user/<uid>: it counts
@@ -102,48 +103,57 @@ func TestWantsAnalyticsNotify(t *testing.T) {
 	}
 }
 
-// The retries one pass armed for a user ping once, when the last of them ends,
-// and only when one of them wrote.
-func TestDeferredRetryGroupPingsOnceAfterItsLastRetry(t *testing.T) {
+// Each retry that wrote pings for its own user as it ends, whatever the other
+// retries of the pass do: a restart may drop them before they fire.
+func TestFinishDeferredRetryPingsWhenItWrote(t *testing.T) {
 	sink := newPingSink(t)
 	s := &SyncService{logger: zap.NewNop(), deferredRetries: map[string]bool{"cto": true, "pea": true}}
 	wirePings(s, sink)
 
-	g := retryGroupFor(withRetryGroup(context.Background(), "user-1"), "user-1")
-	g.pending = 2
-
-	s.finishDeferredRetry("cto", g, true)
-	if n := sink.count("user-1"); n != 0 {
-		t.Fatalf("%d pings after the first of two retries, want none yet", n)
-	}
-	s.finishDeferredRetry("pea", g, false)
+	s.finishDeferredRetry(&repository.ExchangeConnection{ID: "cto", UserUID: "user-1"}, true)
 	if n := sink.count("user-1"); n != 1 {
-		t.Fatalf("%d pings after the group's last retry, want 1", n)
+		t.Fatalf("%d pings after a retry that wrote, want 1 at once", n)
+	}
+	s.finishDeferredRetry(&repository.ExchangeConnection{ID: "pea", UserUID: "user-1"}, false)
+	if n := sink.count("user-1"); n != 1 {
+		t.Fatalf("%d pings after a retry that wrote nothing, want still 1", n)
 	}
 	if len(s.deferredRetries) != 0 {
 		t.Fatalf("retry slots left behind: %v", s.deferredRetries)
 	}
-
-	quiet := retryGroupFor(withRetryGroup(context.Background(), "user-2"), "user-2")
-	quiet.pending = 1
-	s.finishDeferredRetry("other", quiet, false)
-	if n := sink.count("user-2"); n != 0 {
-		t.Fatalf("%d pings for a group that wrote nothing, want none", n)
-	}
 }
 
-// A retry armed outside a pass, or for another user than the pass's, is a
-// group of its own.
-func TestRetryGroupForOutsideAPass(t *testing.T) {
-	if g := retryGroupFor(context.Background(), "user-1"); g == nil || g.userUID != "user-1" {
-		t.Fatalf("retry outside a pass: group %+v, want one of its own", g)
+// A sync that finds a backfill claim held leaves its ping to the claim, and
+// the ping goes out when the claim is released, whoever held it.
+func TestReleaseBackfillSendsThePingASyncLeftToIt(t *testing.T) {
+	sink := newPingSink(t)
+	s := &SyncService{logger: zap.NewNop()}
+	wirePings(s, sink)
+	conn := &repository.ExchangeConnection{UserUID: "user-1", Exchange: "ibkr", Label: "main"}
+
+	if !s.claimBackfill(conn) {
+		t.Fatal("first claim refused")
 	}
-	ctx := withRetryGroup(context.Background(), "user-1")
-	if retryGroupFor(ctx, "user-1") != retryGroupFor(ctx, "user-1") {
-		t.Fatal("two retries of one pass and one user got different groups")
+	if s.claimBackfillOrOwe(conn, false) {
+		t.Fatal("a held claim was granted twice")
 	}
-	if retryGroupFor(ctx, "user-2") == retryGroupFor(ctx, "user-1") {
-		t.Fatal("a retry of another user joined the pass's group")
+	s.releaseBackfill(conn)
+	if n := sink.count("user-1"); n != 0 {
+		t.Fatalf("%d pings on releasing a claim nobody left a ping to, want none", n)
+	}
+
+	if !s.claimBackfill(conn) {
+		t.Fatal("claim refused after its release")
+	}
+	if s.claimBackfillOrOwe(conn, true) {
+		t.Fatal("a held claim was granted to a sync")
+	}
+	if n := sink.count("user-1"); n != 0 {
+		t.Fatalf("%d pings while the claim is held, want none yet", n)
+	}
+	s.releaseBackfill(conn)
+	if n := sink.count("user-1"); n != 1 {
+		t.Fatalf("%d pings on release, want the one the sync left", n)
 	}
 }
 
