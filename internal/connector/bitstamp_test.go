@@ -265,6 +265,18 @@ func TestBitstamp_ErrorClasses(t *testing.T) {
 			}
 		})
 	}
+	t.Run("a key without the ledger permission is refused at connect", func(t *testing.T) {
+		b, _ := newBitstampFake(t, map[string]string{
+			"/api/v2/account_balances/":   `[{"currency":"usd","total":"1","available":"1","reserved":"0"}]`,
+			"/api/v2/earn/subscriptions/": `[]`,
+			"/api/v2/open_positions/":     `[]`,
+			"/api/v2/user_transactions/":  `status:403 {"status":"error","reason":"No permission found","code":"API0003"}`,
+		})
+		err := b.TestConnection(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "permission denied") {
+			t.Fatalf("error = %v, want the missing permission named", err)
+		}
+	})
 	t.Run("wrong secret is refused by the signature check", func(t *testing.T) {
 		b, _ := newBitstampFake(t, map[string]string{"/api/v2/account_balances/": `[]`})
 		b.secret = "another-secret"

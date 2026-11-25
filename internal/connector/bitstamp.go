@@ -70,8 +70,12 @@ func (b *Bitstamp) Exchange() string { return "bitstamp" }
 
 func (b *Bitstamp) DetectIsPaper(_ context.Context) (bool, error) { return false, nil }
 
+// A key without "User transactions" reads balances but would fail at the first sync.
 func (b *Bitstamp) TestConnection(ctx context.Context) error {
-	_, err := b.GetBalance(ctx)
+	if _, err := b.GetBalance(ctx); err != nil {
+		return err
+	}
+	_, err := b.fetchLedger(ctx, time.Now().Add(-24*time.Hour), time.Time{})
 	return err
 }
 
