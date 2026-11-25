@@ -66,12 +66,20 @@ func (p *PredictFun) Exchange() string { return "predictfun" }
 
 func (p *PredictFun) DetectIsPaper(_ context.Context) (bool, error) { return false, nil }
 
+// TestConnection refuses an address that holds nothing and never traded on
+// predict.fun. The venue answers any address, so the signer wallet pasted in
+// place of the Predict account would otherwise connect and track a zero.
 func (p *PredictFun) TestConnection(ctx context.Context) error {
-	if _, err := p.GetBalance(ctx); err != nil {
+	bal, err := p.GetBalance(ctx)
+	if err != nil {
 		return err
 	}
-	if _, err := p.CumulativePnL(ctx, time.Time{}); err != nil {
+	points, err := p.pnlSeries(ctx, "all")
+	if err != nil {
 		return err
+	}
+	if len(points) == 0 && bal.Equity <= 0 {
+		return errors.New("predict.fun: invalid credentials, no Predict account activity at this address; use the Predict account address from the portfolio page")
 	}
 	return nil
 }
@@ -175,20 +183,13 @@ func (p *PredictFun) CumulativePnL(ctx context.Context, at time.Time) (float64, 
 	if !at.IsZero() && time.Since(at) < 23*time.Hour {
 		period = "1d"
 	}
-	var series struct {
-		Points []struct {
-			X int64   `json:"x"`
-			Y float64 `json:"y"`
-		} `json:"points"`
-	}
-	if _, err := p.get(ctx, "/account/"+url.PathEscape(p.wallet)+"/pnl", url.Values{"period": {period}}, &series); err != nil {
+	pts, err := p.pnlSeries(ctx, period)
+	if err != nil {
 		return 0, err
 	}
-	pts := series.Points
 	if len(pts) == 0 {
 		return 0, nil
 	}
-	sort.Slice(pts, func(i, j int) bool { return pts[i].X < pts[j].X })
 	if at.IsZero() {
 		return pts[len(pts)-1].Y, nil
 	}
@@ -201,6 +202,24 @@ func (p *PredictFun) CumulativePnL(ctx context.Context, at time.Time) (float64, 
 	}
 	i := sort.Search(len(pts), func(i int) bool { return pts[i].X > at.Unix() })
 	return pts[i-1].Y, nil
+}
+
+type predictFunPoint struct {
+	X int64   `json:"x"`
+	Y float64 `json:"y"`
+}
+
+// pnlSeries returns the venue's cumulative PnL points over a period, oldest
+// first. An address without an account has none.
+func (p *PredictFun) pnlSeries(ctx context.Context, period string) ([]predictFunPoint, error) {
+	var series struct {
+		Points []predictFunPoint `json:"points"`
+	}
+	if _, err := p.get(ctx, "/account/"+url.PathEscape(p.wallet)+"/pnl", url.Values{"period": {period}}, &series); err != nil {
+		return nil, err
+	}
+	sort.Slice(series.Points, func(i, j int) bool { return series.Points[i].X < series.Points[j].X })
+	return series.Points, nil
 }
 
 // ErrPnLNotCovered marks a moment the venue's PnL series does not reach.

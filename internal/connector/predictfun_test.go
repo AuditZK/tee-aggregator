@@ -198,6 +198,26 @@ func TestPredictFun_Refusals(t *testing.T) {
 			}
 		}
 	})
+	t.Run("an address that never used predict.fun", func(t *testing.T) {
+		p, _ := newPredictFunFake(t, map[string]string{
+			predictFunTestPositions:                                `{"success":true,"cursor":null,"data":[]}`,
+			"/account/" + predictFunTestWallet + "/pnl?period=all": `{"success":true,"data":{"period":"all","points":[]}}`,
+		})
+		err := p.TestConnection(context.Background())
+		if ClassifyConnectFailure(err) != ConnectFailureCredentials || !strings.Contains(err.Error(), "portfolio page") {
+			t.Fatalf("error = %v, want a refusal that says where the address is", err)
+		}
+	})
+	t.Run("a funded account that has not traded yet connects", func(t *testing.T) {
+		p, fake := newPredictFunFake(t, map[string]string{
+			predictFunTestPositions:                                `{"success":true,"cursor":null,"data":[]}`,
+			"/account/" + predictFunTestWallet + "/pnl?period=all": `{"success":true,"data":{"period":"all","points":[]}}`,
+		})
+		fake.cashWei = "de0b6b3a7640000"
+		if err := p.TestConnection(context.Background()); err != nil {
+			t.Fatalf("TestConnection: %v", err)
+		}
+	})
 	t.Run("errors never carry the address", func(t *testing.T) {
 		p, fake := newPredictFunFake(t, map[string]string{})
 		fake.status = http.StatusNotFound
