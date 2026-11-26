@@ -84,6 +84,16 @@ func (s *SyncService) activityWindowStart(ctx context.Context, connMeta *reposit
 		if latest, err := s.snapshotRepo.GetLatestByUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label); err == nil && latest != nil {
 			last = latest.Timestamp.UTC()
 		}
+		// A sync rewriting today's own row reads from where the row before
+		// today left off, not from today's row: the pass that first wrote
+		// today read back to that row, past any missed days, and a rewrite
+		// starting a day back would drop those days' flows from the row.
+		if !last.IsZero() && !last.Before(startOfDay) {
+			last = time.Time{}
+			if prev, err := s.snapshotRepo.GetLatestByUserExchangeLabelBefore(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, startOfDay); err == nil && prev != nil {
+				last = prev.Timestamp.UTC()
+			}
+		}
 	}
 
 	start, widened, clamped := resolveActivityWindow(startOfDay, last)
