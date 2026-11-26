@@ -1834,6 +1834,14 @@ func (s *SyncService) flowsFromPublishedPnL(ctx context.Context, pp connector.Cu
 	measured := prev.Timestamp.UTC()
 	if read := s.lastLiveRead(ctx, connMeta); read != nil && !read.Before(measured) && read.Before(measured.Add(24*time.Hour)) && read.Before(startOfDay) {
 		measured = *read
+	} else if start := s.sameDayWindowStart(ctx, connMeta, startOfDay); start != nil && !start.Before(measured) && start.Before(measured.Add(24*time.Hour)) && !s.previousRowRebuilt(ctx, connMeta, prev) {
+		// A rewrite of today's row: the stamp is today's, but the pass that
+		// first wrote the row started where the previous row was read, and
+		// kept that instant. Measuring from the previous row's midnight
+		// instead puts the PnL made before its read on today's row as a flow.
+		// A row the rebuilder has since rewritten holds its midnight equity,
+		// not the equity of that read, so it keeps the midnight.
+		measured = *start
 	}
 	before, err := pp.CumulativePnL(ctx, measured)
 	if err == nil {
@@ -1865,6 +1873,17 @@ func (s *SyncService) flowsFromPublishedPnL(ctx context.Context, pp connector.Cu
 		)
 	}
 	return deposits, withdrawals
+}
+
+// previousRowRebuilt reports whether prev was written by the external
+// rebuilder (the midnight recalibration rewrites the connect-day row at its
+// midnight equity). A failed lookup answers true, which keeps the midnight.
+func (s *SyncService) previousRowRebuilt(ctx context.Context, connMeta *repository.ExchangeConnection, prev *repository.Snapshot) bool {
+	if prev.FromExternalRebuilder {
+		return true
+	}
+	rebuilt, err := s.snapshotRepo.IsFromExternalRebuilder(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, prev.Timestamp)
+	return err != nil || rebuilt
 }
 
 // enrichBreakdownWithBalances populates equity and available_margin per market
