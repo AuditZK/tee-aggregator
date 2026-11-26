@@ -245,6 +245,16 @@ type reconstructOpts struct {
 	// written receives the days a real run upserted, without the connect-time
 	// row it superseded.
 	written func([]*repository.Snapshot)
+	// keepLiveDays stops an external rebuild at the connection's first live
+	// day: every rebuilt day dated on or after it is dropped before the witness
+	// gate and the upsert (dropDaysFromFirstLive). Set only by the admin
+	// reconstruct entrypoints. The connect-time backfill and the midnight
+	// recalibration leave it false on purpose: there the rebuilt rows upsert
+	// over the connect-day live row to retire its inception deposit.
+	keepLiveDays bool
+	// cut receives how keepLiveDays cut the series, when a live day is stored.
+	// For the dry-run answer, which otherwise shows only the kept days.
+	cut func(LiveDayCut)
 }
 
 // rebuiltDays are the dates, UTC midnight, a reconstruction wrote in this pass.
@@ -1879,6 +1889,17 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{})
 }
 
+// ReconstructHistoryAdmin is the full reconstruction an operator asks for on an
+// existing connection (POST /api/v1/admin/reconstruct without a window). Same
+// routing as ReconstructHistoryOnConnect, except that an external rebuild
+// stops at the connection's first live day: by then the connection has days
+// the live sync measured, and the report starts the verifiable record right
+// after the last reconstructed row, so a rebuilt row written over a live day
+// takes that day out of the verified period.
+func (s *SyncService) ReconstructHistoryAdmin(ctx context.Context, userUID, exchange, label string) {
+	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{keepLiveDays: true})
+}
+
 // ReconstructHistoryRange backfills ONLY the days in [from, to] (inclusive,
 // UTC midnights). Same routing and same credential handling as
 // ReconstructHistoryOnConnect — the only difference is that days outside the
@@ -1890,13 +1911,17 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 // reconstruct, so callers that mean "only these days" must pass both.
 // dryRun performs the full reconstruct but logs the resulting days instead of
 // writing them — use it before committing a splice into an existing timeline.
+//
+// Admin only, like ReconstructHistoryAdmin: an external rebuild writes no day
+// on or after the connection's first live day, inside the window or not.
 func (s *SyncService) ReconstructHistoryRange(ctx context.Context, userUID, exchange, label string, from, to time.Time, dryRun bool) {
 	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{
 		window: dayWindow{
 			from: time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC),
 			to:   time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, time.UTC),
 		},
-		dryRun: dryRun,
+		dryRun:       dryRun,
+		keepLiveDays: true,
 	})
 }
 
@@ -1904,17 +1929,24 @@ func (s *SyncService) ReconstructHistoryRange(ctx context.Context, userUID, exch
 // the days it would have persisted, so they can be compared against what is
 // already stored. Synchronous, unlike ReconstructHistoryRange: the caller is
 // waiting for the answer, not for confirmation that work started.
-func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, exchange, label string, from, to time.Time) []*repository.Snapshot {
+//
+// The cut is how the run stopped at the connection's first live day, nil when
+// no live day is stored: with it the caller can tell an empty answer cut whole
+// from a rebuild that returned nothing.
+func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, exchange, label string, from, to time.Time) ([]*repository.Snapshot, *LiveDayCut) {
 	var out []*repository.Snapshot
+	var cut *LiveDayCut
 	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{
 		window: dayWindow{
 			from: time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC),
 			to:   time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, time.UTC),
 		},
-		dryRun:  true,
-		collect: func(sn []*repository.Snapshot) { out = sn },
+		dryRun:       true,
+		collect:      func(sn []*repository.Snapshot) { out = sn },
+		keepLiveDays: true,
+		cut:          func(c LiveDayCut) { cut = &c },
 	})
-	return out
+	return out, cut
 }
 
 // reconstructHistoryFor pings analytics once when it ends, whatever it wrote,
@@ -2677,6 +2709,22 @@ func (s *SyncService) persistHistoricalSnapshots(
 		return nil
 	}
 
+	// Admin reconstruction: the days the live sync measured stay as measured.
+	// Cut before the inception rule and the witness, so both see only the days
+	// this run may write. External rebuilds only: an in-enclave rebuild writes
+	// the same origin flag as the live branch on the production schema, so its
+	// stored rows cannot be told from live ones.
+	if opts.keepLiveDays && source == sourceExternalRebuilder {
+		kept, err := s.dropDaysFromFirstLive(ctx, connMeta, snapshots, opts)
+		if err != nil {
+			return err
+		}
+		if len(kept) == 0 {
+			return nil
+		}
+		snapshots = kept
+	}
+
 	// A bounded repair window cannot be the account's inception by
 	// construction — it targets days surrounded by existing history. Skipping
 	// keeps UX-001 from stamping the window's first day as starting capital,
@@ -2817,6 +2865,135 @@ func (s *SyncService) persistHistoricalSnapshots(
 		zap.Int("total_days", len(historicalSnapshots)),
 	)
 	return nil
+}
+
+// dropDaysFromFirstLive keeps the rebuilt days dated strictly before the
+// connection's first live day and drops the rest (keepLiveDays). The stored
+// rows must be read: without them nothing tells which days were measured, and
+// writing anyway is the overwrite this guard exists to prevent.
+func (s *SyncService) dropDaysFromFirstLive(ctx context.Context, connMeta *repository.ExchangeConnection, rebuilt []*repository.Snapshot, opts reconstructOpts) ([]*repository.Snapshot, error) {
+	existing, err := s.snapshotRepo.GetByUserAndDateRange(ctx, connMeta.UserUID, time.Unix(0, 0).UTC(), time.Now().UTC().Add(24*time.Hour))
+	if err != nil {
+		s.logger.Error("history reconstruction not written — stored days unreadable, live days cannot be kept",
+			zap.String("user_uid", connMeta.UserUID),
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("label", connMeta.Label),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("read stored snapshots before keeping the live days: %w", err)
+	}
+	mine := make([]*repository.Snapshot, 0, len(existing))
+	for _, e := range existing {
+		if e.Exchange == connMeta.Exchange && e.Label == connMeta.Label {
+			mine = append(mine, e)
+		}
+	}
+	cut := cutAtFirstLiveDay(rebuilt, mine)
+	if cut.firstLive.IsZero() {
+		return rebuilt, nil
+	}
+	if opts.cut != nil {
+		opts.cut(LiveDayCut{
+			FirstLiveDay:        cut.firstLive,
+			DaysKept:            len(cut.kept),
+			DaysDropped:         cut.dropped,
+			DaysDroppedOverLive: cut.overLive,
+			MaxRelativeGap:      cut.maxGap,
+		})
+	}
+	fields := []zap.Field{
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("label", connMeta.Label),
+		zap.String("first_live_day", cut.firstLive.Format("2006-01-02")),
+		zap.Int("days_kept", len(cut.kept)),
+		zap.Int("days_dropped", cut.dropped),
+		zap.Int("days_dropped_over_live", cut.overLive),
+		zap.Float64("max_relative_gap", cut.maxGap),
+	}
+	// The kept days never meet a measured day, so the witness cannot judge
+	// them: the dropped days that do meet one are the only evidence the
+	// rebuild describes this account. A basis difference (Binance PM, 0.14%)
+	// passes; a rebuild of another wallet set, a fifth off, does not.
+	if cut.overLive > 0 && cut.maxGap > liveDayCutTolerance {
+		if opts.dryRun {
+			s.logger.Warn("history reconstruction DRY RUN — contradicts the live days it stops at (series follows)", fields...)
+			return cut.kept, nil
+		}
+		s.logger.Error("history reconstruction rejected — contradicts the live days it stops at",
+			append(fields,
+				zap.Int("days_discarded", len(rebuilt)),
+				zap.String("hint", "the rebuild did not reproduce the days the live sync measured; nothing was written"))...)
+		return nil, fmt.Errorf("reconstruction contradicts the measured equity by %.2f%% after %s",
+			cut.maxGap*100, cut.firstLive.Format("2006-01-02"))
+	}
+	s.logger.Info("history reconstruction stopped at the first live day", fields...)
+	return cut.kept, nil
+}
+
+// liveDayCutTolerance is how far a rebuilt day may sit from the live day it is
+// dropped in favour of before the whole admin reconstruction is refused. Wider
+// than reproductionTolerance on purpose: those days are not written, so a
+// difference of equity basis between the two instruments is no reason to
+// refuse the days before them; a different account is.
+const liveDayCutTolerance = 0.02
+
+// LiveDayCut reports how an admin reconstruction was cut at the connection's
+// first live day, for the dry-run answer.
+type LiveDayCut struct {
+	FirstLiveDay        time.Time
+	DaysKept            int
+	DaysDropped         int
+	DaysDroppedOverLive int
+	MaxRelativeGap      float64
+}
+
+// liveDayCut is a rebuilt series split at the connection's first live day.
+type liveDayCut struct {
+	firstLive time.Time // UTC midnight; zero when no live day is stored
+	kept      []*repository.Snapshot
+	dropped   int
+	overLive  int     // dropped days that fall on a stored live day
+	maxGap    float64 // largest |rebuilt - live| / live over those days
+}
+
+// cutAtFirstLiveDay keeps the rebuilt days dated strictly before the first
+// stored live day. A live day is what the witness counts as measured: neither
+// reconstructed flag, and funded (contradictedDayOf).
+func cutAtFirstLiveDay(rebuilt, stored []*repository.Snapshot) liveDayCut {
+	live := make(map[time.Time]float64, len(stored))
+	var first time.Time
+	for _, e := range stored {
+		if e.IsHistorical || e.FromExternalRebuilder || e.TotalEquity <= 0 {
+			continue
+		}
+		day := e.Timestamp.UTC().Truncate(24 * time.Hour)
+		live[day] = e.TotalEquity
+		if first.IsZero() || day.Before(first) {
+			first = day
+		}
+	}
+	c := liveDayCut{firstLive: first}
+	if first.IsZero() {
+		c.kept = rebuilt
+		return c
+	}
+	c.kept = make([]*repository.Snapshot, 0, len(rebuilt))
+	for _, r := range rebuilt {
+		day := r.Timestamp.UTC().Truncate(24 * time.Hour)
+		if day.Before(first) {
+			c.kept = append(c.kept, r)
+			continue
+		}
+		c.dropped++
+		if m, ok := live[day]; ok {
+			c.overLive++
+			if g := math.Abs(r.TotalEquity-m) / m; g > c.maxGap {
+				c.maxGap = g
+			}
+		}
+	}
+	return c
 }
 
 // applyInceptionDeposit stamps the inception-deposit convention (UX-001) on a

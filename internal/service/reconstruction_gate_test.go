@@ -1,6 +1,7 @@
 package service
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -222,5 +223,37 @@ func TestContradictedDayOf_ComparesInTheStampedCurrency(t *testing.T) {
 func TestLiveHoldsPreviousStatementIsIBKROnly(t *testing.T) {
 	if !liveHoldsPreviousStatement("IBKR") || liveHoldsPreviousStatement("ctrader") || liveHoldsPreviousStatement("bybit") {
 		t.Fatal("the lag applies to IBKR and nothing else")
+	}
+}
+
+// The cut behind the admin reconstruction (keepLiveDays), without a database:
+// the first live day is the first funded row carrying neither reconstructed
+// flag, and every rebuilt day from it on goes.
+func TestCutAtFirstLiveDay(t *testing.T) {
+	d := func(n int) time.Time { return time.Date(2026, 10, 20+n, 0, 0, 0, 0, time.UTC) }
+	stored := []*repository.Snapshot{
+		{Timestamp: d(0), TotalEquity: 1000, FromExternalRebuilder: true},
+		{Timestamp: d(1), TotalEquity: 1000, IsHistorical: true},
+		{Timestamp: d(2), TotalEquity: 0}, // degenerate live row, not a witness
+		{Timestamp: d(3), TotalEquity: 2000},
+		{Timestamp: d(5), TotalEquity: 2000},
+	}
+	rebuilt := []*repository.Snapshot{
+		reconstructed(d(1), 1100), reconstructed(d(2), 1100),
+		reconstructed(d(3), 2003), reconstructed(d(4), 2000), reconstructed(d(5).Add(time.Hour), 1997),
+	}
+	c := cutAtFirstLiveDay(rebuilt, stored)
+	if !c.firstLive.Equal(d(3)) {
+		t.Fatalf("first live day %v, want %v", c.firstLive, d(3))
+	}
+	if len(c.kept) != 2 || c.dropped != 3 || c.overLive != 2 {
+		t.Fatalf("kept %d dropped %d over live %d, want 2 / 3 / 2", len(c.kept), c.dropped, c.overLive)
+	}
+	if math.Abs(c.maxGap-0.0015) > 1e-12 {
+		t.Fatalf("max gap %v, want 0.0015", c.maxGap)
+	}
+
+	if c := cutAtFirstLiveDay(rebuilt, stored[:3]); !c.firstLive.IsZero() || len(c.kept) != len(rebuilt) {
+		t.Fatalf("no live day stored: first %v, kept %d of %d", c.firstLive, len(c.kept), len(rebuilt))
 	}
 }
