@@ -93,6 +93,18 @@ func (s *SyncService) activityWindowStart(ctx context.Context, connMeta *reposit
 			if prev, err := s.snapshotRepo.GetLatestByUserExchangeLabelBefore(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, startOfDay); err == nil && prev != nil {
 				last = prev.Timestamp.UTC()
 			}
+			// A start older than the row before today belongs to a read that
+			// rows written since (a gap repair) now cover: starting there
+			// would book their flows a second time on today's row.
+			if start := s.sameDayWindowStart(ctx, connMeta, startOfDay); start != nil && !last.IsZero() && !start.Before(last) {
+				s.logger.Debug("same-day rewrite reads from where today's first write began",
+					zap.String("user_uid", connMeta.UserUID),
+					zap.String("exchange", connMeta.Exchange),
+					zap.String("label", connMeta.Label),
+					zap.Time("window_start", *start),
+				)
+				return *start
+			}
 		}
 	}
 
@@ -171,6 +183,40 @@ func (s *SyncService) lastLiveRead(ctx context.Context, connMeta *repository.Exc
 	}
 	read := st.LastSyncTime.UTC()
 	return &read
+}
+
+// sameDayWindowStart is where the pass that wrote today's row began reading,
+// for a sync about to rewrite that row, or nil when that is not known.
+//
+// Starting such a rewrite at the previous row's midnight re-reads the hours
+// that row already booked when it was itself written mid-day: deposit on X,
+// manual sync on X, manual sync on D, and the deposit lands on X and on D. The
+// stamp the midnight pass left says only when it ran, so the start is kept
+// beside it (sync_statuses.last_window_start). A rewrite records the start it
+// used, so repeated rewrites keep today's first start.
+//
+// Only an instant ledger can start mid-day (instantLedgerExchanges). A NULL
+// column, a stamp from before today, or a start outside the lookback falls
+// back to the previous row's midnight.
+func (s *SyncService) sameDayWindowStart(ctx context.Context, connMeta *repository.ExchangeConnection, startOfDay time.Time) *time.Time {
+	if s.syncStatus == nil || connMeta == nil || !instantLedgerExchanges[normalizeExchange(connMeta.Exchange)] {
+		return nil
+	}
+	st, err := s.syncStatus.GetByUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
+	// No status check: only a completed pass that wrote its row sets the
+	// start, any other stamp clears it, and a failed attempt keeps the stamp
+	// and the start of the pass that wrote today's row.
+	if err != nil || st.LastSyncTime == nil || st.LastWindowStart == nil {
+		return nil
+	}
+	if st.LastSyncTime.UTC().Before(startOfDay) {
+		return nil
+	}
+	start := st.LastWindowStart.UTC()
+	if !start.Before(startOfDay) || start.Before(startOfDay.Add(-maxActivityLookback)) {
+		return nil
+	}
+	return &start
 }
 
 // resumeAfterLastRead moves the window start to where the previous live read
@@ -618,6 +664,9 @@ type SyncResult struct {
 	// whatever became of the live row after it: those days are as new to
 	// analytics as the row would have been.
 	historyWritten bool
+	// windowStart is where this pass's activity window began, recorded with
+	// the status of a pass that wrote its row (sameDayWindowStart).
+	windowStart time.Time
 }
 
 // SyncUser synchronizes all exchanges for a user (manual sync).
@@ -1283,7 +1332,8 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	if !liveHoldsPreviousStatement(connMeta.Exchange) {
 		rebuilt = nil
 	}
-	act := s.readActivity(ctx, conn, connMeta, s.activityWindowStart(ctx, connMeta, startOfDay), now, rebuilt)
+	result.windowStart = s.activityWindowStart(ctx, connMeta, startOfDay)
+	act := s.readActivity(ctx, conn, connMeta, result.windowStart, now, rebuilt)
 	// After the cashflow read: Bybit and OKX find their gaps there.
 	s.collectCapabilityWarnings(conn, connMeta, result)
 	s.logEquityBasis(conn, connMeta)
@@ -1742,6 +1792,12 @@ func (s *SyncService) recordSyncStatus(ctx context.Context, conn *repository.Exc
 		Status:       status,
 		TotalTrades:  result.TradeCount,
 		ErrorMessage: errMsg,
+	}
+	// Only a pass that wrote its row says where that row's read began; any
+	// other stamp is written with a NULL start (sameDayWindowStart).
+	if status == "completed" && result.snapshot != nil && !result.windowStart.IsZero() {
+		ws := result.windowStart.UTC()
+		record.LastWindowStart = &ws
 	}
 
 	if err := s.syncStatus.Upsert(ctx, record); err != nil {

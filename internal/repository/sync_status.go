@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -17,11 +18,17 @@ type SyncStatus struct {
 	Exchange     string     `json:"exchange"`
 	Label        string     `json:"label"`
 	LastSyncTime *time.Time `json:"last_sync_time,omitempty"`
-	Status       string     `json:"status"` // "pending", "syncing", "completed", "error"
-	TotalTrades  int        `json:"total_trades"`
-	ErrorMessage string     `json:"error_message,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	// LastWindowStart is where the activity window of the pass stamped
+	// LastSyncTime began (migration 021). It travels with LastSyncTime: a
+	// write that sets the stamp also sets this, NULL included, so the two
+	// always describe the same pass. Nil when unknown or when the column is
+	// absent.
+	LastWindowStart *time.Time `json:"last_window_start,omitempty"`
+	Status          string     `json:"status"` // "pending", "syncing", "completed", "error"
+	TotalTrades     int        `json:"total_trades"`
+	ErrorMessage    string     `json:"error_message,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // SyncStatusRepo handles sync status persistence.
@@ -31,6 +38,10 @@ type SyncStatusRepo struct {
 	schemaMu       sync.Mutex
 	schemaDetected bool
 	isTSSchema     bool
+	// hasWindowStart: migration 021's last_window_start column is present.
+	// Production runs the TS schema, where the column is added by hand, so
+	// its absence is an expected state, not an error.
+	hasWindowStart bool
 }
 
 // NewSyncStatusRepo creates a new sync status repository
@@ -57,8 +68,40 @@ func (r *SyncStatusRepo) detectSchema(ctx context.Context) {
 		return
 	}
 
+	var hasWindowStart bool
+	if err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = 'sync_statuses' AND column_name = 'last_window_start'
+		)`).Scan(&hasWindowStart); err != nil {
+		r.isTSSchema = false
+		return
+	}
+
 	r.isTSSchema = exists
+	r.hasWindowStart = hasWindowStart
 	r.schemaDetected = true
+}
+
+// windowStartFragments returns the last_window_start pieces of an upsert, or
+// empty strings when the column is absent. The value follows lastSyncTime: an
+// attempt that keeps the old stamp (NULL, a failure) keeps the old window
+// start with it, and one that sets the stamp sets the window start too.
+func (r *SyncStatusRepo) windowStartFragments(stampCol string, argN int) (col, placeholder, set string) {
+	if !r.hasWindowStart {
+		return "", "", ""
+	}
+	return ", last_window_start",
+		fmt.Sprintf(", $%d", argN),
+		fmt.Sprintf(`,
+			last_window_start = CASE WHEN EXCLUDED.%[1]s IS NULL THEN sync_statuses.last_window_start ELSE EXCLUDED.last_window_start END`, stampCol)
+}
+
+func (r *SyncStatusRepo) windowStartSelect() string {
+	if !r.hasWindowStart {
+		return ", NULL::timestamptz"
+	}
+	return ", last_window_start"
 }
 
 // Upsert creates or updates a sync status
@@ -69,9 +112,10 @@ func (r *SyncStatusRepo) Upsert(ctx context.Context, s *SyncStatus) error {
 		return r.upsertTS(ctx, s)
 	}
 
-	query := `
-		INSERT INTO sync_statuses (user_uid, exchange, label, last_sync_time, status, total_trades, error_message, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+	wsCol, wsPlaceholder, wsSet := r.windowStartFragments("last_sync_time", 8)
+	query := fmt.Sprintf(`
+		INSERT INTO sync_statuses (user_uid, exchange, label, last_sync_time, status, total_trades, error_message, created_at, updated_at%s)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW()%s)
 		ON CONFLICT (user_uid, exchange, label)
 		DO UPDATE SET
 			-- COALESCE, not EXCLUDED: a caller passing NULL is recording an
@@ -82,12 +126,14 @@ func (r *SyncStatusRepo) Upsert(ctx context.Context, s *SyncStatus) error {
 			status = EXCLUDED.status,
 			total_trades = EXCLUDED.total_trades,
 			error_message = EXCLUDED.error_message,
-			updated_at = NOW()
-		RETURNING id`
+			updated_at = NOW()%s
+		RETURNING id`, wsCol, wsPlaceholder, wsSet)
 
-	return r.pool.QueryRow(ctx, query,
-		s.UserUID, s.Exchange, s.Label, s.LastSyncTime, s.Status, s.TotalTrades, s.ErrorMessage,
-	).Scan(&s.ID)
+	args := []any{s.UserUID, s.Exchange, s.Label, s.LastSyncTime, s.Status, s.TotalTrades, s.ErrorMessage}
+	if r.hasWindowStart {
+		args = append(args, s.LastWindowStart)
+	}
+	return r.pool.QueryRow(ctx, query, args...).Scan(&s.ID)
 }
 
 func (r *SyncStatusRepo) upsertTS(ctx context.Context, s *SyncStatus) error {
@@ -95,9 +141,10 @@ func (r *SyncStatusRepo) upsertTS(ctx context.Context, s *SyncStatus) error {
 	// layer so there is no DB-level DEFAULT on id. Generate a UUID here so
 	// the INSERT doesn't fail with a NOT NULL violation on first insert.
 	now := time.Now().UTC()
-	query := `
-		INSERT INTO sync_statuses (id, "userUid", exchange, label, "lastSyncTime", status, "totalTrades", "errorMessage", "createdAt", "updatedAt")
-		VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, $6, $7, $8, $9)
+	wsCol, wsPlaceholder, wsSet := r.windowStartFragments(`"lastSyncTime"`, 10)
+	query := fmt.Sprintf(`
+		INSERT INTO sync_statuses (id, "userUid", exchange, label, "lastSyncTime", status, "totalTrades", "errorMessage", "createdAt", "updatedAt"%s)
+		VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, $6, $7, $8, $9%s)
 		ON CONFLICT ("userUid", exchange, label)
 		DO UPDATE SET
 			-- See the snake_case twin: NULL means "this attempt failed", and a
@@ -106,12 +153,14 @@ func (r *SyncStatusRepo) upsertTS(ctx context.Context, s *SyncStatus) error {
 			status = EXCLUDED.status,
 			"totalTrades" = EXCLUDED."totalTrades",
 			"errorMessage" = EXCLUDED."errorMessage",
-			"updatedAt" = EXCLUDED."updatedAt"
-		RETURNING id`
+			"updatedAt" = EXCLUDED."updatedAt"%s
+		RETURNING id`, wsCol, wsPlaceholder, wsSet)
 
-	return r.pool.QueryRow(ctx, query,
-		s.UserUID, s.Exchange, s.Label, s.LastSyncTime, s.Status, s.TotalTrades, s.ErrorMessage, now, now,
-	).Scan(&s.ID)
+	args := []any{s.UserUID, s.Exchange, s.Label, s.LastSyncTime, s.Status, s.TotalTrades, s.ErrorMessage, now, now}
+	if r.hasWindowStart {
+		args = append(args, s.LastWindowStart)
+	}
+	return r.pool.QueryRow(ctx, query, args...).Scan(&s.ID)
 }
 
 // GetByUserExchangeLabel retrieves a specific sync status
@@ -123,14 +172,14 @@ func (r *SyncStatusRepo) GetByUserExchangeLabel(ctx context.Context, userUID, ex
 	}
 
 	query := `
-		SELECT id, user_uid, exchange, label, last_sync_time, status, total_trades, error_message, created_at, updated_at
+		SELECT id, user_uid, exchange, label, last_sync_time, status, total_trades, error_message, created_at, updated_at` + r.windowStartSelect() + `
 		FROM sync_statuses
 		WHERE user_uid = $1 AND exchange = $2 AND label = $3`
 
 	var s SyncStatus
 	err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(
 		&s.ID, &s.UserUID, &s.Exchange, &s.Label, &s.LastSyncTime,
-		&s.Status, &s.TotalTrades, &s.ErrorMessage, &s.CreatedAt, &s.UpdatedAt,
+		&s.Status, &s.TotalTrades, &s.ErrorMessage, &s.CreatedAt, &s.UpdatedAt, &s.LastWindowStart,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -143,7 +192,7 @@ func (r *SyncStatusRepo) GetByUserExchangeLabel(ctx context.Context, userUID, ex
 
 func (r *SyncStatusRepo) getByKeyTS(ctx context.Context, userUID, exchange, label string) (*SyncStatus, error) {
 	query := `
-		SELECT id, "userUid", exchange, label, "lastSyncTime", status, "totalTrades", "errorMessage", "createdAt", "updatedAt"
+		SELECT id, "userUid", exchange, label, "lastSyncTime", status, "totalTrades", "errorMessage", "createdAt", "updatedAt"` + r.windowStartSelect() + `
 		FROM sync_statuses
 		WHERE "userUid" = $1 AND exchange = $2 AND label = $3`
 
@@ -151,7 +200,7 @@ func (r *SyncStatusRepo) getByKeyTS(ctx context.Context, userUID, exchange, labe
 	var errorMsg *string
 	err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(
 		&s.ID, &s.UserUID, &s.Exchange, &s.Label, &s.LastSyncTime,
-		&s.Status, &s.TotalTrades, &errorMsg, &s.CreatedAt, &s.UpdatedAt,
+		&s.Status, &s.TotalTrades, &errorMsg, &s.CreatedAt, &s.UpdatedAt, &s.LastWindowStart,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
