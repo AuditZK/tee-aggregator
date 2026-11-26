@@ -140,8 +140,9 @@ func (p *Polymarket) GetPositions(ctx context.Context) ([]*Position, error) {
 	return positions, nil
 }
 
-// GetTrades returns the wallet's fills. A window larger than the page cap comes
-// back cut at the cap: trades feed activity counters, never the equity.
+// GetTrades returns the wallet's fills, without fees: the activity feed states
+// none, GetNetTradingFees does. A window larger than the page cap comes back
+// cut at the cap: trades feed activity counters, never the equity.
 func (p *Polymarket) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
 	q := url.Values{
 		"type":           {"TRADE"},
@@ -209,6 +210,63 @@ func (p *Polymarket) GetHistoricalSnapshots(ctx context.Context, since time.Time
 	return polymarketDailyRows(flows, series.Points, since, time.Now().UTC())
 }
 
+// GetNetTradingFees states the fees between two instants from the venue's PnL
+// series, on its hourly grid when the window fits in one.
+func (p *Polymarket) GetNetTradingFees(ctx context.Context, since, until time.Time) (float64, error) {
+	q := url.Values{"user": {p.wallet}, "interval": {"max"}, "fidelity": {"1d"}}
+	switch span := until.Sub(since); {
+	case span <= 6*24*time.Hour:
+		q.Set("interval", "1w")
+		q.Set("fidelity", "1h")
+	case span <= 29*24*time.Hour:
+		q.Set("interval", "1m")
+		q.Set("fidelity", "1h")
+	}
+	var series struct {
+		Points []polymarketPnL `json:"points"`
+	}
+	if _, err := p.get(ctx, "/user-pnl", q, &series); err != nil {
+		return 0, err
+	}
+	return polymarketFeesBetween(series.Points, since, until)
+}
+
+// polymarketFeesBetween is the fee cost between the marks the series holds at
+// since and at until. A wallet with no point by since had paid nothing yet.
+func polymarketFeesBetween(points []polymarketPnL, since, until time.Time) (float64, error) {
+	points = append([]polymarketPnL(nil), points...)
+	sort.SliceStable(points, func(i, j int) bool { return points[i].Timestamp < points[j].Timestamp })
+	var base, end polymarketPnL
+	for _, pt := range points {
+		if pt.Timestamp <= since.Unix() {
+			base = pt
+		}
+		if pt.Timestamp <= until.Unix() {
+			end = pt
+		}
+	}
+	if end.Timestamp == 0 {
+		return 0, nil
+	}
+	fees, ok := polymarketFeesSince(base, end)
+	if !ok {
+		return 0, errors.New("polymarket: fees not stated over the window")
+	}
+	return fees, nil
+}
+
+// polymarketFeesSince is the fee cost from mark base to mark at, unknown when
+// either does not state its charges. A zero base is the wallet before its
+// first mark.
+func polymarketFeesSince(base, at polymarketPnL) (float64, bool) {
+	cur, ok := at.netFees()
+	from, known := base.netFees()
+	if !ok || (!known && base.Timestamp != 0) {
+		return 0, false
+	}
+	return cur - from, true
+}
+
 type polymarketFlow struct {
 	at     time.Time
 	amount float64
@@ -243,9 +301,22 @@ type polymarketPnL struct {
 	Timestamp  int64    `json:"timestamp"`
 	Economic   *float64 `json:"economic_pnl"`
 	Unrealized *float64 `json:"unrealized_pnl"`
-	Fees       *float64 `json:"fees"`
-	VolumeUSDC float64  `json:"volume_usdc"`
-	TradeCount int      `json:"trade_count"`
+	// Fees is the charges, negative; the refunds and rebates are positive.
+	Fees         *float64 `json:"fees"`
+	FeesRefunded *float64 `json:"fees_refunded"`
+	MakerRebate  *float64 `json:"maker_rebate"`
+	TakerRebate  *float64 `json:"taker_rebate"`
+	VolumeUSDC   float64  `json:"volume_usdc"`
+	TradeCount   int      `json:"trade_count"`
+}
+
+// netFees is the running fee cost, charges less refunds and rebates, unknown
+// when the venue could not state the charges.
+func (p polymarketPnL) netFees() (float64, bool) {
+	if p.Fees == nil {
+		return 0, false
+	}
+	return -*p.Fees - polymarketDeref(p.FeesRefunded) - polymarketDeref(p.MakerRebate) - polymarketDeref(p.TakerRebate), true
 }
 
 type polymarketStats struct {
@@ -359,9 +430,7 @@ func polymarketDailyRows(flows []polymarketFlow, points []polymarketPnL, since, 
 			TotalTrades: at.TradeCount - prev.TradeCount,
 			TotalVolume: at.VolumeUSDC - prev.VolumeUSDC,
 		}
-		if at.Fees != nil && (prev.Fees != nil || prev.Timestamp == 0) {
-			row.TotalFees = polymarketDeref(prev.Fees) - *at.Fees
-		}
+		row.TotalFees, _ = polymarketFeesSince(prev, at)
 		prev = at
 		if !marked || day.Before(from) {
 			continue

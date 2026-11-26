@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -358,6 +359,100 @@ func TestPolymarketDailyRows(t *testing.T) {
 		deep := []polymarketPnL{{Timestamp: polymarketDay(3).Unix(), Economic: f64(-5000)}}
 		if _, err := polymarketDailyRows(flows, deep, time.Time{}, now); !errors.Is(err, ErrPolymarketUnreconciled) {
 			t.Fatalf("error = %v, want ErrPolymarketUnreconciled", err)
+		}
+	})
+}
+
+func TestPolymarketDailyRows_RebatesReadAsNegativeFees(t *testing.T) {
+	points := []polymarketPnL{
+		{Timestamp: polymarketDay(2).Unix(), Economic: f64(0), Fees: f64(-2)},
+		// Charges up by 1, a refund of 0.5 and rebates of 4 and 0.5.
+		{Timestamp: polymarketDay(3).Unix(), Economic: f64(3), Fees: f64(-3), FeesRefunded: f64(0.5), MakerRebate: f64(4), TakerRebate: f64(0.5)},
+		{Timestamp: polymarketDay(4).Unix(), Economic: f64(3), Fees: f64(-3), FeesRefunded: f64(0.5), MakerRebate: f64(4), TakerRebate: f64(0.5)},
+	}
+	flows := []polymarketFlow{{at: polymarketDay(1).Add(time.Hour), amount: 100}}
+
+	rows, err := polymarketDailyRows(flows, points, time.Time{}, polymarketDay(4))
+	if err != nil {
+		t.Fatalf("polymarketDailyRows: %v", err)
+	}
+	want := map[int]float64{2: 2, 3: -4, 4: 0}
+	if len(rows) != len(want) {
+		t.Fatalf("got %d rows, want %d", len(rows), len(want))
+	}
+	for _, r := range rows {
+		if w := want[r.Date.Day()]; !approxEq(r.TotalFees, w) {
+			t.Errorf("day %d fees = %v, want %v", r.Date.Day(), r.TotalFees, w)
+		}
+	}
+}
+
+func TestPolymarketGetNetTradingFees(t *testing.T) {
+	since := polymarketDay(4)
+	hour := func(h int) int64 { return since.Add(time.Duration(h) * time.Hour).Unix() }
+	series := `{"data":{"points":[
+		{"timestamp":` + strconv.FormatInt(hour(-1), 10) + `,"fees":-1,"maker_rebate":2},
+		{"timestamp":` + strconv.FormatInt(hour(0), 10) + `,"fees":-1.5,"maker_rebate":3},
+		{"timestamp":` + strconv.FormatInt(hour(23), 10) + `,"fees":-2,"maker_rebate":9},
+		{"timestamp":` + strconv.FormatInt(hour(24), 10) + `,"fees":-2.25,"maker_rebate":10,"fees_refunded":0.25}
+	]}}`
+
+	cases := []struct {
+		name               string
+		until              time.Time
+		interval, fidelity string
+		want               float64
+	}{
+		{"a day on the hourly grid", since.Add(24*time.Hour + 5*time.Minute), "1w", "1h", -6.5},
+		{"a mark short of the window end", since.Add(23*time.Hour + 30*time.Minute), "1w", "1h", -5.5},
+		{"a catch-up over two weeks", since.Add(14 * 24 * time.Hour), "1m", "1h", -6.5},
+		{"a catch-up past a month", since.Add(40 * 24 * time.Hour), "max", "1d", -6.5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query()
+				if r.URL.Path != "/user-pnl" || q.Get("user") != polymarketTestWallet ||
+					q.Get("interval") != tc.interval || q.Get("fidelity") != tc.fidelity {
+					t.Errorf("request %s?%s, want interval %s at fidelity %s", r.URL.Path, r.URL.RawQuery, tc.interval, tc.fidelity)
+				}
+				_, _ = w.Write([]byte(series))
+			}))
+			defer srv.Close()
+			p := NewPolymarket(&Credentials{APIKey: polymarketTestWallet})
+			p.baseURL = srv.URL
+			got, err := p.GetNetTradingFees(context.Background(), since, tc.until)
+			if err != nil {
+				t.Fatalf("GetNetTradingFees: %v", err)
+			}
+			if !approxEq(got, tc.want) {
+				t.Errorf("fees = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("a wallet younger than the window paid from zero", func(t *testing.T) {
+		got, err := polymarketFeesBetween([]polymarketPnL{
+			{Timestamp: hour(5), Fees: f64(-1), MakerRebate: f64(0.25)},
+		}, since, since.Add(24*time.Hour))
+		if err != nil || !approxEq(got, 0.75) {
+			t.Fatalf("fees, err = %v, %v, want 0.75", got, err)
+		}
+	})
+	t.Run("a wallet without a mark paid nothing", func(t *testing.T) {
+		got, err := polymarketFeesBetween(nil, since, since.Add(24*time.Hour))
+		if err != nil || got != 0 {
+			t.Fatalf("fees, err = %v, %v, want 0", got, err)
+		}
+	})
+	t.Run("charges the venue cannot state fail the read", func(t *testing.T) {
+		for _, pts := range [][]polymarketPnL{
+			{{Timestamp: hour(0), Fees: f64(-1)}, {Timestamp: hour(24)}},
+			{{Timestamp: hour(0)}, {Timestamp: hour(24), Fees: f64(-1)}},
+		} {
+			if got, err := polymarketFeesBetween(pts, since, since.Add(24*time.Hour)); err == nil {
+				t.Errorf("fees %v stated from %+v", got, pts)
+			}
 		}
 	})
 }

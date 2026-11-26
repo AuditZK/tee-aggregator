@@ -20,6 +20,7 @@ func TestAllConnectorsImplementInterface(t *testing.T) {
 	var _ Connector = (*Hyperliquid)(nil)
 	var _ Connector = (*Lighter)(nil)
 	var _ Connector = (*Polymarket)(nil)
+	var _ FeeLedgerFetcher = (*Polymarket)(nil)
 	var _ Connector = (*PredictFun)(nil)
 	var _ CumulativePnLProvider = (*PredictFun)(nil)
 	var _ Connector = (*CTrader)(nil)
