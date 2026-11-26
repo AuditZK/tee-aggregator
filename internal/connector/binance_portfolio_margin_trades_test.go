@@ -57,6 +57,12 @@ type binancePMActivityServer struct {
 	portfolioStatus  int
 	// coinMBalance is the /dapi/v1/balance answer ("[]" when empty).
 	coinMBalance string
+	// crossAssetBtc is the gross totalAssetOfBtc of /sapi/v1/margin/account.
+	crossAssetBtc string
+	// poolAmounts overrides the crossMarginAsset ("2") of a /sapi/v1/portfolio/balance asset.
+	poolAmounts map[string]string
+	// deposits is the /sapi/v1/capital/deposit/hisrec answer ("[]" when empty).
+	deposits string
 
 	mu    sync.Mutex
 	calls []*url.URL
@@ -236,7 +242,11 @@ func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
 		case p == "/sapi/v1/portfolio/account":
 			if s.portfolioStatus != 0 {
 				w.WriteHeader(s.portfolioStatus)
-				_, _ = w.Write([]byte(`{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}`))
+				body := `{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}`
+				if s.portfolioAccount != "" {
+					body = s.portfolioAccount
+				}
+				_, _ = w.Write([]byte(body))
 				return
 			}
 			if s.portfolioAccount == "" {
@@ -247,7 +257,11 @@ func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
 		case p == "/sapi/v1/portfolio/balance":
 			rows := []map[string]any{{"asset": "BNB", "crossMarginAsset": "0", "crossMarginBorrowed": "0"}}
 			for _, a := range s.crossAssets {
-				rows = append(rows, map[string]any{"asset": a, "crossMarginAsset": "2", "crossMarginBorrowed": "0"})
+				amount := "2"
+				if v, ok := s.poolAmounts[a]; ok {
+					amount = v
+				}
+				rows = append(rows, map[string]any{"asset": a, "crossMarginAsset": amount, "crossMarginBorrowed": "0"})
 			}
 			write(rows)
 		case p == "/sapi/v1/margin/myTrades":
@@ -262,7 +276,19 @@ func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
 			if net == "" {
 				net = "0"
 			}
-			_, _ = w.Write([]byte(`{"totalNetAssetOfBtc":"` + net + `"}`))
+			gross := s.crossAssetBtc
+			if gross == "" {
+				gross = net
+			}
+			_, _ = w.Write([]byte(`{"totalAssetOfBtc":"` + gross + `","totalLiabilityOfBtc":"0","totalNetAssetOfBtc":"` + net + `"}`))
+		case p == "/sapi/v1/capital/deposit/hisrec":
+			if s.deposits != "" {
+				_, _ = w.Write([]byte(s.deposits))
+				return
+			}
+			_, _ = w.Write([]byte(`[]`))
+		case p == "/sapi/v1/capital/withdraw/history":
+			_, _ = w.Write([]byte(`[]`))
 		case strings.HasPrefix(p, "/sapi/v1/margin/"):
 			_, _ = w.Write([]byte(`{"totalNetAssetOfBtc":"0"}`))
 		case strings.HasPrefix(p, "/sapi/v1/simple-earn/"):
@@ -614,9 +640,9 @@ func TestBinance_PortfolioMargin_PapiPacedUnderBudget(t *testing.T) {
 	b := srv.connector(t)
 	clock := pmDay
 	var slept []time.Duration
-	b.papiPacer.budget = 100
-	b.papiPacer.now = func() time.Time { return clock }
-	b.papiPacer.sleep = func(_ context.Context, d time.Duration) error {
+	b.pacer.budget = 100
+	b.pacer.now = func() time.Time { return clock }
+	b.pacer.sleep = func(_ context.Context, d time.Duration) error {
 		slept = append(slept, d)
 		clock = clock.Add(d)
 		return nil

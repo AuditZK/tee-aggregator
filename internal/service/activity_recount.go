@@ -97,7 +97,7 @@ func (s *SyncService) RecountActivity(ctx context.Context, userUID, exchange, la
 	if scope.horizon > 0 && since.Before(time.Now().Add(-scope.horizon)) {
 		return nil, fmt.Errorf("recount: %s keeps fills for %d days", exchange, int(scope.horizon/(24*time.Hour)))
 	}
-	trades, err := conn.GetTrades(ctx, since, to)
+	trades, err := conn.GetTrades(recountTradesContext(ctx, scope), since, to)
 	if err != nil {
 		return nil, fmt.Errorf("read trades: %w", err)
 	}
@@ -171,6 +171,13 @@ func (s *SyncService) recountSource(ctx context.Context, userUID, exchange, labe
 // reconstructed, or when its global entry does not add up to its markets: a
 // row written before the per-market breakdown existed, which a recount would
 // double.
+// recountTradesContext scopes the recount's fill read to the markets it
+// rewrites: fills of the others would be read and dropped, and on a Binance
+// Portfolio Margin account the margin fills are most of an 89-day read.
+func recountTradesContext(ctx context.Context, scope recountScope) context.Context {
+	return connector.WithTradeMarkets(ctx, scope.markets)
+}
+
 // recountFunding reads the funding since since, and whether it was read at
 // all: a connector that reads no funding for this account (Binance outside
 // Portfolio Margin answers ErrFundingNotRead) leaves the stored funding as

@@ -400,9 +400,9 @@ type Credentials struct {
 	Demo bool
 }
 
-// BalanceCrossCheck is a second reading of part of the equity the last
-// GetBalance measured, from the venue's own figure for it. The sync logs it
-// for operators; nothing stores it.
+// BalanceCrossCheck compares part of the equity a GetBalance measured with
+// the venue's own figure for it. The sync logs it for operators; nothing
+// stores it.
 type BalanceCrossCheck struct {
 	Name      string
 	Measured  float64
@@ -410,7 +410,34 @@ type BalanceCrossCheck struct {
 }
 
 // BalanceCrossChecker is implemented by connectors that can compare part of
-// their equity with the venue's own figure for it.
+// their equity with the venue's own figure for it. A check is handed out
+// once, by the call after the balance read that took it; ok is false
+// until another is taken.
 type BalanceCrossChecker interface {
 	BalanceCrossCheck() (BalanceCrossCheck, bool)
+}
+
+type tradeMarketsKey struct{}
+
+// WithTradeMarkets scopes the GetTrades calls made with the returned context
+// to the given markets: a connector may skip the reads of the others. The
+// activity recount rewrites swap alone, and the Binance margin fills it would
+// otherwise read and drop cost most of a long recount's time.
+func WithTradeMarkets(ctx context.Context, markets []string) context.Context {
+	return context.WithValue(ctx, tradeMarketsKey{}, append([]string(nil), markets...))
+}
+
+// TradeMarketWanted reports whether a GetTrades call made with ctx wants the
+// fills of market; every market is wanted when ctx carries no scope.
+func TradeMarketWanted(ctx context.Context, market string) bool {
+	markets, ok := ctx.Value(tradeMarketsKey{}).([]string)
+	if !ok {
+		return true
+	}
+	for _, m := range markets {
+		if m == market {
+			return true
+		}
+	}
+	return false
 }

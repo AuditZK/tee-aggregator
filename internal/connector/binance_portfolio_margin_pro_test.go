@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -89,8 +90,10 @@ func TestBinance_PMPro_FundingAndMarginFillsRead(t *testing.T) {
 	if spot != 1 || swap != 1 {
 		t.Fatalf("trades = %d spot / %d swap, want the margin fill and the fapi fill", spot, swap)
 	}
-	if got := srv.symbolsAsked("/sapi/v1/margin/myTrades"); !slices.Equal(got, []string{"ETHUSDC", "ETHUSDT", "USCXUSDC", "USCXUSDT"}) {
-		t.Fatalf("margin symbols asked = %v", got)
+	// ETHUSDC and the USCX pairs are not listed spot pairs in the ticker map:
+	// not asked, so no -1121 is spent on them.
+	if got := srv.symbolsAsked("/sapi/v1/margin/myTrades"); !slices.Equal(got, []string{"ETHUSDT"}) {
+		t.Fatalf("margin symbols asked = %v, want only the listed pair", got)
 	}
 
 	fees, err := b.GetFundingFees(ctx, nil, time.Now().Add(-24*time.Hour))
@@ -140,7 +143,7 @@ func TestBinance_PMPro_ResidualRaisesMarkerOnly(t *testing.T) {
 	srv := pmProAccount()
 	srv.portfolioAccount = `{"accountType":"PM_3","actualEquity":"230000"}`
 	b := srv.connector(t)
-	for range 2 {
+	for read := range 2 {
 		bal, err := b.GetBalance(context.Background())
 		if err != nil {
 			t.Fatalf("GetBalance: %v", err)
@@ -148,15 +151,20 @@ func TestBinance_PMPro_ResidualRaisesMarkerOnly(t *testing.T) {
 		if bal.Equity != 240800 {
 			t.Fatalf("equity = %v, want 240800 kept", bal.Equity)
 		}
-		if w := b.CapabilityWarnings(); !slices.Equal(w, []string{binanceMarkerPMProResidual}) {
-			t.Fatalf("warnings = %v, want only %s on every read of the instance", w, binanceMarkerPMProResidual)
+		// Raised and handed out by the read that measured it, not repeated by
+		// the later reads of the instance, which have no new figure.
+		check, ok := b.BalanceCrossCheck()
+		if w := b.CapabilityWarnings(); read == 0 && (!slices.Equal(w, []string{binanceMarkerPMProResidual}) || !ok || check.Reference != 230000) {
+			t.Fatalf("first read: warnings = %v, check = %+v (%v); want the marker and the check", w, check, ok)
+		} else if read == 1 && (len(w) != 0 || ok) {
+			t.Fatalf("second read: warnings = %v, check reported again = %v; want neither", w, ok)
 		}
 	}
 }
 
 func TestBinance_PMPro_UnreadableMarginFillsRaiseMarker(t *testing.T) {
 	srv := pmProAccount()
-	srv.marginErrors["ETHUSDC"] = pmError{http.StatusTeapot, `{"code":-1003,"msg":"Way too many requests; IP banned."}`}
+	srv.marginErrors["ETHUSDT"] = pmError{http.StatusTeapot, `{"code":-1003,"msg":"Way too many requests; IP banned."}`}
 	b := srv.connector(t)
 	if _, err := b.GetBalance(context.Background()); err != nil {
 		t.Fatalf("GetBalance: %v", err)
@@ -165,8 +173,8 @@ func TestBinance_PMPro_UnreadableMarginFillsRaiseMarker(t *testing.T) {
 	if err == nil {
 		t.Fatal("GetTrades hid the ban")
 	}
-	if len(trades) == 0 {
-		t.Fatal("the fapi fill read before the ban was dropped")
+	if len(trades) != 1 || trades[0].MarketType != MarketSwap {
+		t.Fatalf("trades = %+v, want the fapi fill read before the ban", trades)
 	}
 	if !slices.Contains(b.CapabilityWarnings(), binancePMTradesUnreadable) {
 		t.Fatalf("warnings = %v, want %s", b.CapabilityWarnings(), binancePMTradesUnreadable)
@@ -180,14 +188,23 @@ func TestBinance_PMPro_ProbeFailureChangesNothing(t *testing.T) {
 	cases := map[string]struct {
 		srv        func(*binancePMActivityServer)
 		wantProbes int
+		// open: the answer said nothing about the account, so the verdict
+		// stays open (asked again) and pm_trades_unreadable is raised.
+		open bool
 	}{
-		"refused": {func(s *binancePMActivityServer) { s.portfolioStatus = http.StatusUnauthorized }, 1},
-		"banned":  {func(s *binancePMActivityServer) { s.portfolioStatus = http.StatusTeapot }, 2},
+		"binance refusal": {func(s *binancePMActivityServer) { s.portfolioStatus, s.portfolioAccount = http.StatusUnauthorized, "" }, 1, false},
+		"banned":          {func(s *binancePMActivityServer) { s.portfolioStatus, s.portfolioAccount = http.StatusTeapot, "" }, 2, true},
+		"waf page": {func(s *binancePMActivityServer) {
+			s.portfolioStatus, s.portfolioAccount = http.StatusForbidden, `<html>Request blocked</html>`
+		}, 2, true},
+		"proxy json without code": {func(s *binancePMActivityServer) {
+			s.portfolioStatus, s.portfolioAccount = http.StatusBadRequest, `{"error":"bad request"}`
+		}, 2, true},
 		"papi flavour": {func(s *binancePMActivityServer) {
 			s.portfolioAccount = `{"accountType":"PM_2","actualEquity":"240600"}`
-		}, 1},
-		"no account type": {func(s *binancePMActivityServer) { s.portfolioAccount = `{}` }, 1},
-		"not json":        {func(s *binancePMActivityServer) { s.portfolioAccount = `<html>` }, 1},
+		}, 1, false},
+		"no account type": {func(s *binancePMActivityServer) { s.portfolioAccount = `{}` }, 1, false},
+		"truncated":       {func(s *binancePMActivityServer) { s.portfolioAccount = `{"accountType":"PM_` }, 2, true},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -203,8 +220,9 @@ func TestBinance_PMPro_ProbeFailureChangesNothing(t *testing.T) {
 				if bal.Equity != 240800 {
 					t.Fatalf("equity = %v, want 240800", bal.Equity)
 				}
-				if w := b.CapabilityWarnings(); len(w) != 0 {
-					t.Fatalf("warnings = %v, want none", w)
+				w := b.CapabilityWarnings()
+				if want := c.open; want != slices.Equal(w, []string{binancePMTradesUnreadable}) || (!want && len(w) != 0) {
+					t.Fatalf("warnings = %v, want pm_trades_unreadable only when the verdict stays open (%v)", w, c.open)
 				}
 			}
 			if n := srv.count("/sapi/v1/portfolio/account"); n != c.wantProbes {
@@ -314,3 +332,140 @@ func TestBinance_PMPro_PapiAccountNeverProbed(t *testing.T) {
 		t.Fatalf("%d Portfolio Margin Pro reads on a papi account, want 0", n)
 	}
 }
+
+// A catch-up whose margin fills need minutes of pacing must not spend the
+// sync's deadline: the read gives up with what it has and the marker, and
+// the cashflow read after it, on the same context, still returns the flows.
+func TestBinance_PMPro_SlowMarginReadLeavesTimeForCashflows(t *testing.T) {
+	srv := pmProAccount()
+	srv.deposits = `[{"coin":"USDT","amount":"500","insertTime":` +
+		strconvItoa(time.Now().Add(-time.Hour).UnixMilli()) + `,"walletType":0}]`
+	b := srv.connector(t)
+	// 100 a minute: the 30 daily margin windows (300 weight) alone need three
+	// minutes, as ~24 pool pairs would at the real 1200.
+	b.pacer.budget = 100
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	start := time.Now()
+
+	if _, err := b.GetBalance(ctx); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := b.GetTrades(ctx, now.Add(-30*24*time.Hour), now); err == nil {
+		t.Fatal("GetTrades read 30 days of margin fills inside its budget")
+	}
+	_, _ = b.GetFundingFees(ctx, nil, now.Add(-30*24*time.Hour))
+	flows, err := b.GetCashflows(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("GetCashflows after the margin read: %v", err)
+	}
+	if len(flows) != 1 || flows[0].Amount != 500 {
+		t.Fatalf("flows = %+v, want the 500 deposit", flows)
+	}
+	if !slices.Contains(b.CapabilityWarnings(), binancePMTradesUnreadable) {
+		t.Fatalf("warnings = %v, want %s", b.CapabilityWarnings(), binancePMTradesUnreadable)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("reads took %v of a 4 s deadline", elapsed)
+	}
+}
+
+func TestBinanceWeightPacer_GivesUpBeforeTheDeadline(t *testing.T) {
+	p := &binanceWeightPacer{budget: 10}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := p.wait(ctx, 10); err != nil {
+		t.Fatalf("first wait: %v", err)
+	}
+	start := time.Now()
+	if err := p.wait(ctx, 10); !errors.Is(err, ErrTransient) {
+		t.Fatalf("wait whose window opens after the deadline = %v, want ErrTransient", err)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Fatal("the pacer slept toward a deadline it could not beat")
+	}
+}
+
+// A pool asset worth under $1 is not asked for.
+func TestBinance_PMPro_DustPoolAssetNotAsked(t *testing.T) {
+	srv := pmProAccount()
+	srv.crossAssets = []string{"ETH", "BTC"}
+	srv.poolAmounts = map[string]string{"BTC": "0.00001"} // $0.50
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if _, err := b.GetTrades(context.Background(), pmDay, pmDay.Add(24*time.Hour)); err != nil {
+		t.Fatalf("GetTrades: %v", err)
+	}
+	if got := srv.symbolsAsked("/sapi/v1/margin/myTrades"); !slices.Equal(got, []string{"ETHUSDT"}) {
+		t.Fatalf("margin symbols asked = %v, want the dust BTC left out", got)
+	}
+}
+
+// The recount scopes its read to swap: no margin fill and no pool read, on a
+// Pro account (sapi) and on a papi one alike, the swap fills still read.
+func TestBinance_SwapScopedReadSkipsMarginFills(t *testing.T) {
+	ctx := WithTradeMarkets(context.Background(), []string{MarketSwap})
+
+	pro := pmProAccount()
+	b := pro.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	trades, err := b.GetTrades(ctx, pmDay, pmDay.Add(24*time.Hour))
+	if err != nil || len(trades) != 1 || trades[0].MarketType != MarketSwap {
+		t.Fatalf("Pro swap read = %+v, %v; want the fapi fill alone", trades, err)
+	}
+	if n := pro.count("/sapi/v1/margin/myTrades") + pro.count("/sapi/v1/portfolio/balance") + pro.count("/api/v3/myTrades"); n != 0 {
+		t.Fatalf("%d spot or margin reads in a swap-scoped read", n)
+	}
+
+	papi := pmAccountWithActivity()
+	pb := papi.connector(t)
+	if _, err := pb.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	trades, err = pb.GetTrades(ctx, pmDay, pmDay.Add(24*time.Hour))
+	if err != nil || len(trades) != 4 {
+		t.Fatalf("papi swap read = %d trades, %v; want the 3 UM and 1 COIN-M fills", len(trades), err)
+	}
+	if n := papi.count("/papi/v1/margin/myTrades") + papi.count("/papi/v1/balance"); n != 1 {
+		// The one /papi/v1/balance is the balance read's own.
+		t.Fatalf("%d papi margin reads in a swap-scoped read, want only the balance read's", n)
+	}
+}
+
+// A Pro key without the Futures scope is not probed: its fills and funding
+// cannot be read, and futures_permission_missing already says so.
+func TestBinance_PMPro_NoProbeWithoutFuturesScope(t *testing.T) {
+	srv := pmProAccount()
+	srv.fapiDenied = true
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if n := srv.count("/sapi/v1/portfolio/account"); n != 0 {
+		t.Fatalf("probed %d times without the Futures scope, want 0", n)
+	}
+	if slices.Contains(b.CapabilityWarnings(), binancePMTradesUnreadable) {
+		t.Fatalf("warnings = %v: pm_trades_unreadable on top of the scope warning", b.CapabilityWarnings())
+	}
+}
+
+// The gate reads the cross margin wallet gross: a pool whose assets and
+// debts net to zero is still a pool.
+func TestBinance_PMPro_ProbedOnGrossCrossMargin(t *testing.T) {
+	srv := pmProAccount()
+	srv.crossNetBtc, srv.crossAssetBtc = "0", "1.5"
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if pro, _ := b.portfolioMarginProState(); pro != binancePMYes || srv.count("/sapi/v1/portfolio/account") != 1 {
+		t.Fatalf("verdict = %v after %d probes, want Pro after one", pro, srv.count("/sapi/v1/portfolio/account"))
+	}
+}
+
+func strconvItoa(v int64) string { return strconv.FormatInt(v, 10) }

@@ -1,7 +1,10 @@
 package connector
 
 // Live activity of a Binance Portfolio Margin (PM) account: fills, fees and
-// funding read from papi, since fapi refuses a PM key with -2015.
+// funding read from papi, since fapi refuses a PM key with -2015. Portfolio
+// Margin Pro, where fapi answers and papi refuses, is read through fapi, dapi
+// and sapi instead (binance_portfolio_margin_pro.go); the helpers below take
+// the base URL for that reason.
 //
 // Known coverage gaps, accepted:
 //   - Margin fills are asked only for the assets /papi/v1/balance shows the
@@ -12,13 +15,15 @@ package connector
 //     pm_trades_unreadable: the day is short. The activity recount repairs
 //     its swap fills and funding later; its margin (spot bucket) fills stay
 //     short, the recount does not read that market.
-//   - PM options and Portfolio Margin Pro are not read.
+//   - PM options are not read, nor Portfolio Margin Pro's COIN-M fills,
+//     interest and loans.
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"slices"
 	"strconv"
@@ -88,12 +93,17 @@ var binancePacedWeights = map[string]int{
 	"/dapi/v1/income":            20,
 }
 
-// binancePapiBudgetPerMinute caps the papi weight one connector spends per
-// minute. Binance documents 6000/min per IP for Portfolio Margin, and the
+// binancePacedBudgetPerMinute caps the weight one connector's paced reads
+// spend per minute. Binance documents 6000/min per IP for Portfolio Margin
+// (2400 on fapi, 12000 on sapi), and the
 // enclave's egress IP is shared by every customer: one account stays at a
 // fifth of it. A daily sync spends a few hundred; a long recount is what
 // reaches the cap and is slowed down rather than banned.
-const binancePapiBudgetPerMinute = 1200
+const binancePacedBudgetPerMinute = 1200
+
+// binanceMarginDustUSD is the value under which a Portfolio Margin Pro pool
+// asset's margin fills are not asked for.
+const binanceMarginDustUSD = 1.0
 
 // binanceWeightPacer spends a weight budget per fixed one-minute window and
 // sleeps out the rest of the window when the next call would overrun it. The
@@ -110,7 +120,7 @@ type binanceWeightPacer struct {
 func (p *binanceWeightPacer) wait(ctx context.Context, weight int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now, sleep, budget := time.Now, sleepCtx, binancePapiBudgetPerMinute
+	now, sleep, budget := time.Now, sleepCtx, binancePacedBudgetPerMinute
 	if p.now != nil {
 		now = p.now
 	}
@@ -125,7 +135,13 @@ func (p *binanceWeightPacer) wait(ctx context.Context, weight int) error {
 		p.start, p.used = t, 0
 	}
 	if p.used > 0 && p.used+weight > budget {
-		if err := sleep(ctx, p.start.Add(time.Minute).Sub(t)); err != nil {
+		d := p.start.Add(time.Minute).Sub(t)
+		// Sleeping into the caller's deadline would spend the time the reads
+		// after this one need (the sync's cashflows share it): give up now.
+		if deadline, ok := ctx.Deadline(); ok && time.Now().Add(d).After(deadline) {
+			return fmt.Errorf("%w: binance weight budget spent until after the deadline", ErrTransient)
+		}
+		if err := sleep(ctx, d); err != nil {
 			return err
 		}
 		p.start, p.used = now(), 0
@@ -160,7 +176,7 @@ func (b *Binance) pacedGet(ctx context.Context, base, path string, params url.Va
 	if !ok {
 		weight = 20
 	}
-	if err := b.papiPacer.wait(ctx, weight); err != nil {
+	if err := b.pacer.wait(ctx, weight); err != nil {
 		return nil, err
 	}
 	return b.doRequest(ctx, "GET", base, path, params, true)
@@ -249,7 +265,10 @@ func (b *Binance) getPortfolioMarginTrades(ctx context.Context, start, end time.
 		}
 		trades = append(trades, binancePMCMFillTrades(fills)...)
 	}
-	marginSyms, err := b.marginPoolSymbols(ctx, binancePortfolioMarginAPI, "/papi/v1/balance")
+	if !TradeMarketWanted(ctx, MarketSpot) {
+		return trades, nil
+	}
+	marginSyms, err := b.marginPoolSymbols(ctx, binancePortfolioMarginAPI, "/papi/v1/balance", nil)
 	if err != nil {
 		return trades, fmt.Errorf("margin symbols: %w", err)
 	}
@@ -378,7 +397,11 @@ func (b *Binance) papiOpenPositionSymbols(ctx context.Context, path string) ([]s
 // on Portfolio Margin Pro, same fields) shows the cross margin wallet
 // holding, owing or charging interest on, against USDT and USDC. No pair is
 // asked on speculation: each costs weight on an IP every customer shares.
-func (b *Binance) marginPoolSymbols(ctx context.Context, base, path string) ([]string, error) {
+// With a price map (the Portfolio Margin Pro read), a pair the map does not
+// list is not asked (no spot pair: USCX, a -1121 every window), nor an asset
+// worth under binanceMarginDustUSD: each pair costs a call per day of the
+// window, and a 30-day catch-up on dust would spend the sync's deadline.
+func (b *Binance) marginPoolSymbols(ctx context.Context, base, path string, priceMap map[string]float64) ([]string, error) {
 	body, err := b.pacedGet(ctx, base, path, url.Values{})
 	if err != nil {
 		return nil, err
@@ -401,13 +424,31 @@ func (b *Binance) marginPoolSymbols(ctx context.Context, base, path string) ([]s
 			continue
 		}
 		asset := strings.ToUpper(r.Asset)
+		var pairs []string
 		switch {
 		case asset == "USDT" || asset == "USD" || asset == "BNFCR":
 		case IsStablecoinUSD(asset):
-			out = appendSortedUnique(out, asset+"USDT")
+			pairs = []string{asset + "USDT"}
 		default:
-			out = appendSortedUnique(out, asset+"USDT")
-			out = appendSortedUnique(out, asset+"USDC")
+			pairs = []string{asset + "USDT", asset + "USDC"}
+		}
+		if priceMap != nil {
+			units := 0.0
+			for _, q := range []string{r.CrossMarginAsset, r.CrossMarginBorrowed, r.CrossMarginFree, r.CrossMarginLocked, r.CrossMarginInterest} {
+				v, _ := strconv.ParseFloat(q, 64)
+				units = max(units, math.Abs(v))
+			}
+			price := 1.0
+			if !IsStablecoinUSD(asset) {
+				price = priceMap[asset+"USDT"]
+			}
+			if units*price < binanceMarginDustUSD {
+				pairs = nil
+			}
+			pairs = slices.DeleteFunc(pairs, func(p string) bool { return priceMap[p] == 0 })
+		}
+		for _, p := range pairs {
+			out = appendSortedUnique(out, p)
 		}
 	}
 	return out, nil
