@@ -118,3 +118,46 @@ func TestReadActivity_FundingSeenByTwoWindowsCountsOnce(t *testing.T) {
 		t.Fatalf("funding over two rows = %v, want -21", total)
 	}
 }
+
+// IG reconciles its flows from the balance, which moves the instant a charge
+// is made. The reconciliation subtracts the charges of the instant window it
+// compares; the row stores the closed days'. Given the closed days instead, a
+// rewrite of row D at 14:00 read a 09:00 commission as a withdrawal and row
+// D+1 read it back as a deposit.
+func TestReadActivity_BalanceReconciliationUsesTheInstantWindow(t *testing.T) {
+	s := NewSyncService(nil, nil, nil, zap.NewNop())
+	meta := &repository.ExchangeConnection{UserUID: "u", Exchange: "ig", Label: "main"}
+	d := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	charge := d.Add(9 * time.Hour)
+	conn := &lateFundingConnector{rows: []postedFunding{{at: charge, posted: charge, amount: -12}}}
+
+	flow := func(from, now time.Time, prevSettled, settled float64) (act liveActivity, dep, wd float64) {
+		conn.clock = now
+		act = s.readActivity(context.Background(), conn, meta, from, now, nil)
+		dep, wd = InferCapitalFlow(
+			ReconInputs{SettledBalance: prevSettled},
+			ReconInputs{SettledBalance: settled, Charges: act.reconciliationCharges()},
+			reconThreshold(settled),
+		)
+		return act, dep, wd
+	}
+
+	// Row D rewritten at D 14:00 (a manual sync): the window runs from the
+	// fallback D-1 00:00, the balance from row D-1's 1000 to 988.
+	act, dep, wd := flow(d.Add(-24*time.Hour), d.Add(14*time.Hour), 1000, 988)
+	if dep != 0 || wd != 0 {
+		t.Fatalf("row D books +%v/-%v, want no flow: the drop is the commission", dep, wd)
+	}
+	if act.fundingCharges != 0 {
+		t.Fatalf("row D stores funding %v, want 0: the commission belongs to day D", act.fundingCharges)
+	}
+
+	// Row D+1 resumes at the rewrite's start stamp, the balance unmoved.
+	act, dep, wd = flow(d.Add(14*time.Hour), d.Add(24*time.Hour+25*time.Second), 988, 988)
+	if dep != 0 || wd != 0 {
+		t.Fatalf("row D+1 books +%v/-%v, want no flow: the balance did not move", dep, wd)
+	}
+	if act.fundingCharges != -12 {
+		t.Fatalf("row D+1 stores funding %v, want -12 (day D, closed)", act.fundingCharges)
+	}
+}

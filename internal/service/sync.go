@@ -1275,7 +1275,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 		return result
 	}
 
-	deposits, withdrawals := s.reconcileCapitalFlow(ctx, connMeta, startOfDay, act.trades, balance.Equity, balance.UnrealizedPnL, act.fundingCharges, act.deposits, act.withdrawals)
+	deposits, withdrawals := s.reconcileCapitalFlow(ctx, connMeta, startOfDay, act.trades, balance.Equity, balance.UnrealizedPnL, act.reconciliationCharges(), act.deposits, act.withdrawals)
 	if pp, ok := conn.(connector.CumulativePnLProvider); ok {
 		deposits, withdrawals = s.flowsFromPublishedPnL(ctx, pp, connMeta, startOfDay, balance.Equity)
 	}
@@ -1420,12 +1420,23 @@ type liveActivity struct {
 	trades         []*connector.Trade
 	breakdown      *aggregatedBreakdown
 	fundingCharges float64
-	deposits       float64
-	withdrawals    float64
+	// reconCharges is the funding over [from, now], the window the balance
+	// reconciliation compares; fundingCharges, written on the row, covers the
+	// closed days of fundingWindow. A balance-reconciled venue (IG) books a
+	// charge in the balance the instant it is made, so its reconciliation
+	// needs the instant window or a same-day rewrite reads a charge as a
+	// withdrawal and the next row reads it back as a deposit.
+	reconCharges float64
+	deposits     float64
+	withdrawals  float64
 	// cashflows are the flows deposits and withdrawals were summed from,
 	// kept so a non-USD account can convert each at its own day's rate.
 	cashflows []*connector.Cashflow
 }
+
+// reconciliationCharges is the funding the balance reconciliation subtracts:
+// the instant window's, not the closed days written on the row.
+func (a liveActivity) reconciliationCharges() float64 { return a.reconCharges }
 
 // fundingWindow is the funding a live row carries: whole closed UTC days,
 // [midnight of the activity window's start, midnight of now), the rule the
@@ -1474,6 +1485,11 @@ func (s *SyncService) readActivity(ctx context.Context, conn connector.Connector
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
 		fFrom, fTo := fundingWindow(from, now)
 		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, fFrom); err == nil {
+			for _, f := range fees {
+				if !f.Timestamp.UTC().Before(from) {
+					act.reconCharges += f.Amount
+				}
+			}
 			fees = slices.DeleteFunc(fees, func(f *connector.FundingFee) bool {
 				ts := f.Timestamp.UTC()
 				return ts.Before(fFrom) || !ts.Before(fTo)
