@@ -70,6 +70,9 @@ type Binance struct {
 	// carried no position list (the /fapi/v2/balance fallback).
 	umHeld      float64
 	umHeldKnown bool
+	// degradations are the causes the last GetBalance fell back to a coarser
+	// split for (BalanceDegradationReporter).
+	degradations []string
 }
 
 // Binance wallet names. Their own vocabulary, not market types: cross and
@@ -193,6 +196,7 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 
 	b.cachedBreakdown = nil
 	b.umHeld, b.umHeldKnown = 0, false
+	b.degradations = nil
 
 	earn, earnErr := b.getSimpleEarn(ctx)
 	if errors.Is(earnErr, ErrTransient) {
@@ -649,7 +653,6 @@ func (b *Binance) getFuturesBalance(ctx context.Context, priceMap map[string]flo
 	equity, _ := strconv.ParseFloat(resp.TotalMarginBalance, 64)
 	unrealized, _ := strconv.ParseFloat(resp.TotalUnrealizedProfit, 64)
 	available, _ := strconv.ParseFloat(resp.AvailableBalance, 64)
-	b.umHeld, b.umHeldKnown = binanceUMPositionMargin(resp.Positions), true
 
 	// In single-asset mode the totals count USDT alone: a USDC or BNFCR margin
 	// wallet would read as its USDT leftover. Measured before shipping across
@@ -679,6 +682,11 @@ func (b *Binance) getFuturesBalance(ctx context.Context, priceMap map[string]flo
 			return bal, nil
 		}
 	}
+
+	// The positions count only with the answer they came in: the balance
+	// endpoint taken above carries none, and a Pro split on this degraded
+	// answer's list would hold nothing and read the whole pool as free.
+	b.umHeld, b.umHeldKnown = binanceUMPositionMargin(resp.Positions), true
 
 	return &Balance{
 		Available:     available,

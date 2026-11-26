@@ -45,3 +45,31 @@ func TestLogBalanceCrossCheck(t *testing.T) {
 		t.Fatalf("fields = %v", fields)
 	}
 }
+
+type degradedConnector struct {
+	partialTradesConnector
+	causes []string
+}
+
+func (c *degradedConnector) BalanceDegradations() []string { return c.causes }
+
+func TestLogBalanceDegradations(t *testing.T) {
+	core, logs := observer.New(zapcore.WarnLevel)
+	s := NewSyncService(nil, nil, nil, zap.New(core))
+	meta := &repository.ExchangeConnection{UserUID: "u", Exchange: "binance", Label: "main"}
+	s.logBalanceDegradations(&degradedConnector{causes: []string{"COIN-M positions unreadable (HTTP 429), classic split kept"}}, meta)
+	entries := logs.FilterMessage("balance read degraded").All()
+	if len(entries) != 1 {
+		t.Fatalf("%d degraded lines, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["exchange"] != "binance" || fields["cause"] == nil {
+		t.Fatalf("fields = %v", fields)
+	}
+	if _, ok := fields["user_uid"]; ok {
+		t.Fatal("the account is named in the line")
+	}
+	if _, ok := fields["label"]; ok {
+		t.Fatal("the account label is named in the line")
+	}
+}

@@ -1267,6 +1267,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	// After the cashflow read: Bybit and OKX find their gaps there.
 	s.collectCapabilityWarnings(conn, connMeta, result)
 	s.logBalanceCrossCheck(conn, connMeta)
+	s.logBalanceDegradations(conn, connMeta)
 	s.completeBreakdown(ctx, conn, connMeta, act.breakdown, balance)
 	// Everything below compares with stored rows, which are in USD: convert
 	// first.
@@ -3810,4 +3811,20 @@ func (s *SyncService) logBalanceCrossCheck(conn connector.Connector, connMeta *r
 		zap.Float64("residual", residual),
 		zap.Float64("residual_share", share),
 	)
+}
+
+// logBalanceDegradations logs, at Warn, each cause the connector's balance
+// read fell back to a coarser reading for. The exchange is named, the account
+// is not: the causes are for operators, and no marker reaches the user.
+func (s *SyncService) logBalanceDegradations(conn connector.Connector, connMeta *repository.ExchangeConnection) {
+	dr, ok := conn.(connector.BalanceDegradationReporter)
+	if !ok {
+		return
+	}
+	for _, cause := range dr.BalanceDegradations() {
+		s.logger.Warn("balance read degraded",
+			zap.String("exchange", connMeta.Exchange),
+			zap.String("cause", cause),
+		)
+	}
 }

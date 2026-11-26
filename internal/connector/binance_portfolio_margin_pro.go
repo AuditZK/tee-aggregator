@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -299,13 +300,18 @@ func (b *Binance) coinMPositionMargin(ctx context.Context) (float64, error) {
 // or the positions could not be read (the /fapi/v2/balance fallback carries
 // none, or the COIN-M positions read failed).
 func (b *Binance) portfolioMarginProSplit(ctx context.Context, nonUM, crossEq, coinMEq float64, futures *Balance) ([]*MarketBalance, bool) {
-	if b.pmPro.verdict != binancePMYes || futures == nil || !b.umHeldKnown {
+	if b.pmPro.verdict != binancePMYes || futures == nil {
+		return nil, false
+	}
+	if !b.umHeldKnown {
+		b.degradations = append(b.degradations, "binance portfolio margin pro free margin: USDⓈ-M positions not in the futures read (balance endpoint fallback), classic split kept")
 		return nil, false
 	}
 	held := b.umHeld
 	if coinMEq != 0 {
 		cm, err := b.coinMPositionMargin(ctx)
 		if err != nil {
+			b.degradations = append(b.degradations, "binance portfolio margin pro free margin: COIN-M positions unreadable ("+binanceErrorClass(err)+"), classic split kept")
 			return nil, false
 		}
 		held += cm
@@ -320,4 +326,36 @@ func (b *Binance) portfolioMarginProSplit(ctx context.Context, nonUM, crossEq, c
 		split = append(split, &MarketBalance{MarketType: MarketSwap, Equity: poolEq, AvailableMargin: free})
 	}
 	return split, true
+}
+
+// BalanceDegradations implements BalanceDegradationReporter.
+func (b *Binance) BalanceDegradations() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := b.degradations
+	b.degradations = nil
+	return out
+}
+
+// binanceErrorClass names a failed read's cause without its text: an error
+// can carry the signed request URL or the venue's message.
+func binanceErrorClass(err error) string {
+	msg := err.Error()
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return "out of time"
+	case strings.Contains(msg, "weight budget spent"):
+		return "weight budget spent until after the deadline"
+	case strings.Contains(msg, "HTTP 418"):
+		return "HTTP 418"
+	case strings.Contains(msg, "HTTP 429"):
+		return "HTTP 429"
+	case strings.Contains(msg, "HTTP 5"):
+		return "HTTP 5xx"
+	case strings.Contains(msg, "HTTP 4"):
+		return "HTTP 4xx"
+	case errors.Is(err, ErrTransient):
+		return "transient"
+	}
+	return "unreadable answer or transport"
 }

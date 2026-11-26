@@ -65,6 +65,10 @@ type binancePMActivityServer struct {
 	// /dapi/v1/positionRisk answer ("[]" when empty).
 	fapiAccount    string
 	cmPositionRisk string
+	// fapiBalance is the /fapi/v2/balance answer; cmPositionStatus refuses
+	// /dapi/v1/positionRisk with that status.
+	fapiBalance      string
+	cmPositionStatus int
 	// deposits is the /sapi/v1/capital/deposit/hisrec answer ("[]" when empty).
 	deposits string
 
@@ -193,7 +197,18 @@ func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
 					strconv.FormatInt(q2ms(q), 10) + `,"side":"BUY","realizedPnl":"0"}]`))
 			case "/fapi/v1/income":
 				write(s.income(q, s.umIncome))
+			case "/fapi/v2/balance":
+				if s.fapiBalance != "" {
+					_, _ = w.Write([]byte(s.fapiBalance))
+					return
+				}
+				_, _ = w.Write([]byte(`[]`))
 			case "/dapi/v1/positionRisk":
+				if s.cmPositionStatus != 0 {
+					w.WriteHeader(s.cmPositionStatus)
+					_, _ = w.Write([]byte(`{"code":-1003,"msg":"refused"}`))
+					return
+				}
 				if s.cmPositionRisk != "" {
 					_, _ = w.Write([]byte(s.cmPositionRisk))
 					return

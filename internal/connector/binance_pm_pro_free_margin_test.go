@@ -3,6 +3,8 @@ package connector
 import (
 	"context"
 	"math"
+	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -132,5 +134,55 @@ func TestBinanceUMPositionMargin(t *testing.T) {
 	}
 	if got := binanceUMPositionMargin(rows); math.Abs(got-5100) > 1e-9 {
 		t.Fatalf("held = %v, want 5100", got)
+	}
+}
+
+// /fapi/v2/account answering 200 with zero equity sends the read to
+// /fapi/v2/balance, which lists no position: the degraded answer's position
+// list must not feed a Pro split that would then hold nothing.
+func TestBinance_PMPro_BalanceEndpointFallbackKeepsClassicSplit(t *testing.T) {
+	srv := pmProAccount()
+	srv.fapiAccount = `{"totalMarginBalance":"0","totalUnrealizedProfit":"0","availableBalance":"0","positions":[]}`
+	srv.fapiBalance = `[{"asset":"USDT","balance":"700","crossUnPnl":"0","availableBalance":"650"}]`
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	split := splitOf(t, b)
+	if s := split[MarketSwap]; s == nil || s.Equity != 700 || s.AvailableMargin != 650 {
+		t.Fatalf("swap = %+v, want the classic USDⓈ-M wallet 700 / 650", s)
+	}
+	if s := split[MarketSpot]; s == nil || s.Equity != 240100 {
+		t.Fatalf("spot = %+v, want the classic 240100", s)
+	}
+	if d := b.BalanceDegradations(); len(d) != 1 || !strings.Contains(d[0], "balance endpoint fallback") {
+		t.Fatalf("degradations = %v, want the fallback named", d)
+	}
+}
+
+// A refused COIN-M positions read keeps the classic split, says why for the
+// operator, and raises no marker the user would see.
+func TestBinance_PMPro_CoinMPositionsUnreadableIsLoggedNotMarked(t *testing.T) {
+	srv := pmProAccount()
+	srv.fapiAccount = pmProFapiAccount
+	srv.coinMBalance = `[{"asset":"BTC","balance":"0.1","crossUnPnl":"0"}]`
+	srv.cmPositionStatus = http.StatusTeapot
+	srv.portfolioAccount = `{"accountType":"PM_1","actualEquity":"245600"}`
+	b := srv.connector(t)
+	if _, err := b.GetBalance(context.Background()); err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+	if s := splitOf(t, b)[MarketSwap]; s == nil || s.Equity != 700 {
+		t.Fatalf("swap = %+v, want the classic split", s)
+	}
+	d := b.BalanceDegradations()
+	if len(d) != 1 || !strings.Contains(d[0], "COIN-M positions unreadable (HTTP 418)") {
+		t.Fatalf("degradations = %v, want the COIN-M read and its cause", d)
+	}
+	if again := b.BalanceDegradations(); len(again) != 0 {
+		t.Fatalf("degradations handed out twice: %v", again)
+	}
+	if w := b.CapabilityWarnings(); len(w) != 0 {
+		t.Fatalf("warnings = %v, want no marker", w)
 	}
 }
