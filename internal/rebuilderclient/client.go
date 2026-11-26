@@ -68,6 +68,11 @@ type rebuildResponse struct {
 	DurationMs  int64                   `json:"durationMs"`
 	Snapshots   []rebuildSnapshotOnWire `json:"snapshots"`
 	CoveredFrom time.Time               `json:"coveredFrom"`
+	Warnings    []string                `json:"warnings"`
+	// MarginHeldReplayed: every snapshot's marginHeld was replayed from the
+	// account's positions, so an absent one is a flat day (Binance Portfolio
+	// Margin). Absent from every other rebuild.
+	MarginHeldReplayed bool `json:"marginHeldReplayed"`
 }
 
 // rebuildSnapshotOnWire mirrors the rebuilder's HistoricalSnapshot JSON
@@ -87,6 +92,7 @@ type rebuildSnapshotOnWire struct {
 	ShortTrades     int                             `json:"shortTrades"`
 	LongVolume      float64                         `json:"longVolume"`
 	ShortVolume     float64                         `json:"shortVolume"`
+	MarginHeld      float64                         `json:"marginHeld"`
 	Breakdown       map[string]*marketBalanceOnWire `json:"breakdown,omitempty"`
 }
 
@@ -108,6 +114,12 @@ type RebuildResult struct {
 	// absence from Snapshots is silence, not a correction, and pruning it would
 	// destroy history nothing can rebuild. Zero when the rebuilder said nothing.
 	CoveredFrom time.Time
+
+	// Warnings are the gaps the rebuilder reported ("<scope>.<code>[: detail]").
+	Warnings []string
+	// MarginHeldReplayed is true when every snapshot's MarginHeld is a
+	// measure: zero is then a flat day, not a missing figure.
+	MarginHeldReplayed bool
 }
 
 // Client is a thin HTTP client. The pointed-at service runs on a separate
@@ -208,6 +220,9 @@ func (c *Client) Rebuild(ctx context.Context, req RebuildRequest) (*RebuildResul
 		Snapshots:   mapWireSnapshots(out.Snapshots),
 		DurationMs:  out.DurationMs,
 		CoveredFrom: out.CoveredFrom.UTC(),
+
+		Warnings:           out.Warnings,
+		MarginHeldReplayed: out.MarginHeldReplayed,
 	}, nil
 }
 
@@ -228,6 +243,7 @@ func mapWireSnapshots(in []rebuildSnapshotOnWire) []*connector.HistoricalSnapsho
 			ShortTrades:     s.ShortTrades,
 			LongVolume:      s.LongVolume,
 			ShortVolume:     s.ShortVolume,
+			MarginHeld:      s.MarginHeld,
 			Breakdown:       mapWireBreakdown(s.Breakdown),
 		})
 	}

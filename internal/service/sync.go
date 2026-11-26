@@ -427,6 +427,10 @@ func (s *SyncService) everySyncReconstructSince(ctx context.Context, connMeta *r
 
 // SyncService orchestrates exchange synchronization.
 type SyncService struct {
+	// freeMarginPlans holds the free-margin rewrites a dry run computed,
+	// which apply writes (free_margin_rewrite.go). Zero value ready.
+	freeMarginPlans freeMarginPlanStore
+
 	connSvc      *ConnectionService
 	snapshotRepo *repository.SnapshotRepo
 	syncStatus   *repository.SyncStatusRepo
