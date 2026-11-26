@@ -348,32 +348,38 @@ type SpotHolding struct {
 // than failing the whole balance — pricing must never crash a sync. Callers
 // pass a single wallet's holdings, so nothing is double-counted here.
 func ValueSpotHoldingsUSD(holdings []SpotHolding, priceMap map[string]float64) float64 {
-	btcUSD := priceMap["BTCUSDT"]
 	var total float64
 	for _, h := range holdings {
 		if h.Amount <= 0 {
 			continue
 		}
-		asset := strings.ToUpper(strings.TrimSpace(h.Asset))
-		if IsStablecoinUSD(asset) {
-			total += h.Amount
-			continue
-		}
-		if p := priceMap[asset+"USDT"]; p > 0 {
+		if p, ok := SpotPriceUSD(h.Asset, priceMap); ok {
 			total += h.Amount * p
-			continue
-		}
-		if p := priceMap[asset+"USDC"]; p > 0 {
-			total += h.Amount * p
-			continue
-		}
-		if btcUSD > 0 {
-			if p := priceMap[asset+"BTC"]; p > 0 {
-				total += h.Amount * p * btcUSD
-			}
 		}
 	}
 	return total
+}
+
+// SpotPriceUSD is the USD price ValueSpotHoldingsUSD values one unit of asset
+// at: 1 for a USD stablecoin, else the lookup order above. ok is false when
+// no price resolves.
+func SpotPriceUSD(asset string, priceMap map[string]float64) (float64, bool) {
+	asset = strings.ToUpper(strings.TrimSpace(asset))
+	if IsStablecoinUSD(asset) {
+		return 1, true
+	}
+	if p := priceMap[asset+"USDT"]; p > 0 {
+		return p, true
+	}
+	if p := priceMap[asset+"USDC"]; p > 0 {
+		return p, true
+	}
+	if btcUSD := priceMap["BTCUSDT"]; btcUSD > 0 {
+		if p := priceMap[asset+"BTC"]; p > 0 {
+			return p * btcUSD, true
+		}
+	}
+	return 0, false
 }
 
 // FetchBinanceStylePriceMap fetches every symbol price from a Binance-compatible

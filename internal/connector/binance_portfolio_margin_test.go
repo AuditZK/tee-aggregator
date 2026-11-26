@@ -23,10 +23,28 @@ func (s *binancePMServer) hit(prefix string) bool {
 	return slices.ContainsFunc(s.paths, func(p string) bool { return strings.Contains(p, prefix) })
 }
 
+// The default Portfolio Margin pool: actualEquity 5000, and /papi/v1/balance
+// rows worth exactly 5000 at the fixture's ticker (BTCUSDT 50000). USDT nets
+// 1000 free less 200 borrowed less 0.5 interest, plus a 1650.5 UM wallet and
+// 50 of UM uPnL (2500); BTC is 0.048 margin free, a 0.001 COIN-M wallet and
+// 0.001 of COIN-M uPnL (0.05 BTC, 2500).
+const (
+	binancePMAccountBody = `{"accountEquity":"4800","actualEquity":"5000","accountInitialMargin":"1200","totalMarginOpenLoss":"100","totalAvailableBalance":"3500"}`
+	binancePMBalanceBody = `[{"asset":"USDT","crossMarginFree":"1000","crossMarginLocked":"0","crossMarginBorrowed":"200","crossMarginInterest":"0.5","umWalletBalance":"1650.5","umUnrealizedPNL":"50","cmWalletBalance":"0","cmUnrealizedPNL":"0"},` +
+		`{"asset":"BTC","crossMarginFree":"0.048","crossMarginLocked":"0","crossMarginBorrowed":"0","crossMarginInterest":"0","umWalletBalance":"0","umUnrealizedPNL":"0","cmWalletBalance":"0.001","cmUnrealizedPNL":"0.001"}]`
+)
+
 // newBinancePMConnector serves a spot wallet of 100 USDT and a cross margin
 // read worth 2 BTC at 50000. futures is "ok" or "denied"; papi is "ok",
 // "denied", "throttled" or "banned" (418).
 func newBinancePMConnector(t *testing.T, futures, papi string) (*Binance, *binancePMServer) {
+	t.Helper()
+	return newBinancePMConnectorWith(t, futures, papi, binancePMBalanceBody)
+}
+
+// newBinancePMConnectorWith is newBinancePMConnector with the pool's
+// /papi/v1/balance rows given.
+func newBinancePMConnectorWith(t *testing.T, futures, papi, papiBalance string) (*Binance, *binancePMServer) {
 	t.Helper()
 	state := &binancePMServer{}
 	denied := func(w http.ResponseWriter) {
@@ -55,9 +73,9 @@ func newBinancePMConnector(t *testing.T, futures, papi string) (*Binance, *binan
 				w.WriteHeader(http.StatusTooManyRequests)
 				_, _ = w.Write([]byte(`{"code":-1003,"msg":"Too many requests"}`))
 			case strings.Contains(p, "/papi/v1/account"):
-				_, _ = w.Write([]byte(`{"accountEquity":"4800","actualEquity":"5000","accountInitialMargin":"1200","totalMarginOpenLoss":"100","totalAvailableBalance":"3500"}`))
+				_, _ = w.Write([]byte(binancePMAccountBody))
 			case strings.Contains(p, "/papi/v1/balance"):
-				_, _ = w.Write([]byte(`[{"asset":"USDT","umUnrealizedPNL":"50","cmUnrealizedPNL":"0"},{"asset":"BTC","umUnrealizedPNL":"0","cmUnrealizedPNL":"0.001"}]`))
+				_, _ = w.Write([]byte(papiBalance))
 			case strings.Contains(p, "/papi/v1/um/positionRisk"):
 				_, _ = w.Write([]byte(`[{"symbol":"BTCUSDT","positionAmt":"-0.5","entryPrice":"51000","markPrice":"50000","unRealizedProfit":"500","positionSide":"BOTH"}]`))
 			default:
@@ -92,13 +110,13 @@ func TestBinance_PortfolioMargin_EquityReadOnceFromPapi(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetBalance: %v", err)
 	}
-	if bal.Equity != 5100 {
+	if !near(bal.Equity, 5100) {
 		t.Fatalf("equity = %v, want 5100 (spot 100 + portfolio margin 5000, cross margin not added on top)", bal.Equity)
 	}
 	if bal.UnrealizedPnL != 100 {
 		t.Fatalf("unrealized = %v, want 100 (50 USDT + 0.001 BTC at 50000)", bal.UnrealizedPnL)
 	}
-	if bal.Available != 3800 {
+	if !near(bal.Available, 3800) {
 		t.Fatalf("available = %v, want 3800 (spot 100 + portfolio margin 5000 less 1300 held by positions and orders)", bal.Available)
 	}
 	if srv.hit("/sapi/v1/margin/account") || srv.hit("/dapi/") {
@@ -108,7 +126,7 @@ func TestBinance_PortfolioMargin_EquityReadOnceFromPapi(t *testing.T) {
 		t.Fatalf("warnings = %v, want none", w)
 	}
 	m := marketMap(t, mustMarket(t, b))
-	if swap := m[MarketSwap]; swap == nil || swap.Equity != 5000 || swap.AvailableMargin != 3700 {
+	if swap := m[MarketSwap]; swap == nil || !near(swap.Equity, 5000) || !near(swap.AvailableMargin, 3700) {
 		t.Fatalf("swap bucket = %+v, want equity 5000 / available 3700", swap)
 	}
 	measured := b.measuredWallets()
