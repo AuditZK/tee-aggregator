@@ -1,7 +1,10 @@
 package connector
 
 // Live activity of a Binance Portfolio Margin (PM) account: fills, fees and
-// funding read from papi, since fapi refuses a PM key with -2015.
+// funding read from papi, since fapi refuses a PM key with -2015. Portfolio
+// Margin Pro, where fapi answers and papi refuses, is read through fapi, dapi
+// and sapi instead (binance_portfolio_margin_pro.go); the helpers below take
+// the base URL for that reason.
 //
 // Known coverage gaps, accepted:
 //   - Margin fills are asked only for the assets /papi/v1/balance shows the
@@ -12,13 +15,15 @@ package connector
 //     pm_trades_unreadable: the day is short. The activity recount repairs
 //     its swap fills and funding later; its margin (spot bucket) fills stay
 //     short, the recount does not read that market.
-//   - PM options and Portfolio Margin Pro are not read.
+//   - PM options are not read, nor Portfolio Margin Pro's COIN-M fills,
+//     interest and loans.
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"slices"
 	"strconv"
@@ -67,9 +72,10 @@ const (
 	binancePMPageLimit        = 1000
 )
 
-// binancePapiWeights is the documented IP weight of each papi read this
-// connector makes; an unlisted path is charged 20.
-var binancePapiWeights = map[string]int{
+// binancePacedWeights is the documented weight of each read that goes
+// through the pacer: the papi reads, and the Portfolio Margin Pro reads on
+// sapi, fapi and dapi. An unlisted path is charged 20.
+var binancePacedWeights = map[string]int{
 	"/papi/v1/account":         20,
 	"/papi/v1/balance":         20,
 	"/papi/v1/um/positionRisk": 5,
@@ -79,14 +85,25 @@ var binancePapiWeights = map[string]int{
 	"/papi/v1/margin/myTrades": 5,
 	"/papi/v1/um/income":       30,
 	"/papi/v1/cm/income":       30,
+	// Portfolio Margin Pro. The account read is weighted per UID, not per IP.
+	"/sapi/v1/portfolio/account": 5,
+	"/sapi/v1/portfolio/balance": 20,
+	"/sapi/v1/margin/myTrades":   10,
+	"/fapi/v1/income":            30,
+	"/dapi/v1/income":            20,
 }
 
-// binancePapiBudgetPerMinute caps the papi weight one connector spends per
-// minute. Binance documents 6000/min per IP for Portfolio Margin, and the
+// binancePacedBudgetPerMinute caps the weight one connector's paced reads
+// spend per minute. Binance documents 6000/min per IP for Portfolio Margin
+// (2400 on fapi, 12000 on sapi), and the
 // enclave's egress IP is shared by every customer: one account stays at a
 // fifth of it. A daily sync spends a few hundred; a long recount is what
 // reaches the cap and is slowed down rather than banned.
-const binancePapiBudgetPerMinute = 1200
+const binancePacedBudgetPerMinute = 1200
+
+// binanceMarginDustUSD is the value under which a Portfolio Margin Pro pool
+// asset's margin fills are not asked for.
+const binanceMarginDustUSD = 1.0
 
 // binanceWeightPacer spends a weight budget per fixed one-minute window and
 // sleeps out the rest of the window when the next call would overrun it. The
@@ -103,7 +120,7 @@ type binanceWeightPacer struct {
 func (p *binanceWeightPacer) wait(ctx context.Context, weight int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now, sleep, budget := time.Now, sleepCtx, binancePapiBudgetPerMinute
+	now, sleep, budget := time.Now, sleepCtx, binancePacedBudgetPerMinute
 	if p.now != nil {
 		now = p.now
 	}
@@ -118,7 +135,13 @@ func (p *binanceWeightPacer) wait(ctx context.Context, weight int) error {
 		p.start, p.used = t, 0
 	}
 	if p.used > 0 && p.used+weight > budget {
-		if err := sleep(ctx, p.start.Add(time.Minute).Sub(t)); err != nil {
+		d := p.start.Add(time.Minute).Sub(t)
+		// Sleeping into the caller's deadline would spend the time the reads
+		// after this one need (the sync's cashflows share it): give up now.
+		if deadline, ok := ctx.Deadline(); ok && time.Now().Add(d).After(deadline) {
+			return fmt.Errorf("%w: binance weight budget spent until after the deadline", ErrTransient)
+		}
+		if err := sleep(ctx, d); err != nil {
 			return err
 		}
 		p.start, p.used = now(), 0
@@ -143,14 +166,20 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 
 // papiGet is every signed papi read, paced by its documented weight.
 func (b *Binance) papiGet(ctx context.Context, path string, params url.Values) ([]byte, error) {
-	weight, ok := binancePapiWeights[path]
+	return b.pacedGet(ctx, binancePortfolioMarginAPI, path, params)
+}
+
+// pacedGet is a signed GET charged to the connector's pacer at the path's
+// documented weight.
+func (b *Binance) pacedGet(ctx context.Context, base, path string, params url.Values) ([]byte, error) {
+	weight, ok := binancePacedWeights[path]
 	if !ok {
 		weight = 20
 	}
-	if err := b.papiPacer.wait(ctx, weight); err != nil {
+	if err := b.pacer.wait(ctx, weight); err != nil {
 		return nil, err
 	}
-	return b.doRequest(ctx, "GET", binancePortfolioMarginAPI, path, params, true)
+	return b.doRequest(ctx, "GET", base, path, params, true)
 }
 
 // isBinanceThrottled reports a failure that says nothing about the account:
@@ -236,12 +265,25 @@ func (b *Binance) getPortfolioMarginTrades(ctx context.Context, start, end time.
 		}
 		trades = append(trades, binancePMCMFillTrades(fills)...)
 	}
-	marginSyms, err := b.portfolioMarginMarginSymbols(ctx)
+	if !TradeMarketWanted(ctx, MarketSpot) {
+		return trades, nil
+	}
+	marginSyms, err := b.marginPoolSymbols(ctx, binancePortfolioMarginAPI, "/papi/v1/balance", nil)
 	if err != nil {
 		return trades, fmt.Errorf("margin symbols: %w", err)
 	}
-	for _, sym := range marginSyms {
-		fills, err := readBinanceWindows(start, end, binancePMMarginFillWindow, binancePMPageLimit, "binance portfolio margin margin fills",
+	marginTrades, err := b.readMarginFills(ctx, binancePortfolioMarginAPI, "/papi/v1/margin/myTrades", marginSyms, start, end)
+	return append(trades, marginTrades...), err
+}
+
+// readMarginFills reads the margin fills of each symbol over [start, end]
+// from a myTrades list (papi's or sapi's: same shape, same "less than 24
+// hours" rule, startTime and endTime always sent together). On an error it
+// returns the fills read before it.
+func (b *Binance) readMarginFills(ctx context.Context, base, path string, symbols []string, start, end time.Time) ([]*Trade, error) {
+	var trades []*Trade
+	for _, sym := range symbols {
+		fills, err := readBinanceWindows(start, end, binancePMMarginFillWindow, binancePMPageLimit, "binance margin fills",
 			func(from, to time.Time) ([]binanceSpotFill, error) {
 				// "less than 24 hours": a full window stops 1 ms short of the
 				// next one, so an exact day still costs a single call.
@@ -249,7 +291,7 @@ func (b *Binance) getPortfolioMarginTrades(ctx context.Context, start, end time.
 					to = to.Add(-time.Millisecond)
 				}
 				var page []binanceSpotFill
-				return page, b.papiPage(ctx, "/papi/v1/margin/myTrades", sym, from, to, &page)
+				return page, b.fillPage(ctx, base, path, sym, from, to, &page)
 			},
 			func(f binanceSpotFill) string { return strconv.FormatInt(f.ID, 10) })
 		if isBinanceThrottled(err) {
@@ -268,12 +310,17 @@ func (b *Binance) getPortfolioMarginTrades(ctx context.Context, start, end time.
 
 // papiPage reads one page of a papi fill list for symbol over [from, to].
 func (b *Binance) papiPage(ctx context.Context, path, symbol string, from, to time.Time, out any) error {
+	return b.fillPage(ctx, binancePortfolioMarginAPI, path, symbol, from, to, out)
+}
+
+// fillPage reads one page of a fill list for symbol over [from, to].
+func (b *Binance) fillPage(ctx context.Context, base, path, symbol string, from, to time.Time, out any) error {
 	params := url.Values{}
 	params.Set("symbol", symbol)
 	params.Set("startTime", strconv.FormatInt(from.UnixMilli(), 10))
 	params.Set("endTime", strconv.FormatInt(to.UnixMilli(), 10))
 	params.Set("limit", strconv.Itoa(binancePMPageLimit))
-	body, err := b.papiGet(ctx, path, params)
+	body, err := b.pacedGet(ctx, base, path, params)
 	if err != nil {
 		return err
 	}
@@ -345,12 +392,17 @@ func (b *Binance) papiOpenPositionSymbols(ctx context.Context, path string) ([]s
 	return out, nil
 }
 
-// portfolioMarginMarginSymbols names the spot pairs the margin fills are
-// asked for: each asset /papi/v1/balance shows the cross margin wallet
+// marginPoolSymbols names the spot pairs the margin fills are asked for: each
+// asset the pool's balance (/papi/v1/balance, or /sapi/v1/portfolio/balance
+// on Portfolio Margin Pro, same fields) shows the cross margin wallet
 // holding, owing or charging interest on, against USDT and USDC. No pair is
 // asked on speculation: each costs weight on an IP every customer shares.
-func (b *Binance) portfolioMarginMarginSymbols(ctx context.Context) ([]string, error) {
-	body, err := b.papiGet(ctx, "/papi/v1/balance", url.Values{})
+// With a price map (the Portfolio Margin Pro read), a pair the map does not
+// list is not asked (no spot pair: USCX, a -1121 every window), nor an asset
+// worth under binanceMarginDustUSD: each pair costs a call per day of the
+// window, and a 30-day catch-up on dust would spend the sync's deadline.
+func (b *Binance) marginPoolSymbols(ctx context.Context, base, path string, priceMap map[string]float64) ([]string, error) {
+	body, err := b.pacedGet(ctx, base, path, url.Values{})
 	if err != nil {
 		return nil, err
 	}
@@ -363,7 +415,7 @@ func (b *Binance) portfolioMarginMarginSymbols(ctx context.Context) ([]string, e
 		CrossMarginInterest string `json:"crossMarginInterest"`
 	}
 	if err := json.Unmarshal(body, &rows); err != nil {
-		return nil, fmt.Errorf("decode /papi/v1/balance: %w", err)
+		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
 	var out []string
 	for _, r := range rows {
@@ -372,13 +424,31 @@ func (b *Binance) portfolioMarginMarginSymbols(ctx context.Context) ([]string, e
 			continue
 		}
 		asset := strings.ToUpper(r.Asset)
+		var pairs []string
 		switch {
 		case asset == "USDT" || asset == "USD" || asset == "BNFCR":
 		case IsStablecoinUSD(asset):
-			out = appendSortedUnique(out, asset+"USDT")
+			pairs = []string{asset + "USDT"}
 		default:
-			out = appendSortedUnique(out, asset+"USDT")
-			out = appendSortedUnique(out, asset+"USDC")
+			pairs = []string{asset + "USDT", asset + "USDC"}
+		}
+		if priceMap != nil {
+			units := 0.0
+			for _, q := range []string{r.CrossMarginAsset, r.CrossMarginBorrowed, r.CrossMarginFree, r.CrossMarginLocked, r.CrossMarginInterest} {
+				v, _ := strconv.ParseFloat(q, 64)
+				units = max(units, math.Abs(v))
+			}
+			price := 1.0
+			if !IsStablecoinUSD(asset) {
+				price = priceMap[asset+"USDT"]
+			}
+			if units*price < binanceMarginDustUSD {
+				pairs = nil
+			}
+			pairs = slices.DeleteFunc(pairs, func(p string) bool { return priceMap[p] == 0 })
+		}
+		for _, p := range pairs {
+			out = appendSortedUnique(out, p)
 		}
 	}
 	return out, nil
@@ -407,7 +477,13 @@ func (r binancePMIncome) key() string {
 // papiIncome reads an income history over [start, end], every type when
 // incomeType is empty.
 func (b *Binance) papiIncome(ctx context.Context, path, incomeType string, start, end time.Time, window time.Duration) ([]binancePMIncome, error) {
-	return readBinanceWindows(start, end, window, binancePMPageLimit, "binance portfolio margin income",
+	return b.incomeHistory(ctx, binancePortfolioMarginAPI, path, incomeType, start, end, window)
+}
+
+// incomeHistory reads an income list (papi's UM/CM, or fapi's and dapi's on
+// Portfolio Margin Pro: same rows) over [start, end].
+func (b *Binance) incomeHistory(ctx context.Context, base, path, incomeType string, start, end time.Time, window time.Duration) ([]binancePMIncome, error) {
+	return readBinanceWindows(start, end, window, binancePMPageLimit, "binance income",
 		func(from, to time.Time) ([]binancePMIncome, error) {
 			params := url.Values{}
 			if incomeType != "" {
@@ -416,7 +492,7 @@ func (b *Binance) papiIncome(ctx context.Context, path, incomeType string, start
 			params.Set("startTime", strconv.FormatInt(from.UnixMilli(), 10))
 			params.Set("endTime", strconv.FormatInt(to.UnixMilli(), 10))
 			params.Set("limit", strconv.Itoa(binancePMPageLimit))
-			body, err := b.papiGet(ctx, path, params)
+			body, err := b.pacedGet(ctx, base, path, params)
 			if err != nil {
 				return nil, err
 			}
@@ -504,28 +580,48 @@ func binancePMCMFillTrades(fills []binancePMCMFill) []*Trade {
 
 // GetFundingFees implements FundingFeesFetcher for a Portfolio Margin
 // account: the FUNDING_FEE rows of the UM and COIN-M income since since,
-// valued in USD (COIN-M funding is paid in the coin). Any other account
+// valued in USD (COIN-M funding is paid in the coin), from papi on Portfolio
+// Margin and from fapi/dapi on Portfolio Margin Pro. Any other account
 // answers ErrFundingNotRead without a request: it reads no funding, and a
 // caller that rewrites stored funding must not take that for a zero.
 func (b *Binance) GetFundingFees(ctx context.Context, _ []string, since time.Time) ([]*FundingFee, error) {
-	if b.portfolioMarginVerdict() != binancePMYes {
+	now := time.Now().UTC()
+	var um, cm []binancePMIncome
+	var err error
+	switch pro, coinM := b.portfolioMarginProState(); {
+	case b.portfolioMarginVerdict() == binancePMYes:
+		if um, err = b.papiIncome(ctx, "/papi/v1/um/income", "FUNDING_FEE", since, now, binancePMUMIncomeWindow); err != nil {
+			b.activityNotes.add(binancePMTradesUnreadable)
+			return nil, fmt.Errorf("UM funding: %w", err)
+		}
+		if cm, err = b.papiIncome(ctx, "/papi/v1/cm/income", "FUNDING_FEE", since, now, binancePMCMIncomeWindow); err != nil {
+			b.activityNotes.add(binancePMTradesUnreadable)
+			return nil, fmt.Errorf("COIN-M funding: %w", err)
+		}
+	case pro == binancePMYes:
+		if um, err = b.incomeHistory(ctx, binanceFuturesAPI, "/fapi/v1/income", "FUNDING_FEE", since, now, binancePMUMIncomeWindow); err != nil {
+			b.activityNotes.add(binancePMTradesUnreadable)
+			return nil, fmt.Errorf("UM funding: %w", err)
+		}
+		if coinM {
+			if cm, err = b.incomeHistory(ctx, binanceCoinMFuturesAPI, "/dapi/v1/income", "FUNDING_FEE", since, now, binancePMCMIncomeWindow); err != nil {
+				b.activityNotes.add(binancePMTradesUnreadable)
+				return nil, fmt.Errorf("COIN-M funding: %w", err)
+			}
+		}
+	default:
 		return nil, ErrFundingNotRead
 	}
-	now := time.Now().UTC()
-	um, err := b.papiIncome(ctx, "/papi/v1/um/income", "FUNDING_FEE", since, now, binancePMUMIncomeWindow)
-	if err != nil {
-		b.activityNotes.add(binancePMTradesUnreadable)
-		return nil, fmt.Errorf("UM funding: %w", err)
-	}
-	cm, err := b.papiIncome(ctx, "/papi/v1/cm/income", "FUNDING_FEE", since, now, binancePMCMIncomeWindow)
-	if err != nil {
-		b.activityNotes.add(binancePMTradesUnreadable)
-		return nil, fmt.Errorf("COIN-M funding: %w", err)
-	}
+	return b.fundingFromIncome(ctx, append(um, cm...))
+}
 
+// fundingFromIncome values FUNDING_FEE rows in USD, a non-stable asset at
+// its spot ticker.
+func (b *Binance) fundingFromIncome(ctx context.Context, rows []binancePMIncome) ([]*FundingFee, error) {
 	var priceMap map[string]float64
 	var out []*FundingFee
-	for _, r := range append(um, cm...) {
+	var err error
+	for _, r := range rows {
 		amt, _ := strconv.ParseFloat(r.Income, 64)
 		if amt == 0 {
 			continue

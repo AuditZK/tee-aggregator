@@ -49,6 +49,20 @@ type binancePMActivityServer struct {
 	// fapiDenied refuses fapi on a classic account too: a key without the
 	// futures scope, which papi refuses as well.
 	fapiDenied bool
+	// crossNetBtc is the /sapi/v1/margin/account net asset in BTC ("0" when
+	// empty). portfolioAccount, when set, is the /sapi/v1/portfolio/account
+	// answer; portfolioStatus replaces it with a refusal of that status.
+	crossNetBtc      string
+	portfolioAccount string
+	portfolioStatus  int
+	// coinMBalance is the /dapi/v1/balance answer ("[]" when empty).
+	coinMBalance string
+	// crossAssetBtc is the gross totalAssetOfBtc of /sapi/v1/margin/account.
+	crossAssetBtc string
+	// poolAmounts overrides the crossMarginAsset ("2") of a /sapi/v1/portfolio/balance asset.
+	poolAmounts map[string]string
+	// deposits is the /sapi/v1/capital/deposit/hisrec answer ("[]" when empty).
+	deposits string
 
 	mu    sync.Mutex
 	calls []*url.URL
@@ -169,7 +183,17 @@ func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
 			case "/fapi/v1/userTrades":
 				_, _ = w.Write([]byte(`[{"id":1,"symbol":"BTCUSDT","price":"50000","qty":"0.01","commission":"0.2","commissionAsset":"USDT","time":` +
 					strconv.FormatInt(q2ms(q), 10) + `,"side":"BUY","realizedPnl":"0"}]`))
-			case "/dapi/v1/balance", "/fapi/v2/positionRisk":
+			case "/fapi/v1/income":
+				write(s.income(q, s.umIncome))
+			case "/dapi/v1/income":
+				write(s.income(q, s.cmIncome))
+			case "/dapi/v1/balance":
+				if s.coinMBalance != "" {
+					_, _ = w.Write([]byte(s.coinMBalance))
+					return
+				}
+				_, _ = w.Write([]byte(`[]`))
+			case "/fapi/v2/positionRisk":
 				_, _ = w.Write([]byte(`[]`))
 			default:
 				_, _ = w.Write([]byte(`{}`))
@@ -215,6 +239,56 @@ func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
 			default:
 				_, _ = w.Write([]byte(`{}`))
 			}
+		case p == "/sapi/v1/portfolio/account":
+			if s.portfolioStatus != 0 {
+				w.WriteHeader(s.portfolioStatus)
+				body := `{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}`
+				if s.portfolioAccount != "" {
+					body = s.portfolioAccount
+				}
+				_, _ = w.Write([]byte(body))
+				return
+			}
+			if s.portfolioAccount == "" {
+				denied()
+				return
+			}
+			_, _ = w.Write([]byte(s.portfolioAccount))
+		case p == "/sapi/v1/portfolio/balance":
+			rows := []map[string]any{{"asset": "BNB", "crossMarginAsset": "0", "crossMarginBorrowed": "0"}}
+			for _, a := range s.crossAssets {
+				amount := "2"
+				if v, ok := s.poolAmounts[a]; ok {
+					amount = v
+				}
+				rows = append(rows, map[string]any{"asset": a, "crossMarginAsset": amount, "crossMarginBorrowed": "0"})
+			}
+			write(rows)
+		case p == "/sapi/v1/margin/myTrades":
+			if e, ok := s.marginErrors[q.Get("symbol")]; ok {
+				w.WriteHeader(e.status)
+				_, _ = w.Write([]byte(e.body))
+				return
+			}
+			write(s.fills(q, s.mFills))
+		case p == "/sapi/v1/margin/account":
+			net := s.crossNetBtc
+			if net == "" {
+				net = "0"
+			}
+			gross := s.crossAssetBtc
+			if gross == "" {
+				gross = net
+			}
+			_, _ = w.Write([]byte(`{"totalAssetOfBtc":"` + gross + `","totalLiabilityOfBtc":"0","totalNetAssetOfBtc":"` + net + `"}`))
+		case p == "/sapi/v1/capital/deposit/hisrec":
+			if s.deposits != "" {
+				_, _ = w.Write([]byte(s.deposits))
+				return
+			}
+			_, _ = w.Write([]byte(`[]`))
+		case p == "/sapi/v1/capital/withdraw/history":
+			_, _ = w.Write([]byte(`[]`))
 		case strings.HasPrefix(p, "/sapi/v1/margin/"):
 			_, _ = w.Write([]byte(`{"totalNetAssetOfBtc":"0"}`))
 		case strings.HasPrefix(p, "/sapi/v1/simple-earn/"):
@@ -566,9 +640,9 @@ func TestBinance_PortfolioMargin_PapiPacedUnderBudget(t *testing.T) {
 	b := srv.connector(t)
 	clock := pmDay
 	var slept []time.Duration
-	b.papiPacer.budget = 100
-	b.papiPacer.now = func() time.Time { return clock }
-	b.papiPacer.sleep = func(_ context.Context, d time.Duration) error {
+	b.pacer.budget = 100
+	b.pacer.now = func() time.Time { return clock }
+	b.pacer.sleep = func(_ context.Context, d time.Duration) error {
 		slept = append(slept, d)
 		clock = clock.Add(d)
 		return nil
@@ -583,7 +657,7 @@ func TestBinance_PortfolioMargin_PapiPacedUnderBudget(t *testing.T) {
 	spent := 0
 	for _, u := range srv.calls {
 		if strings.HasPrefix(u.Path, "/papi/") {
-			spent += binancePapiWeights[u.Path]
+			spent += binancePacedWeights[u.Path]
 		}
 	}
 	srv.mu.Unlock()

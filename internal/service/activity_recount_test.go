@@ -173,3 +173,20 @@ func TestRecountKeepsStoredFundingOfAClassicBinanceAccount(t *testing.T) {
 		t.Fatalf("funding = %v / %v, want the stored 1.5 kept", d.breakdown.Swap.FundingFees, d.NewFundingFees)
 	}
 }
+
+// The recount rewrites swap alone, so it asks for swap fills alone: on a
+// Binance Portfolio Margin account the margin fills it would drop are most
+// of a long read.
+func TestRecountAsksForTheMarketsItRewrites(t *testing.T) {
+	scope, _ := recountScopeFor("binance")
+	ctx := recountTradesContext(context.Background(), scope)
+	if !connector.TradeMarketWanted(ctx, connector.MarketSwap) {
+		t.Fatal("swap fills not wanted by the recount that rewrites them")
+	}
+	if connector.TradeMarketWanted(ctx, connector.MarketSpot) {
+		t.Fatal("spot and margin fills asked for by a recount that drops them")
+	}
+	if !connector.TradeMarketWanted(context.Background(), connector.MarketSpot) {
+		t.Fatal("an unscoped read must want every market")
+	}
+}

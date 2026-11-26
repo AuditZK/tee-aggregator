@@ -57,9 +57,14 @@ type Binance struct {
 	// activityNotes carries the markers the last GetTrades/GetFundingFees
 	// raised (pm_trades_unreadable).
 	activityNotes noteList
-	// papiPacer keeps the papi weight this connector spends under
-	// binancePapiBudgetPerMinute.
-	papiPacer binanceWeightPacer
+	// pacer keeps the weight the paced reads (papi, and the Portfolio Margin
+	// Pro reads on sapi, fapi and dapi) spend under
+	// binancePacedBudgetPerMinute.
+	pacer binanceWeightPacer
+	// pmPro is what the last /sapi/v1/portfolio/account probe found: whether
+	// the account is Portfolio Margin Pro (fapi answers, papi refuses), and
+	// the pool's cross-check. Probed once per instance, never fatal.
+	pmPro binancePMProState
 }
 
 // Binance wallet names. Their own vocabulary, not market types: cross and
@@ -248,9 +253,12 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 		b.pmVerdict = binancePMYes
 	}
 
+	var crossEq, coinMEq float64
+	var crossHeld bool
 	if !portfolioMargin {
 		if eq, cerr := b.getCoinMFuturesEquity(ctx, priceMap); cerr == nil {
 			total.Equity += eq
+			coinMEq = eq
 			nonUM += eq
 			b.noteWallet(binanceWalletCoinM, nil)
 		} else if errors.Is(cerr, ErrTransient) {
@@ -262,8 +270,9 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 			b.capabilityWarnings = append(b.capabilityWarnings, "coinm_unreadable")
 			b.noteWallet(binanceWalletCoinM, cerr)
 		}
-		if eq, merr := b.getCrossMarginEquity(ctx, priceMap); merr == nil {
+		if eq, held, merr := b.getCrossMarginEquity(ctx, priceMap); merr == nil {
 			total.Equity += eq
+			crossEq, crossHeld = eq, held
 			nonUM += eq
 			b.noteWallet(binanceWalletCross, nil)
 		} else if errors.Is(merr, ErrTransient) {
@@ -336,6 +345,16 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	total.Available = nonUM
 	if futures != nil {
 		total.Available += futures.Available
+	}
+
+	// Portfolio Margin Pro shows nothing here: fapi answers and the pool reads
+	// as cross margin. Settled from /sapi/v1/portfolio/account, never fatal.
+	if !portfolioMargin {
+		pool := crossEq + coinMEq
+		if futures != nil {
+			pool += futures.Equity
+		}
+		b.settlePortfolioMarginPro(ctx, crossHeld, futures != nil, coinMEq, pool, priceMap)
 	}
 
 	return total, nil
@@ -543,39 +562,45 @@ func (b *Binance) simpleEarnPositions(ctx context.Context, path string) ([]SpotH
 
 // getCrossMarginEquity returns the cross margin wallet's net equity in USD:
 // totalNetAssetOfBtc (assets − borrowed liabilities, in BTC) × BTCUSDT.
-func (b *Binance) getCrossMarginEquity(ctx context.Context, priceMap map[string]float64) (float64, error) {
+// held is whether the wallet holds or owes anything at all (gross), which a
+// net of zero does not say.
+func (b *Binance) getCrossMarginEquity(ctx context.Context, priceMap map[string]float64) (eq float64, held bool, err error) {
 	return b.marginNetEquityUSD(ctx, "/sapi/v1/margin/account", priceMap)
 }
 
 // getIsolatedMarginEquity returns the isolated margin wallet's net equity in
 // USD (same totalNetAssetOfBtc shape, aggregated across all isolated pairs).
 func (b *Binance) getIsolatedMarginEquity(ctx context.Context, priceMap map[string]float64) (float64, error) {
-	return b.marginNetEquityUSD(ctx, "/sapi/v1/margin/isolated/account", priceMap)
+	eq, _, err := b.marginNetEquityUSD(ctx, "/sapi/v1/margin/isolated/account", priceMap)
+	return eq, err
 }
 
 // marginNetEquityUSD reads a SAPI margin account endpoint that reports
 // totalNetAssetOfBtc (net of borrowed funds, in BTC) and converts it to USD via
 // the BTCUSDT price. Best-effort: a key without margin permission errors and
 // the caller skips it.
-func (b *Binance) marginNetEquityUSD(ctx context.Context, path string, priceMap map[string]float64) (float64, error) {
+func (b *Binance) marginNetEquityUSD(ctx context.Context, path string, priceMap map[string]float64) (float64, bool, error) {
 	params := url.Values{}
 	body, err := b.doRequest(ctx, "GET", binanceSpotAPI, path, params, true)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	var resp struct {
-		TotalNetAssetOfBtc string `json:"totalNetAssetOfBtc"`
+		TotalAssetOfBtc     string `json:"totalAssetOfBtc"`
+		TotalLiabilityOfBtc string `json:"totalLiabilityOfBtc"`
+		TotalNetAssetOfBtc  string `json:"totalNetAssetOfBtc"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
+	held := !isZeroAmount(resp.TotalAssetOfBtc) || !isZeroAmount(resp.TotalLiabilityOfBtc) || !isZeroAmount(resp.TotalNetAssetOfBtc)
 	netBtc, _ := strconv.ParseFloat(resp.TotalNetAssetOfBtc, 64)
 	if netBtc == 0 {
-		return 0, nil
+		return 0, held, nil
 	}
-	return netBtc * priceMap["BTCUSDT"], nil
+	return netBtc * priceMap["BTCUSDT"], held, nil
 }
 
 func (b *Binance) getFuturesBalance(ctx context.Context, priceMap map[string]float64) (*Balance, error) {
@@ -754,17 +779,24 @@ func parseBinancePositions(body []byte) ([]*Position, error) {
 }
 
 // GetTrades reads the spot fills, then the UM fills from fapi or, on a
-// Portfolio Margin account, the UM, COIN-M and margin fills from papi. A
-// failed papi read returns the fills read so far with the error, and raises
-// pm_trades_unreadable: the sync keeps the day, and the gap is on record.
+// Portfolio Margin account, the UM, COIN-M and margin fills from papi. On a
+// Portfolio Margin Pro account it adds the pool's margin fills from sapi to
+// the fapi UM fills. A failed papi or sapi read returns the fills read so
+// far with the error, and raises pm_trades_unreadable: the sync keeps the
+// day, and the gap is on record. A context scoped by WithTradeMarkets skips
+// the markets it leaves out (the recount reads swap only).
 func (b *Binance) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
 	var allTrades []*Trade
 	b.activityNotes.set(nil)
 
+	spotWanted := TradeMarketWanted(ctx, MarketSpot)
+
 	// Spot trades
-	spotTrades, err := b.getSpotTrades(ctx, start, end)
-	if err == nil {
-		allTrades = append(allTrades, spotTrades...)
+	if spotWanted {
+		spotTrades, err := b.getSpotTrades(ctx, start, end)
+		if err == nil {
+			allTrades = append(allTrades, spotTrades...)
+		}
 	}
 
 	verdict := b.portfolioMarginVerdict()
@@ -773,6 +805,16 @@ func (b *Binance) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade
 		futuresTrades, err := b.getFuturesTrades(ctx, start, end)
 		if err == nil {
 			allTrades = append(allTrades, futuresTrades...)
+			if pro, _ := b.portfolioMarginProState(); pro == binancePMYes && spotWanted {
+				// Portfolio Margin Pro: UM fills read on fapi above, the pool's
+				// margin fills on sapi.
+				marginTrades, merr := b.getPortfolioMarginProMarginTrades(ctx, start, end)
+				allTrades = append(allTrades, marginTrades...)
+				if merr != nil {
+					b.activityNotes.add(binancePMTradesUnreadable)
+					return allTrades, fmt.Errorf("portfolio margin pro trades: %w", merr)
+				}
+			}
 			return allTrades, nil
 		}
 		if verdict == binancePMNo || !b.probePortfolioMargin(ctx, err) {

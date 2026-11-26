@@ -1266,6 +1266,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	act := s.readActivity(ctx, conn, connMeta, s.activityWindowStart(ctx, connMeta, startOfDay), now, rebuilt)
 	// After the cashflow read: Bybit and OKX find their gaps there.
 	s.collectCapabilityWarnings(conn, connMeta, result)
+	s.logBalanceCrossCheck(conn, connMeta)
 	s.completeBreakdown(ctx, conn, connMeta, act.breakdown, balance)
 	// Everything below compares with stored rows, which are in USD: convert
 	// first.
@@ -3779,4 +3780,34 @@ func aggregateSyncResults(userUID, exchange string, results []*SyncResult) *Sync
 	}
 
 	return out
+}
+
+// logBalanceCrossCheck logs, once per sync, the venue's own figure for part
+// of the equity next to what the connector measured (Binance Portfolio
+// Margin Pro: actualEquity against the pool). Operators read the residual;
+// nothing is stored.
+func (s *SyncService) logBalanceCrossCheck(conn connector.Connector, connMeta *repository.ExchangeConnection) {
+	cc, ok := conn.(connector.BalanceCrossChecker)
+	if !ok {
+		return
+	}
+	check, ok := cc.BalanceCrossCheck()
+	if !ok {
+		return
+	}
+	residual := check.Measured - check.Reference
+	share := 0.0
+	if check.Reference != 0 {
+		share = residual / check.Reference
+	}
+	s.logger.Info("balance cross-check",
+		zap.String("user_uid", connMeta.UserUID),
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("label", connMeta.Label),
+		zap.String("check", check.Name),
+		zap.Float64("measured", check.Measured),
+		zap.Float64("reference", check.Reference),
+		zap.Float64("residual", residual),
+		zap.Float64("residual_share", share),
+	)
 }
