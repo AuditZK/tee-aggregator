@@ -303,3 +303,22 @@ func TestBybitGetFundingFees_HedgeLegsSharingAnExecID(t *testing.T) {
 	}
 }
 
+// The sync reads funding over whole UTC days from midnight: a settlement
+// stamped exactly at that midnight is inside the read, not after it.
+func TestBybitGetFundingFees_SettlementOnTheMidnightItStartsFrom(t *testing.T) {
+	midnight := time.Now().UTC().Truncate(24 * time.Hour).Add(-24 * time.Hour)
+	s := newBybitExecServer(t, []bybitExecRow{
+		{id: "f0", side: "Buy", execType: "Funding", fee: "1", at: midnight},
+		{id: "f1", side: "Buy", execType: "Funding", fee: "2", at: midnight.Add(-time.Millisecond)},
+	}, 0)
+	fees, err := s.b.GetFundingFees(context.Background(), nil, midnight)
+	if err != nil {
+		t.Fatalf("GetFundingFees: %v", err)
+	}
+	if len(fees) != 1 || fees[0].Amount != -1 || !fees[0].Timestamp.Equal(midnight) {
+		t.Fatalf("fees = %+v, want the midnight settlement alone", fees)
+	}
+	if st := s.recorded()[0].Get("startTime"); st != strconv.FormatInt(midnight.UnixMilli(), 10) {
+		t.Fatalf("startTime = %s, want the midnight itself", st)
+	}
+}

@@ -190,3 +190,26 @@ func TestRecountAsksForTheMarketsItRewrites(t *testing.T) {
 		t.Fatal("an unscoped read must want every market")
 	}
 }
+
+// The recount files funding on the same whole UTC days as the live read: a
+// settlement stamped at D 00:00 belongs to the row of D+1, never to both.
+func TestRecountDayFilesAMidnightSettlementOnTheNextRow(t *testing.T) {
+	d1 := time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC)
+	d2, d3 := d1.Add(24*time.Hour), d1.Add(48*time.Hour)
+	rows := []*repository.Snapshot{recountRow(d1, 1000, 0, true), recountRow(d2, 1000, 0, false), recountRow(d3, 1000, 0, false)}
+	funding := []*connector.FundingFee{
+		{Amount: -1, Timestamp: d1},
+		{Amount: -2, Timestamp: d2},
+		{Amount: -4, Timestamp: d2.Add(16 * time.Hour)},
+		{Amount: -8, Timestamp: d3},
+	}
+	s := &SyncService{}
+	row2 := s.recountDay(rows, 1, "binance", []string{connector.MarketSwap}, nil, funding, true)
+	row3 := s.recountDay(rows, 2, "binance", []string{connector.MarketSwap}, nil, funding, true)
+	if row2.NewFundingFees != 1 || row3.NewFundingFees != 6 {
+		t.Fatalf("funding = %v on D2, %v on D3; want 1 (D1 00:00) and 6 (D2 00:00 + 16:00)", row2.NewFundingFees, row3.NewFundingFees)
+	}
+	if lo, hi := fundingWindow(d1.Add(20*time.Second), d2.Add(25*time.Second)); !lo.Equal(reflowWindowStart(rows, 1)) || !hi.Equal(d2) {
+		t.Fatalf("live window [%v, %v) differs from the recount's [%v, %v)", lo, hi, reflowWindowStart(rows, 1), d2)
+	}
+}

@@ -56,8 +56,8 @@ func TestReadActivity_FailedTradeReadKeepsFillsAndRaisesMarker(t *testing.T) {
 		err:     errors.New("portfolio margin trades: UM fills BTCUSDT: -1000"),
 		warning: "pm_trades_unreadable",
 		funding: []*connector.FundingFee{
-			{Amount: -1.5, Symbol: "BTCUSDT", Timestamp: now.Add(-2 * time.Hour)},
-			{Amount: -5, Symbol: "BTCUSD_PERP", Timestamp: now.Add(-3 * time.Hour)},
+			{Amount: -1.5, Symbol: "BTCUSDT", Timestamp: calendarDay(now).Add(-2 * time.Hour)},
+			{Amount: -5, Symbol: "BTCUSD_PERP", Timestamp: calendarDay(now).Add(-3 * time.Hour)},
 		},
 	}
 	meta := &repository.ExchangeConnection{UserUID: "u", Exchange: "binance", Label: "main"}
