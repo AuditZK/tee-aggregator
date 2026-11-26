@@ -54,6 +54,9 @@ type Binance struct {
 	// activity read keys off it, so one sync probes papi at most once and an
 	// account fapi answers never reaches papi at all.
 	pmVerdict binancePMVerdict
+	// pmBasis is the equity basis note of the last Portfolio Margin balance
+	// read (EquityBasisReporter), handed out once.
+	pmBasis EquityBasisNote
 	// activityNotes carries the markers the last GetTrades/GetFundingFees
 	// raised (pm_trades_unreadable).
 	activityNotes noteList
@@ -215,6 +218,7 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	var futures *Balance
 	portfolioMargin := false
 	b.capabilityWarnings = nil
+	b.pmBasis = EquityBasisNote{}
 	if fut, ferr := b.getFuturesBalance(ctx, priceMap); ferr == nil && fut != nil {
 		total.Equity += fut.Equity
 		total.UnrealizedPnL += fut.UnrealizedPnL

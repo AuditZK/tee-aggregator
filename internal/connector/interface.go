@@ -417,6 +417,39 @@ type BalanceCrossChecker interface {
 	BalanceCrossCheck() (BalanceCrossCheck, bool)
 }
 
+// EquityBasisNote says which basis the last GetBalance valued part of the
+// account on, and how far the venue's own figure for it sits from that value.
+// It carries no balance: the sync logs it once per sync without the user or
+// the label, and nothing stores it.
+type EquityBasisNote struct {
+	// Name says which part of the account the note is about.
+	Name string
+	// Basis is what the stored equity is: EquityBasisMarketValue, or
+	// EquityBasisVenue when the venue's figure was kept.
+	Basis string
+	// Residual is the market value less the venue's figure, in USD, and
+	// ResidualShare the same as a share of the venue's figure. Both are 0
+	// when the market value could not be taken.
+	Residual      float64
+	ResidualShare float64
+	// Fallback says why the venue's figure was kept; empty when it was not.
+	Fallback string
+}
+
+// The two bases an EquityBasisNote can report.
+const (
+	EquityBasisMarketValue = "market_value"
+	EquityBasisVenue       = "venue_equity"
+)
+
+// EquityBasisReporter is implemented by connectors that value part of an
+// account themselves rather than take the venue's total for it. The note of
+// a balance read is handed out once, by the call after that read; ok is false
+// until another read takes one.
+type EquityBasisReporter interface {
+	EquityBasisNote() (EquityBasisNote, bool)
+}
+
 type tradeMarketsKey struct{}
 
 // WithTradeMarkets scopes the GetTrades calls made with the returned context

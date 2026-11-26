@@ -1266,6 +1266,7 @@ func (s *SyncService) buildConnectionSnapshot(ctx context.Context, connMeta *rep
 	act := s.readActivity(ctx, conn, connMeta, s.activityWindowStart(ctx, connMeta, startOfDay), now, rebuilt)
 	// After the cashflow read: Bybit and OKX find their gaps there.
 	s.collectCapabilityWarnings(conn, connMeta, result)
+	s.logEquityBasis(conn, connMeta)
 	s.logBalanceCrossCheck(conn, connMeta)
 	s.completeBreakdown(ctx, conn, connMeta, act.breakdown, balance)
 	// Everything below compares with stored rows, which are in USD: convert
@@ -3780,6 +3781,33 @@ func aggregateSyncResults(userUID, exchange string, results []*SyncResult) *Sync
 	}
 
 	return out
+}
+
+// logEquityBasis logs, once per sync, the basis the connector valued part of
+// the account on and the residual to the venue's own figure for it (Binance
+// Portfolio Margin: the pool at market value against actualEquity), and why
+// the venue's figure was kept when it was. The exchange is named, the account
+// is not, and the residual is the only figure in the line.
+func (s *SyncService) logEquityBasis(conn connector.Connector, connMeta *repository.ExchangeConnection) {
+	r, ok := conn.(connector.EquityBasisReporter)
+	if !ok {
+		return
+	}
+	note, ok := r.EquityBasisNote()
+	if !ok {
+		return
+	}
+	fields := []zap.Field{
+		zap.String("exchange", connMeta.Exchange),
+		zap.String("check", note.Name),
+		zap.String("basis", note.Basis),
+		zap.Float64("residual_usd", note.Residual),
+		zap.Float64("residual_share", note.ResidualShare),
+	}
+	if note.Fallback != "" {
+		fields = append(fields, zap.String("fallback", note.Fallback))
+	}
+	s.logger.Info("equity basis", fields...)
 }
 
 // logBalanceCrossCheck logs, once per sync, the venue's own figure for part
