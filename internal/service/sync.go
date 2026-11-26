@@ -89,7 +89,14 @@ func (s *SyncService) activityWindowStart(ctx context.Context, connMeta *reposit
 		// today read back to that row, past any missed days, and a rewrite
 		// starting a day back would drop those days' flows from the row.
 		if !last.IsZero() && !last.Before(startOfDay) {
-			if start := s.sameDayWindowStart(ctx, connMeta, startOfDay); start != nil {
+			last = time.Time{}
+			if prev, err := s.snapshotRepo.GetLatestByUserExchangeLabelBefore(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, startOfDay); err == nil && prev != nil {
+				last = prev.Timestamp.UTC()
+			}
+			// A start older than the row before today belongs to a read that
+			// rows written since (a gap repair) now cover: starting there
+			// would book their flows a second time on today's row.
+			if start := s.sameDayWindowStart(ctx, connMeta, startOfDay); start != nil && !last.IsZero() && !start.Before(last) {
 				s.logger.Debug("same-day rewrite reads from where today's first write began",
 					zap.String("user_uid", connMeta.UserUID),
 					zap.String("exchange", connMeta.Exchange),
@@ -97,10 +104,6 @@ func (s *SyncService) activityWindowStart(ctx context.Context, connMeta *reposit
 					zap.Time("window_start", *start),
 				)
 				return *start
-			}
-			last = time.Time{}
-			if prev, err := s.snapshotRepo.GetLatestByUserExchangeLabelBefore(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label, startOfDay); err == nil && prev != nil {
-				last = prev.Timestamp.UTC()
 			}
 		}
 	}
@@ -193,14 +196,17 @@ func (s *SyncService) lastLiveRead(ctx context.Context, connMeta *repository.Exc
 // used, so repeated rewrites keep today's first start.
 //
 // Only an instant ledger can start mid-day (instantLedgerExchanges). A NULL
-// column, a status that is not today's completed write, or a start outside
-// the lookback falls back to the previous row's midnight.
+// column, a stamp from before today, or a start outside the lookback falls
+// back to the previous row's midnight.
 func (s *SyncService) sameDayWindowStart(ctx context.Context, connMeta *repository.ExchangeConnection, startOfDay time.Time) *time.Time {
 	if s.syncStatus == nil || connMeta == nil || !instantLedgerExchanges[normalizeExchange(connMeta.Exchange)] {
 		return nil
 	}
 	st, err := s.syncStatus.GetByUserExchangeLabel(ctx, connMeta.UserUID, connMeta.Exchange, connMeta.Label)
-	if err != nil || st.Status != "completed" || st.LastSyncTime == nil || st.LastWindowStart == nil {
+	// No status check: only a completed pass that wrote its row sets the
+	// start, any other stamp clears it, and a failed attempt keeps the stamp
+	// and the start of the pass that wrote today's row.
+	if err != nil || st.LastSyncTime == nil || st.LastWindowStart == nil {
 		return nil
 	}
 	if st.LastSyncTime.UTC().Before(startOfDay) {

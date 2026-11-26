@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -181,5 +182,93 @@ func TestDBSyncStatusWindowStartFollowsTheStamp(t *testing.T) {
 	up(&repository.SyncStatus{LastSyncTime: &later, Status: "pending", ErrorMessage: "skipped_stale: x"})
 	if st := h.status(t, "binance", "main"); st.LastWindowStart != nil {
 		t.Errorf("after a stamp without a row: window start %v, want NULL", st.LastWindowStart)
+	}
+}
+
+// A failed manual sync on D leaves status error with the stamp and start of
+// the pass that wrote row D; the next successful rewrite still starts there.
+func TestDBSameDayRewriteAfterAFailedAttemptKeepsTheStoredStart(t *testing.T) {
+	h := newDBHarness(t)
+	h.seedConnection(t, "binance", "main", dbKey, dbSecret)
+	today := startOfTodayUTC()
+	x := today.Add(-24 * time.Hour)
+	deposit, read := seedMidDayRow(t, h, "binance", x)
+	c := &scriptedConnector{
+		exchange:  "binance",
+		balances:  []connector.Balance{{Equity: 1300, Available: 1300}},
+		cashflows: []*connector.Cashflow{{Amount: 300, Currency: "USDT", Timestamp: deposit}},
+	}
+	h.plant(dbKey, dbSecret, c)
+	if res := h.sync.SyncConnectionScheduledByLabel(h.ctx, dbUser, "binance", "main"); !res.Success {
+		t.Fatalf("midnight pass failed: %+v", res)
+	}
+
+	c.mu.Lock()
+	c.balanceErr = errors.New("connection reset")
+	c.mu.Unlock()
+	if res := h.sync.SyncConnectionScheduledByLabel(h.ctx, dbUser, "binance", "main"); res.Success {
+		t.Fatalf("failed attempt reported success: %+v", res)
+	}
+	if st := h.status(t, "binance", "main"); st.Status != "error" || st.LastWindowStart == nil || !st.LastWindowStart.Equal(read) {
+		t.Fatalf("after the failure: status %q, window start %v; want error, %s kept", st.Status, st.LastWindowStart, read.Format(time.RFC3339))
+	}
+
+	c.mu.Lock()
+	c.balanceErr = nil
+	c.mu.Unlock()
+	if res := h.sync.SyncConnectionScheduledByLabel(h.ctx, dbUser, "binance", "main"); !res.Success {
+		t.Fatalf("rewrite failed: %+v", res)
+	}
+	if snap := h.snapshotToday(t, "binance", "main"); snap.Deposits != 0 {
+		t.Errorf("row D = +%v after the rewrite, want +0: the X 09:00 deposit is already on row X", snap.Deposits)
+	}
+}
+
+// A gap repair filling D-2 and D-1 after row D was first written leaves the
+// stored start (X 14:00) older than the row before today. The rewrite starts
+// at that row, or a flow the repaired rows carry lands on row D as well.
+func TestDBSameDayRewriteAfterAGapRepairStartsAtTheRepairedRow(t *testing.T) {
+	h := newDBHarness(t)
+	h.seedConnection(t, "binance", "main", dbKey, dbSecret)
+	today := startOfTodayUTC()
+	x := today.Add(-72 * time.Hour)
+	deposit, _ := seedMidDayRow(t, h, "binance", x)
+	gapDeposit := today.Add(-48*time.Hour + 12*time.Hour)
+	c := &scriptedConnector{
+		exchange: "binance",
+		balances: []connector.Balance{{Equity: 1500, Available: 1500}},
+		cashflows: []*connector.Cashflow{
+			{Amount: 300, Currency: "USDT", Timestamp: deposit},
+			{Amount: 200, Currency: "USDT", Timestamp: gapDeposit},
+		},
+	}
+	h.plant(dbKey, dbSecret, c)
+	if res := h.sync.SyncConnectionScheduledByLabel(h.ctx, dbUser, "binance", "main"); !res.Success {
+		t.Fatalf("midnight pass failed: %+v", res)
+	}
+
+	dMinus1 := today.Add(-24 * time.Hour)
+	for _, r := range []*repository.Snapshot{
+		{Timestamp: today.Add(-48 * time.Hour), TotalEquity: 1500, RealizedBalance: 1500, Deposits: 200},
+		{Timestamp: dMinus1, TotalEquity: 1500, RealizedBalance: 1500},
+	} {
+		r.UserUID, r.Exchange, r.Label = dbUser, "binance", "main"
+		if err := h.snaps.Upsert(h.ctx, r); err != nil {
+			t.Fatalf("seed repaired row: %v", err)
+		}
+	}
+
+	connMeta, err := h.conns.GetByUserExchangeLabel(h.ctx, dbUser, "binance", "main")
+	if err != nil {
+		t.Fatalf("read connection: %v", err)
+	}
+	if got := h.sync.activityWindowStart(h.ctx, connMeta, today); !got.Equal(dMinus1) {
+		t.Errorf("window starts %s, want row D-1's midnight %s", got.Format(time.RFC3339), dMinus1.Format(time.RFC3339))
+	}
+	if res := h.sync.SyncConnectionScheduledByLabel(h.ctx, dbUser, "binance", "main"); !res.Success {
+		t.Fatalf("rewrite failed: %+v", res)
+	}
+	if snap := h.snapshotToday(t, "binance", "main"); snap.Deposits != 0 {
+		t.Errorf("row D = +%v after the rewrite, want +0: the D-2 deposit is on the repaired row", snap.Deposits)
 	}
 }
