@@ -160,27 +160,172 @@ func (p *Polymarket) fetchTrades(ctx context.Context, start, end time.Time) ([]*
 	}
 	var trades []*Trade
 	complete, err := walkPolymarket(ctx, p, "/activity", q, polymarketMaxTradePages, func(r polymarketActivity) error {
-		side := strings.ToLower(r.Side)
-		if r.Type != "TRADE" || (side != "buy" && side != "sell") {
-			return nil
+		if fill := polymarketFill(r); fill != nil {
+			trades = append(trades, fill)
 		}
-		trades = append(trades, &Trade{
-			ID:          r.TransactionHash,
-			Symbol:      polymarketSymbol(r.Slug, r.Outcome, r.TokenID),
-			Side:        side,
-			Price:       r.Price,
-			Quantity:    r.Size,
-			USDNotional: r.USDCSize,
-			FeeCurrency: "USDC",
-			Timestamp:   time.Unix(r.Timestamp, 0).UTC(),
-			MarketType:  MarketSpot,
-		})
 		return nil
 	})
 	if err != nil {
 		return nil, false, err
 	}
 	return trades, complete, nil
+}
+
+// polymarketFill is the fill an activity row records, nil for any other row.
+func polymarketFill(r polymarketActivity) *Trade {
+	side := strings.ToLower(r.Side)
+	if r.Type != "TRADE" || (side != "buy" && side != "sell") {
+		return nil
+	}
+	return &Trade{
+		ID:          r.TransactionHash,
+		Symbol:      polymarketSymbol(r.Slug, r.Outcome, r.TokenID),
+		Side:        side,
+		Price:       r.Price,
+		Quantity:    r.Size,
+		USDNotional: r.USDCSize,
+		FeeCurrency: "USDC",
+		Timestamp:   time.Unix(r.Timestamp, 0).UTC(),
+		MarketType:  MarketSpot,
+	}
+}
+
+// polymarketLedgerTypes is every row type of the activity feed, transfers
+// included: TIP is served only when named.
+const polymarketLedgerTypes = "TRADE,SPLIT,MERGE,REDEEM,CONVERSION,MIGRATION,REWARD,YIELD,MAKER_REBATE," +
+	"TAKER_REBATE,REFERRAL_REWARD,DEPOSIT,WITHDRAWAL,DIRECTIONAL_SPLIT,DIRECTIONAL_MERGE," +
+	"THRESHOLD_COMPOSE,THRESHOLD_DECOMPOSE,TIP"
+
+// polymarketCashSign is the direction of usdc_size for the wallet's cash, for
+// the types whose direction does not depend on the row.
+var polymarketCashSign = map[string]float64{
+	"SPLIT": -1, "MERGE": 1, "REDEEM": 1, "REWARD": 1, "YIELD": 1,
+	"MAKER_REBATE": 1, "TAKER_REBATE": 1, "REFERRAL_REWARD": 1,
+}
+
+// polymarketLedger is the wallet's pUSD as the activity feed moves it, oldest
+// move first. From unknownFrom on, a row the replay cannot sign (a
+// conversion, a combo leg) leaves the cash unknown.
+type polymarketLedger struct {
+	moves       []polymarketFlow
+	unknownFrom time.Time
+}
+
+func (l *polymarketLedger) add(r polymarketActivity) {
+	at := time.Unix(r.Timestamp, 0).UTC()
+	amount, ok := polymarketCashMove(r)
+	if !ok {
+		if l.unknownFrom.IsZero() || at.Before(l.unknownFrom) {
+			l.unknownFrom = at
+		}
+		return
+	}
+	if amount != 0 {
+		l.moves = append(l.moves, polymarketFlow{at: at, amount: amount})
+	}
+}
+
+// polymarketCashMove is what a row moves in or out of the wallet's pUSD,
+// false when the replay cannot tell.
+func polymarketCashMove(r polymarketActivity) (float64, bool) {
+	if r.IsCombo {
+		return 0, false
+	}
+	switch r.Type {
+	case "TRADE":
+		switch strings.ToUpper(r.Side) {
+		case "BUY":
+			return -r.USDCSize, true
+		case "SELL":
+			return r.USDCSize, true
+		}
+		return 0, false
+	case "DEPOSIT", "WITHDRAWAL", "TIP":
+		return polymarketTransfer(r)
+	}
+	sign, ok := polymarketCashSign[r.Type]
+	return sign * r.USDCSize, ok
+}
+
+// polymarketTransfer is the collateral a transfer row brings in (positive) or
+// takes out, false when it states no direction.
+func polymarketTransfer(r polymarketActivity) (float64, bool) {
+	amount := r.USDCSize
+	if amount == 0 {
+		amount = r.Size
+	}
+	switch {
+	case r.Type == "DEPOSIT", r.Type == "TIP" && strings.EqualFold(r.Side, "IN"):
+		return amount, true
+	case r.Type == "WITHDRAWAL", r.Type == "TIP" && strings.EqualFold(r.Side, "OUT"):
+		return -amount, true
+	}
+	return 0, false
+}
+
+// fetchLedger reads the whole activity feed once: the fills, and the cash
+// every row moves. It reports whether the feed ended before the page cap.
+func (p *Polymarket) fetchLedger(ctx context.Context, end time.Time) ([]*Trade, *polymarketLedger, bool, error) {
+	q := url.Values{
+		"type":                         {polymarketLedgerTypes},
+		"exclude_deposits_withdrawals": {"false"},
+		"start":                        {"1"},
+		"end":                          {strconv.FormatInt(end.Unix(), 10)},
+		"sort_direction":               {"ASC"},
+		"limit":                        {strconv.Itoa(polymarketPageSize)},
+	}
+	var fills []*Trade
+	ledger := &polymarketLedger{}
+	complete, err := walkPolymarket(ctx, p, "/activity", q, polymarketMaxTradePages, func(r polymarketActivity) error {
+		if fill := polymarketFill(r); fill != nil {
+			fills = append(fills, fill)
+		}
+		ledger.add(r)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, false, err
+	}
+	sort.SliceStable(ledger.moves, func(i, j int) bool { return ledger.moves[i].at.Before(ledger.moves[j].at) })
+	return fills, ledger, complete, nil
+}
+
+// polymarketHeldSlack is how far the replayed cash may exceed a midnight's
+// equity before the replay is taken to miss a move. The venue marks its
+// series minutes before midnight, so a market settled and redeemed in
+// between is cash at midnight but still a position in the mark.
+func polymarketHeldSlack(equity float64) float64 {
+	return max(5, equity*0.01)
+}
+
+// stampFree states each row's free balance, the cash replayed to its
+// midnight, so that equity less it is what positions held then. Rows come in
+// date order. It states none when the cash contradicts a row's equity, which
+// means the feed misses a move, and none from the first row it cannot sign.
+func (l *polymarketLedger) stampFree(rows []*HistoricalSnapshot) {
+	if l == nil {
+		return
+	}
+	free := make([]float64, 0, len(rows))
+	cash, mi := 0.0, 0
+	for _, row := range rows {
+		if !l.unknownFrom.IsZero() && !row.Date.Before(l.unknownFrom) {
+			break
+		}
+		for ; mi < len(l.moves) && !l.moves[mi].at.After(row.Date); mi++ {
+			cash += l.moves[mi].amount
+		}
+		slack := polymarketHeldSlack(row.TotalEquity)
+		if cash > row.TotalEquity+slack || cash < -slack {
+			return
+		}
+		free = append(free, min(max(cash, 0), row.TotalEquity))
+	}
+	for i, f := range free {
+		rows[i].Breakdown = map[string]*MarketBalance{
+			MarketSpot: {MarketType: MarketSpot, Equity: rows[i].TotalEquity, AvailableMargin: f},
+		}
+	}
 }
 
 // GetCashflows returns the collateral that entered or left the wallet without
@@ -215,13 +360,20 @@ func (p *Polymarket) GetHistoricalSnapshots(ctx context.Context, since time.Time
 	if _, err := p.get(ctx, "/user-pnl", q, &series); err != nil {
 		return nil, err
 	}
-	// The series counts fills but not their side. Without the whole feed the
-	// rows keep its counts and leave the buy/sell split unstated.
+	// The series counts fills but not their side, and states no cash. Without
+	// the whole feed the rows keep its counts, unsplit, and no free balance.
 	var days map[int64]*polymarketFillDay
-	if fills, complete, err := p.fetchTrades(ctx, time.Time{}, now); err == nil && complete {
+	var ledger *polymarketLedger
+	if fills, l, complete, err := p.fetchLedger(ctx, now); err == nil && complete {
 		days = polymarketFillDays(fills)
+		ledger = l
 	}
-	return polymarketDailyRows(flows, series.Points, days, since, now)
+	rows, err := polymarketDailyRows(flows, series.Points, days, since, now)
+	if err != nil {
+		return nil, err
+	}
+	ledger.stampFree(rows)
+	return rows, nil
 }
 
 // polymarketFillDay is the fills a row counts: those of the UTC day before it,
@@ -336,6 +488,7 @@ type polymarketActivity struct {
 	Outcome         string  `json:"outcome"`
 	TokenID         string  `json:"token_id"`
 	TransactionHash string  `json:"transaction_hash"`
+	IsCombo         bool    `json:"is_combo"`
 }
 
 type polymarketPosition struct {
@@ -410,15 +563,8 @@ func (p *Polymarket) fetchFlows(ctx context.Context, since time.Time) ([]polymar
 	}
 	var flows []polymarketFlow
 	complete, err := walkPolymarket(ctx, p, "/activity", q, polymarketMaxFlowPages, func(r polymarketActivity) error {
-		amount := r.USDCSize
-		if amount == 0 {
-			amount = r.Size
-		}
-		switch {
-		case r.Type == "DEPOSIT", r.Type == "TIP" && strings.EqualFold(r.Side, "IN"):
-		case r.Type == "WITHDRAWAL", r.Type == "TIP" && strings.EqualFold(r.Side, "OUT"):
-			amount = -amount
-		default:
+		amount, ok := polymarketTransfer(r)
+		if !ok {
 			return fmt.Errorf("polymarket: transfer of type %q has no direction", r.Type)
 		}
 		if amount != 0 {

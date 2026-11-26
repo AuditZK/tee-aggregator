@@ -461,10 +461,12 @@ func TestPolymarketGetHistoricalSnapshots(t *testing.T) {
 	start := truncUTCDay(time.Now().UTC()).Add(-72 * time.Hour)
 	stamp := func(d time.Duration) string { return polymarketEpoch(start.Add(d)) }
 	flows := `{"data":[{"timestamp":` + stamp(-time.Hour) + `,"type":"DEPOSIT","usdc_size":100}],"pagination":{"next_cursor":null}}`
-	fills := `{"data":[
+	ledger := `{"data":[
+		{"timestamp":` + stamp(-time.Hour) + `,"type":"DEPOSIT","usdc_size":100},
 		{"timestamp":` + stamp(2*time.Hour) + `,"type":"TRADE","side":"BUY","size":10,"usdc_size":4,"price":0.4,"slug":"rain","outcome":"Yes"},
 		{"timestamp":` + stamp(5*time.Hour) + `,"type":"TRADE","side":"SELL","size":5,"usdc_size":2.5,"price":0.5,"slug":"rain","outcome":"Yes"},
-		{"timestamp":` + stamp(26*time.Hour) + `,"type":"TRADE","side":"BUY","size":4,"usdc_size":1,"price":0.25,"slug":"rain","outcome":"No"}
+		{"timestamp":` + stamp(26*time.Hour) + `,"type":"TRADE","side":"BUY","size":4,"usdc_size":1,"price":0.25,"slug":"rain","outcome":"No"},
+		{"timestamp":` + stamp(30*time.Hour) + `,"type":"REDEEM","size":5,"usdc_size":3,"slug":"rain"}
 	],"pagination":{"next_cursor":null}}`
 	series := `{"data":{"points":[
 		{"timestamp":` + stamp(24*time.Hour) + `,"economic_pnl":8,"unrealized_pnl":2,"volume_usdc":50,"trade_count":3}
@@ -474,12 +476,12 @@ func TestPolymarketGetHistoricalSnapshots(t *testing.T) {
 			switch {
 			case r.URL.Path == "/user-pnl":
 				_, _ = w.Write([]byte(series))
-			case r.URL.Path == "/activity" && r.URL.Query().Get("type") == "TRADE":
+			case r.URL.Path == "/activity" && r.URL.Query().Get("type") == polymarketLedgerTypes:
 				if !tradeFeed {
 					w.WriteHeader(http.StatusServiceUnavailable)
 					return
 				}
-				_, _ = w.Write([]byte(fills))
+				_, _ = w.Write([]byte(ledger))
 			case r.URL.Path == "/activity":
 				_, _ = w.Write([]byte(flows))
 			default:
@@ -516,6 +518,13 @@ func TestPolymarketGetHistoricalSnapshots(t *testing.T) {
 	if !approxEq(rows[3].TotalEquity, 108) || rows[3].TotalTrades != 0 {
 		t.Errorf("last row = %+v, want the last mark carried with no activity", rows[3])
 	}
+	// The cash replayed to each midnight: deposit, fills and redemption.
+	for i, want := range []float64{100, 98.5, 100.5, 100.5} {
+		spot := rows[i].Breakdown[MarketSpot]
+		if spot == nil || !approxEq(spot.AvailableMargin, want) || !approxEq(spot.Equity, rows[i].TotalEquity) {
+			t.Errorf("row %d free balance = %+v, want %.2f free of %.2f", i, spot, want, rows[i].TotalEquity)
+		}
+	}
 
 	t.Run("without the fill feed the series counts stay, unsplit", func(t *testing.T) {
 		rows, err := serve(t, false).GetHistoricalSnapshots(context.Background(), time.Time{})
@@ -524,6 +533,95 @@ func TestPolymarketGetHistoricalSnapshots(t *testing.T) {
 		}
 		if r := rows[1]; r.TotalTrades != 3 || !approxEq(r.TotalVolume, 50) || r.LongTrades != 0 || r.ShortTrades != 0 {
 			t.Errorf("second row = %+v, want the series' 3 trades and no split", r)
+		}
+		for _, r := range rows {
+			if r.Breakdown != nil {
+				t.Errorf("row %s states a free balance %+v without the feed", r.Date.Format("2006-01-02"), r.Breakdown)
+			}
+		}
+	})
+}
+
+func TestPolymarketLedgerStampFree(t *testing.T) {
+	day := time.Date(2026, 3, 2, 0, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) int64 { return day.Add(d).Unix() }
+	rowsAt := func(equities ...float64) []*HistoricalSnapshot {
+		out := make([]*HistoricalSnapshot, len(equities))
+		for i, eq := range equities {
+			out[i] = &HistoricalSnapshot{Date: day.Add(time.Duration(i) * 24 * time.Hour), TotalEquity: eq}
+		}
+		return out
+	}
+	ledgerOf := func(rows ...polymarketActivity) *polymarketLedger {
+		l := &polymarketLedger{}
+		for _, r := range rows {
+			l.add(r)
+		}
+		return l
+	}
+	free := func(rows []*HistoricalSnapshot) []float64 {
+		out := make([]float64, len(rows))
+		for i, r := range rows {
+			out[i] = -1
+			if spot := r.Breakdown[MarketSpot]; spot != nil {
+				out[i] = spot.AvailableMargin
+			}
+		}
+		return out
+	}
+	deposit := polymarketActivity{Timestamp: at(-time.Hour), Type: "DEPOSIT", USDCSize: 50}
+	buy := polymarketActivity{Timestamp: at(time.Hour), Type: "TRADE", Side: "BUY", USDCSize: 20}
+
+	t.Run("signs every movement and counts one at midnight in that midnight's row", func(t *testing.T) {
+		rows := rowsAt(50, 52, 52)
+		ledgerOf(deposit, buy,
+			polymarketActivity{Timestamp: at(24 * time.Hour), Type: "REDEEM", USDCSize: 12},
+			polymarketActivity{Timestamp: at(30 * time.Hour), Type: "MAKER_REBATE", USDCSize: 1},
+			polymarketActivity{Timestamp: at(31 * time.Hour), Type: "SPLIT", USDCSize: 4},
+			polymarketActivity{Timestamp: at(32 * time.Hour), Type: "TIP", Side: "OUT", USDCSize: 2},
+		).stampFree(rows)
+		if got := free(rows); !approxEq(got[0], 50) || !approxEq(got[1], 42) || !approxEq(got[2], 37) {
+			t.Errorf("free = %v, want [50 42 37]", got)
+		}
+	})
+
+	t.Run("a row it cannot sign leaves that midnight and the later ones unstated", func(t *testing.T) {
+		for _, odd := range []polymarketActivity{
+			{Timestamp: at(30 * time.Hour), Type: "CONVERSION", USDCSize: 3},
+			{Timestamp: at(30 * time.Hour), Type: "TRADE", Side: "BUY", USDCSize: 3, IsCombo: true},
+			{Timestamp: at(30 * time.Hour), Type: "TRADE", Side: "", USDCSize: 3},
+		} {
+			rows := rowsAt(50, 52, 52)
+			ledgerOf(deposit, buy, odd).stampFree(rows)
+			if got := free(rows); !approxEq(got[0], 50) || !approxEq(got[1], 30) || got[2] != -1 {
+				t.Errorf("%s: free = %v, want [50 30 unstated]", odd.Type, got)
+			}
+		}
+	})
+
+	t.Run("cash beyond the equity means a missing move: nothing is stated", func(t *testing.T) {
+		rows := rowsAt(50, 52, 52)
+		ledgerOf(deposit, buy, polymarketActivity{Timestamp: at(30 * time.Hour), Type: "REDEEM", USDCSize: 60}).stampFree(rows)
+		for i, f := range free(rows) {
+			if f != -1 {
+				t.Errorf("row %d states %v free, want none", i, f)
+			}
+		}
+	})
+
+	t.Run("a settlement between the mark and midnight is clamped to the equity", func(t *testing.T) {
+		rows := rowsAt(50, 52)
+		ledgerOf(deposit, polymarketActivity{Timestamp: at(23 * time.Hour), Type: "REDEEM", USDCSize: 4}).stampFree(rows)
+		if got := free(rows); !approxEq(got[1], 52) {
+			t.Errorf("free = %v, want the second row clamped to its 52 of equity", got)
+		}
+	})
+
+	t.Run("no ledger, no free balance", func(t *testing.T) {
+		rows := rowsAt(50)
+		(*polymarketLedger)(nil).stampFree(rows)
+		if rows[0].Breakdown != nil {
+			t.Errorf("breakdown = %+v, want none", rows[0].Breakdown)
 		}
 	})
 }
