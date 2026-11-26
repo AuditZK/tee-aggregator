@@ -1557,6 +1557,18 @@ func (s *SyncService) readActivity(ctx context.Context, conn connector.Connector
 		}
 	}
 	act.breakdown = s.aggregateTrades(act.trades)
+	if fl, ok := conn.(connector.FeeLedgerFetcher); ok {
+		if fees, err := fl.GetNetTradingFees(ctx, from, now); err != nil {
+			s.logger.Warn("fee ledger read failed; the window's fees are the fills' own",
+				zap.String("user_uid", connMeta.UserUID),
+				zap.String("exchange", connMeta.Exchange),
+				zap.String("label", connMeta.Label),
+				zap.Error(err),
+			)
+		} else {
+			act.breakdown.getOrCreateMarket(primaryMarketType(connMeta.Exchange)).fees += fees
+		}
+	}
 
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
 		fFrom, fTo := fundingWindow(from, now)
@@ -3878,7 +3890,7 @@ func (m *marketAgg) hasData() bool {
 	// equity of its own (a position opened last window and still held charges
 	// funding every night). Omitting it dropped the whole bucket at
 	// persistence, so the cost was fetched and then thrown away.
-	return m.trades > 0 || m.equity > 0 || m.availableMargin > 0 || m.fundingFees != 0
+	return m.trades > 0 || m.equity > 0 || m.availableMargin > 0 || m.fundingFees != 0 || m.fees != 0
 }
 
 // fundingMarketType names the bucket an exchange's funding charges belong in —

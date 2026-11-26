@@ -216,6 +216,13 @@ type FundingFeesFetcher interface {
 // must keep what it holds.
 var ErrFundingNotRead = errors.New("funding not read for this account")
 
+// FeeLedgerFetcher is implemented by a venue whose fills carry no fee and that
+// states its fees as a running total instead. The amount is a cost net of the
+// rebates and refunds credited, negative when they exceed the charges.
+type FeeLedgerFetcher interface {
+	GetNetTradingFees(ctx context.Context, since, until time.Time) (float64, error)
+}
+
 // Connectors that hold a long-lived resource — a WebSocket with its read loop
 // and heartbeat, a pooled session — implement io.Closer. The connector cache
 // calls it whenever an instance leaves the cache (LRU eviction, TTL cleanup,
