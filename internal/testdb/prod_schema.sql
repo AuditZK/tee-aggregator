@@ -113,7 +113,8 @@ CREATE TABLE public.sync_statuses (
     "errorMessage" text,
     "createdAt" timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     "updatedAt" timestamp(3) without time zone NOT NULL,
-    label text DEFAULT ''::text NOT NULL
+    label text DEFAULT ''::text NOT NULL,
+    last_window_start timestamp with time zone
 );
 
 CREATE TABLE public.users (
