@@ -405,24 +405,18 @@ func (h *Hyperliquid) postInfo(ctx context.Context, body interface{}) (json.RawM
 
 // GetCashflows returns deposits/withdrawals from Hyperliquid ledger.
 func (h *Hyperliquid) GetCashflows(ctx context.Context, since time.Time) ([]*Cashflow, error) {
-	respBody, err := h.postInfo(ctx, map[string]interface{}{
-		"type":      "userNonFundingLedgerUpdates",
-		"user":      h.walletAddress,
-		"startTime": since.UnixMilli(),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	var updates []struct {
-		Time  int64 `json:"time"`
+	type ledgerRow struct {
+		Time  int64  `json:"time"`
+		Hash  string `json:"hash"`
 		Delta struct {
 			Type string `json:"type"`
 			Usdc string `json:"usdc"`
 		} `json:"delta"`
 	}
-
-	if err := json.Unmarshal(respBody, &updates); err != nil {
+	updates, err := hlInfoPaged(ctx, h, "userNonFundingLedgerUpdates", since, func(r ledgerRow) hlPagedKey {
+		return hlPagedKey{time: r.Time, id: r.Hash + "|" + r.Delta.Type + "|" + r.Delta.Usdc}
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -514,20 +508,13 @@ func (h *Hyperliquid) GetBalanceByMarket(ctx context.Context) ([]*MarketBalance,
 	return balances, nil
 }
 
-
 // GetFundingFees returns funding fee history from Hyperliquid.
-// Uses the userFunding endpoint (read-only, no signing needed).
+// Uses the userFunding endpoint (read-only, no signing needed). Funding is
+// settled every hour on every open position, so one page of 500 rows covers
+// less than a day for an account holding more than twenty positions: the
+// read pages through (hlInfoPaged).
 func (h *Hyperliquid) GetFundingFees(ctx context.Context, symbols []string, since time.Time) ([]*FundingFee, error) {
-	respBody, err := h.postInfo(ctx, map[string]interface{}{
-		"type":      "userFunding",
-		"user":      h.walletAddress,
-		"startTime": since.UnixMilli(),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	var entries []struct {
+	type fundingRow struct {
 		Time  int64 `json:"time"`
 		Delta struct {
 			Type        string `json:"type"`
@@ -536,8 +523,12 @@ func (h *Hyperliquid) GetFundingFees(ctx context.Context, symbols []string, sinc
 			FundingRate string `json:"fundingRate"`
 		} `json:"delta"`
 	}
-
-	if err := json.Unmarshal(respBody, &entries); err != nil {
+	// A funding row carries no transaction hash. There is one settlement per
+	// coin per hour, so the time and the coin name it.
+	entries, err := hlInfoPaged(ctx, h, "userFunding", since, func(r fundingRow) hlPagedKey {
+		return hlPagedKey{time: r.Time, id: r.Delta.Coin}
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -555,4 +546,68 @@ func (h *Hyperliquid) GetFundingFees(ctx context.Context, symbols []string, sinc
 	}
 
 	return fees, nil
+}
+
+// hlPageSize is the most rows Hyperliquid answers to an info request that
+// takes a time range ("Responses that take a time range will only return 500
+// elements or distinct blocks of data").
+const hlPageSize = 500
+
+// hlMaxPages bounds a paged read. 200 pages of 500 rows is 100,000 rows,
+// far past any sync window; reaching it fails the read rather than return a
+// truncated history.
+const hlMaxPages = 200
+
+// hlPagedKey names one row of a paged answer: its time, and what tells it
+// apart from the other rows at that same millisecond.
+type hlPagedKey struct {
+	time int64
+	id   string
+}
+
+// hlInfoPaged reads every row of a time-ranged info request from since to
+// now. Hyperliquid answers at most hlPageSize rows, oldest first, and its
+// documented way to read further is to send the last returned time as the
+// next startTime. startTime is inclusive, so the rows at that millisecond come
+// back on the next page: key names a row, and a row is kept once.
+func hlInfoPaged[T any](ctx context.Context, h *Hyperliquid, infoType string, since time.Time, key func(T) hlPagedKey) ([]T, error) {
+	var out []T
+	seen := map[hlPagedKey]struct{}{}
+	start := since.UnixMilli()
+	for page := 0; page < hlMaxPages; page++ {
+		body, err := h.postInfo(ctx, map[string]interface{}{
+			"type":      infoType,
+			"user":      h.walletAddress,
+			"startTime": start,
+		})
+		if err != nil {
+			return nil, err
+		}
+		var rows []T
+		if err := json.Unmarshal(body, &rows); err != nil {
+			return nil, fmt.Errorf("hyperliquid %s: %w", infoType, err)
+		}
+		last := start
+		for _, r := range rows {
+			k := key(r)
+			if k.time > last {
+				last = k.time
+			}
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			out = append(out, r)
+		}
+		if len(rows) < hlPageSize {
+			return out, nil
+		}
+		// A full page that does not move forward would be read forever: 500
+		// rows at one millisecond. Say so instead of dropping the rest.
+		if last == start {
+			return nil, fmt.Errorf("hyperliquid %s: %d rows at %d ms, cannot page past them", infoType, len(rows), start)
+		}
+		start = last
+	}
+	return nil, fmt.Errorf("hyperliquid %s: more than %d pages since %s", infoType, hlMaxPages, since.UTC().Format(time.RFC3339))
 }
