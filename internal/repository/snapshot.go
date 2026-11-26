@@ -318,6 +318,32 @@ type ExternalRebuilderDay struct {
 	Day      time.Time
 }
 
+// IsFromExternalRebuilder reports whether the connection's row at ts was
+// written by the external history rebuilder. A schema without the column
+// (pre-015) has no such rows and answers false.
+func (r *SnapshotRepo) IsFromExternalRebuilder(ctx context.Context, userUID, exchange, label string, ts time.Time) (bool, error) {
+	if !r.hasFromExternalRebuilderColumn(ctx) {
+		return false, nil
+	}
+	userCol := "user_uid"
+	if r.isTSSchema {
+		userCol = `"userUid"`
+	}
+	query := fmt.Sprintf(`
+		SELECT EXISTS (
+			SELECT 1 FROM snapshot_data
+			WHERE %s = $1 AND exchange = $2 AND timestamp = $3 AND from_external_rebuilder = TRUE`, userCol)
+	args := []any{userUID, exchange, ts}
+	if r.hasLabelColumn(ctx) {
+		query += " AND label = $4"
+		args = append(args, label)
+	}
+	query += ")"
+	var rebuilt bool
+	err := r.pool.QueryRow(ctx, query, args...).Scan(&rebuilt)
+	return rebuilt, err
+}
+
 // GetExternalRebuilderConnectionDays is GetExternalRebuilderDays by connection,
 // for a report that covers only some of them.
 func (r *SnapshotRepo) GetExternalRebuilderConnectionDays(ctx context.Context, userUID string, start, end time.Time) ([]ExternalRebuilderDay, error) {
