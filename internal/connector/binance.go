@@ -65,6 +65,11 @@ type Binance struct {
 	// the account is Portfolio Margin Pro (fapi answers, papi refuses), and
 	// the pool's cross-check. Probed once per instance, never fatal.
 	pmPro binancePMProState
+	// umHeld is the initial margin the USDⓈ-M positions of the last balance
+	// read held (binanceUMPositionMargin); umHeldKnown is false when that read
+	// carried no position list (the /fapi/v2/balance fallback).
+	umHeld      float64
+	umHeldKnown bool
 }
 
 // Binance wallet names. Their own vocabulary, not market types: cross and
@@ -187,6 +192,7 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	}
 
 	b.cachedBreakdown = nil
+	b.umHeld, b.umHeldKnown = 0, false
 
 	earn, earnErr := b.getSimpleEarn(ctx)
 	if errors.Is(earnErr, ErrTransient) {
@@ -321,6 +327,24 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 		b.noteWallet(binanceWalletEarn, earnErr)
 	}
 
+	// Portfolio Margin Pro shows nothing above: fapi answers and the pool reads
+	// as cross margin. Settled from /sapi/v1/portfolio/account, never fatal.
+	if !portfolioMargin {
+		pool := crossEq + coinMEq
+		if futures != nil {
+			pool += futures.Equity
+		}
+		b.settlePortfolioMarginPro(ctx, crossHeld, futures != nil, coinMEq, pool, priceMap)
+		if split, ok := b.portfolioMarginProSplit(ctx, nonUM, crossEq, coinMEq, futures); ok {
+			b.cachedBreakdown = split
+			total.Available = 0
+			for _, m := range split {
+				total.Available += m.AvailableMargin
+			}
+			return total, nil
+		}
+	}
+
 	// Per-market split, matching the history rebuilder's two-bucket convention
 	// (its "spot" carries everything non-UM — spot, COIN-M, cross+iso margin —
 	// with available=equity; "swap" is UM futures with the true free margin).
@@ -345,16 +369,6 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	total.Available = nonUM
 	if futures != nil {
 		total.Available += futures.Available
-	}
-
-	// Portfolio Margin Pro shows nothing here: fapi answers and the pool reads
-	// as cross margin. Settled from /sapi/v1/portfolio/account, never fatal.
-	if !portfolioMargin {
-		pool := crossEq + coinMEq
-		if futures != nil {
-			pool += futures.Equity
-		}
-		b.settlePortfolioMarginPro(ctx, crossHeld, futures != nil, coinMEq, pool, priceMap)
 	}
 
 	return total, nil
@@ -620,11 +634,12 @@ func (b *Binance) getFuturesBalance(ctx context.Context, priceMap map[string]flo
 	// non-USDT collateral. It never overlaps the spot wallet, so summing the two
 	// in GetBalance does not double-count.
 	var resp struct {
-		TotalWalletBalance    string                   `json:"totalWalletBalance"`
-		TotalMarginBalance    string                   `json:"totalMarginBalance"`
-		TotalUnrealizedProfit string                   `json:"totalUnrealizedProfit"`
-		AvailableBalance      string                   `json:"availableBalance"`
-		Assets                []binanceFuturesAssetRow `json:"assets"`
+		TotalWalletBalance    string                      `json:"totalWalletBalance"`
+		TotalMarginBalance    string                      `json:"totalMarginBalance"`
+		TotalUnrealizedProfit string                      `json:"totalUnrealizedProfit"`
+		AvailableBalance      string                      `json:"availableBalance"`
+		Assets                []binanceFuturesAssetRow    `json:"assets"`
+		Positions             []binanceFuturesPositionRow `json:"positions"`
 	}
 
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -634,6 +649,7 @@ func (b *Binance) getFuturesBalance(ctx context.Context, priceMap map[string]flo
 	equity, _ := strconv.ParseFloat(resp.TotalMarginBalance, 64)
 	unrealized, _ := strconv.ParseFloat(resp.TotalUnrealizedProfit, 64)
 	available, _ := strconv.ParseFloat(resp.AvailableBalance, 64)
+	b.umHeld, b.umHeldKnown = binanceUMPositionMargin(resp.Positions), true
 
 	// In single-asset mode the totals count USDT alone: a USDC or BNFCR margin
 	// wallet would read as its USDT leftover. Measured before shipping across

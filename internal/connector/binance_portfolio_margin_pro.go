@@ -199,3 +199,125 @@ func (b *Binance) getPortfolioMarginProMarginTrades(ctx context.Context, start, 
 	}
 	return trades, err
 }
+
+// binanceFuturesPositionRow is one position of /fapi/v2/account.
+type binanceFuturesPositionRow struct {
+	Symbol           string `json:"symbol"`
+	PositionAmt      string `json:"positionAmt"`
+	EntryPrice       string `json:"entryPrice"`
+	UnrealizedProfit string `json:"unrealizedProfit"`
+	Leverage         string `json:"leverage"`
+}
+
+// binanceUMPositionMargin is the initial margin the USDⓈ-M positions hold:
+// per symbol, the net position at the mark price divided by its leverage.
+// A leg's notional at the mark is positionAmt × entryPrice + unrealizedProfit
+// exactly (the profit is positionAmt × (mark − entry)), so the account read
+// GetBalance already makes is enough. Hedge legs are netted per symbol and a
+// symbol with no leverage counts 0, as the history rebuilder does
+// (portfolio_margin_held.go), so live and rebuilt days hold the same margin.
+func binanceUMPositionMargin(rows []binanceFuturesPositionRow) float64 {
+	net := map[string]float64{}
+	leverage := map[string]float64{}
+	for _, r := range rows {
+		amt, _ := strconv.ParseFloat(r.PositionAmt, 64)
+		if amt == 0 {
+			continue
+		}
+		entry, _ := strconv.ParseFloat(r.EntryPrice, 64)
+		upnl, _ := strconv.ParseFloat(r.UnrealizedProfit, 64)
+		net[r.Symbol] += amt*entry + upnl
+		if lev, _ := strconv.ParseFloat(r.Leverage, 64); lev > 0 {
+			leverage[r.Symbol] = lev
+		}
+	}
+	held := 0.0
+	for sym, notional := range net {
+		if lev := leverage[sym]; lev > 0 {
+			held += math.Abs(notional) / lev
+		}
+	}
+	return held
+}
+
+// coinMPositionMargin is the initial margin the COIN-M positions hold, in
+// USD: per symbol, the net notional (notionalValue is in the coin) at the
+// mark price divided by its leverage, the rebuilder's |contracts| × face ÷
+// leverage.
+func (b *Binance) coinMPositionMargin(ctx context.Context) (float64, error) {
+	body, err := b.pacedGet(ctx, binanceCoinMFuturesAPI, "/dapi/v1/positionRisk", url.Values{})
+	if err != nil {
+		return 0, err
+	}
+	var rows []struct {
+		Symbol        string `json:"symbol"`
+		PositionAmt   string `json:"positionAmt"`
+		MarkPrice     string `json:"markPrice"`
+		Leverage      string `json:"leverage"`
+		NotionalValue string `json:"notionalValue"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return 0, err
+	}
+	net := map[string]float64{}
+	leverage := map[string]float64{}
+	for _, r := range rows {
+		amt, _ := strconv.ParseFloat(r.PositionAmt, 64)
+		if amt == 0 {
+			continue
+		}
+		mark, _ := strconv.ParseFloat(r.MarkPrice, 64)
+		coin, _ := strconv.ParseFloat(r.NotionalValue, 64)
+		net[r.Symbol] += math.Copysign(math.Abs(coin*mark), amt)
+		if lev, _ := strconv.ParseFloat(r.Leverage, 64); lev > 0 {
+			leverage[r.Symbol] = lev
+		}
+	}
+	held := 0.0
+	for sym, usd := range net {
+		if lev := leverage[sym]; lev > 0 {
+			held += math.Abs(usd) / lev
+		}
+	}
+	return held, nil
+}
+
+// portfolioMarginProSplit is the per-market split of a Portfolio Margin Pro
+// account, runs inside GetBalance (b.mu held). It follows the history
+// rebuilder's Pro output: swap is the pool (cross margin + USDⓈ-M + COIN-M)
+// with its free margin, spot the rest (spot wallet, Earn, isolated margin,
+// options) with available = equity.
+//
+// Under Pro, /fapi/v2/account answers availableBalance 0: the positions'
+// margin is drawn from the pool, not from the USDⓈ-M wallet. The classic
+// split then kept the cross margin pool in spot at available = equity and
+// the USDⓈ-M wallet at 0: the whole pool read as free, nothing deducted for
+// the positions. Here free = pool − the positions' initial margin, never
+// above the pool, never below 0.
+//
+// ok is false, and the classic split applies, when the account is not Pro
+// or the positions could not be read (the /fapi/v2/balance fallback carries
+// none, or the COIN-M positions read failed).
+func (b *Binance) portfolioMarginProSplit(ctx context.Context, nonUM, crossEq, coinMEq float64, futures *Balance) ([]*MarketBalance, bool) {
+	if b.pmPro.verdict != binancePMYes || futures == nil || !b.umHeldKnown {
+		return nil, false
+	}
+	held := b.umHeld
+	if coinMEq != 0 {
+		cm, err := b.coinMPositionMargin(ctx)
+		if err != nil {
+			return nil, false
+		}
+		held += cm
+	}
+	poolEq := crossEq + coinMEq + futures.Equity
+	free := max(min(poolEq-held, poolEq), 0)
+	var split []*MarketBalance
+	if spotEq := nonUM - crossEq - coinMEq; spotEq != 0 {
+		split = append(split, &MarketBalance{MarketType: MarketSpot, Equity: spotEq, AvailableMargin: spotEq})
+	}
+	if poolEq != 0 || free != 0 {
+		split = append(split, &MarketBalance{MarketType: MarketSwap, Equity: poolEq, AvailableMargin: free})
+	}
+	return split, true
+}

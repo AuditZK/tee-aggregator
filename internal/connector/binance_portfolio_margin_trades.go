@@ -91,6 +91,7 @@ var binancePacedWeights = map[string]int{
 	"/sapi/v1/margin/myTrades":   10,
 	"/fapi/v1/income":            30,
 	"/dapi/v1/income":            20,
+	"/dapi/v1/positionRisk":      1,
 }
 
 // binancePacedBudgetPerMinute caps the weight one connector's paced reads

@@ -61,6 +61,10 @@ type binancePMActivityServer struct {
 	crossAssetBtc string
 	// poolAmounts overrides the crossMarginAsset ("2") of a /sapi/v1/portfolio/balance asset.
 	poolAmounts map[string]string
+	// fapiAccount overrides the /fapi/v2/account answer; cmPositionRisk is the
+	// /dapi/v1/positionRisk answer ("[]" when empty).
+	fapiAccount    string
+	cmPositionRisk string
 	// deposits is the /sapi/v1/capital/deposit/hisrec answer ("[]" when empty).
 	deposits string
 
@@ -179,12 +183,22 @@ func (s *binancePMActivityServer) connector(t *testing.T) *Binance {
 			}
 			switch p {
 			case "/fapi/v2/account":
+				if s.fapiAccount != "" {
+					_, _ = w.Write([]byte(s.fapiAccount))
+					return
+				}
 				_, _ = w.Write([]byte(`{"totalMarginBalance":"700","totalUnrealizedProfit":"0","availableBalance":"600"}`))
 			case "/fapi/v1/userTrades":
 				_, _ = w.Write([]byte(`[{"id":1,"symbol":"BTCUSDT","price":"50000","qty":"0.01","commission":"0.2","commissionAsset":"USDT","time":` +
 					strconv.FormatInt(q2ms(q), 10) + `,"side":"BUY","realizedPnl":"0"}]`))
 			case "/fapi/v1/income":
 				write(s.income(q, s.umIncome))
+			case "/dapi/v1/positionRisk":
+				if s.cmPositionRisk != "" {
+					_, _ = w.Write([]byte(s.cmPositionRisk))
+					return
+				}
+				_, _ = w.Write([]byte(`[]`))
 			case "/dapi/v1/income":
 				write(s.income(q, s.cmIncome))
 			case "/dapi/v1/balance":
