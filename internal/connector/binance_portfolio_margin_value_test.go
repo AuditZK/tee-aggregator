@@ -71,8 +71,9 @@ func TestBinance_PortfolioMargin_UnpricedAssetKeepsActualEquity(t *testing.T) {
 		t.Fatalf("buckets sum to %v, equity is %v", sum, bal.Equity)
 	}
 	note, ok := b.EquityBasisNote()
-	if !ok || note.Basis != EquityBasisVenue || !strings.Contains(note.Fallback, "XYZ") {
-		t.Fatalf("note = %+v (ok %v), want the venue basis and the unpriced asset named", note, ok)
+	// The log line carries a count, never which assets the user holds.
+	if !ok || note.Basis != EquityBasisVenue || note.Fallback != "1 asset without a spot price" || strings.Contains(note.Fallback, "XYZ") {
+		t.Fatalf("note = %+v (ok %v), want the venue basis and the unpriced assets counted, not named", note, ok)
 	}
 	if note.Residual != 0 {
 		t.Fatalf("residual = %v, want 0 when the market value could not be taken", note.Residual)

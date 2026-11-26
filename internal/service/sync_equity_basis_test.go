@@ -37,7 +37,7 @@ func TestLogEquityBasis(t *testing.T) {
 		ok:   true,
 	}, meta)
 	s.logEquityBasis(&equityBasisConnector{
-		note: connector.EquityBasisNote{Name: "binance_pm_market_value", Basis: connector.EquityBasisVenue, Fallback: "no spot price for XYZ"},
+		note: connector.EquityBasisNote{Name: "binance_pm_market_value", Basis: connector.EquityBasisVenue, Fallback: "2 assets without a spot price"},
 		ok:   true,
 	}, meta)
 	entries := logs.FilterMessage("equity basis").All()
@@ -59,7 +59,7 @@ func TestLogEquityBasis(t *testing.T) {
 	if first["residual_usd"] != 3.2 || first["residual_share"] != 0.00064 || first["basis"] != "market_value" || first["exchange"] != "binance" {
 		t.Fatalf("fields = %v", first)
 	}
-	if second["basis"] != "venue_equity" || second["fallback"] != "no spot price for XYZ" {
+	if second["basis"] != "venue_equity" || second["fallback"] != "2 assets without a spot price" {
 		t.Fatalf("fields = %v", second)
 	}
 }

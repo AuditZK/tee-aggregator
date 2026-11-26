@@ -156,9 +156,15 @@ func binancePMEquity(rows []binancePMBalanceRow, actual float64, priceMap map[st
 		value += q * p
 	}
 	if len(unpriced) > 0 {
-		// Valued at 0, an unpriced asset would come off the equity whole.
+		// Valued at 0, an unpriced asset would come off the equity whole. The
+		// note reaches the log, so it counts the assets and does not name what
+		// the user holds.
 		slices.Sort(unpriced)
-		note.Fallback = "no spot price for " + strings.Join(slices.Compact(unpriced), ",")
+		n := len(slices.Compact(unpriced))
+		note.Fallback = fmt.Sprintf("%d assets without a spot price", n)
+		if n == 1 {
+			note.Fallback = "1 asset without a spot price"
+		}
 		return actual, note
 	}
 	note.Residual = value - actual
