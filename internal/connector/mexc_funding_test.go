@@ -139,3 +139,27 @@ func TestMEXCFundingTransportFailureIsAnError(t *testing.T) {
 		t.Fatalf("want a plain error, got %v", err)
 	}
 }
+
+// MEXC does not document the sign of `funding`. The direction comes from the
+// side and the rate, whichever way the figure is sent.
+func TestMEXCFundingAmountIsSignedBySideAndRate(t *testing.T) {
+	cases := []struct {
+		name         string
+		positionType int
+		rate, raw    float64
+		want         float64
+	}{
+		{"long, positive rate, pays", 1, 0.0005, 0.5, -0.5},
+		{"long, positive rate, sent negative", 1, 0.0005, -0.5, -0.5},
+		{"long, negative rate, receives", 1, -0.002, 0.0837798, 0.0837798},
+		{"short, positive rate, receives", 2, 0.0005, -0.5, 0.5},
+		{"short, negative rate, pays", 2, -0.0005, 0.5, -0.5},
+		{"no rate, as sent", 1, 0, -0.5, -0.5},
+		{"no side, as sent", 0, 0.0005, 0.5, 0.5},
+	}
+	for _, c := range cases {
+		if got := mexcFundingAmount(c.positionType, c.rate, c.raw); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}

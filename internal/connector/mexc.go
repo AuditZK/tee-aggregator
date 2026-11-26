@@ -198,9 +198,8 @@ func (m *MEXC) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
 
 // GetFundingFees returns the account's funding settlements since a time,
 // from MEXC futures. The endpoint has no time filter: it pages newest first,
-// so the read walks pages until one ends before since. funding is the amount
-// the account received, negative when it paid, which is the FundingFee
-// convention.
+// so the read walks pages until one ends before since. Each amount is signed
+// by mexcFundingAmount.
 //
 // An account whose key cannot read futures answers ErrFundingNotRead, so a
 // recount keeps the funding it stored instead of writing a zero. Any other
@@ -222,10 +221,12 @@ func (m *MEXC) GetFundingFees(ctx context.Context, _ []string, since time.Time) 
 			Data    struct {
 				TotalPage  int `json:"totalPage"`
 				ResultList []struct {
-					ID         int64   `json:"id"`
-					Symbol     string  `json:"symbol"`
-					SettleTime int64   `json:"settleTime"`
-					Funding    float64 `json:"funding"`
+					ID           int64   `json:"id"`
+					Symbol       string  `json:"symbol"`
+					PositionType int     `json:"positionType"` // 1 long, 2 short
+					Rate         float64 `json:"rate"`
+					SettleTime   int64   `json:"settleTime"`
+					Funding      float64 `json:"funding"`
 				} `json:"resultList"`
 			} `json:"data"`
 		}
@@ -256,7 +257,7 @@ func (m *MEXC) GetFundingFees(ctx context.Context, _ []string, since time.Time) 
 				continue
 			}
 			fees = append(fees, &FundingFee{
-				Amount:    f.Funding,
+				Amount:    mexcFundingAmount(f.PositionType, f.Rate, f.Funding),
 				Symbol:    f.Symbol,
 				Timestamp: ts,
 			})
@@ -266,6 +267,26 @@ func (m *MEXC) GetFundingFees(ctx context.Context, _ []string, since time.Time) 
 		}
 	}
 	return nil, fmt.Errorf("mexc funding records: more than %d pages since %s", mexcFundingMaxPages, since.UTC().Format(time.RFC3339))
+}
+
+// mexcFundingAmount is a settlement as the FundingFee contract wants it:
+// positive received, negative paid. MEXC does not document the sign of
+// `funding`, so the direction is taken from what it does state: a long pays
+// when the rate is positive and receives when it is negative, a short the
+// reverse. Only the size comes from `funding`. A record without a side or a
+// rate keeps the figure as sent.
+func mexcFundingAmount(positionType int, rate, funding float64) float64 {
+	if rate == 0 || (positionType != 1 && positionType != 2) {
+		return funding
+	}
+	size := funding
+	if size < 0 {
+		size = -size
+	}
+	if long := positionType == 1; long == (rate > 0) {
+		return -size
+	}
+	return size
 }
 
 func (m *MEXC) futuresSignedGET(ctx context.Context, path, params string) ([]byte, error) {
