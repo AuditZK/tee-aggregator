@@ -562,10 +562,10 @@ func TestDBPersistOAuthTokensRoundTrip(t *testing.T) {
 }
 
 // The pass after a connect reads from the moment the connect read began, so
-// the trades made that morning are not counted on both days. IG dates every
-// ledger line to the second, which is what makes resuming mid-day safe.
+// the trades made that morning are not counted on both days. IG and MT5 date
+// every ledger line to the second, which is what makes resuming mid-day safe.
 func TestDBActivityWindowResumesAfterTheConnectRead(t *testing.T) {
-	for _, exchange := range []string{"bybit", "ig"} {
+	for _, exchange := range []string{"bybit", "ig", "mt5"} {
 		t.Run(exchange, func(t *testing.T) {
 			h := newDBHarness(t)
 			h.seedConnection(t, exchange, "main", dbKey, dbSecret)

@@ -164,6 +164,7 @@ var instantLedgerExchanges = map[string]bool{
 	"bybit":       true,
 	"hyperliquid": true,
 	"ig":          true,
+	"mt5":         true, // the connector reads deals the bridge dates ahead of the clock (mtDealClockSlack)
 	"okx":         true,
 	"polymarket":  true,
 	"predictfun":  true,
