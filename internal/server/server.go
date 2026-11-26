@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -50,6 +51,8 @@ type Server struct {
 	reflowSvc cashflowReflower
 	// recountSvc does the same for the admin recount-activity endpoint.
 	recountSvc activityRecounter
+	// freeMarginSvc does the same for the admin rewrite-free-margin endpoint.
+	freeMarginSvc freeMarginRewriter
 
 	// handoffHandler, when non-nil, exposes the B2 handoff endpoint
 	// at POST /api/v1/admin/handoff. Successor enclaves use this to
@@ -147,6 +150,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/admin/reflow", s.localhostOnly(s.handleAdminReflow))
 	mux.HandleFunc("/api/v1/admin/convert-to-usd", s.localhostOnly(s.handleAdminConvertToUSD))
 	mux.HandleFunc("/api/v1/admin/recount-activity", s.localhostOnly(s.handleAdminRecountActivity))
+	mux.HandleFunc("/api/v1/admin/rewrite-free-margin", s.localhostOnly(s.handleAdminRewriteFreeMargin))
 
 	// B2 handoff: deliberately NOT gated by localhostOnly because the
 	// successor enclave runs in a different container with a non-loopback
@@ -839,6 +843,79 @@ func (s *Server) handleAdminRecountActivity(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "apply": apply, "count": len(days), "days": days})
+}
+
+// freeMarginRewriter is the slice of the sync service the free-margin rewrite
+// endpoint needs.
+type freeMarginRewriter interface {
+	RewriteRebuiltFreeMargin(ctx context.Context, userUID, exchange, label string, from, to time.Time, apply bool) (*service.FreeMarginRewrite, error)
+}
+
+func (s *Server) freeMarginRewriter() freeMarginRewriter {
+	if s.freeMarginSvc != nil {
+		return s.freeMarginSvc
+	}
+	if s.handler == nil || s.handler.syncSvc == nil {
+		return nil
+	}
+	return s.handler.syncSvc
+}
+
+// handleAdminRewriteFreeMargin rewrites the free margin (available_margin of
+// spot, swap and global) of a connection's REBUILT days between from and to
+// from the margin held the history rebuilder replays from the positions.
+// Live-measured days, equity, flows and activity are never touched. A dry run
+// unless apply=1; apply writes the numbers of the last dry run of the same
+// connection and window (12 hours), without calling the rebuilder again.
+//
+// Usage: POST /api/v1/admin/rewrite-free-margin?user_uid=X&exchange=binance&label=Y&from=2026-08-29&to=2026-11-19[&apply=1]
+func (s *Server) handleAdminRewriteFreeMargin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
+		return
+	}
+	q := r.URL.Query()
+	userUID, exchange, label := q.Get("user_uid"), q.Get("exchange"), q.Get("label")
+	if err := validation.ValidateUserUID(userUID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateExchange(exchange); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validation.ValidateLabel(label); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	from, ferr := time.Parse("2006-01-02", q.Get("from"))
+	to, terr := time.Parse("2006-01-02", q.Get("to"))
+	if ferr != nil || terr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "from and to are required, YYYY-MM-DD"})
+		return
+	}
+	apply := q.Get("apply") == "1"
+
+	rewriter := s.freeMarginRewriter()
+	if rewriter == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "sync service not available"})
+		return
+	}
+	// The dry run waits on a full rebuild.
+	extendWriteDeadline(w, adminReconstructTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), adminReconstructTimeout)
+	defer cancel()
+	out, err := rewriter.RewriteRebuiltFreeMargin(ctx, userUID, exchange, label, from, to, apply)
+	if errors.Is(err, service.ErrFreeMarginNoDryRun) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		s.log().Error("admin rewrite-free-margin failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": s.sanitizeErr(err), "result": out})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "result": out})
 }
 
 // adminReconstructTimeout outlasts the rebuilder call it waits on: expiring

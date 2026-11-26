@@ -167,3 +167,40 @@ func TestClient_TimeoutIsTheChainLink(t *testing.T) {
 		t.Fatalf("RequestTimeout %v does not outlast nginx's 3660s", RequestTimeout)
 	}
 }
+
+// A Portfolio Margin rebuild says its margin held was replayed and carries it
+// per row; an absent marginHeld on such a row is a flat day (0). A rebuild
+// that says nothing leaves the flag false.
+func TestClient_Rebuild_MarginHeldReplayed(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		replayed bool
+		held     []float64
+	}{
+		{"pm rebuild", `{"exchange":"binance","marginHeldReplayed":true,"warnings":["binance_pm.leverage_assumed_constant"],"snapshots":[
+			{"date":"2026-10-01T00:00:00Z","totalEquity":252061,"marginHeld":30000.5},
+			{"date":"2026-10-02T00:00:00Z","totalEquity":252061}]}`, true, []float64{30000.5, 0}},
+		{"classic rebuild", `{"exchange":"binance","snapshots":[{"date":"2026-10-01T00:00:00Z","totalEquity":10}]}`, false, []float64{0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(tc.body)) }))
+			defer srv.Close()
+			res, err := New(srv.URL, "secret-token", zap.NewNop()).Rebuild(context.Background(), RebuildRequest{Exchange: "binance"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.MarginHeldReplayed != tc.replayed {
+				t.Fatalf("replayed = %v, want %v", res.MarginHeldReplayed, tc.replayed)
+			}
+			for i, want := range tc.held {
+				if got := res.Snapshots[i].MarginHeld; got != want {
+					t.Fatalf("row %d margin held %v, want %v", i, got, want)
+				}
+			}
+			if tc.replayed && len(res.Warnings) != 1 {
+				t.Fatalf("warnings = %v", res.Warnings)
+			}
+		})
+	}
+}

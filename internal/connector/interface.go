@@ -297,6 +297,12 @@ type HistoricalSnapshot struct {
 	ShortVolume     float64                   `json:"short_volume"`
 	Breakdown       map[string]*MarketBalance `json:"breakdown,omitempty"` // per-asset breakdown (stocks, options, futures, etc.)
 
+	// MarginHeld is the initial margin the positions held at the end of the
+	// day (USD), as the external rebuilder replayed it (Binance Portfolio
+	// Margin). Not persisted: the rebuilt row's free margin already carries
+	// it. Read by the free-margin rewrite of rebuilt days.
+	MarginHeld float64 `json:"margin_held,omitempty"`
+
 	// Currency is the ISO code the balances and flows above are in, for a
 	// broker that reports an account in its own base currency (IBKR, cTrader).
 	// Empty means USD. The sync converts the row before anything is stored.
