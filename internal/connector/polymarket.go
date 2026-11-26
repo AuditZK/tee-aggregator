@@ -144,6 +144,13 @@ func (p *Polymarket) GetPositions(ctx context.Context) ([]*Position, error) {
 // none, GetNetTradingFees does. A window larger than the page cap comes back
 // cut at the cap: trades feed activity counters, never the equity.
 func (p *Polymarket) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade, error) {
+	trades, _, err := p.fetchTrades(ctx, start, end)
+	return trades, err
+}
+
+// fetchTrades reads the fills between two instants and reports whether the
+// feed ended before the page cap.
+func (p *Polymarket) fetchTrades(ctx context.Context, start, end time.Time) ([]*Trade, bool, error) {
 	q := url.Values{
 		"type":           {"TRADE"},
 		"start":          {polymarketEpoch(start)},
@@ -152,7 +159,7 @@ func (p *Polymarket) GetTrades(ctx context.Context, start, end time.Time) ([]*Tr
 		"limit":          {strconv.Itoa(polymarketPageSize)},
 	}
 	var trades []*Trade
-	_, err := walkPolymarket(ctx, p, "/activity", q, polymarketMaxTradePages, func(r polymarketActivity) error {
+	complete, err := walkPolymarket(ctx, p, "/activity", q, polymarketMaxTradePages, func(r polymarketActivity) error {
 		side := strings.ToLower(r.Side)
 		if r.Type != "TRADE" || (side != "buy" && side != "sell") {
 			return nil
@@ -171,9 +178,9 @@ func (p *Polymarket) GetTrades(ctx context.Context, start, end time.Time) ([]*Tr
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return trades, nil
+	return trades, complete, nil
 }
 
 // GetCashflows returns the collateral that entered or left the wallet without
@@ -196,6 +203,7 @@ func (p *Polymarket) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 // takes. A row dated D holds the equity at 00:00 UTC of D and the activity of
 // the day before.
 func (p *Polymarket) GetHistoricalSnapshots(ctx context.Context, since time.Time) ([]*HistoricalSnapshot, error) {
+	now := time.Now().UTC()
 	flows, err := p.fetchFlows(ctx, time.Time{})
 	if err != nil {
 		return nil, err
@@ -207,7 +215,52 @@ func (p *Polymarket) GetHistoricalSnapshots(ctx context.Context, since time.Time
 	if _, err := p.get(ctx, "/user-pnl", q, &series); err != nil {
 		return nil, err
 	}
-	return polymarketDailyRows(flows, series.Points, since, time.Now().UTC())
+	// The series counts fills but not their side. Without the whole feed the
+	// rows keep its counts and leave the buy/sell split unstated.
+	var days map[int64]*polymarketFillDay
+	if fills, complete, err := p.fetchTrades(ctx, time.Time{}, now); err == nil && complete {
+		days = polymarketFillDays(fills)
+	}
+	return polymarketDailyRows(flows, series.Points, days, since, now)
+}
+
+// polymarketFillDay is the fills a row counts: those of the UTC day before it,
+// the window a live sync at that midnight reads.
+type polymarketFillDay struct {
+	buys, sells     int
+	buyVol, sellVol float64
+}
+
+func polymarketFillDays(fills []*Trade) map[int64]*polymarketFillDay {
+	days := map[int64]*polymarketFillDay{}
+	for _, t := range fills {
+		key := truncUTCDay(t.Timestamp).Add(24 * time.Hour).Unix()
+		d := days[key]
+		if d == nil {
+			d = &polymarketFillDay{}
+			days[key] = d
+		}
+		if t.Side == "sell" {
+			d.sells++
+			d.sellVol += t.Notional()
+		} else {
+			d.buys++
+			d.buyVol += t.Notional()
+		}
+	}
+	return days
+}
+
+// stamp sets a row's activity from its fills, which replace the series'
+// counts so that buys and sells add up to the trades.
+func (d *polymarketFillDay) stamp(row *HistoricalSnapshot) {
+	if d == nil {
+		d = &polymarketFillDay{}
+	}
+	row.TotalTrades = d.buys + d.sells
+	row.TotalVolume = d.buyVol + d.sellVol
+	row.LongTrades, row.ShortTrades = d.buys, d.sells
+	row.LongVolume, row.ShortVolume = d.buyVol, d.sellVol
 }
 
 // GetNetTradingFees states the fees between two instants from the venue's PnL
@@ -385,8 +438,9 @@ func (p *Polymarket) fetchFlows(ctx context.Context, since time.Time) ([]polymar
 
 // polymarketDailyRows builds one row per UTC midnight from the first one after
 // the wallet's first event to today's. A midnight the series cannot mark is
-// left out instead of stated at its settled value.
-func polymarketDailyRows(flows []polymarketFlow, points []polymarketPnL, since, now time.Time) ([]*HistoricalSnapshot, error) {
+// left out instead of stated at its settled value. Fills keyed by row, when
+// given, state each row's activity in place of the series' counts.
+func polymarketDailyRows(flows []polymarketFlow, points []polymarketPnL, fills map[int64]*polymarketFillDay, since, now time.Time) ([]*HistoricalSnapshot, error) {
 	points = append([]polymarketPnL(nil), points...)
 	sort.SliceStable(points, func(i, j int) bool { return points[i].Timestamp < points[j].Timestamp })
 
@@ -429,6 +483,9 @@ func polymarketDailyRows(flows []polymarketFlow, points []polymarketPnL, since, 
 			Withdrawals: withdrawals,
 			TotalTrades: at.TradeCount - prev.TradeCount,
 			TotalVolume: at.VolumeUSDC - prev.VolumeUSDC,
+		}
+		if fills != nil {
+			fills[day.Unix()].stamp(row)
 		}
 		row.TotalFees, _ = polymarketFeesSince(prev, at)
 		prev = at

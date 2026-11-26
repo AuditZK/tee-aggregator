@@ -304,7 +304,7 @@ func TestPolymarketDailyRows(t *testing.T) {
 	}
 	now := polymarketDay(6).Add(9 * time.Hour)
 
-	rows, err := polymarketDailyRows(flows, points, time.Time{}, now)
+	rows, err := polymarketDailyRows(flows, points, nil, time.Time{}, now)
 	if err != nil {
 		t.Fatalf("polymarketDailyRows: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestPolymarketDailyRows(t *testing.T) {
 	}
 
 	t.Run("a later start keeps the running totals", func(t *testing.T) {
-		rows, err := polymarketDailyRows(flows, points, polymarketDay(5).Add(3*time.Hour), now)
+		rows, err := polymarketDailyRows(flows, points, nil, polymarketDay(5).Add(3*time.Hour), now)
 		if err != nil {
 			t.Fatalf("polymarketDailyRows: %v", err)
 		}
@@ -350,14 +350,14 @@ func TestPolymarketDailyRows(t *testing.T) {
 		}
 	})
 	t.Run("an empty wallet has no history", func(t *testing.T) {
-		rows, err := polymarketDailyRows(nil, nil, time.Time{}, now)
+		rows, err := polymarketDailyRows(nil, nil, nil, time.Time{}, now)
 		if err != nil || rows != nil {
 			t.Fatalf("rows, err = %v, %v", rows, err)
 		}
 	})
 	t.Run("a day below zero fails the whole history", func(t *testing.T) {
 		deep := []polymarketPnL{{Timestamp: polymarketDay(3).Unix(), Economic: f64(-5000)}}
-		if _, err := polymarketDailyRows(flows, deep, time.Time{}, now); !errors.Is(err, ErrPolymarketUnreconciled) {
+		if _, err := polymarketDailyRows(flows, deep, nil, time.Time{}, now); !errors.Is(err, ErrPolymarketUnreconciled) {
 			t.Fatalf("error = %v, want ErrPolymarketUnreconciled", err)
 		}
 	})
@@ -372,7 +372,7 @@ func TestPolymarketDailyRows_RebatesReadAsNegativeFees(t *testing.T) {
 	}
 	flows := []polymarketFlow{{at: polymarketDay(1).Add(time.Hour), amount: 100}}
 
-	rows, err := polymarketDailyRows(flows, points, time.Time{}, polymarketDay(4))
+	rows, err := polymarketDailyRows(flows, points, nil, time.Time{}, polymarketDay(4))
 	if err != nil {
 		t.Fatalf("polymarketDailyRows: %v", err)
 	}
@@ -460,13 +460,39 @@ func TestPolymarketGetNetTradingFees(t *testing.T) {
 func TestPolymarketGetHistoricalSnapshots(t *testing.T) {
 	start := truncUTCDay(time.Now().UTC()).Add(-72 * time.Hour)
 	stamp := func(d time.Duration) string { return polymarketEpoch(start.Add(d)) }
-	p, _ := polymarketServer(t, map[string]string{
-		"/activity": `{"data":[{"timestamp":` + stamp(-time.Hour) + `,"type":"DEPOSIT","usdc_size":100}],"pagination":{"next_cursor":null}}`,
-		"/user-pnl": `{"data":{"points":[
-			{"timestamp":` + stamp(24*time.Hour) + `,"economic_pnl":8,"unrealized_pnl":2,"volume_usdc":50,"trade_count":3}
-		]}}`,
-	})
-	rows, err := p.GetHistoricalSnapshots(context.Background(), time.Time{})
+	flows := `{"data":[{"timestamp":` + stamp(-time.Hour) + `,"type":"DEPOSIT","usdc_size":100}],"pagination":{"next_cursor":null}}`
+	fills := `{"data":[
+		{"timestamp":` + stamp(2*time.Hour) + `,"type":"TRADE","side":"BUY","size":10,"usdc_size":4,"price":0.4,"slug":"rain","outcome":"Yes"},
+		{"timestamp":` + stamp(5*time.Hour) + `,"type":"TRADE","side":"SELL","size":5,"usdc_size":2.5,"price":0.5,"slug":"rain","outcome":"Yes"},
+		{"timestamp":` + stamp(26*time.Hour) + `,"type":"TRADE","side":"BUY","size":4,"usdc_size":1,"price":0.25,"slug":"rain","outcome":"No"}
+	],"pagination":{"next_cursor":null}}`
+	series := `{"data":{"points":[
+		{"timestamp":` + stamp(24*time.Hour) + `,"economic_pnl":8,"unrealized_pnl":2,"volume_usdc":50,"trade_count":3}
+	]}}`
+	serve := func(t *testing.T, tradeFeed bool) *Polymarket {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/user-pnl":
+				_, _ = w.Write([]byte(series))
+			case r.URL.Path == "/activity" && r.URL.Query().Get("type") == "TRADE":
+				if !tradeFeed {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				_, _ = w.Write([]byte(fills))
+			case r.URL.Path == "/activity":
+				_, _ = w.Write([]byte(flows))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(srv.Close)
+		p := NewPolymarket(&Credentials{APIKey: polymarketTestWallet})
+		p.baseURL = srv.URL
+		return p
+	}
+
+	rows, err := serve(t, true).GetHistoricalSnapshots(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("GetHistoricalSnapshots: %v", err)
 	}
@@ -476,10 +502,28 @@ func TestPolymarketGetHistoricalSnapshots(t *testing.T) {
 	if !rows[0].Date.Equal(start) || !approxEq(rows[0].TotalEquity, 100) || !approxEq(rows[0].Deposits, 100) {
 		t.Errorf("first row = %+v", rows[0])
 	}
-	if !approxEq(rows[1].TotalEquity, 108) || !approxEq(rows[1].RealizedBalance, 106) || rows[1].TotalTrades != 3 {
+	if !approxEq(rows[1].TotalEquity, 108) || !approxEq(rows[1].RealizedBalance, 106) {
 		t.Errorf("second row = %+v", rows[1])
+	}
+	// The fills of the day before each row, by side, in place of the series' count.
+	if r := rows[1]; r.TotalTrades != 2 || r.LongTrades != 1 || r.ShortTrades != 1 ||
+		!approxEq(r.LongVolume, 4) || !approxEq(r.ShortVolume, 2.5) || !approxEq(r.TotalVolume, 6.5) {
+		t.Errorf("second row activity = %+v", r)
+	}
+	if r := rows[2]; r.TotalTrades != 1 || r.LongTrades != 1 || r.ShortTrades != 0 || !approxEq(r.TotalVolume, 1) {
+		t.Errorf("third row activity = %+v", r)
 	}
 	if !approxEq(rows[3].TotalEquity, 108) || rows[3].TotalTrades != 0 {
 		t.Errorf("last row = %+v, want the last mark carried with no activity", rows[3])
 	}
+
+	t.Run("without the fill feed the series counts stay, unsplit", func(t *testing.T) {
+		rows, err := serve(t, false).GetHistoricalSnapshots(context.Background(), time.Time{})
+		if err != nil {
+			t.Fatalf("GetHistoricalSnapshots: %v", err)
+		}
+		if r := rows[1]; r.TotalTrades != 3 || !approxEq(r.TotalVolume, 50) || r.LongTrades != 0 || r.ShortTrades != 0 {
+			t.Errorf("second row = %+v, want the series' 3 trades and no split", r)
+		}
+	})
 }
