@@ -13,6 +13,22 @@ import (
 
 const mexcAPI = "https://api.mexc.com"
 
+// mexcFuturesAPI hosts the contract (futures) API, which signs differently.
+const mexcFuturesAPI = "https://contract.mexc.com"
+
+// mexcPathFundingRecords is the account's funding settlements, paged, newest
+// first, with no time filter (contract API v1, "Get details of user's funding
+// rate"). The connector used to call /api/v1/private/account/funding_records,
+// which the API does not have, and read the failure as "no futures".
+const mexcPathFundingRecords = "/api/v1/private/position/funding_records"
+
+// mexcFundingPageSize is the API's maximum page size for funding records.
+const mexcFundingPageSize = 100
+
+// mexcFundingMaxPages bounds a funding read: 200 pages of 100 records. A
+// window that still reaches further back fails rather than come back short.
+const mexcFundingMaxPages = 200
+
 // QUAL-001: extracted to remove a 3-way duplication of the spot-account path.
 const mexcPathAccount = "/api/v3/account"
 
@@ -30,6 +46,9 @@ type MEXC struct {
 
 	// cashflowNotes carries the markers the last GetCashflows raised.
 	cashflowNotes noteList
+
+	// futuresURL is mexcFuturesAPI, swapped by tests.
+	futuresURL string
 }
 
 // CapabilityWarnings implements CapabilityWarner with the flows the last
@@ -39,7 +58,8 @@ func (m *MEXC) CapabilityWarnings() []string { return m.cashflowNotes.get() }
 // NewMEXC creates a new MEXC connector.
 func NewMEXC(creds *Credentials) *MEXC {
 	return &MEXC{
-		base: NewCryptoBase(creds.APIKey, creds.APISecret, mexcAPI),
+		base:       NewCryptoBase(creds.APIKey, creds.APISecret, mexcAPI),
+		futuresURL: mexcFuturesAPI,
 	}
 }
 
@@ -176,47 +196,76 @@ func (m *MEXC) GetBalanceByMarket(_ context.Context) ([]*MarketBalance, error) {
 	return balances, nil
 }
 
-// GetFundingFees returns funding fee history from MEXC futures.
-func (m *MEXC) GetFundingFees(ctx context.Context, symbols []string, since time.Time) ([]*FundingFee, error) {
-	params := "page_num=1&page_size=100"
-	body, err := m.futuresSignedGET(ctx, "/api/v1/private/account/funding_records", params)
-	if err != nil {
-		return nil, nil // Futures not available, return empty
-	}
-
-	var resp struct {
-		Success bool `json:"success"`
-		Data    struct {
-			ResultList []struct {
-				Symbol      string  `json:"symbol"`
-				FundingRate float64 `json:"fundingRate"`
-				SettleTime  int64   `json:"settleTime"`
-				Funding     float64 `json:"funding"`
-			} `json:"resultList"`
-		} `json:"data"`
-	}
-
-	if json.Unmarshal(body, &resp) != nil || !resp.Success {
-		return nil, nil
-	}
-
+// GetFundingFees returns the account's funding settlements since a time,
+// from MEXC futures. The endpoint has no time filter: it pages newest first,
+// so the read walks pages until one ends before since. funding is the amount
+// the account received, negative when it paid, which is the FundingFee
+// convention.
+//
+// An account whose key cannot read futures answers ErrFundingNotRead, so a
+// recount keeps the funding it stored instead of writing a zero. Any other
+// failure is an error: it used to come back as "no funding", which a sync
+// stored as a zero.
+func (m *MEXC) GetFundingFees(ctx context.Context, _ []string, since time.Time) ([]*FundingFee, error) {
 	var fees []*FundingFee
-	for _, f := range resp.Data.ResultList {
-		ts := time.UnixMilli(f.SettleTime)
-		if ts.Before(since) {
-			continue
+	seen := map[int64]struct{}{}
+	for page := 1; page <= mexcFundingMaxPages; page++ {
+		params := fmt.Sprintf("page_num=%d&page_size=%d", page, mexcFundingPageSize)
+		body, err := m.futuresSignedGET(ctx, mexcPathFundingRecords, params)
+		if err != nil {
+			return nil, fmt.Errorf("mexc funding records page %d: %w", page, err)
 		}
-		if f.Funding == 0 {
-			continue
-		}
-		fees = append(fees, &FundingFee{
-			Amount:    f.Funding,
-			Symbol:    f.Symbol,
-			Timestamp: ts,
-		})
-	}
 
-	return fees, nil
+		var resp struct {
+			Success bool `json:"success"`
+			Code    int  `json:"code"`
+			Data    struct {
+				TotalPage  int `json:"totalPage"`
+				ResultList []struct {
+					ID         int64   `json:"id"`
+					Symbol     string  `json:"symbol"`
+					SettleTime int64   `json:"settleTime"`
+					Funding    float64 `json:"funding"`
+				} `json:"resultList"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("parse mexc funding records: %w", err)
+		}
+		if !resp.Success {
+			// MEXC answers HTTP 200 with success=false when the key has no
+			// futures access, the same way /account/assets does in GetBalance.
+			return nil, fmt.Errorf("%w: mexc funding records code %d", ErrFundingNotRead, resp.Code)
+		}
+
+		reachedSince := false
+		for _, f := range resp.Data.ResultList {
+			ts := time.UnixMilli(f.SettleTime).UTC()
+			if ts.Before(since) {
+				reachedSince = true
+				continue
+			}
+			// A settlement landing while we page shifts every row down one
+			// place, so the last row of a page comes back at the top of the
+			// next one.
+			if _, dup := seen[f.ID]; dup {
+				continue
+			}
+			seen[f.ID] = struct{}{}
+			if f.Funding == 0 {
+				continue
+			}
+			fees = append(fees, &FundingFee{
+				Amount:    f.Funding,
+				Symbol:    f.Symbol,
+				Timestamp: ts,
+			})
+		}
+		if reachedSince || len(resp.Data.ResultList) < mexcFundingPageSize || page >= resp.Data.TotalPage {
+			return fees, nil
+		}
+	}
+	return nil, fmt.Errorf("mexc funding records: more than %d pages since %s", mexcFundingMaxPages, since.UTC().Format(time.RFC3339))
 }
 
 func (m *MEXC) futuresSignedGET(ctx context.Context, path, params string) ([]byte, error) {
@@ -226,7 +275,11 @@ func (m *MEXC) futuresSignedGET(ctx context.Context, path, params string) ([]byt
 		// MEXC futures signature: HMAC-SHA256(apiKey + timestamp + params)
 		signature := signHMACHex(m.base.APISecret, m.base.APIKey+ts+params)
 
-		url := "https://contract.mexc.com" + path
+		base := m.futuresURL
+		if base == "" {
+			base = mexcFuturesAPI
+		}
+		url := base + path
 		if params != "" {
 			url += "?" + params
 		}
