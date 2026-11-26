@@ -27,6 +27,23 @@ const metatraderPathSessions = "/api/v1/sessions/"
 // the same rule.
 var mtServerName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$`)
 
+// mtDealClockSlack is how far ahead of the clock the bridge can date a deal: it
+// guesses the server's UTC offset from the latest deal or position, and the
+// guess only comes out low for a server east of UTC.
+const mtDealClockSlack = 6 * time.Hour
+
+// mtDealsUntil is where a deal read ending at end stops. A read ending now runs
+// past it by mtDealClockSlack, since no deal dated later was made after now.
+func mtDealsUntil(end, now time.Time) time.Time {
+	if end.Before(now.Add(-time.Minute)) {
+		return end
+	}
+	if ahead := now.Add(mtDealClockSlack); ahead.After(end) {
+		return ahead
+	}
+	return end
+}
+
 // MetaTrader implements Connector for MT4/MT5 through mt-bridge service.
 type MetaTrader struct {
 	protocol string // mt4 or mt5
@@ -267,8 +284,9 @@ func (m *MetaTrader) GetTrades(ctx context.Context, start, end time.Time) ([]*Tr
 		return nil, err
 	}
 
+	until := mtDealsUntil(end, time.Now())
 	from := strconv.FormatInt(start.Unix(), 10)
-	to := strconv.FormatInt(end.Unix(), 10)
+	to := strconv.FormatInt(until.Unix(), 10)
 	path := metatraderPathSessions + sessionID + "/history-deals?from=" + url.QueryEscape(from) + "&to=" + url.QueryEscape(to)
 
 	var rows []struct {
@@ -294,7 +312,7 @@ func (m *MetaTrader) GetTrades(ctx context.Context, start, end time.Time) ([]*Tr
 			ts = start
 		}
 		// Bridge ignores from/to params — filter client-side
-		if ts.Before(start) || ts.After(end) {
+		if ts.Before(start) || ts.After(until) {
 			continue
 		}
 		side := strings.ToLower(strings.TrimSpace(d.Side))
@@ -450,9 +468,9 @@ func (m *MetaTrader) GetCashflows(ctx context.Context, since time.Time) ([]*Cash
 		return nil, err
 	}
 
-	now := time.Now().UTC()
+	until := time.Now().UTC().Add(mtDealClockSlack)
 	path := fmt.Sprintf("/api/v1/sessions/%s/history-deals?from=%d&to=%d",
-		sessionID, since.Unix(), now.Unix())
+		sessionID, since.Unix(), until.Unix())
 
 	// Bridge returns a direct array of deals (same format as GetTrades)
 	var deals []struct {
