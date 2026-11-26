@@ -81,8 +81,83 @@ func TestRecountOnlyVenuesThatReadAPastRange(t *testing.T) {
 	if !ok || containsMarket(bn.markets, connector.MarketSpot) || bn.horizon == 0 {
 		t.Fatalf("binance scope = %+v, want swap only with a horizon", bn)
 	}
-	if _, ok := recountScopeFor("hyperliquid"); ok {
-		t.Fatal("hyperliquid recountable without a checked past-range reader")
+	for _, venue := range []string{"hyperliquid", "mexc"} {
+		sc, ok := recountScopeFor(venue)
+		if !ok || !sc.fundingOnly || len(sc.markets) != 0 {
+			t.Fatalf("%s scope = %+v, want funding only: its fills are not read back", venue, sc)
+		}
+	}
+	if _, ok := recountScopeFor("okx"); ok {
+		t.Fatal("okx recountable without a checked past-range reader")
+	}
+}
+
+// A funding-only venue has its funding rewritten from the settlements of the
+// row's window. Trades, volume, fees, equity and margin stay as stored.
+func TestRecountFundingDayRewritesFundingAlone(t *testing.T) {
+	d1 := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
+	d2 := d1.Add(24 * time.Hour)
+	rows := []*repository.Snapshot{recountRow(d1, 1000, 5, false), recountRow(d2, 1100, 68, false)}
+	rows[1].Breakdown.Swap.FundingFees, rows[1].Breakdown.Global.FundingFees = 9, 9
+	funding := []*connector.FundingFee{
+		{Amount: -50, Timestamp: d1.Add(-time.Hour)},
+		{Amount: -6, Timestamp: d1},
+		{Amount: 2, Timestamp: d1.Add(16 * time.Hour)},
+		{Amount: -100, Timestamp: d2},
+	}
+
+	d := recountFundingDay(rows, 1, "hyperliquid", funding)
+	if d.Kept != "" {
+		t.Fatalf("live day kept: %s", d.Kept)
+	}
+	if d.OldFundingFees != 9 || d.NewFundingFees != 4 || !d.changed() {
+		t.Fatalf("funding %v -> %v, want 9 -> 4 (paid, as a cost)", d.OldFundingFees, d.NewFundingFees)
+	}
+	if d.NewTrades != 68 || d.NewVolume != 99999 || d.NewTradingFees != -20 {
+		t.Fatalf("activity moved: %+v", d)
+	}
+	for _, m := range []*repository.MarketMetrics{d.breakdown.Swap, d.breakdown.Global} {
+		if m.FundingFees != 4 || m.Trades != 68 || m.Volume != 99999 || m.Equity != 1100 || m.AvailableMargin != 400 {
+			t.Fatalf("entry = %+v, want funding 4 and the rest as stored", m)
+		}
+	}
+	if rows[1].Breakdown.Swap.FundingFees != 9 {
+		t.Fatal("the stored row was edited in place")
+	}
+}
+
+// MEXC days were stored with no funding and sometimes no swap entry at all.
+func TestRecountFundingDayCreatesTheFundingMarket(t *testing.T) {
+	d1 := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
+	d2 := d1.Add(24 * time.Hour)
+	rows := []*repository.Snapshot{recountRow(d1, 1000, 0, false), recountRow(d2, 1100, 0, false)}
+	rows[1].Breakdown.Swap = nil
+	rows[1].Breakdown.Spot = &repository.MarketMetrics{Equity: 1100}
+
+	d := recountFundingDay(rows, 1, "mexc", []*connector.FundingFee{{Amount: -0.5, Timestamp: d1.Add(8 * time.Hour)}})
+	if d.NewFundingFees != 0.5 || d.breakdown.Swap == nil || d.breakdown.Swap.FundingFees != 0.5 {
+		t.Fatalf("funding = %v, swap = %+v, want 0.5 on a new swap entry", d.NewFundingFees, d.breakdown.Swap)
+	}
+	if d.breakdown.Spot.Equity != 1100 || d.breakdown.Global.Equity != 1100 {
+		t.Fatal("equity moved")
+	}
+}
+
+// A read that does not reach back to the row's day says nothing about it: a
+// stored figure is not replaced by a zero.
+func TestRecountFundingDayKeepsADayTheReadDoesNotReach(t *testing.T) {
+	d1 := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	d2 := d1.Add(24 * time.Hour)
+	rows := []*repository.Snapshot{recountRow(d1, 1000, 5, false), recountRow(d2, 1100, 68, false)}
+	rows[1].Breakdown.Swap.FundingFees, rows[1].Breakdown.Global.FundingFees = 9, 9
+	later := []*connector.FundingFee{{Amount: -3, Timestamp: d2.Add(48 * time.Hour)}}
+
+	if d := recountFundingDay(rows, 1, "hyperliquid", later); d.Kept == "" || d.changed() {
+		t.Fatalf("day rewritten from a read that starts after it: %+v", d)
+	}
+	rows[1].FromExternalRebuilder = true
+	if d := recountFundingDay(rows, 1, "hyperliquid", nil); d.Kept != "reconstructed day" {
+		t.Fatalf("reconstructed day not kept: %+v", d)
 	}
 }
 

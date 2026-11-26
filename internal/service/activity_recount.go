@@ -21,6 +21,10 @@ import (
 type recountScope struct {
 	markets []string
 	horizon time.Duration
+	// fundingOnly: the venue's funding can be read back over a past range
+	// but its fills cannot be trusted to (a capped or unpaged fill read), so
+	// the recount rewrites the stored funding and nothing else.
+	fundingOnly bool
 }
 
 var activityRecountScopes = map[string]recountScope{
@@ -28,6 +32,12 @@ var activityRecountScopes = map[string]recountScope{
 	// Spot reads only the symbols held today, one day per call, so its past
 	// days cannot be read back. UM fills are kept three months.
 	"binance": {markets: []string{connector.MarketSwap}, horizon: 89 * 24 * time.Hour},
+	// userFillsByTime answers at most 2000 fills and is not paged; userFunding
+	// is (hlInfoPaged).
+	"hyperliquid": {fundingOnly: true},
+	// Funding records page back with no time filter; past fills are not read
+	// back by range.
+	"mexc": {fundingOnly: true},
 }
 
 func recountScopeFor(exchange string) (recountScope, bool) {
@@ -97,13 +107,18 @@ func (s *SyncService) RecountActivity(ctx context.Context, userUID, exchange, la
 	if scope.horizon > 0 && since.Before(time.Now().Add(-scope.horizon)) {
 		return nil, fmt.Errorf("recount: %s keeps fills for %d days", exchange, int(scope.horizon/(24*time.Hour)))
 	}
-	trades, err := conn.GetTrades(recountTradesContext(ctx, scope), since, to)
-	if err != nil {
-		return nil, fmt.Errorf("read trades: %w", err)
+	var trades []*connector.Trade
+	if !scope.fundingOnly {
+		if trades, err = conn.GetTrades(recountTradesContext(ctx, scope), since, to); err != nil {
+			return nil, fmt.Errorf("read trades: %w", err)
+		}
 	}
 	funding, readsFunding, err := recountFunding(ctx, conn, since)
 	if err != nil {
 		return nil, err
+	}
+	if scope.fundingOnly && !readsFunding {
+		return nil, fmt.Errorf("recount: %s funding cannot be read on this account", exchange)
 	}
 
 	var out []RecountDay
@@ -112,7 +127,12 @@ func (s *SyncService) RecountActivity(ctx context.Context, userUID, exchange, la
 		if day := r.Timestamp.UTC(); day.Before(from) || day.After(to) {
 			continue
 		}
-		d := s.recountDay(rows, i, connMeta.Exchange, scope.markets, trades, funding, readsFunding)
+		var d RecountDay
+		if scope.fundingOnly {
+			d = recountFundingDay(rows, i, connMeta.Exchange, funding)
+		} else {
+			d = s.recountDay(rows, i, connMeta.Exchange, scope.markets, trades, funding, readsFunding)
+		}
 		if apply && d.Kept == "" && d.changed() {
 			ok, err := s.snapshotRepo.UpdateActivity(ctx, r.ID, d.OldTrades, d.OldVolume, d.breakdown)
 			if err != nil {
@@ -243,6 +263,83 @@ func (s *SyncService) recountDay(rows []*repository.Snapshot, i int, exchange st
 	d.NewTrades, d.NewVolume = g.Trades, g.Volume
 	d.NewTradingFees, d.NewFundingFees = g.TradingFees, g.FundingFees
 	d.NewLongTrades, d.NewShortTrades = g.LongTrades, g.ShortTrades
+	return d
+}
+
+// recountFundingDay rewrites the funding of row i from the settlements in its
+// window and leaves its trades, volume and fees as stored. The row is kept
+// when it was reconstructed, and when the read holds no settlement as old as
+// its window while the row stores some: the venue's history may simply not
+// reach that far, and a zero would erase what the sync measured.
+func recountFundingDay(rows []*repository.Snapshot, i int, exchange string, funding []*connector.FundingFee) RecountDay {
+	r := rows[i]
+	day := r.Timestamp.UTC()
+	d := RecountDay{Day: day}
+	if r.Breakdown != nil && r.Breakdown.Global != nil {
+		g := r.Breakdown.Global
+		d.OldTrades, d.OldVolume = g.Trades, g.Volume
+		d.OldTradingFees, d.OldFundingFees = g.TradingFees, g.FundingFees
+		d.OldLongTrades, d.OldShortTrades = g.LongTrades, g.ShortTrades
+	}
+	d.NewTrades, d.NewVolume = d.OldTrades, d.OldVolume
+	d.NewTradingFees, d.NewFundingFees = d.OldTradingFees, d.OldFundingFees
+	d.NewLongTrades, d.NewShortTrades = d.OldLongTrades, d.OldShortTrades
+	if r.FromExternalRebuilder || r.IsHistorical {
+		d.Kept = "reconstructed day"
+		return d
+	}
+
+	start := reflowWindowStart(rows, i)
+	charges, reached := 0.0, false
+	for _, f := range funding {
+		ts := f.Timestamp.UTC()
+		if ts.Before(day) {
+			reached = true
+		}
+		if !ts.Before(start) && ts.Before(day) {
+			charges += f.Amount
+		}
+	}
+	if !reached && d.OldFundingFees != 0 {
+		d.Kept = "no funding read as far back as this day"
+		return d
+	}
+
+	out := &repository.MarketBreakdown{}
+	if r.Breakdown != nil {
+		*out = *r.Breakdown
+	}
+	// The market that carries funding (applyFundingFees): its entry takes the
+	// new figure, and global moves by the same amount.
+	agg := &aggregatedBreakdown{}
+	slot := marketSlot{}
+	for _, sl := range marketSlots(out, agg) {
+		if sl.name == fundingMarketType(exchange) {
+			slot = sl
+		}
+	}
+	stored := 0.0
+	if *slot.m != nil {
+		stored = (*slot.m).FundingFees
+	}
+	fresh := -charges // funding is stored as a cost
+	if *slot.m != nil || fresh != 0 {
+		m := &repository.MarketMetrics{}
+		if *slot.m != nil {
+			*m = **slot.m
+		}
+		m.FundingFees = fresh
+		*slot.m = m
+	}
+	g := &repository.MarketMetrics{Equity: r.TotalEquity}
+	if out.Global != nil {
+		*g = *out.Global
+	}
+	g.FundingFees += fresh - stored
+	out.Global = g
+
+	d.breakdown = out
+	d.NewFundingFees = g.FundingFees
 	return d
 }
 
