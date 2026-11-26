@@ -28,7 +28,7 @@ func (f *fakeFreeMargin) RewriteRebuiltFreeMargin(_ context.Context, _, _, _ str
 }
 
 func TestAdminRewriteFreeMargin(t *testing.T) {
-	const uid = "0134b0b7-6aec-50ec-b0bf-bde0ae11fcbd"
+	const uid = "0f1e2d3c-4b5a-5968-8776-a5b4c3d2e1f0"
 	const window = "&from=2026-08-29&to=2026-11-19"
 	cases := []struct {
 		name      string
@@ -39,12 +39,12 @@ func TestAdminRewriteFreeMargin(t *testing.T) {
 		wantCall  bool
 		wantApply bool
 	}{
-		{"GET refused", http.MethodGet, "user_uid=" + uid + "&exchange=binance&label=efrxx" + window, nil, http.StatusMethodNotAllowed, false, false},
-		{"bad uid", http.MethodPost, "user_uid=nope&exchange=binance&label=efrxx" + window, nil, http.StatusBadRequest, false, false},
-		{"missing window", http.MethodPost, "user_uid=" + uid + "&exchange=binance&label=efrxx", nil, http.StatusBadRequest, false, false},
-		{"dry run by default", http.MethodPost, "user_uid=" + uid + "&exchange=binance&label=efrxx" + window, nil, http.StatusOK, true, false},
-		{"apply only when asked", http.MethodPost, "user_uid=" + uid + "&exchange=binance&label=efrxx" + window + "&apply=1", nil, http.StatusOK, true, true},
-		{"apply without dry run", http.MethodPost, "user_uid=" + uid + "&exchange=binance&label=efrxx" + window + "&apply=1", service.ErrFreeMarginNoDryRun, http.StatusConflict, true, true},
+		{"GET refused", http.MethodGet, "user_uid=" + uid + "&exchange=binance&label=main" + window, nil, http.StatusMethodNotAllowed, false, false},
+		{"bad uid", http.MethodPost, "user_uid=nope&exchange=binance&label=main" + window, nil, http.StatusBadRequest, false, false},
+		{"missing window", http.MethodPost, "user_uid=" + uid + "&exchange=binance&label=main", nil, http.StatusBadRequest, false, false},
+		{"dry run by default", http.MethodPost, "user_uid=" + uid + "&exchange=binance&label=main" + window, nil, http.StatusOK, true, false},
+		{"apply only when asked", http.MethodPost, "user_uid=" + uid + "&exchange=binance&label=main" + window + "&apply=1", nil, http.StatusOK, true, true},
+		{"apply without dry run", http.MethodPost, "user_uid=" + uid + "&exchange=binance&label=main" + window + "&apply=1", service.ErrFreeMarginNoDryRun, http.StatusConflict, true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -104,10 +104,10 @@ func fmIdentical(t *testing.T, day time.Time, a, b fmRow) {
 }
 
 func fmProRow(day time.Time, rebuilt bool) *repository.Snapshot {
-	r := classicProRow(241946, 10115, 0, rebuilt)
+	r := classicProRow(180000, 8000, 0, rebuilt)
 	r.ID = ""
 	r.UserUID, r.Exchange, r.Label, r.Timestamp = dbUser, "binance", "main", day
-	r.RealizedBalance, r.Deposits, r.Withdrawals = 250000, 125, 40
+	r.RealizedBalance, r.Deposits, r.Withdrawals = 185000, 125, 40
 	return r
 }
 
@@ -118,10 +118,10 @@ func serveProRebuild(t *testing.T, days []time.Time, held float64, coveredFrom t
 	var snaps []map[string]any
 	for _, d := range days {
 		snaps = append(snaps, map[string]any{
-			"date": d, "totalEquity": 260000.0, "realizedBalance": 255000.0, "deposits": 9999.0, "totalTrades": 99,
+			"date": d, "totalEquity": 195000.0, "realizedBalance": 190000.0, "deposits": 9999.0, "totalTrades": 99,
 			"marginHeld": held,
 			"breakdown": map[string]any{
-				"swap": map[string]any{"marketType": "swap", "equity": 257000.0, "availableMargin": 257000.0 - held},
+				"swap": map[string]any{"marketType": "swap", "equity": 192000.0, "availableMargin": 192000.0 - held},
 				"spot": map[string]any{"marketType": "spot", "equity": 3000.0, "availableMargin": 3000.0},
 			},
 		})
@@ -190,8 +190,8 @@ func TestDBRewriteRebuiltFreeMargin(t *testing.T) {
 		t.Fatalf("written %d, want 3", applied.Written)
 	}
 	after := h.storedRows(t)
-	// held 30000: the wallet's 10115 to zero, 19885 off the pool in spot.
-	wantSpot := 241946.0 - (held - 10115)
+	// held 30000: the wallet's 8000 to zero, 22000 off the pool in spot.
+	wantSpot := 180000.0 - (held - 8000)
 	for day, b := range before {
 		a := after[day]
 		if day.Before(d1) || !day.Before(d4) {
@@ -224,7 +224,7 @@ func TestDBRewriteRebuiltFreeMargin(t *testing.T) {
 		t.Fatal(err)
 	}
 	ok, err := h.snaps.UpdateRebuiltAvailableMargin(h.ctx, liveID,
-		map[string]repository.MarketMargin{"spot": {Equity: 241946, AvailableMargin: 241946}}, map[string]float64{"spot": 1})
+		map[string]repository.MarketMargin{"spot": {Equity: 180000, AvailableMargin: 180000}}, map[string]float64{"spot": 1})
 	if err != nil || ok {
 		t.Fatalf("live row written by the repository: ok=%v err=%v", ok, err)
 	}

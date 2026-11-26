@@ -41,24 +41,25 @@ func proRebuilt(pool, held, outside float64) *connector.HistoricalSnapshot {
 
 func fmNear(a, b float64) bool { return math.Abs(a-b) < 1e-6 }
 
-// The efrxx shape: ~252k, ~20k held by the USDⓈ-M positions. The held margin
+// A pool mostly in cross margin, a small USDⓈ-M wallet, more held by the
+// USDⓈ-M positions than that wallet holds. The held margin
 // comes off the USDⓈ-M wallet to zero, then off the cross margin pool in
 // spot; equity is not part of what is written.
 func TestFreeMarginDayDeductsHeldFromThePool(t *testing.T) {
-	d := freeMarginDay(classicProRow(241946, 10115, 0, true), proRebuilt(249000, 20000, 3061), time.Time{})
+	d := freeMarginDay(classicProRow(180000, 8000, 0, true), proRebuilt(186000, 20000, 2000), time.Time{})
 	if d.Kept != "" {
 		t.Fatalf("kept: %s", d.Kept)
 	}
-	if !fmNear(d.OldAvailable, 241946) || !fmNear(d.NewAvailable, 232061) {
-		t.Fatalf("global free margin %.2f -> %.2f, want 241946 (the whole pool, the wallet at 0) -> 232061", d.OldAvailable, d.NewAvailable)
+	if !fmNear(d.OldAvailable, 180000) || !fmNear(d.NewAvailable, 168000) {
+		t.Fatalf("global free margin %.2f -> %.2f, want 180000 (the whole pool, the wallet at 0) -> 168000", d.OldAvailable, d.NewAvailable)
 	}
-	if m := d.Markets["swap"]; !fmNear(m.NewAvailable, 0) || !fmNear(m.Equity, 10115) {
-		t.Fatalf("swap %+v, want free 0 on equity 10115", m)
+	if m := d.Markets["swap"]; !fmNear(m.NewAvailable, 0) || !fmNear(m.Equity, 8000) {
+		t.Fatalf("swap %+v, want free 0 on equity 8000", m)
 	}
-	if m := d.Markets["spot"]; !fmNear(m.NewAvailable, 241946-(20000-10115)) {
-		t.Fatalf("spot free %.2f, want %.2f", m.NewAvailable, 241946.0-(20000-10115))
+	if m := d.Markets["spot"]; !fmNear(m.NewAvailable, 180000-(20000-8000)) {
+		t.Fatalf("spot free %.2f, want %.2f", m.NewAvailable, 180000.0-(20000-8000))
 	}
-	if !fmNear(d.Equity, 252061) || !fmNear(d.MarginHeld, 20000) {
+	if !fmNear(d.Equity, 188000) || !fmNear(d.MarginHeld, 20000) {
 		t.Fatalf("day equity/held %+v", d)
 	}
 	for key := range d.next {
@@ -85,13 +86,13 @@ func TestFreeMarginDayReplacesTheClassicDeduction(t *testing.T) {
 
 func TestFreeMarginDayKeepsWhatItCannotFix(t *testing.T) {
 	cover := fmDay.AddDate(0, 0, 3)
-	bad := proRebuilt(249000, 20000, 0)
-	bad.Breakdown["swap"].AvailableMargin = 249000 // a classic row: held not deducted from the pool
-	noPool := proRebuilt(249000, 20000, 0)
+	bad := proRebuilt(186000, 20000, 0)
+	bad.Breakdown["swap"].AvailableMargin = 186000 // a classic row: held not deducted from the pool
+	noPool := proRebuilt(186000, 20000, 0)
 	delete(noPool.Breakdown, "swap")
-	converted := classicProRow(241946, 10115, 0, true)
+	converted := classicProRow(180000, 8000, 0, true)
 	converted.Breakdown.Global.NativeCurrency = "EUR"
-	brokenSum := classicProRow(241946, 10115, 0, true)
+	brokenSum := classicProRow(180000, 8000, 0, true)
 	brokenSum.Breakdown.Global.Equity += 50
 
 	for _, tc := range []struct {
@@ -101,13 +102,13 @@ func TestFreeMarginDayKeepsWhatItCannotFix(t *testing.T) {
 		cover   time.Time
 		kept    string
 	}{
-		{"live day", classicProRow(241946, 10115, 0, false), proRebuilt(249000, 20000, 0), time.Time{}, "live-measured"},
-		{"before the reach", classicProRow(241946, 10115, 0, true), nil, cover, "before the rebuild's reach"},
-		{"not rebuilt", classicProRow(241946, 10115, 0, true), nil, time.Time{}, "not in the rebuild"},
-		{"not a pool row", classicProRow(241946, 10115, 0, true), bad, time.Time{}, "does not follow"},
-		{"no pool entry", classicProRow(241946, 10115, 0, true), noPool, time.Time{}, "no pool"},
-		{"converted row", converted, proRebuilt(249000, 20000, 0), time.Time{}, "converted"},
-		{"global not the sum", brokenSum, proRebuilt(249000, 20000, 0), time.Time{}, "not the sum"},
+		{"live day", classicProRow(180000, 8000, 0, false), proRebuilt(186000, 20000, 0), time.Time{}, "live-measured"},
+		{"before the reach", classicProRow(180000, 8000, 0, true), nil, cover, "before the rebuild's reach"},
+		{"not rebuilt", classicProRow(180000, 8000, 0, true), nil, time.Time{}, "not in the rebuild"},
+		{"not a pool row", classicProRow(180000, 8000, 0, true), bad, time.Time{}, "does not follow"},
+		{"no pool entry", classicProRow(180000, 8000, 0, true), noPool, time.Time{}, "no pool"},
+		{"converted row", converted, proRebuilt(186000, 20000, 0), time.Time{}, "converted"},
+		{"global not the sum", brokenSum, proRebuilt(186000, 20000, 0), time.Time{}, "not the sum"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := freeMarginDay(tc.stored, tc.rebuilt, tc.cover)
@@ -137,15 +138,15 @@ func TestFreeMarginDayFloorsAtZero(t *testing.T) {
 // margin: it all comes off the pool in spot. No bucket ends above its
 // equity or below zero.
 func TestFreeMarginDayNegativeWallet(t *testing.T) {
-	d := freeMarginDay(classicProRow(252561, -500, 0, true), proRebuilt(252000, 20000, 61), time.Time{})
+	d := freeMarginDay(classicProRow(190500, -500, 0, true), proRebuilt(189900, 20000, 100), time.Time{})
 	if d.Kept != "" {
 		t.Fatalf("kept: %s", d.Kept)
 	}
-	if !fmNear(d.Markets["swap"].NewAvailable, 0) || !fmNear(d.Markets["spot"].NewAvailable, 232561) {
+	if !fmNear(d.Markets["swap"].NewAvailable, 0) || !fmNear(d.Markets["spot"].NewAvailable, 170500) {
 		t.Fatalf("got %+v", d.Markets)
 	}
-	if !fmNear(d.NewAvailable, 232561) {
-		t.Fatalf("global %.2f, want 232561 (under the global equity 252061, no clamp)", d.NewAvailable)
+	if !fmNear(d.NewAvailable, 170500) {
+		t.Fatalf("global %.2f, want 170500 (under the global equity 190000, no clamp)", d.NewAvailable)
 	}
 	if err := checkFreeMarginBuckets(d.Markets); err != nil {
 		t.Fatal(err)

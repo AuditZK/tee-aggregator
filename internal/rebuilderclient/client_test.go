@@ -179,8 +179,8 @@ func TestClient_Rebuild_MarginHeldReplayed(t *testing.T) {
 		held     []float64
 	}{
 		{"pm rebuild", `{"exchange":"binance","marginHeldReplayed":true,"warnings":["binance_pm.leverage_assumed_constant"],"snapshots":[
-			{"date":"2026-10-01T00:00:00Z","totalEquity":252061,"marginHeld":30000.5},
-			{"date":"2026-10-02T00:00:00Z","totalEquity":252061}]}`, true, []float64{30000.5, 0}},
+			{"date":"2026-10-01T00:00:00Z","totalEquity":188000,"marginHeld":30000.5},
+			{"date":"2026-10-02T00:00:00Z","totalEquity":188000}]}`, true, []float64{30000.5, 0}},
 		{"classic rebuild", `{"exchange":"binance","snapshots":[{"date":"2026-10-01T00:00:00Z","totalEquity":10}]}`, false, []float64{0}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

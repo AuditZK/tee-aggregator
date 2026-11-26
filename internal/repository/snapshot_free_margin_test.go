@@ -10,9 +10,9 @@ import (
 // margin pool in spot at available = equity, the USDⓈ-M wallet floored at 0.
 // The numbers carry more digits than a float round trip would keep exactly
 // if it re-encoded them, and an unknown key.
-const storedRebuiltDay = `{"spot":{"equity":241946.123456789012,"available_margin":241946.123456789012,"volume":0,"trades":0,"trading_fees":0,"funding_fees":0,"x_unknown":{"a":[1,2]}},` +
-	`"swap":{"equity":10115.5,"volume":1234.5,"trades":7,"trading_fees":0.61,"funding_fees":-3.25},` +
-	`"global":{"equity":252061.623456789012,"available_margin":252061.623456789012,"volume":1234.5,"trades":7,"trading_fees":0.61,"funding_fees":-3.25,"long_trades":4,"short_trades":3}}`
+const storedRebuiltDay = `{"spot":{"equity":180000.123456789012,"available_margin":180000.123456789012,"volume":0,"trades":0,"trading_fees":0,"funding_fees":0,"x_unknown":{"a":[1,2]}},` +
+	`"swap":{"equity":8000.5,"volume":1234.5,"trades":7,"trading_fees":0.61,"funding_fees":-3.25},` +
+	`"global":{"equity":188000.623456789012,"available_margin":188000.623456789012,"volume":1234.5,"trades":7,"trading_fees":0.61,"funding_fees":-3.25,"long_trades":4,"short_trades":3}}`
 
 func entries(t *testing.T, raw []byte) map[string]map[string]json.RawMessage {
 	t.Helper()
@@ -35,11 +35,11 @@ func entries(t *testing.T, raw []byte) map[string]map[string]json.RawMessage {
 // other key of every entry keeps its stored bytes, equity included.
 func TestPatchAvailableMarginTouchesOnlyFreeMargin(t *testing.T) {
 	expect := map[string]MarketMargin{
-		"spot":   {Equity: 241946.123456789012, AvailableMargin: 241946.123456789012},
-		"swap":   {Equity: 10115.5, AvailableMargin: 0},
-		"global": {Equity: 252061.623456789012, AvailableMargin: 252061.623456789012},
+		"spot":   {Equity: 180000.123456789012, AvailableMargin: 180000.123456789012},
+		"swap":   {Equity: 8000.5, AvailableMargin: 0},
+		"global": {Equity: 188000.623456789012, AvailableMargin: 188000.623456789012},
 	}
-	next := map[string]float64{"spot": 231946.12, "swap": 0, "global": 231946.12}
+	next := map[string]float64{"spot": 170000.12, "swap": 0, "global": 170000.12}
 	out, ok, err := patchAvailableMargin([]byte(storedRebuiltDay), expect, next)
 	if err != nil || !ok {
 		t.Fatalf("patch: ok=%v err=%v", ok, err)
@@ -76,11 +76,11 @@ func TestPatchAvailableMarginTouchesOnlyFreeMargin(t *testing.T) {
 // A row rewritten since the dry run read it (equity or free margin moved) is
 // left alone, and so is a row without the entry.
 func TestPatchAvailableMarginRefusesAMovedRow(t *testing.T) {
-	good := map[string]MarketMargin{"spot": {Equity: 241946.123456789012, AvailableMargin: 241946.123456789012}}
+	good := map[string]MarketMargin{"spot": {Equity: 180000.123456789012, AvailableMargin: 180000.123456789012}}
 	next := map[string]float64{"spot": 1}
 	for name, expect := range map[string]map[string]MarketMargin{
-		"equity moved": {"spot": {Equity: 241000, AvailableMargin: 241946.123456789012}},
-		"margin moved": {"spot": {Equity: 241946.123456789012, AvailableMargin: 1000}},
+		"equity moved": {"spot": {Equity: 179000, AvailableMargin: 180000.123456789012}},
+		"margin moved": {"spot": {Equity: 180000.123456789012, AvailableMargin: 1000}},
 	} {
 		if _, ok, err := patchAvailableMargin([]byte(storedRebuiltDay), expect, next); err != nil || ok {
 			t.Errorf("%s: ok=%v err=%v, want refused", name, ok, err)
