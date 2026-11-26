@@ -441,3 +441,12 @@ func TradeMarketWanted(ctx context.Context, market string) bool {
 	}
 	return false
 }
+
+// BalanceDegradationReporter is implemented by connectors whose balance read
+// can fall back to a coarser reading. BalanceDegradations hands out, once,
+// the causes the last GetBalance fell back for, worded without account
+// identifiers or amounts. The sync logs them for operators; they are not
+// capability markers, which the frontend shows the user.
+type BalanceDegradationReporter interface {
+	BalanceDegradations() []string
+}
