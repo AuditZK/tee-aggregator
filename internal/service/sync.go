@@ -1427,6 +1427,22 @@ type liveActivity struct {
 	cashflows []*connector.Cashflow
 }
 
+// fundingWindow is the funding a live row carries: whole closed UTC days,
+// [midnight of the activity window's start, midnight of now), the rule the
+// activity recount applies too (a row at D 00:00 carries [D-1 00:00, D
+// 00:00)). The fills and flows keep the instant-to-instant window; funding
+// cannot. Binance and Bybit stamp a settlement on the hour (00:00:00) and
+// post it seconds to minutes later, while the midnight pass reads from
+// 00:00:00 on and the next window resumes at that pass's start stamp:
+// a 00:00 settlement posted after the read fell before every later window
+// and was never counted. On whole days it belongs to the day it opens and
+// is read a day after it was posted. The windows are half-open and touch, so
+// each row counts once, and a pass that rewrites its own day reads the same
+// window again over the same row.
+func fundingWindow(from, now time.Time) (time.Time, time.Time) {
+	return calendarDay(from.UTC()), calendarDay(now.UTC())
+}
+
 // readActivity reads the window's trades, funding fees and cashflows, leaving
 // out those filed under a day in booked. Trades and funding fees are
 // best-effort.
@@ -1456,7 +1472,12 @@ func (s *SyncService) readActivity(ctx context.Context, conn connector.Connector
 	act.breakdown = s.aggregateTrades(act.trades)
 
 	if ffFetcher, ok := conn.(connector.FundingFeesFetcher); ok {
-		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, from); err == nil {
+		fFrom, fTo := fundingWindow(from, now)
+		if fees, err := ffFetcher.GetFundingFees(ctx, swapSymbols, fFrom); err == nil {
+			fees = slices.DeleteFunc(fees, func(f *connector.FundingFee) bool {
+				ts := f.Timestamp.UTC()
+				return ts.Before(fFrom) || !ts.Before(fTo)
+			})
 			act.fundingCharges = applyFundingFees(act.breakdown, connMeta.Exchange, fees)
 		}
 	}

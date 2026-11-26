@@ -469,3 +469,46 @@ func TestBinance_PMPro_ProbedOnGrossCrossMargin(t *testing.T) {
 }
 
 func strconvItoa(v int64) string { return strconv.FormatInt(v, 10) }
+
+// The sync reads funding over whole UTC days from midnight: on both
+// Portfolio Margin flavours a settlement stamped exactly at that midnight is
+// inside the read, and the income is asked from that very millisecond.
+func TestBinance_PortfolioMarginFunding_SettlementOnTheMidnightItStartsFrom(t *testing.T) {
+	midnight := time.Now().UTC().Truncate(24 * time.Hour).Add(-24 * time.Hour)
+	rows := []pmIncomeRow{
+		{symbol: "BTCUSDT", incomeType: "FUNDING_FEE", income: "-3", asset: "USDT", time: midnight, tranID: 1},
+		{symbol: "BTCUSDT", incomeType: "FUNDING_FEE", income: "-7", asset: "USDT", time: midnight.Add(-time.Millisecond), tranID: 2},
+	}
+	for name, c := range map[string]struct {
+		srv  *binancePMActivityServer
+		path string
+	}{
+		"papi":   {&binancePMActivityServer{portfolioMargin: true, umIncome: rows}, "/papi/v1/um/income"},
+		"pm pro": {func() *binancePMActivityServer { s := pmProAccount(); s.umIncome = rows; return s }(), "/fapi/v1/income"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := c.srv.connector(t)
+			if _, err := b.GetBalance(context.Background()); err != nil {
+				t.Fatalf("GetBalance: %v", err)
+			}
+			fees, err := b.GetFundingFees(context.Background(), nil, midnight)
+			if err != nil {
+				t.Fatalf("GetFundingFees: %v", err)
+			}
+			if len(fees) != 1 || fees[0].Amount != -3 || !fees[0].Timestamp.Equal(midnight) {
+				t.Fatalf("fees = %+v, want the midnight settlement alone", fees)
+			}
+			c.srv.mu.Lock()
+			defer c.srv.mu.Unlock()
+			for _, u := range c.srv.calls {
+				if u.Path == c.path {
+					if st := u.Query().Get("startTime"); st != strconv.FormatInt(midnight.UnixMilli(), 10) {
+						t.Fatalf("startTime = %s, want the midnight itself", st)
+					}
+					return
+				}
+			}
+			t.Fatalf("%s never read", c.path)
+		})
+	}
+}
