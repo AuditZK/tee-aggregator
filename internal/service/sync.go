@@ -1834,6 +1834,12 @@ func (s *SyncService) flowsFromPublishedPnL(ctx context.Context, pp connector.Cu
 	measured := prev.Timestamp.UTC()
 	if read := s.lastLiveRead(ctx, connMeta); read != nil && !read.Before(measured) && read.Before(measured.Add(24*time.Hour)) && read.Before(startOfDay) {
 		measured = *read
+	} else if start := s.sameDayWindowStart(ctx, connMeta, startOfDay); start != nil && !start.Before(measured) && start.Before(measured.Add(24*time.Hour)) {
+		// A rewrite of today's row: the stamp is today's, but the pass that
+		// first wrote the row started where the previous row was read, and
+		// kept that instant. Measuring from the previous row's midnight
+		// instead puts the PnL made before its read on today's row as a flow.
+		measured = *start
 	}
 	before, err := pp.CumulativePnL(ctx, measured)
 	if err == nil {

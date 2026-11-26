@@ -120,3 +120,54 @@ func TestDBFlowsFromPublishedPnL_ConnectRowIsReadAtItsSyncInstant(t *testing.T) 
 		t.Errorf("pnl asked at %v, want the connect read at %v", c.asked, connected)
 	}
 }
+
+// Equity 1000 at X 00:00, 1100 when a manual sync reads it at X 14:00, the
+// midnight pass writes row D at 1100, a manual sync rewrites row D at 1100.
+// The rewrite used to measure the PnL from X 00:00 against X's 14:00 equity,
+// and the morning's +100 came out as a withdrawal on row D.
+func TestDBFlowsFromPublishedPnL_SameDayRewriteMeasuresFromThePreviousRead(t *testing.T) {
+	for _, exchange := range []string{"hyperliquid", "predictfun"} {
+		t.Run(exchange, func(t *testing.T) {
+			h := newDBHarness(t)
+			h.seedConnection(t, exchange, "main", dbKey, dbSecret)
+			x := startOfTodayUTC().Add(-24 * time.Hour)
+			read := x.Add(14 * time.Hour)
+			if err := h.snaps.Upsert(h.ctx, &repository.Snapshot{
+				UserUID: dbUser, Exchange: exchange, Label: "main", Timestamp: x,
+				TotalEquity: 1100, RealizedBalance: 1100,
+			}); err != nil {
+				t.Fatalf("seed row X: %v", err)
+			}
+			if err := h.statuses.Upsert(h.ctx, &repository.SyncStatus{
+				UserUID: dbUser, Exchange: exchange, Label: "main", LastSyncTime: &read, Status: "completed",
+			}); err != nil {
+				t.Fatalf("seed status: %v", err)
+			}
+			c := &pnlConnector{
+				scriptedConnector: scriptedConnector{exchange: exchange, balances: []connector.Balance{{Equity: 1100, Available: 1100}}},
+				pnlNow:            100,
+				pnlAt: func(at time.Time) (float64, error) {
+					if at.Before(read) {
+						return 0, nil
+					}
+					return 100, nil
+				},
+			}
+			h.plant(dbKey, dbSecret, c)
+
+			for _, pass := range []string{"midnight pass", "rewrite 1", "rewrite 2"} {
+				if res := h.sync.SyncConnectionScheduledByLabel(h.ctx, dbUser, exchange, "main"); !res.Success {
+					t.Fatalf("%s failed: %+v", pass, res)
+				}
+				if snap := h.snapshotToday(t, exchange, "main"); snap.Deposits != 0 || snap.Withdrawals != 0 {
+					t.Errorf("%s: row D = +%v/-%v, want none: the PnL since X's read explains the move", pass, snap.Deposits, snap.Withdrawals)
+				}
+			}
+			for i, at := range c.asked {
+				if !at.Equal(read) {
+					t.Errorf("pnl asked at %s on pass %d, want X's read %s", at.Format(time.RFC3339), i+1, read.Format(time.RFC3339))
+				}
+			}
+		})
+	}
+}
