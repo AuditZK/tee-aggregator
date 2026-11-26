@@ -399,3 +399,18 @@ type Credentials struct {
 	// reaches both the live and the demo account (BingX).
 	Demo bool
 }
+
+// BalanceCrossCheck is a second reading of part of the equity the last
+// GetBalance measured, from the venue's own figure for it. The sync logs it
+// for operators; nothing stores it.
+type BalanceCrossCheck struct {
+	Name      string
+	Measured  float64
+	Reference float64
+}
+
+// BalanceCrossChecker is implemented by connectors that can compare part of
+// their equity with the venue's own figure for it.
+type BalanceCrossChecker interface {
+	BalanceCrossCheck() (BalanceCrossCheck, bool)
+}

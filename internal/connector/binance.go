@@ -60,6 +60,10 @@ type Binance struct {
 	// papiPacer keeps the papi weight this connector spends under
 	// binancePapiBudgetPerMinute.
 	papiPacer binanceWeightPacer
+	// pmPro is what the last /sapi/v1/portfolio/account probe found: whether
+	// the account is Portfolio Margin Pro (fapi answers, papi refuses), and
+	// the pool's cross-check. Probed once per instance, never fatal.
+	pmPro binancePMProState
 }
 
 // Binance wallet names. Their own vocabulary, not market types: cross and
@@ -248,9 +252,11 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 		b.pmVerdict = binancePMYes
 	}
 
+	var crossEq, coinMEq float64
 	if !portfolioMargin {
 		if eq, cerr := b.getCoinMFuturesEquity(ctx, priceMap); cerr == nil {
 			total.Equity += eq
+			coinMEq = eq
 			nonUM += eq
 			b.noteWallet(binanceWalletCoinM, nil)
 		} else if errors.Is(cerr, ErrTransient) {
@@ -264,6 +270,7 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 		}
 		if eq, merr := b.getCrossMarginEquity(ctx, priceMap); merr == nil {
 			total.Equity += eq
+			crossEq = eq
 			nonUM += eq
 			b.noteWallet(binanceWalletCross, nil)
 		} else if errors.Is(merr, ErrTransient) {
@@ -336,6 +343,16 @@ func (b *Binance) GetBalance(ctx context.Context) (*Balance, error) {
 	total.Available = nonUM
 	if futures != nil {
 		total.Available += futures.Available
+	}
+
+	// Portfolio Margin Pro shows nothing here: fapi answers and the pool reads
+	// as cross margin. Settled from /sapi/v1/portfolio/account, never fatal.
+	if !portfolioMargin {
+		pool := crossEq + coinMEq
+		if futures != nil {
+			pool += futures.Equity
+		}
+		b.settlePortfolioMarginPro(ctx, crossEq, coinMEq, pool)
 	}
 
 	return total, nil
@@ -773,6 +790,16 @@ func (b *Binance) GetTrades(ctx context.Context, start, end time.Time) ([]*Trade
 		futuresTrades, err := b.getFuturesTrades(ctx, start, end)
 		if err == nil {
 			allTrades = append(allTrades, futuresTrades...)
+			if pro, _ := b.portfolioMarginProState(); pro == binancePMYes {
+				// Portfolio Margin Pro: UM fills read on fapi above, the pool's
+				// margin fills on sapi.
+				marginTrades, merr := b.getPortfolioMarginProMarginTrades(ctx, start, end)
+				allTrades = append(allTrades, marginTrades...)
+				if merr != nil {
+					b.activityNotes.add(binancePMTradesUnreadable)
+					return allTrades, fmt.Errorf("portfolio margin pro trades: %w", merr)
+				}
+			}
 			return allTrades, nil
 		}
 		if verdict == binancePMNo || !b.probePortfolioMargin(ctx, err) {
