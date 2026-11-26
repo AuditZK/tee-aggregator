@@ -242,6 +242,9 @@ type reconstructOpts struct {
 	// recalibration leave it false on purpose: there the rebuilt rows upsert
 	// over the connect-day live row to retire its inception deposit.
 	keepLiveDays bool
+	// cut receives how keepLiveDays cut the series, when a live day is stored.
+	// For the dry-run answer, which otherwise shows only the kept days.
+	cut func(LiveDayCut)
 }
 
 // rebuiltDays are the dates, UTC midnight, a reconstruction wrote in this pass.
@@ -1877,8 +1880,13 @@ func (s *SyncService) ReconstructHistoryRange(ctx context.Context, userUID, exch
 // the days it would have persisted, so they can be compared against what is
 // already stored. Synchronous, unlike ReconstructHistoryRange: the caller is
 // waiting for the answer, not for confirmation that work started.
-func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, exchange, label string, from, to time.Time) []*repository.Snapshot {
+//
+// The cut is how the run stopped at the connection's first live day, nil when
+// no live day is stored: with it the caller can tell an empty answer cut whole
+// from a rebuild that returned nothing.
+func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, exchange, label string, from, to time.Time) ([]*repository.Snapshot, *LiveDayCut) {
 	var out []*repository.Snapshot
+	var cut *LiveDayCut
 	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{
 		window: dayWindow{
 			from: time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC),
@@ -1887,8 +1895,9 @@ func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, excha
 		dryRun:       true,
 		collect:      func(sn []*repository.Snapshot) { out = sn },
 		keepLiveDays: true,
+		cut:          func(c LiveDayCut) { cut = &c },
 	})
-	return out
+	return out, cut
 }
 
 // reconstructHistoryFor pings analytics once when it ends, whatever it wrote,
@@ -2657,7 +2666,7 @@ func (s *SyncService) persistHistoricalSnapshots(
 	// the same origin flag as the live branch on the production schema, so its
 	// stored rows cannot be told from live ones.
 	if opts.keepLiveDays && source == sourceExternalRebuilder {
-		kept, err := s.dropDaysFromFirstLive(ctx, connMeta, snapshots)
+		kept, err := s.dropDaysFromFirstLive(ctx, connMeta, snapshots, opts)
 		if err != nil {
 			return err
 		}
@@ -2813,7 +2822,7 @@ func (s *SyncService) persistHistoricalSnapshots(
 // connection's first live day and drops the rest (keepLiveDays). The stored
 // rows must be read: without them nothing tells which days were measured, and
 // writing anyway is the overwrite this guard exists to prevent.
-func (s *SyncService) dropDaysFromFirstLive(ctx context.Context, connMeta *repository.ExchangeConnection, rebuilt []*repository.Snapshot) ([]*repository.Snapshot, error) {
+func (s *SyncService) dropDaysFromFirstLive(ctx context.Context, connMeta *repository.ExchangeConnection, rebuilt []*repository.Snapshot, opts reconstructOpts) ([]*repository.Snapshot, error) {
 	existing, err := s.snapshotRepo.GetByUserAndDateRange(ctx, connMeta.UserUID, time.Unix(0, 0).UTC(), time.Now().UTC().Add(24*time.Hour))
 	if err != nil {
 		s.logger.Error("history reconstruction not written — stored days unreadable, live days cannot be kept",
@@ -2834,7 +2843,16 @@ func (s *SyncService) dropDaysFromFirstLive(ctx context.Context, connMeta *repos
 	if cut.firstLive.IsZero() {
 		return rebuilt, nil
 	}
-	s.logger.Info("history reconstruction stopped at the first live day",
+	if opts.cut != nil {
+		opts.cut(LiveDayCut{
+			FirstLiveDay:        cut.firstLive,
+			DaysKept:            len(cut.kept),
+			DaysDropped:         cut.dropped,
+			DaysDroppedOverLive: cut.overLive,
+			MaxRelativeGap:      cut.maxGap,
+		})
+	}
+	fields := []zap.Field{
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
 		zap.String("label", connMeta.Label),
@@ -2843,8 +2861,42 @@ func (s *SyncService) dropDaysFromFirstLive(ctx context.Context, connMeta *repos
 		zap.Int("days_dropped", cut.dropped),
 		zap.Int("days_dropped_over_live", cut.overLive),
 		zap.Float64("max_relative_gap", cut.maxGap),
-	)
+	}
+	// The kept days never meet a measured day, so the witness cannot judge
+	// them: the dropped days that do meet one are the only evidence the
+	// rebuild describes this account. A basis difference (Binance PM, 0.14%)
+	// passes; a rebuild of another wallet set, a fifth off, does not.
+	if cut.overLive > 0 && cut.maxGap > liveDayCutTolerance {
+		if opts.dryRun {
+			s.logger.Warn("history reconstruction DRY RUN — contradicts the live days it stops at (series follows)", fields...)
+			return cut.kept, nil
+		}
+		s.logger.Error("history reconstruction rejected — contradicts the live days it stops at",
+			append(fields,
+				zap.Int("days_discarded", len(rebuilt)),
+				zap.String("hint", "the rebuild did not reproduce the days the live sync measured; nothing was written"))...)
+		return nil, fmt.Errorf("reconstruction contradicts the measured equity by %.2f%% after %s",
+			cut.maxGap*100, cut.firstLive.Format("2006-01-02"))
+	}
+	s.logger.Info("history reconstruction stopped at the first live day", fields...)
 	return cut.kept, nil
+}
+
+// liveDayCutTolerance is how far a rebuilt day may sit from the live day it is
+// dropped in favour of before the whole admin reconstruction is refused. Wider
+// than reproductionTolerance on purpose: those days are not written, so a
+// difference of equity basis between the two instruments is no reason to
+// refuse the days before them; a different account is.
+const liveDayCutTolerance = 0.02
+
+// LiveDayCut reports how an admin reconstruction was cut at the connection's
+// first live day, for the dry-run answer.
+type LiveDayCut struct {
+	FirstLiveDay        time.Time
+	DaysKept            int
+	DaysDropped         int
+	DaysDroppedOverLive int
+	MaxRelativeGap      float64
 }
 
 // liveDayCut is a rebuilt series split at the connection's first live day.

@@ -88,11 +88,16 @@ func TestDBAdminReconstructKeepsEveryLiveDay(t *testing.T) {
 	basisShift := utcDay(2026, 11, 20)
 
 	for _, tc := range []struct {
-		name string
-		gap  float64 // relative gap of the rebuild over the live days from Nov 20
+		name    string
+		gap     float64 // relative gap of the rebuild over the live days from Nov 20
+		refused bool
 	}{
-		{"live days on another basis from Nov 20", 0.0015},
-		{"live days reproduced", 0},
+		{"live days on another basis from Nov 20", 0.0015, false},
+		{"live days reproduced", 0, false},
+		// The kept days meet no measured day, so the live days the rebuild is
+		// cut at are its only witness: a rebuild of another wallet set, a
+		// fifth off, is refused whole rather than written before them.
+		{"rebuild of another account", 0.20, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newDBHarness(t)
@@ -133,10 +138,14 @@ func TestDBAdminReconstructKeepsEveryLiveDay(t *testing.T) {
 					t.Fatalf("%s, older than the rebuild's horizon, was changed: %+v", d.Format(time.DateOnly), r)
 				}
 			})
+			wantBefore := freshRebuild
+			if tc.refused {
+				wantBefore = storedRebuilt
+			}
 			eachDay(utcDay(2026, 8, 29), firstLive.AddDate(0, 0, -1), func(d time.Time) {
 				r := got[d]
-				if r == nil || r.TotalEquity != freshRebuild || !r.FromExternalRebuilder {
-					t.Fatalf("%s before the first live day not written by the rebuild: %+v", d.Format(time.DateOnly), r)
+				if r == nil || r.TotalEquity != wantBefore || !r.FromExternalRebuilder {
+					t.Fatalf("%s before the first live day: %+v, want equity %v from the rebuilder", d.Format(time.DateOnly), r, wantBefore)
 				}
 			})
 			eachDay(firstLive, lastLive, func(d time.Time) {
@@ -149,8 +158,15 @@ func TestDBAdminReconstructKeepsEveryLiveDay(t *testing.T) {
 						d.Format(time.DateOnly), r.TotalEquity, r.FromExternalRebuilder, r.IsHistorical)
 				}
 			})
-			if n := logs.FilterMessageSnippet("rejected").Len(); n != 0 {
-				t.Fatalf("%d refusal lines, want none", n)
+			refusals := logs.FilterMessageSnippet("rejected").All()
+			if tc.refused {
+				if len(refusals) != 1 || refusals[0].Level != zapcore.ErrorLevel {
+					t.Fatalf("%d refusal lines, want one at Error", len(refusals))
+				}
+				return
+			}
+			if len(refusals) != 0 {
+				t.Fatalf("%d refusal lines, want none", len(refusals))
 			}
 
 			lines := logs.FilterMessage("history reconstruction stopped at the first live day").All()
@@ -193,8 +209,12 @@ func TestDBAdminReconstructDryRunStopsAtTheFirstLiveDay(t *testing.T) {
 	srv := serveRebuild(t, days, utcDay(2026, 8, 29))
 	h.sync.SetRebuilderClient(rebuilderclient.New(srv.URL, "internal-token-0123456789", zap.NewNop()))
 
-	out := h.sync.DryRunReconstructRange(h.ctx, dbUser, "binance", "main", utcDay(2026, 8, 29), utcDay(2026, 11, 26))
+	out, cut := h.sync.DryRunReconstructRange(h.ctx, dbUser, "binance", "main", utcDay(2026, 8, 29), utcDay(2026, 11, 26))
 
+	if cut == nil || !cut.FirstLiveDay.Equal(firstLive) || cut.DaysKept != 56 || cut.DaysDroppedOverLive != 33 ||
+		math.Abs(cut.MaxRelativeGap-0.0015) > 1e-9 {
+		t.Fatalf("dry run cut: %+v", cut)
+	}
 	if len(out) != 56 {
 		t.Fatalf("dry run would write %d days, want the 56 before Oct 24", len(out))
 	}
@@ -234,5 +254,34 @@ func TestDBConnectReconstructStillOverwritesTheConnectDay(t *testing.T) {
 	}
 	if len(got) != len(days) {
 		t.Fatalf("%d rows after the connect backfill, want %d", len(got), len(days))
+	}
+}
+
+// A dry run cut whole still says why it has no day to show.
+func TestDBAdminReconstructDryRunCutWholeReportsTheCut(t *testing.T) {
+	h := newDBHarness(t)
+	h.seedConnection(t, "binance", "main", dbKey, dbSecret)
+	firstLive := utcDay(2026, 10, 24)
+	var seed []*repository.Snapshot
+	eachDay(firstLive, utcDay(2026, 11, 25), func(d time.Time) {
+		seed = append(seed, binanceRow(d, 2000, false))
+	})
+	if err := h.snaps.UpsertBatch(h.ctx, seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	var days []rebuiltDay
+	eachDay(utcDay(2026, 11, 1), utcDay(2026, 11, 20), func(d time.Time) {
+		days = append(days, rebuiltDay{Date: d, TotalEquity: 2000})
+	})
+	srv := serveRebuild(t, days, utcDay(2026, 11, 1))
+	h.sync.SetRebuilderClient(rebuilderclient.New(srv.URL, "internal-token-0123456789", zap.NewNop()))
+
+	out, cut := h.sync.DryRunReconstructRange(h.ctx, dbUser, "binance", "main", utcDay(2026, 11, 1), utcDay(2026, 11, 20))
+
+	if len(out) != 0 {
+		t.Fatalf("dry run would write %d live days", len(out))
+	}
+	if cut == nil || !cut.FirstLiveDay.Equal(firstLive) || cut.DaysKept != 0 || cut.DaysDropped != 20 {
+		t.Fatalf("dry run cut whole: %+v, want first live day %s, 0 kept, 20 dropped", cut, firstLive.Format(time.DateOnly))
 	}
 }

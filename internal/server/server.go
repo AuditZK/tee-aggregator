@@ -395,11 +395,15 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		extendWriteDeadline(w, adminReconstructTimeout)
 		ctx, cancel := context.WithTimeout(r.Context(), adminReconstructTimeout)
 		defer cancel()
-		days := s.handler.syncSvc.DryRunReconstructRange(ctx, userUID, exchange, label, from, to)
+		days, cut := s.handler.syncSvc.DryRunReconstructRange(ctx, userUID, exchange, label, from, to)
 		rows := dryRunRows(days)
-		writeJSON(w, http.StatusOK, map[string]any{
+		resp := map[string]any{
 			"success": true, "dry_run": true, "count": len(rows), "days": rows,
-		})
+		}
+		if cut != nil {
+			resp["live_day_cut"] = liveDayCutJSON(cut)
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
@@ -538,6 +542,18 @@ func (s *Server) handleAdminUnpinBrokerAccounts(w http.ResponseWriter, r *http.R
 // The breakdown carries the per-market free margin, which a stored day can
 // lack while its equity is right: margin used is read from it and applied to
 // the stored equity, never the rebuilt equity itself.
+// liveDayCutJSON is how a dry run stopped at the connection's first live day.
+// Counts and a ratio only, no balance.
+func liveDayCutJSON(c *service.LiveDayCut) map[string]any {
+	return map[string]any{
+		"first_live_day":         c.FirstLiveDay.Format("2006-01-02"),
+		"days_kept":              c.DaysKept,
+		"days_dropped":           c.DaysDropped,
+		"days_dropped_over_live": c.DaysDroppedOverLive,
+		"max_relative_gap":       c.MaxRelativeGap,
+	}
+}
+
 func dryRunRows(days []*repository.Snapshot) []map[string]any {
 	rows := make([]map[string]any, 0, len(days))
 	for _, d := range days {
