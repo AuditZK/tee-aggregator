@@ -313,6 +313,10 @@ func (s *Server) handleAdminSyncConnection(w http.ResponseWriter, r *http.Reques
 // rewriting up to 90 days of already-correct live snapshots. Both bounds are
 // required together; passing only one is rejected rather than silently
 // widening to a full reconstruct.
+//
+// Whatever the mode, an external rebuild writes no day on or after the
+// connection's first live day (service.ReconstructHistoryAdmin): those days
+// stay as the live sync measured them.
 func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
@@ -403,7 +407,7 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		ctx, cancel := context.WithTimeout(context.Background(), adminReconstructTimeout)
 		defer cancel()
 		if fromStr == "" {
-			s.handler.syncSvc.ReconstructHistoryOnConnect(ctx, userUID, exchange, label)
+			s.handler.syncSvc.ReconstructHistoryAdmin(ctx, userUID, exchange, label)
 			return
 		}
 		s.handler.syncSvc.ReconstructHistoryRange(ctx, userUID, exchange, label, from, to, dryRun)
