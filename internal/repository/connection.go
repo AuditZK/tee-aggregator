@@ -59,6 +59,9 @@ type ExchangeConnection struct {
 	// the external rebuilder, MUST skip this connection (SEC-08). Set by
 	// MarkRebuildRequested; other scan paths leave it nil.
 	RebuildRequestedAt *time.Time `json:"rebuild_requested_at,omitempty"`
+	// RebuildFrom is the first day of the month a rebuild starts from. Only
+	// GetByUserExchangeLabel and ListUnfinalizedExternalRebuilds read it.
+	RebuildFrom *time.Time `json:"rebuild_from,omitempty"`
 }
 
 // ConnectionRepo handles exchange connection persistence.
@@ -75,6 +78,7 @@ type ConnectionRepo struct {
 	hasIsPaperCol             bool
 	hasRebuildFinalizedAtCol  bool
 	hasRebuildRequestedAtCol  bool
+	hasRebuildFromCol         bool
 	hasBrokerAccountsCol      bool
 	isTSSchema                bool // true = TS Prisma camelCase columns
 }
@@ -826,7 +830,7 @@ func (r *ConnectionRepo) getByUserExchangeLabelTS(ctx context.Context, userUID, 
 	query := `
 		SELECT id, "userUid", exchange, label,
 			"encryptedApiKey", "encryptedApiSecret", "encryptedPassphrase",
-			"isActive", "createdAt", "updatedAt", ` + paperCol + `
+			"isActive", "createdAt", "updatedAt", ` + paperCol + `, ` + r.rebuildFromSelect(ctx) + `
 		FROM exchange_connections
 		WHERE "userUid" = $1 AND exchange = $2 AND TRIM(label) = TRIM($3) AND "isActive" = true`
 
@@ -835,7 +839,7 @@ func (r *ConnectionRepo) getByUserExchangeLabelTS(ctx context.Context, userUID, 
 	err := r.pool.QueryRow(ctx, query, userUID, exchange, label).Scan(
 		&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label,
 		&conn.EncryptedAPIKey, &conn.EncryptedAPISecret, &encPassphrase,
-		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt, &conn.IsPaper,
+		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt, &conn.IsPaper, &conn.RebuildFrom,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -859,7 +863,7 @@ func (r *ConnectionRepo) GetByUserExchangeLabel(ctx context.Context, userUID, ex
 			encrypted_api_key, api_key_iv, api_key_auth_tag,
 			encrypted_api_secret, api_secret_iv, api_secret_auth_tag,
 			encrypted_passphrase, passphrase_iv, passphrase_auth_tag,
-			is_active, created_at, updated_at
+			is_active, created_at, updated_at, ` + r.rebuildFromSelect(ctx) + `
 		FROM exchange_connections
 		WHERE user_uid = $1 AND exchange = $2 AND TRIM(label) = TRIM($3) AND is_active = true`
 
@@ -869,7 +873,7 @@ func (r *ConnectionRepo) GetByUserExchangeLabel(ctx context.Context, userUID, ex
 		&conn.EncryptedAPIKey, &conn.APIKeyIV, &conn.APIKeyAuthTag,
 		&conn.EncryptedAPISecret, &conn.APISecretIV, &conn.APISecretAuthTag,
 		&conn.EncryptedPassphrase, &conn.PassphraseIV, &conn.PassphraseAuthTag,
-		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt,
+		&conn.IsActive, &conn.CreatedAt, &conn.UpdatedAt, &conn.RebuildFrom,
 	)
 
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -966,6 +970,7 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 	isPaperCol := probe(r.colName("is_paper"))
 	rebuildFinalizedCol := probe(r.colName("rebuild_finalized_at"))
 	rebuildRequestedCol := probe(r.colName("rebuild_requested_at"))
+	rebuildFromCol := probe(r.colName("rebuild_from"))
 	brokerAccountsCol := probe(r.colName("broker_accounts"))
 
 	r.hasCredentialsHashCol = credHashCol
@@ -975,6 +980,7 @@ func (r *ConnectionRepo) getCapabilityFlags(ctx context.Context) (hasCredentials
 	r.hasIsPaperCol = isPaperCol
 	r.hasRebuildFinalizedAtCol = rebuildFinalizedCol
 	r.hasRebuildRequestedAtCol = rebuildRequestedCol
+	r.hasRebuildFromCol = rebuildFromCol
 	r.hasBrokerAccountsCol = brokerAccountsCol
 	r.capabilitiesLoaded = !probeFailed
 
@@ -1005,6 +1011,25 @@ func (r *ConnectionRepo) HasRebuildRequestedAtCol(ctx context.Context) bool {
 	r.capMu.Lock()
 	defer r.capMu.Unlock()
 	return r.hasRebuildRequestedAtCol
+}
+
+// HasRebuildFromCol reports whether the schema includes the rebuild_from
+// column (migration 022). Without it no start month is stored or read, and
+// every rebuild uses the rebuilder's default window.
+func (r *ConnectionRepo) HasRebuildFromCol(ctx context.Context) bool {
+	r.getCapabilityFlags(ctx)
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	return r.hasRebuildFromCol
+}
+
+// rebuildFromSelect is the rebuild_from select expression, a typed NULL when
+// the column is absent so the scan stays the same shape.
+func (r *ConnectionRepo) rebuildFromSelect(ctx context.Context) string {
+	if !r.HasRebuildFromCol(ctx) {
+		return "NULL::date"
+	}
+	return r.qcol("rebuild_from")
 }
 
 // colName returns the raw column name (without quotes) for columnExists checks.
@@ -1050,6 +1075,7 @@ var tsColumnMap = map[string]string{
 	"updated_at":            "updatedAt",
 	"rebuild_finalized_at":  "rebuildFinalizedAt",
 	"rebuild_requested_at":  "rebuildRequestedAt",
+	"rebuild_from":          "rebuildFrom",
 	"broker_accounts":       "brokerAccounts",
 }
 
@@ -1058,11 +1084,11 @@ var tsColumnMap = map[string]string{
 // consent predicate (rebuild_requested_at IS NOT NULL) and the retry-window
 // bound (created_at > $3) can be regression-tested without a live DB — dropping
 // either predicate would re-open unscoped credential egress. Params are the
-// already-quoted, schema-aware column names; $1=beforeCutoff, $2=exchanges,
-// $3=createdAfter.
-func unfinalizedExternalRebuildsQuery(uid, createdAt, rebFin, rebReq, isAct string) string {
+// already-quoted, schema-aware column names (rebFrom may be a typed NULL);
+// $1=beforeCutoff, $2=exchanges, $3=createdAfter.
+func unfinalizedExternalRebuildsQuery(uid, createdAt, rebFin, rebReq, isAct, rebFrom string) string {
 	return `
-		SELECT id, ` + uid + `, exchange, label, ` + createdAt + `
+		SELECT id, ` + uid + `, exchange, label, ` + createdAt + `, ` + rebFrom + `
 		FROM exchange_connections
 		WHERE ` + rebReq + ` IS NOT NULL
 		  AND ` + rebFin + ` IS NULL
@@ -1119,6 +1145,7 @@ func (r *ConnectionRepo) ListUnfinalizedExternalRebuilds(ctx context.Context, be
 	query := unfinalizedExternalRebuildsQuery(
 		r.qcol("user_uid"), r.qcol("created_at"),
 		r.qcol("rebuild_finalized_at"), r.qcol("rebuild_requested_at"), r.qcol("is_active"),
+		r.rebuildFromSelect(ctx),
 	)
 
 	rows, err := r.pool.Query(ctx, query, beforeCutoff, exchanges, createdAfter)
@@ -1130,7 +1157,7 @@ func (r *ConnectionRepo) ListUnfinalizedExternalRebuilds(ctx context.Context, be
 	var out []*ExchangeConnection
 	for rows.Next() {
 		conn := &ExchangeConnection{}
-		if err := rows.Scan(&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label, &conn.CreatedAt); err != nil {
+		if err := rows.Scan(&conn.ID, &conn.UserUID, &conn.Exchange, &conn.Label, &conn.CreatedAt, &conn.RebuildFrom); err != nil {
 			return nil, fmt.Errorf("scan unfinalized connection: %w", err)
 		}
 		out = append(out, conn)
@@ -1195,6 +1222,23 @@ func (r *ConnectionRepo) MarkRebuildRequested(ctx context.Context, connID string
 	tag, err := r.pool.Exec(ctx, query, at.UTC(), connID)
 	if err != nil {
 		return fmt.Errorf("mark rebuild requested: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetRebuildFrom stores the day a connection's history rebuild starts from.
+// No-op when the column is absent (migration 022 not applied).
+func (r *ConnectionRepo) SetRebuildFrom(ctx context.Context, connID string, from time.Time) error {
+	if !r.HasRebuildFromCol(ctx) {
+		return nil
+	}
+	query := `UPDATE exchange_connections SET ` + r.qcol("rebuild_from") + ` = $1 WHERE id = $2`
+	tag, err := r.pool.Exec(ctx, query, from.UTC(), connID)
+	if err != nil {
+		return fmt.Errorf("set rebuild from: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

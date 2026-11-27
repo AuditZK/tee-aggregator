@@ -122,6 +122,9 @@ type CreateConnectionRequest struct {
 	// no rebuild, no plaintext exit. IBKR's in-enclave Flex rebuild is also gated
 	// by this flag for consistency, even though it stays inside the ZK perimeter.
 	RebuildHistory bool
+	// RebuildFrom is the first day of the month the rebuild starts from, zero
+	// for the rebuilder's default window. Stored only with RebuildHistory.
+	RebuildFrom time.Time
 }
 
 // Create encrypts and stores a new exchange connection
@@ -342,6 +345,15 @@ func (s *ConnectionService) Create(ctx context.Context, req *CreateConnectionReq
 				zap.String("exchange", conn.Exchange),
 				zap.Error(err),
 			)
+		}
+		if !req.RebuildFrom.IsZero() {
+			if err := s.repo.SetRebuildFrom(ctx, conn.ID, req.RebuildFrom); err != nil && s.logger != nil {
+				s.logger.Warn("failed to persist rebuild start month; rebuilds will use the default window",
+					zap.String("user_uid", conn.UserUID),
+					zap.String("exchange", conn.Exchange),
+					zap.Error(err),
+				)
+			}
 		}
 	}
 

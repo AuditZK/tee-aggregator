@@ -363,6 +363,13 @@ func (s *Server) CreateUserConnection(ctx context.Context, req *pb.CreateUserCon
 	}); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	var rebuildFrom time.Time
+	if req.RebuildHistory {
+		var err error
+		if rebuildFrom, err = validation.ParseRebuildFrom(req.RebuildFrom, time.Now()); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+	}
 
 	if s.connSvc == nil {
 		return &pb.CreateUserConnectionResponse{
@@ -392,6 +399,7 @@ func (s *Server) CreateUserConnection(ctx context.Context, req *pb.CreateUserCon
 		Passphrase:        req.Passphrase,
 		ExcludeFromReport: req.ExcludeFromReport,
 		RebuildHistory:    req.RebuildHistory,
+		RebuildFrom:       rebuildFrom,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrConnectionAlreadyExists) {
