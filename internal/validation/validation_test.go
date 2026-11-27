@@ -401,3 +401,47 @@ func TestParseHistoryStart(t *testing.T) {
 		})
 	}
 }
+
+func TestParseRebuildFrom(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name, in string
+		want     time.Time
+		wantErr  bool
+	}{
+		{"absent", "", time.Time{}, false},
+		{"past month", "2025-03", time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC), false},
+		{"current month", "2026-10", time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), false},
+		{"ten years to the month", "2016-10", time.Date(2016, 10, 1, 0, 0, 0, 0, time.UTC), false},
+		{"next month", "2026-11", time.Time{}, true},
+		{"over ten years", "2016-09", time.Time{}, true},
+		{"day given", "2025-03-01", time.Time{}, true},
+		{"single digit month", "2025-3", time.Time{}, true},
+		{"month out of range", "2025-13", time.Time{}, true},
+		{"reversed", "03-2025", time.Time{}, true},
+		{"padded", " 2025-03", time.Time{}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseRebuildFrom(tt.in, now)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ParseRebuildFrom(%q) err = %v, wantErr %v", tt.in, err, tt.wantErr)
+			}
+			if !got.Equal(tt.want) || got.Location() != time.UTC {
+				t.Fatalf("ParseRebuildFrom(%q) = %v, want %v UTC", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// The current month is read in UTC: just after midnight on the first, east of
+// UTC, the UTC month has not turned yet.
+func TestParseRebuildFromReadsTheMonthInUTC(t *testing.T) {
+	east := time.FixedZone("UTC+3", 3*3600)
+	now := time.Date(2026, 11, 1, 1, 0, 0, 0, east)
+	if _, err := ParseRebuildFrom("2026-11", now); err == nil {
+		t.Fatal("next UTC month accepted")
+	}
+	if _, err := ParseRebuildFrom("2026-10", now); err != nil {
+		t.Fatalf("current UTC month refused: %v", err)
+	}
+}

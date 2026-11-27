@@ -889,8 +889,11 @@ type CreateUserConnectionRequest struct {
 	// means the gRPC caller must explicitly request the rebuild — silent
 	// upgrades won't trigger plaintext exit.
 	RebuildHistory bool `protobuf:"varint,8,opt,name=rebuild_history,json=rebuildHistory,proto3" json:"rebuild_history,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// YYYY-MM month the rebuild starts from, read only with rebuild_history.
+	// Empty keeps the rebuilder's default window.
+	RebuildFrom   string `protobuf:"bytes,9,opt,name=rebuild_from,json=rebuildFrom,proto3" json:"rebuild_from,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CreateUserConnectionRequest) Reset() {
@@ -977,6 +980,13 @@ func (x *CreateUserConnectionRequest) GetRebuildHistory() bool {
 		return x.RebuildHistory
 	}
 	return false
+}
+
+func (x *CreateUserConnectionRequest) GetRebuildFrom() string {
+	if x != nil {
+		return x.RebuildFrom
+	}
+	return ""
 }
 
 // Response from creating a user with exchange connection
@@ -2571,7 +2581,7 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"\vlong_volume\x18\t \x01(\x01R\n" +
 	"longVolume\x12!\n" +
 	"\fshort_volume\x18\n" +
-	" \x01(\x01R\vshortVolume\"\x9b\x02\n" +
+	" \x01(\x01R\vshortVolume\"\xbe\x02\n" +
 	"\x1bCreateUserConnectionRequest\x12\x19\n" +
 	"\buser_uid\x18\x01 \x01(\tR\auserUid\x12\x1a\n" +
 	"\bexchange\x18\x02 \x01(\tR\bexchange\x12\x14\n" +
@@ -2583,7 +2593,8 @@ const file_api_proto_enclave_proto_rawDesc = "" +
 	"passphrase\x18\x06 \x01(\tR\n" +
 	"passphrase\x12.\n" +
 	"\x13exclude_from_report\x18\a \x01(\bR\x11excludeFromReport\x12'\n" +
-	"\x0frebuild_history\x18\b \x01(\bR\x0erebuildHistory\"i\n" +
+	"\x0frebuild_history\x18\b \x01(\bR\x0erebuildHistory\x12!\n" +
+	"\frebuild_from\x18\t \x01(\tR\vrebuildFrom\"i\n" +
 	"\x1cCreateUserConnectionResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x19\n" +
 	"\buser_uid\x18\x02 \x01(\tR\auserUid\x12\x14\n" +

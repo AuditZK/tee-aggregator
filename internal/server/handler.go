@@ -356,6 +356,8 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 		// SEC-ZK-001: explicit opt-in for historical reconstruction. See the
 		// twin field on the legacy /api/v1/connection handler for rationale.
 		RebuildHistory bool `json:"rebuild_history"`
+		// YYYY-MM month the rebuild starts from; read only with rebuild_history.
+		RebuildFrom string `json:"rebuild_from"`
 	}
 
 	if err := readJSON(w, r, &req); err != nil {
@@ -481,6 +483,14 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	rebuildFrom, err := parseRebuildFrom(req.RebuildHistory, req.RebuildFrom)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
 
 	err = h.connSvc.Create(r.Context(), &service.CreateConnectionRequest{
 		UserUID:           userUID,
@@ -491,6 +501,7 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 		Passphrase:        passphrase,
 		ExcludeFromReport: req.ExcludeFromReport,
 		RebuildHistory:    req.RebuildHistory,
+		RebuildFrom:       rebuildFrom,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrConnectionAlreadyExists) {
@@ -533,6 +544,16 @@ func (h *Handler) ConnectCredentials(w http.ResponseWriter, r *http.Request) {
 		"exchange": req.Exchange,
 		"message":  "Credentials encrypted and stored in enclave",
 	})
+}
+
+// parseRebuildFrom reads rebuild_from only when the rebuild was asked for:
+// otherwise the month is never used, and a leftover form value must not refuse
+// the connection.
+func parseRebuildFrom(rebuildHistory bool, month string) (time.Time, error) {
+	if !rebuildHistory {
+		return time.Time{}, nil
+	}
+	return validation.ParseRebuildFrom(month, time.Now())
 }
 
 func hexDecode(s string) ([]byte, error) {
@@ -594,6 +615,8 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 		// silently trigger a plaintext-credential POST to the rebuilder. The
 		// frontend toggle sends true when the user pre-checks "rebuild history".
 		RebuildHistory bool `json:"rebuild_history"`
+		// YYYY-MM month the rebuild starts from; read only with rebuild_history.
+		RebuildFrom string `json:"rebuild_from"`
 	}
 
 	if err := readJSON(w, r, &req); err != nil {
@@ -630,6 +653,14 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	rebuildFrom, err := parseRebuildFrom(req.RebuildHistory, req.RebuildFrom)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
 
 	if h.connSvc == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
@@ -651,7 +682,7 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	err := h.connSvc.Create(r.Context(), &service.CreateConnectionRequest{
+	err = h.connSvc.Create(r.Context(), &service.CreateConnectionRequest{
 		UserUID:             userUID,
 		Exchange:            req.Exchange,
 		Label:               req.Label,
@@ -661,6 +692,7 @@ func (h *Handler) CreateUserConnection(w http.ResponseWriter, r *http.Request) {
 		SyncIntervalMinutes: req.SyncIntervalMinutes,
 		ExcludeFromReport:   req.ExcludeFromReport,
 		RebuildHistory:      req.RebuildHistory,
+		RebuildFrom:         rebuildFrom,
 	})
 
 	if err != nil {

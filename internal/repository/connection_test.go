@@ -14,7 +14,7 @@ import (
 // credential egress.
 func TestUnfinalizedExternalRebuildsQuery_ConsentGateAndWindow(t *testing.T) {
 	q := unfinalizedExternalRebuildsQuery(
-		`"user_uid"`, `"created_at"`, `"rebuild_finalized_at"`, `"rebuild_requested_at"`, `"is_active"`,
+		`"user_uid"`, `"created_at"`, `"rebuild_finalized_at"`, `"rebuild_requested_at"`, `"is_active"`, `"rebuild_from"`,
 	)
 
 	mustContain := []string{
@@ -29,5 +29,8 @@ func TestUnfinalizedExternalRebuildsQuery_ConsentGateAndWindow(t *testing.T) {
 		if !strings.Contains(q, want) {
 			t.Errorf("recalibration query missing %q — credential egress may be unscoped:\n%s", want, q)
 		}
+	}
+	if !strings.Contains(q, `"created_at", "rebuild_from"`) {
+		t.Errorf("recalibration query does not read the stored start month:\n%s", q)
 	}
 }

@@ -22,6 +22,7 @@ type fakeRebuilder struct {
 	fail     bool
 	calls    atomic.Int32
 	override atomic.Value
+	since    atomic.Value
 }
 
 func (f *fakeRebuilder) serve(t *testing.T) *httptest.Server {
@@ -37,6 +38,7 @@ func (f *fakeRebuilder) serve(t *testing.T) *httptest.Server {
 			return
 		}
 		f.override.Store(req.EndEquityOverride)
+		f.since.Store(req.Since)
 		if f.fail {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -190,5 +192,41 @@ func TestDBRecalibrationSkipsConnectionsWithoutConsent(t *testing.T) {
 
 	if n := fake.calls.Load(); n != 0 {
 		t.Errorf("credentials left the enclave %d time(s) for a connection that never consented", n)
+	}
+}
+
+// The midnight pass rebuilds the whole history again, so it asks for the
+// month stored at connect: with the default window its prune would delete the
+// older days the connect-time rebuild wrote.
+func TestDBRecalibrationAsksForTheStoredMonth(t *testing.T) {
+	stored := utcDay(2025, 3, 1)
+	for _, tc := range []struct {
+		name   string
+		stored *time.Time
+		want   string
+	}{
+		{"stored month", &stored, "2025-03-01"},
+		{"none stored", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newDBHarness(t)
+			conn := h.seedRecalibrationCandidate(t, true)
+			if tc.stored != nil {
+				if err := h.conns.SetRebuildFrom(h.ctx, conn.ID, *tc.stored); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fake := &fakeRebuilder{}
+			h.sync.SetRebuilderClient(rebuilderclient.New(fake.serve(t).URL, rebuilderToken, zap.NewNop()))
+
+			h.sync.RecalibrateRebuiltHistories(h.ctx)
+
+			if fake.calls.Load() != 1 {
+				t.Fatalf("rebuilder calls = %d, want 1", fake.calls.Load())
+			}
+			if got, _ := fake.since.Load().(string); got != tc.want {
+				t.Errorf("since = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

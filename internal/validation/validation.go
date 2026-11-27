@@ -153,6 +153,27 @@ func ParseHistoryStart(fromStr string, now time.Time) (time.Time, error) {
 	return from, nil
 }
 
+// ParseRebuildFrom parses the YYYY-MM month a history rebuild starts from and
+// returns its first day, UTC. Empty means no start was asked for.
+func ParseRebuildFrom(s string, now time.Time) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	from, err := time.Parse("2006-01", s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid rebuild_from format: use YYYY-MM")
+	}
+	now = now.UTC()
+	currentMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	if from.After(currentMonth) {
+		return time.Time{}, fmt.Errorf("rebuild_from must not be after the current month")
+	}
+	if from.Before(currentMonth.AddDate(-maxHistoryYears, 0, 0)) {
+		return time.Time{}, fmt.Errorf("rebuild_from too far back: max %d years", maxHistoryYears)
+	}
+	return from, nil
+}
+
 // ValidateOptionalTimestampMillis validates optional epoch-millisecond timestamps.
 // Zero is treated as "not provided", matching gRPC optional semantics.
 func ValidateOptionalTimestampMillis(ts int64, field string) error {

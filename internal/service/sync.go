@@ -2067,6 +2067,7 @@ func (s *SyncService) reconstructHistoryFor(ctx context.Context, userUID, exchan
 		)
 		return
 	}
+	opts.since = rebuildStart(opts.since, connMeta)
 	creds, err := s.connSvc.GetDecryptedCredentialsByLabel(ctx, userUID, exchange, label)
 	if err != nil {
 		s.logger.Error("history backfill: credential decrypt failed",
@@ -2164,6 +2165,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 		zap.String("user_uid", connMeta.UserUID),
 		zap.String("exchange", connMeta.Exchange),
 		zap.Float64("end_equity_anchor", endEquity),
+		zap.String("since", rebuildSince(opts.since)),
 	)
 	res, err := s.rebuilder.Rebuild(ctx, rebuilderclient.RebuildRequest{
 		UserUID:  connMeta.UserUID,
@@ -2489,6 +2491,7 @@ func (s *SyncService) recalibrateOne(ctx context.Context, conn *repository.Excha
 			Passphrase:    creds.Passphrase,
 		},
 		EndEquityOverride: latest.TotalEquity,
+		Since:             rebuildSince(rebuildStart(time.Time{}, conn)),
 	})
 	// LOG-CREDS-001: drop the local plaintext reference promptly. Best-effort
 	// (Go strings are immutable — the original heap allocation may live until
@@ -4177,6 +4180,17 @@ func (s *SyncService) logBalanceDegradations(conn connector.Connector, connMeta 
 			zap.String("cause", cause),
 		)
 	}
+}
+
+// rebuildStart is the first day a rebuild asks for: the caller's, else the one
+// stored on the connection. A rebuild that states no horizon prunes the rebuilt
+// days it does not produce, so falling back to the default window would delete
+// the older days a deeper rebuild wrote.
+func rebuildStart(asked time.Time, conn *repository.ExchangeConnection) time.Time {
+	if asked.IsZero() && conn.RebuildFrom != nil {
+		return conn.RebuildFrom.UTC()
+	}
+	return asked
 }
 
 func rebuildSince(t time.Time) string {
