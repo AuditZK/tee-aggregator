@@ -289,6 +289,9 @@ type reconstructOpts struct {
 	// examined and stays. Zero means the rebuilder stated no horizon, and the
 	// prune falls back to owning the whole rebuilt history.
 	coveredFrom time.Time
+	// since is the first day asked of the external rebuilder, zero for its
+	// default window.
+	since time.Time
 	// written receives the days a real run upserted, without the connect-time
 	// row it superseded.
 	written func([]*repository.Snapshot)
@@ -1988,8 +1991,8 @@ func (s *SyncService) ReconstructHistoryOnConnect(ctx context.Context, userUID, 
 // the live sync measured, and the report starts the verifiable record right
 // after the last reconstructed row, so a rebuilt row written over a live day
 // takes that day out of the verified period.
-func (s *SyncService) ReconstructHistoryAdmin(ctx context.Context, userUID, exchange, label string) {
-	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{keepLiveDays: true})
+func (s *SyncService) ReconstructHistoryAdmin(ctx context.Context, userUID, exchange, label string, since time.Time) {
+	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{keepLiveDays: true, since: since})
 }
 
 // ReconstructHistoryRange backfills ONLY the days in [from, to] (inclusive,
@@ -2006,7 +2009,7 @@ func (s *SyncService) ReconstructHistoryAdmin(ctx context.Context, userUID, exch
 //
 // Admin only, like ReconstructHistoryAdmin: an external rebuild writes no day
 // on or after the connection's first live day, inside the window or not.
-func (s *SyncService) ReconstructHistoryRange(ctx context.Context, userUID, exchange, label string, from, to time.Time, dryRun bool) {
+func (s *SyncService) ReconstructHistoryRange(ctx context.Context, userUID, exchange, label string, from, to time.Time, dryRun bool, since time.Time) {
 	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{
 		window: dayWindow{
 			from: time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC),
@@ -2014,6 +2017,7 @@ func (s *SyncService) ReconstructHistoryRange(ctx context.Context, userUID, exch
 		},
 		dryRun:       dryRun,
 		keepLiveDays: true,
+		since:        since,
 	})
 }
 
@@ -2025,7 +2029,7 @@ func (s *SyncService) ReconstructHistoryRange(ctx context.Context, userUID, exch
 // The cut is how the run stopped at the connection's first live day, nil when
 // no live day is stored: with it the caller can tell an empty answer cut whole
 // from a rebuild that returned nothing.
-func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, exchange, label string, from, to time.Time) ([]*repository.Snapshot, *LiveDayCut) {
+func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, exchange, label string, from, to, since time.Time) ([]*repository.Snapshot, *LiveDayCut) {
 	var out []*repository.Snapshot
 	var cut *LiveDayCut
 	s.reconstructHistoryFor(ctx, userUID, exchange, label, reconstructOpts{
@@ -2036,6 +2040,7 @@ func (s *SyncService) DryRunReconstructRange(ctx context.Context, userUID, excha
 		dryRun:       true,
 		collect:      func(sn []*repository.Snapshot) { out = sn },
 		keepLiveDays: true,
+		since:        since,
 		cut:          func(c LiveDayCut) { cut = &c },
 	})
 	return out, cut
@@ -2174,6 +2179,7 @@ func (s *SyncService) reconstructHistory(ctx context.Context, connMeta *reposito
 			Passphrase:    creds.Passphrase,
 		},
 		EndEquityOverride: endEquity,
+		Since:             rebuildSince(opts.since),
 	})
 	// LOG-CREDS-001: drop the local reference promptly. Best-effort — Go
 	// strings are immutable so the original heap allocation may live until
@@ -4171,4 +4177,11 @@ func (s *SyncService) logBalanceDegradations(conn connector.Connector, connMeta 
 			zap.String("cause", cause),
 		)
 	}
+}
+
+func rebuildSince(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format("2006-01-02")
 }

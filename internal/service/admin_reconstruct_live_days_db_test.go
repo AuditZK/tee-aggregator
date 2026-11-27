@@ -130,7 +130,7 @@ func TestDBAdminReconstructKeepsEveryLiveDay(t *testing.T) {
 			srv := serveRebuild(t, days, utcDay(2026, 8, 29))
 			h.sync.SetRebuilderClient(rebuilderclient.New(srv.URL, "internal-token-0123456789", zap.NewNop()))
 
-			h.sync.ReconstructHistoryAdmin(h.ctx, dbUser, "binance", "main")
+			h.sync.ReconstructHistoryAdmin(h.ctx, dbUser, "binance", "main", time.Time{})
 
 			got := h.binanceRows(t)
 			eachDay(utcDay(2026, 8, 1), utcDay(2026, 8, 28), func(d time.Time) {
@@ -209,7 +209,7 @@ func TestDBAdminReconstructDryRunStopsAtTheFirstLiveDay(t *testing.T) {
 	srv := serveRebuild(t, days, utcDay(2026, 8, 29))
 	h.sync.SetRebuilderClient(rebuilderclient.New(srv.URL, "internal-token-0123456789", zap.NewNop()))
 
-	out, cut := h.sync.DryRunReconstructRange(h.ctx, dbUser, "binance", "main", utcDay(2026, 8, 29), utcDay(2026, 11, 26))
+	out, cut := h.sync.DryRunReconstructRange(h.ctx, dbUser, "binance", "main", utcDay(2026, 8, 29), utcDay(2026, 11, 26), time.Time{})
 
 	if cut == nil || !cut.FirstLiveDay.Equal(firstLive) || cut.DaysKept != 56 || cut.DaysDroppedOverLive != 33 ||
 		math.Abs(cut.MaxRelativeGap-0.0015) > 1e-9 {
@@ -276,7 +276,7 @@ func TestDBAdminReconstructDryRunCutWholeReportsTheCut(t *testing.T) {
 	srv := serveRebuild(t, days, utcDay(2026, 11, 1))
 	h.sync.SetRebuilderClient(rebuilderclient.New(srv.URL, "internal-token-0123456789", zap.NewNop()))
 
-	out, cut := h.sync.DryRunReconstructRange(h.ctx, dbUser, "binance", "main", utcDay(2026, 11, 1), utcDay(2026, 11, 20))
+	out, cut := h.sync.DryRunReconstructRange(h.ctx, dbUser, "binance", "main", utcDay(2026, 11, 1), utcDay(2026, 11, 20), time.Time{})
 
 	if len(out) != 0 {
 		t.Fatalf("dry run would write %d live days", len(out))

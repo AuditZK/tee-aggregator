@@ -57,6 +57,9 @@ type RebuildRequest struct {
 	// historical equities to the exact midnight snapshot value without
 	// re-fetching live equity (avoiding API drift between 00:00 and ~00:04).
 	EndEquityOverride float64 `json:"endEquityOverride,omitempty"`
+	// Since: optional first day (YYYY-MM-DD) an operator asked for. The
+	// rebuilder goes back to it only as far as the exchange's ledgers justify.
+	Since string `json:"since,omitempty"`
 }
 
 // rebuildResponse is the wire shape returned by the rebuilder. Internal —
