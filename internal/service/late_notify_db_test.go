@@ -362,7 +362,7 @@ func TestDBConnectWithARebuildPingsOnceEvenWhenNothingIsRebuilt(t *testing.T) {
 		t.Fatalf("%d pings for the connect, want exactly 1", n)
 	}
 
-	h.sync.DryRunReconstructRange(h.ctx, dbUser, "binance", "main", startOfTodayUTC().AddDate(0, 0, -7), startOfTodayUTC().AddDate(0, 0, -1))
+	h.sync.DryRunReconstructRange(h.ctx, dbUser, "binance", "main", startOfTodayUTC().AddDate(0, 0, -7), startOfTodayUTC().AddDate(0, 0, -1), time.Time{})
 	if n := sink.count(dbUser); n != 1 {
 		t.Fatalf("%d pings after a dry run, want still 1", n)
 	}

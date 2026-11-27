@@ -371,6 +371,16 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	// since asks the rebuilder to start further back than its default window.
+	var since time.Time
+	if sinceStr := q.Get("since"); sinceStr != "" {
+		var err error
+		if since, err = validation.ParseHistoryStart(sinceStr, time.Now()); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
 	// dry_run only makes sense with an explicit window — it exists to inspect a
 	// splice before committing it.
 	dryRun := q.Get("dry_run") == "1" || q.Get("dry_run") == "true"
@@ -391,6 +401,7 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		zap.String("from", fromStr),
 		zap.String("to", toStr),
 		zap.Bool("dry_run", dryRun),
+		zap.Time("since", since),
 	)
 	// A dry run answers the caller rather than the log: logredact masks every
 	// money field, on purpose, so the days would arrive empty. Synchronous for
@@ -399,7 +410,7 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		extendWriteDeadline(w, adminReconstructTimeout)
 		ctx, cancel := context.WithTimeout(r.Context(), adminReconstructTimeout)
 		defer cancel()
-		days, cut := s.handler.syncSvc.DryRunReconstructRange(ctx, userUID, exchange, label, from, to)
+		days, cut := s.handler.syncSvc.DryRunReconstructRange(ctx, userUID, exchange, label, from, to, since)
 		rows := dryRunRows(days)
 		resp := map[string]any{
 			"success": true, "dry_run": true, "count": len(rows), "days": rows,
@@ -415,10 +426,10 @@ func (s *Server) handleAdminReconstruct(w http.ResponseWriter, r *http.Request) 
 		ctx, cancel := context.WithTimeout(context.Background(), adminReconstructTimeout)
 		defer cancel()
 		if fromStr == "" {
-			s.handler.syncSvc.ReconstructHistoryAdmin(ctx, userUID, exchange, label)
+			s.handler.syncSvc.ReconstructHistoryAdmin(ctx, userUID, exchange, label, since)
 			return
 		}
-		s.handler.syncSvc.ReconstructHistoryRange(ctx, userUID, exchange, label, from, to, dryRun)
+		s.handler.syncSvc.ReconstructHistoryRange(ctx, userUID, exchange, label, from, to, dryRun, since)
 	}()
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "dry_run": dryRun, "message": "reconstruction triggered, check logs"})
 }

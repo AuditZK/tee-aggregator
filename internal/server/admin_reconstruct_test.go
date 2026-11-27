@@ -37,3 +37,22 @@ func TestHandleAdminReconstruct_Validation(t *testing.T) {
 		t.Errorf("valid inputs were wrongly rejected as 400")
 	}
 }
+
+func TestHandleAdminReconstruct_SinceValidation(t *testing.T) {
+	s := &Server{}
+	post := func(since string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost,
+			"/api/v1/admin/reconstruct?user_uid=user_abc1234567890&exchange=binance&label=main&since="+since, nil)
+		s.handleAdminReconstruct(rec, req)
+		return rec.Code
+	}
+	for _, bad := range []string{"2026-13-01", "01-06-2026", "2999-01-01", "1990-01-01"} {
+		if got := post(bad); got != http.StatusBadRequest {
+			t.Errorf("since=%s: got %d, want 400", bad, got)
+		}
+	}
+	if got := post("2026-06-01"); got == http.StatusBadRequest {
+		t.Errorf("a valid since was rejected as 400")
+	}
+}
