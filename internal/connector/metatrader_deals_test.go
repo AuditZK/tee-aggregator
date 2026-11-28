@@ -88,6 +88,28 @@ func TestMetaTraderKeepsDealsDatedAheadOfTheClock(t *testing.T) {
 	}
 }
 
+// A deposit is a BALANCE deal: GetCashflows books it, GetTrades must not count
+// it as a zero-volume buy carrying the deposit as realized P&L.
+func TestMetaTraderBalanceDealsAreNotTrades(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	at := now.Add(-30 * time.Minute).Format(time.RFC3339)
+	bridge, _ := fakeMTDealsBridge(t, []map[string]any{
+		{"ticket": 1, "symbol": "BALANCE", "side": "deposit", "realized_pnl": 500.0, "close_time": at},
+		{"ticket": 2, "symbol": "BALANCE", "side": "withdrawal", "realized_pnl": -200.0, "close_time": at},
+		{"ticket": 3, "symbol": "EURUSD", "side": "sell", "size": 1.0, "close_price": 1.1, "realized_pnl": 3.0, "close_time": at},
+	})
+	defer bridge.Close()
+	mt := newTestMetaTrader(t, bridge.URL, "Broker-Live")
+
+	trades, err := mt.GetTrades(context.Background(), now.Add(-time.Hour), now)
+	if err != nil {
+		t.Fatalf("trades: %v", err)
+	}
+	if len(trades) != 1 || trades[0].ID != "3" {
+		t.Errorf("trades = %+v, want only the EURUSD deal", trades)
+	}
+}
+
 func hasTradeID(trades []*Trade, id string) bool {
 	for _, tr := range trades {
 		if tr.ID == id {
