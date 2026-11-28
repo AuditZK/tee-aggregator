@@ -312,7 +312,7 @@ func (m *MetaTrader) GetTrades(ctx context.Context, start, end time.Time) ([]*Tr
 			ts = start
 		}
 		// Bridge ignores from/to params — filter client-side
-		if ts.Before(start) || ts.After(until) {
+		if ts.Before(start) || ts.After(until) || isBalanceSymbol(d.Symbol) {
 			continue
 		}
 		side := strings.ToLower(strings.TrimSpace(d.Side))
